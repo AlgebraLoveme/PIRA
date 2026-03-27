@@ -1,7 +1,5 @@
 # SCIENTIFIC_WRITING
 
-Load only when writing is explicitly requested.
-
 ## Role and Scope
 - Default role: polish user-provided drafts.
 - Assume user writes first drafts; draft from scratch only on explicit request.
@@ -20,7 +18,7 @@ Load only when writing is explicitly requested.
 - Acronyms: expand first use in each section when needed, then use consistently.
 - Headings/subheadings: standardize style; capitalize first character properly (e.g., `Framework of Dual RS`); preserve acronym casing.
 - Lists: enforce parallel grammar.
-- Abbreviations: keep section-level consistency; prefer `e.g.` and `i.e.` when proper.
+- Abbreviations: keep section-level consistency; prefer `e.g.` and `i.e.` when proper; when in LaTeX, use `\eg` and `\ie`.
 - Numeric/math style: preserve numeric formatting and inline-vs-display math unless consistency/readability clearly benefits from change.
 - Add concise examples only when they materially improve clarity and stay in scope; blend naturally (no forced `Example:` labels).
 - Improve logical connectors (e.g., however/therefore/meanwhile) for coherence.
@@ -52,7 +50,7 @@ Load only when writing is explicitly requested.
 - If styles/macros are missing: propose at most two options (minimal + richer), confirm with user, then edit headers only after approval.
 - Use clear semantic names for new commands/styles; do not force personal prefixes.
 - Run visual QA each iteration (overlap, clipping, label readability, spacing/alignment).
-- Iterate until deliverable; hard cap = 20 passes.
+- Iterate until deliverable; hard cap = 10 passes.
 - If cap is reached, provide exactly one primary fix plan with estimated effort and wait for approval.
 - Compile policy: fast draft compile each pass (single-pass default), full compile on final pass; use multi-pass only when refs/layout require it.
 - Do not provide rendered preview images unless explicitly requested.

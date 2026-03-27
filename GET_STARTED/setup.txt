@@ -1,0 +1,74 @@
+SETUP PIPELINE (FOR NEW USERS)
+
+Repository
+- https://github.com/AlgebraLoveme/personal_agent
+
+Goal
+- After cloning this repo, configure your coding model so it auto-loads this agent policy globally.
+- Source of truth: ~/agent/AGENTS.md and its referenced modules.
+- Recommended clone location: `~/agent` (to avoid symlink/setup friction).
+
+How to use this file
+1) Clone the repo to `~/agent` (recommended).
+   - Example: `git clone https://github.com/AlgebraLoveme/personal_agent.git ~/agent`
+2) Initialize `USER.md`:
+   - Option A: copy-paste your own `USER.md` into `~/agent/USER.md`
+   - Option B: ask your agent to request your profile (URL or brief description) and auto-generate `USER.md`
+   - See `~/agent/GET_STARTED/USER_TEMPLATE.md` for rules.
+3) Open your coding model tool (Codex / Claude / others).
+4) Paste the PROMPT below.
+5) Let the model perform setup and verification.
+
+PROMPT TO PASTE INTO YOUR MODEL
+---
+I cloned a repo that contains an agent policy folder. Please set up a global agent pipeline for me.
+
+Requirements:
+1. Detect the directory containing this repository.
+2. Ensure the directory is `~/agent`.
+   - If not, create a symlink `~/agent -> <detected-folder>`.
+3. Initialize `~/agent/USER.md`:
+   - ask me for either:
+     a) public profile URL(s), or
+     b) a brief self-description, or
+     c) user creates the USER.md later by themselves
+     then generate/update `USER.md` (in the last case, create an empty one).
+   - Follow `~/agent/GET_STARTED/USER_TEMPLATE.md`.
+4. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
+5. Keep existing policy text unchanged unless needed for compatibility.
+6. Verify setup and report exactly what changed.
+
+Verification checklist:
+- Confirm `~/agent/AGENTS.md` exists.
+- Confirm global config points to `~/agent/AGENTS.md`.
+- If `~/agent/USER.md` exists, confirm it is loaded as mandatory context.
+- Start/describe a fresh-session check with only mandatory modules; confirm no load acknowledgement is printed; ask about the verification token contained in SOUL.md and check consistency.
+- Then ask a conceptual question (e.g., "what is machine learning?") and confirm teaching is auto-inferred and acknowledgement appears:
+  -- BEGIN LOADING --
+  Loading module: teaching
+  -- END LOADING --
+
+If your platform does not support native global instruction loading:
+- Create a startup wrapper/preset that injects `~/agent/AGENTS.md` automatically.
+- Explain exactly how I should launch sessions to keep behavior equivalent.
+
+For Codex specifically:
+- Update/create `~/.codex/config.toml` with:
+  - `model_instructions_file = "~/agent/AGENTS.md"`
+  - keep or set `project_doc_max_bytes = 65536`
+- Ensure `~/.codex/AGENTS.md` also points to `~/agent/AGENTS.md`.
+
+Output format:
+- Changed files (absolute paths)
+- Diff summary
+- Verification results
+- Any remaining manual step (if unavoidable)
+---
+
+Notes
+- This repo contains modular policy files:
+  SOUL.md, TOOLS.md, TASK_LOOP.md, RESEARCH_POLICY.md,
+  USER.md, GET_STARTED/USER_TEMPLATE.md, CODING_STYLE.md, SCIENTIFIC_WRITING.md, TEACHING_STYLE.md, MEMORY.md.
+- `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, and `TEACHING_STYLE.md` are on-demand modules.
+- `USER.md` is private, gitignored, and should keep knowledge/ability context only.
+- Do not duplicate global policy preferences in `USER.md`.

@@ -7,7 +7,7 @@
 4. Report evidence, uncertainty, and the next step.
 
 ## Research Loop
-1. Set search depth (broad-first by default; deep/full only on explicit request).
+1. When proper, gather information online. Set search depth (broad-first by default; deep/full only on explicit request).
 2. Collect and verify evidence (per RESEARCH_POLICY).
 3. Report in order: findings -> key raw data (if needed) -> interpretation/conflicts -> primary recommendation -> short plan.
 4. Include the strongest counterargument when useful; add confidence labels only when uncertainty is non-trivial.

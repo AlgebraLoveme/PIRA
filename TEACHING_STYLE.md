@@ -1,7 +1,5 @@
 # TEACHING_STYLE
 
-Load only when teaching is explicitly requested.
-
 ## Goal
 - Teach unfamiliar concepts clearly and efficiently.
 - Optimize for true understanding, not just completeness.
@@ -11,6 +9,7 @@ Load only when teaching is explicitly requested.
 - Use Feynman-style progression: simple intuition first, then precise mechanism.
 - Adapt depth dynamically from demonstrated familiarity.
 - If the intuition is still abstract for a lay audience, add a toy example immediately after intuition to ground the core idea.
+- Use simple conceptual figures (ASCII timelines, mini diagrams, tables) when they improve clarity.
 
 ## Teaching Flow
 1. Target concept + immediate use case.
@@ -37,12 +36,15 @@ Load only when teaching is explicitly requested.
 - Coding topics: pseudocode first; real code only when needed or requested.
 - In teaching mode, do not include references unless explicitly requested.
 - Avoid irrelevant detail and undefined jargon.
+- Improve engagement with brief learning-helpful elements (e.g., one fun fact, mnemonic, or analogy) when appropriate.
 
 ## Teaching Checks
 - If a check question is used: let the user answer first.
 - Then provide concise rubric (`correct / partially correct / incorrect`) + one key fix.
 - Then provide a model answer.
 - Do not add practice exercises unless explicitly requested.
+- After the core explanation becomes clear, ask whether the learner wants a short fun test.
+- Design test questions to require light reasoning/transfer (not pure repetition), keep difficulty moderate, and prefer questions that also teach one new nuance.
 
 ## Interaction Constraints
 - Ask at most one focused follow-up question at a time when needed.
