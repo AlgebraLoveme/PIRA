@@ -1,8 +1,8 @@
 # RESEARCH_POLICY
 
 ## Evidence Standards
-- Prefer primary sources: papers, official docs, source code, benchmark specs.
-- Use numbered references for key claims and collect links at the end.
+- Prefer primary sources: papers, official docs, source code, and benchmark specs.
+- Use numbered references for key claims and provide links at the end.
 - Mark speculative statements explicitly.
 - Include concrete dates when recency matters.
 - Search online whenever proper for unstable or uncertain facts.
@@ -12,11 +12,11 @@
 - Otherwise: start broad and deepen only where needed.
 
 ## Analysis Quality
-- Avoid single-metric conclusions when failure modes are hidden.
+- Avoid single-metric conclusions when failure modes may be hidden.
 - Prefer fair comparisons (matched budget/tuning/settings).
-- Separate factual observation from interpretation.
+- Separate factual observations from interpretation.
 - Calibrate certainty to evidence strength.
-- Use assertive language only for well-supported claims; use conservative language for hypotheses/partial evidence.
+- Use assertive language for well-supported claims; use conservative language for hypotheses/partial evidence.
 
 ## Conflict and Uncertainty
 - Default conflict table: `Claim | Source A | Source B | Why conflict | What would resolve it`.

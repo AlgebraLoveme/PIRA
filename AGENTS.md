@@ -1,32 +1,30 @@
 # GLOBAL AGENT BOOTSTRAP
 
 Load every session:
-1. ~/agent/SOUL.md: your role.
-2. ~/agent/TOOLS.md: strict safety/tool rules.
-3. ~/agent/TASK_LOOP.md: execution flow.
-4. ~/agent/RESEARCH_POLICY.md: evidence standards.
-5. ~/agent/USER.md: user knowledge/abilities.
+1. ~/agent/SOUL.md
+2. ~/agent/TOOLS.md
+3. ~/agent/TASK_LOOP.md
+4. ~/agent/RESEARCH_POLICY.md
+5. ~/agent/USER.md
 
-Load on demand (explicitly requested or implicitly inferred; triggers are indicative, not exhaustive):
-- ~/agent/CODING_STYLE.md when tasks involve code changes/debugging/testing/review or repo-level implementation discussion.
-- ~/agent/SCIENTIFIC_WRITING.md when tasks involve polishing/writing scientific text, LaTeX manuscripts, or TikZ figures.
-- ~/agent/TEACHING_STYLE.md when tasks involve teaching/explaining concepts, especially foundational what/how/why questions.
+Load on demand (explicit or inferred; examples only):
+- ~/agent/CODING_STYLE.md for code implementation/debugging/testing/review.
+- ~/agent/SCIENTIFIC_WRITING.md for manuscript/LaTeX/TikZ polishing or writing.
+- ~/agent/TEACHING_STYLE.md for explanatory/teaching tasks, especially foundational what/how/why questions.
 
 Not auto-loaded:
-- ~/agent/MEMORY.md: cold archive only; update only on explicit request.
+- ~/agent/MEMORY.md (cold archive; update only on explicit request).
 
 ## Maintenance
-- Edit instruction files only when the user explicitly asks.
-- Overwrite with the current policy only.
-- Do not keep timestamps, question IDs, changelogs, or override chains.
-- After every write, check whether instruction files have conflicting instructions; in this case, raise the conflict immediately and confirm with the user to resolve.
+- Edit instruction files only on explicit user request.
+- Overwrite with current policy text only (no timestamps, question IDs, changelogs, or override chains).
+- After every write, check cross-file conflicts; if any exist, raise them immediately and confirm resolution with the user.
 
 ## Load Acknowledgement
-- Print loading acknowledgement only when at least one optional module is loaded.
-- If only mandatory modules are loaded, print nothing.
-- Print the acknowledgement immediately after you read the optional modules.
+- Print only when at least one optional module is loaded (print nothing for mandatory-only loads).
+- Print immediately after reading optional modules, and list optional modules only.
 - Format:
 -- BEGIN LOADING --
 Loading module: <comma-separated-optional-module-list>
 -- END LOADING --
-- Optional module names: `coding`, `writing`, `teaching`.
+- Module names: `coding`, `writing`, `teaching`.
