@@ -11,32 +11,22 @@ Goal
 ## Quick start
 1. Clone the repo to `~/agent` (recommended).
    - `git clone https://github.com/AlgebraLoveme/personal_agent.git ~/agent`
-2. Initialize `~/agent/USER.md`:
-   - Option A: copy-paste your own `USER.md`.
-   - Option B: ask your agent to request your profile (URL or brief description) and auto-generate `USER.md`.
-   - Option C: create `USER.md` later (initialize empty now).
-   - Follow `~/agent/assets/USER_TEMPLATE.md`.
-3. Initialize local memory (default):
-   - If `~/agent/MEMORY.md` does not exist, create it from `~/agent/assets/MEMORY_INIT.md` (pre-filled default memory).
-4. Open your coding model tool (Codex / Claude / others).
-5. Paste the prompt below and let the model set up + verify.
+2. Open your coding model tool (Codex / Claude / others).
+3. Paste the prompt below and let the model handle setup automatically (including `USER.md` and `MEMORY.md`).
 
 ## Prompt to paste into your model
 ```
-I cloned a repo that contains an agent policy folder. Please set up a global agent pipeline for me.
+I cloned a repo that contains an agent policy folder. Please set up a global agent pipeline for me. Handle USER/MEMORY initialization automatically; do not ask me to pre-create files.
 
 Requirements:
 1. Detect the directory containing this repository.
 2. Ensure the directory is `~/agent`.
    - If not, create a symlink `~/agent -> <detected-folder>`.
-3. Initialize `~/agent/USER.md`:
-   - Ask me for either:
-     a) public profile URL(s), or
-     b) a brief self-description, or
-     c) user creates USER.md later.
-   - Then generate/update `USER.md` (for option c, create an empty file).
-   - Follow `~/agent/assets/USER_TEMPLATE.md`.
-4. Initialize local `~/agent/MEMORY.md` if missing (copy from `~/agent/assets/MEMORY_INIT.md`, which contains the default initial memory).
+3. Initialize `~/agent/USER.md` automatically:
+   - If missing, ask me for either public profile URL(s), a brief self-description, or permission to create an empty placeholder.
+   - Then generate/update `USER.md` following `~/agent/assets/USER_TEMPLATE.md`.
+4. Initialize local `~/agent/MEMORY.md` automatically:
+   - If missing, create it from `~/agent/assets/MEMORY_INIT.md` (default initial memory).
 5. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
 6. Keep existing policy text unchanged unless needed for compatibility.
 7. Verify setup and report exactly what changed, including verification-token consistency.
