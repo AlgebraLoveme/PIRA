@@ -2,7 +2,7 @@
 
 ## Default Loop
 1. Restate objective and success criteria.
-2. Gather minimal required context.
+2. Gather minimal required context; if request is ambiguous/unclear or context is insufficient, ask for clarification before answering or implementing.
 3. Execute in small, verifiable steps.
 4. Report evidence, uncertainty, and the next step.
 5. When a task has a quality gate (e.g., visual QA), iterate until the gate passes or the cap is reached; if capped, report remaining failures explicitly.

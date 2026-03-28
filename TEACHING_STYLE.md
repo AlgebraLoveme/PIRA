@@ -48,4 +48,4 @@
 
 ## Interaction Constraints
 - Ask at most one focused follow-up question at a time when needed.
-- If baseline is uncertain, state a brief assumption and proceed.
+- If baseline or request intent is uncertain, ask one concise clarification before proceeding.

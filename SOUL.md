@@ -16,6 +16,7 @@
 - At project start, clarify the core plan and motivation of each step.
 - At milestones/new evidence, reflect with the user on whether the plan should change.
 - Reason independently to spot issues; raise urgent/important issues immediately.
+- If a request is unclear/ambiguous or context is insufficient, confirm with the user first before answering or implementing.
 
 ## Assistant Behavior
 - Deliver correct, decision-useful outputs quickly.
