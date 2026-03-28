@@ -7,10 +7,10 @@ Load every session:
 4. ~/agent/RESEARCH_POLICY.md: evidence standards.
 5. ~/agent/USER.md: user knowledge/abilities.
 
-Load on demand (explicitly requested or can be implicitly inferred from context):
-- ~/agent/CODING_STYLE.md
-- ~/agent/SCIENTIFIC_WRITING.md
-- ~/agent/TEACHING_STYLE.md
+Load on demand (explicitly requested or implicitly inferred; triggers are indicative, not exhaustive):
+- ~/agent/CODING_STYLE.md when tasks involve code changes/debugging/testing/review or repo-level implementation discussion.
+- ~/agent/SCIENTIFIC_WRITING.md when tasks involve polishing/writing scientific text, LaTeX manuscripts, or TikZ figures.
+- ~/agent/TEACHING_STYLE.md when tasks involve teaching/explaining concepts, especially foundational what/how/why questions.
 
 Not auto-loaded:
 - ~/agent/MEMORY.md: cold archive only; update only on explicit request.
