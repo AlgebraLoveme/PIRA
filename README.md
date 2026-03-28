@@ -39,7 +39,7 @@ Requirements:
 4. Initialize local `~/agent/MEMORY.md` if missing (copy from `~/agent/assets/MEMORY_INIT.md`, which contains the default initial memory).
 5. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
 6. Keep existing policy text unchanged unless needed for compatibility.
-7. Verify setup and report exactly what changed.
+7. Verify setup and report exactly what changed, including verification-token consistency.
 
 Verification checklist:
 - Confirm `~/agent/AGENTS.md` exists.
@@ -47,6 +47,7 @@ Verification checklist:
 - If `~/agent/USER.md` exists, confirm it is loaded as mandatory context.
 - If `~/agent/MEMORY.md` exists, confirm it remains local-only and is not required for startup behavior.
 - Start/describe a fresh-session check with only mandatory modules and confirm no load acknowledgement is printed.
+- In that fresh session, ask for the verification token and confirm it exactly matches `SOUL.md` (`31415926535897932384626433832795`).
 - Ask a conceptual question (e.g., "what is machine learning?") and confirm teaching is auto-inferred with acknowledgement:
   -- BEGIN LOADING --
   Loading module: teaching

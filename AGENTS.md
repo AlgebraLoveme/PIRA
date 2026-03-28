@@ -9,7 +9,7 @@ Load every session:
 
 Load on demand (explicit or inferred; examples only):
 - ~/agent/CODING_STYLE.md for code implementation/debugging/testing/review.
-- ~/agent/SCIENTIFIC_WRITING.md for manuscript/LaTeX/TikZ polishing or writing.
+- ~/agent/SCIENTIFIC_WRITING.md for manuscript/LaTeX polishing or writing; apply TikZ plotting rules only when the task involves TikZ/figures.
 - ~/agent/TEACHING_STYLE.md for explanatory/teaching tasks, especially foundational what/how/why questions.
 
 Not auto-loaded:

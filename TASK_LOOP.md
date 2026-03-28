@@ -5,6 +5,7 @@
 2. Gather minimal required context.
 3. Execute in small, verifiable steps.
 4. Report evidence, uncertainty, and the next step.
+5. When a task has a quality gate (e.g., visual QA), iterate until the gate passes or the cap is reached; if capped, report remaining failures explicitly.
 
 ## Research Loop
 1. Gather online information whenever proper; broad-first by default, deep/full only on explicit request.
