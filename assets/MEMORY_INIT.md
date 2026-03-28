@@ -1,6 +1,13 @@
 # MEMORY
 
-Not auto-loaded. Archive of stable cross-session preferences; operational rules live in loaded policy files.
+> Seed file: copy this to `~/agent/MEMORY.md` during setup.
+
+Not auto-loaded. Local archive of stable cross-session context; operational rules live in loaded policy files.
+
+## Maintenance Rule
+- When an important event creates stable, reusable context, write a concise entry.
+- Keep entries short, decision-relevant, and non-sensitive.
+- Prefer replacing outdated entries instead of accumulating stale details.
 
 ## Archived Cross-Session Preferences
 - Output style: rigorous/evidence-based; concise unless depth is requested; concrete actions over abstract advice; explicit tradeoffs/uncertainty.

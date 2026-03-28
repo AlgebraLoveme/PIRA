@@ -13,10 +13,11 @@ Load on demand (explicit or inferred; examples only):
 - ~/agent/TEACHING_STYLE.md for explanatory/teaching tasks, especially foundational what/how/why questions.
 
 Not auto-loaded:
-- ~/agent/MEMORY.md (cold archive; update only on explicit request).
+- ~/agent/MEMORY.md (cold local archive; not auto-loaded).
 
 ## Maintenance
 - Edit instruction files only on explicit user request.
+- Exception: `MEMORY.md` may be updated when important events create stable context; keep entries concise and non-sensitive.
 - Overwrite with current policy text only (no timestamps, question IDs, changelogs, or override chains).
 - After every write, check cross-file conflicts; if any exist, raise them immediately and confirm resolution with the user.
 

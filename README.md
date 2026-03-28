@@ -16,8 +16,10 @@ Goal
    - Option B: ask your agent to request your profile (URL or brief description) and auto-generate `USER.md`.
    - Option C: create `USER.md` later (initialize empty now).
    - Follow `~/agent/assets/USER_TEMPLATE.md`.
-3. Open your coding model tool (Codex / Claude / others).
-4. Paste the prompt below and let the model set up + verify.
+3. Initialize local memory (default):
+   - If `~/agent/MEMORY.md` does not exist, create it from `~/agent/assets/MEMORY_INIT.md` (pre-filled default memory).
+4. Open your coding model tool (Codex / Claude / others).
+5. Paste the prompt below and let the model set up + verify.
 
 ## Prompt to paste into your model
 ```
@@ -34,14 +36,16 @@ Requirements:
      c) user creates USER.md later.
    - Then generate/update `USER.md` (for option c, create an empty file).
    - Follow `~/agent/assets/USER_TEMPLATE.md`.
-4. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
-5. Keep existing policy text unchanged unless needed for compatibility.
-6. Verify setup and report exactly what changed.
+4. Initialize local `~/agent/MEMORY.md` if missing (copy from `~/agent/assets/MEMORY_INIT.md`, which contains the default initial memory).
+5. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
+6. Keep existing policy text unchanged unless needed for compatibility.
+7. Verify setup and report exactly what changed.
 
 Verification checklist:
 - Confirm `~/agent/AGENTS.md` exists.
 - Confirm global config points to `~/agent/AGENTS.md`.
 - If `~/agent/USER.md` exists, confirm it is loaded as mandatory context.
+- If `~/agent/MEMORY.md` exists, confirm it remains local-only and is not required for startup behavior.
 - Start/describe a fresh-session check with only mandatory modules and confirm no load acknowledgement is printed.
 - Ask a conceptual question (e.g., "what is machine learning?") and confirm teaching is auto-inferred with acknowledgement:
   -- BEGIN LOADING --
@@ -68,7 +72,7 @@ Output format:
 ## Notes
 - Modular policy files:
   `SOUL.md`, `TOOLS.md`, `TASK_LOOP.md`, `RESEARCH_POLICY.md`,
-  `USER.md`, `assets/USER_TEMPLATE.md`, `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`, `MEMORY.md`.
+  `USER.md`, `assets/USER_TEMPLATE.md`, `assets/MEMORY_INIT.md`, `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`, and local `MEMORY.md`.
 - `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, and `TEACHING_STYLE.md` are on-demand modules.
-- `USER.md` is private (gitignored) and should keep knowledge/ability context only.
+- `USER.md` and `MEMORY.md` are private (gitignored).
 - Do not duplicate global policy preferences in `USER.md`.
