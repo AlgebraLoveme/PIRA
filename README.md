@@ -25,9 +25,10 @@ Requirements:
    - Then generate/update `USER.md` from `~/agent/assets/USER_TEMPLATE.md`.
 4. Initialize local `~/agent/MEMORY.md` automatically.
    - If missing, create it from `~/agent/assets/MEMORY_INIT.md`.
-5. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
-6. Keep existing policy text unchanged unless compatibility requires edits.
-7. Verify setup and report exactly what changed, including verification-token consistency.
+5. Tell the user the agent's preferred name is `PI`, and briefly explain the meaning: pi is an early magic number for humans, represents the circle and thus infinite potential and curiosity, and symbolizes the hope that the agent's work can help define the world.
+6. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
+7. Keep existing policy text unchanged unless compatibility requires edits.
+8. Verify setup and report exactly what changed, including verification-token consistency.
 
 Verification checklist:
 - Confirm `~/agent/AGENTS.md` exists.
