@@ -8,6 +8,7 @@
 ## Polishing Policy
 - Preserve technical meaning, author intent, core claims, and uncertainty calibration unless correctness or an explicit request requires change.
 - Improve clarity, flow, and academic concision; remove redundancy without dropping important information.
+- When the user asks to compact or tighten text, preserve reviewer praise, key claims, concessions, limitations, and other decision-relevant content unless the user explicitly asks to remove them.
 - Allow moderate sentence-level restructuring, but keep paragraph order/length and section flow (`motivation -> method -> evidence -> takeaway`) unless coherence/readability clearly improves.
 - Preserve author voice; use present tense for both our work and prior work; prefer `we` and active voice when clear.
 - Preserve notation/symbol choices by default; fix them only for consistency or correctness.
