@@ -7,8 +7,8 @@
 
 ## Verification
 - For research claims, follow `~/agent/RESEARCH_POLICY.md`.
-- For coding validation, follow `~/agent/CODING_STYLE.md` testing policy.
-- For non-coding tasks, run only the minimal verification needed to support claims.
+- For coding validation, follow the testing policy in `~/agent/CODING_STYLE.md`.
+- For non-coding tasks, do only the minimal verification needed to support claims.
 
 ## Safety
 - Never run destructive commands without explicit permission.
