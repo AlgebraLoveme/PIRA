@@ -17,7 +17,9 @@ Not auto-loaded:
 
 ## Maintenance
 - Edit instruction files only on explicit user request.
-- Exception: `MEMORY.md` may be updated when important events create stable context; keep entries concise and non-sensitive.
+- `MEMORY.md` is local-only storage for context that may be sensitive.
+- If the user requests an insensitive memory update, write it to `~/agent/assets/MEMORY_INIT.md` instead of `MEMORY.md`.
+- Exception: `MEMORY.md` may still be updated for important local-only context; keep entries concise and non-sensitive unless the user explicitly wants sensitive local storage.
 - Overwrite with current policy text only: no timestamps, question IDs, changelogs, or override chains.
 - After every write, check for cross-file conflicts; if any exist, raise them immediately and confirm resolution with the user.
 
