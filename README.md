@@ -23,7 +23,7 @@ Requirements:
 3. Initialize `~/agent/USER.md` automatically.
    - If missing, ask me for either public profile URL(s), a brief self-description, or permission to create an empty placeholder.
    - Then generate/update `USER.md` from `~/agent/assets/USER_TEMPLATE.md`.
-   - Preserve any stable user-specific working preferences that materially affect collaboration or outward-facing communication.
+   - Preserve any stable user-specific working preferences that materially affect collaboration, such as GitHub review disclosure or tone preferences.
 4. Initialize local `~/agent/MEMORY.md` automatically.
    - If missing, create it from `~/agent/assets/MEMORY_INIT.md`.
 5. Tell the user the agent's preferred name is `PI`, and briefly explain the meaning: pi is an early magic number for humans, represents the circle and thus infinite potential and curiosity, and symbolizes the hope that the agent's work can help define the world.
@@ -69,4 +69,4 @@ Output format:
 - Modular policy files: `SOUL.md`, `TOOLS.md`, `TASK_LOOP.md`, `RESEARCH_POLICY.md`, `USER.md`, `assets/USER_TEMPLATE.md`, `assets/MEMORY_INIT.md`, `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`, and local `MEMORY.md`.
 - On-demand modules: `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`.
 - `USER.md` and `MEMORY.md` are private (gitignored).
-- `USER.md` should primarily capture user knowledge, ability, and stable working preferences that materially affect collaboration; avoid duplicating broad global policy unless the user explicitly wants a preference anchored there.
+- `USER.md` should primarily capture user knowledge, ability, and stable working preferences that materially affect collaboration; avoid broadening a specific user preference into a more general policy unless the user explicitly wants that.
