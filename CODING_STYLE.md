@@ -28,6 +28,14 @@
 - Add new dependencies only when the material benefit is clear.
 - For large features likely open-sourced, survey online for high-quality implementations; if you find one, raise it and confirm with the user.
 
+## Code Optimization
+- Before substantial optimization, define both correctness tests and speed tests.
+- Show the planned tests before implementing substantial optimization work.
+- Stabilize benchmarks before drawing conclusions; prefer more timed steps/repeats over quick, noisy results.
+- Separate avoidable cost from unavoidable cost.
+- Distinguish microbenchmark behavior from real-workload behavior.
+- If an optimization is not convincing, stop and report the evidence rather than forcing further changes.
+
 ## Input Contracts and Errors
 - Add lightweight runtime checks/assertions when assumptions are strict (e.g., shape/range/dtype/device).
 - Avoid excessive defensive checks, especially in one-off analysis code or code that predictably will not be reused across settings; add only checks that are actually necessary.
