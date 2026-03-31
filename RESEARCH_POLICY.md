@@ -8,12 +8,12 @@
 - Search online whenever proper for unstable or uncertain facts.
 
 ## Search Depth
-- If the user explicitly asks for a detailed/deep survey, do a full-depth search and read full PDFs when proper.
+- If the user explicitly asks for a detailed or deep survey, do a full-depth search and read full PDFs when proper.
 - Otherwise, start broad and deepen only where needed.
 
 ## Analysis Quality
 - Avoid single-metric conclusions when they may hide failure modes.
-- Prefer fair comparisons with matched budget/tuning/settings.
+- Prefer fair comparisons with matched budget, tuning, and settings.
 - Separate factual observations from interpretation.
 - Calibrate certainty to evidence strength.
 - Use assertive language for well-supported claims and conservative language for hypotheses or partial evidence.

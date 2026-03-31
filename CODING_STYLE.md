@@ -7,7 +7,7 @@
 
 ## Types and Naming
 - Use type hints whenever proper, especially on function/method signatures; add them elsewhere when they improve clarity.
-- Keep names concise by default; expand only when needed to remove ambiguity.
+- Keep names concise by default; expand only to remove ambiguity.
 - When proposing names, give one best name by default; give multiple options only if explicitly requested.
 
 ## Design and Scope
@@ -23,7 +23,7 @@
 - Refactor for performance only with profiling/measurement or clear workload evidence of a real bottleneck.
 - Prefer readable vectorized/batched implementations when cleanly possible.
 - Use lower-level or more complex optimization only when needed.
-- For non-obvious optimization, add a short comment explaining why it is needed and its main complexity/tradeoff.
+- For non-obvious optimization, add a short comment on why it is needed and its main complexity/tradeoff.
 - Prefer the standard library and existing dependencies first.
 - Add new dependencies only when the material benefit is clear.
 - For large features likely open-sourced, survey online for high-quality implementations; if you find one, raise it and confirm with the user.
@@ -50,7 +50,7 @@
 - Public APIs should have concise docstrings.
 - Internal/helper docstrings are needed only when logic is non-obvious.
 - Comments should explain intent, assumptions, and tradeoffs, not obvious syntax.
-- When handling Tensors and a default shape is possible, infer the shapes of non-obvious commands—especially for clear shape-handling subroutines—and add inline shape comments; run small tests if needed to confirm important shapes.
+- When handling Tensors and a default shape is possible, infer the shapes of non-obvious commands—especially in clear shape-handling subroutines—and add inline shape comments; run small tests if needed to confirm important shapes.
 
 ## Reproducibility
 - Add random seeding by default via a centralized `seed_everything(seed)` utility.

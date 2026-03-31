@@ -26,16 +26,19 @@ Requirements:
 4. Initialize local `~/agent/MEMORY.md` automatically.
    - If missing, create it from `~/agent/assets/MEMORY_INIT.md`.
 5. Tell the user the agent's preferred name is `PI`, and briefly explain the meaning: pi is an early magic number for humans, represents the circle and thus infinite potential and curiosity, and symbolizes the hope that the agent's work can help define the world.
-6. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
-7. Keep existing policy text unchanged unless compatibility requires edits.
-8. Verify setup and report exactly what changed, including verification-token consistency.
+6. Ask the user to choose a default execution mode before writing platform config:
+   - Safe approval mode: ask for approval for non-trusted/destructive actions by default.
+   - Soft-safe mode: default to no per-command approval prompts, rely on the agent's safety rules, and ask the user only when the agent judges it necessary.
+7. Configure your platform so `~/agent/AGENTS.md` is automatically loaded at the start of every session.
+8. Keep existing policy text unchanged unless compatibility requires edits.
+9. Verify setup and report exactly what changed, including verification-token consistency.
 
 Verification checklist:
 - Confirm `~/agent/AGENTS.md` exists.
 - Confirm global config points to `~/agent/AGENTS.md`.
 - If `~/agent/USER.md` exists, confirm it is loaded as mandatory context.
 - If `~/agent/MEMORY.md` exists, confirm it stays local-only and is not required for startup behavior.
-- Start/describe a fresh-session check with only mandatory modules and confirm no load acknowledgement is printed.
+- Start or describe a fresh-session check with only mandatory modules and confirm no load acknowledgement is printed.
 - In that fresh session, ask for the verification token and confirm it exactly matches `SOUL.md` (`31415926535897932384626433832795`).
 - Ask a conceptual question such as `what is machine learning?` and confirm teaching is auto-inferred with acknowledgement:
   -- BEGIN LOADING --
@@ -43,13 +46,15 @@ Verification checklist:
   -- END LOADING --
 
 If your platform does not support native global instruction loading:
-- Create a startup wrapper/preset that injects `~/agent/AGENTS.md` automatically.
+- Create a startup wrapper or preset that injects `~/agent/AGENTS.md` automatically.
 - Explain exactly how to launch sessions to preserve equivalent behavior.
 
 For Codex specifically:
 - Update/create `~/.codex/config.toml` with:
   - `model_instructions_file = "~/agent/AGENTS.md"`
   - keep or set `project_doc_max_bytes = 65536`
+  - if the user chose Safe approval mode, set a conservative default approval policy/sandbox combination.
+  - if the user chose Soft-safe mode, set `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`.
 - Ensure `~/.codex/AGENTS.md` also points to `~/agent/AGENTS.md`.
 
 Output format:

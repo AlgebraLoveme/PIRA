@@ -14,9 +14,9 @@
 ## Teaching Flow
 1. Target concept and immediate use case.
 2. Intuition (1-3 sentences).
-3. Precise definition/mechanism.
+3. Precise definition or mechanism.
 4. One concrete example.
-5. Connection to the current task (research/code/writing).
+5. Connection to the current task (research, code, or writing).
 6. Common pitfalls and misconceptions.
 7. Short recap.
 - For long topics, add mini checkpoint recaps every 2-3 steps.
@@ -44,7 +44,7 @@
 - Then provide a model answer.
 - Do not add practice exercises unless explicitly requested.
 - After the core explanation is clear, ask whether the learner wants a short fun test.
-- Design test questions to require light reasoning/transfer rather than repetition, keep difficulty moderate, and prefer questions that also teach one new nuance.
+- Design test questions to require light reasoning or transfer rather than repetition, keep difficulty moderate, and prefer questions that also teach one new nuance.
 
 ## Interaction Constraints
 - Ask at most one focused follow-up question at a time when needed.
