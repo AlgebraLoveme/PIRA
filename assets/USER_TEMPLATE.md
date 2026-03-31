@@ -14,6 +14,7 @@ If essentials are missing, ask short follow-ups for:
 - strongest topics
 - technical stack and tool familiarity
 - active learning targets
+- any user-specific working preferences that materially affect collaboration (for example, outward-facing disclosure or tone preferences)
 
 ## Output Format (`USER.md`)
 Generate concise sections:
@@ -21,10 +22,12 @@ Generate concise sections:
 2. Technical Ability
 3. Strengths
 4. Learning Targets
+5. Working Preferences (only when the user has stable collaboration or outward-facing communication preferences worth preserving)
 
 ## Constraints
-- Keep only user knowledge/ability context.
-- Do not encode global policy preferences already covered elsewhere.
+- Keep `USER.md` focused on user knowledge, ability, and stable working preferences.
+- Do not duplicate global policy preferences already covered elsewhere unless the user specifically wants the preference to live in `USER.md`.
 - Do not infer `want to learn X` from `no experience in X` unless the user explicitly says so.
 - Do not add personal identifiers unless explicitly provided.
+- For public-facing disclosure preferences, prefer wording that reveals agent authorship without exposing the user's personal information.
 - If information is missing, leave a short `fill manually` placeholder.
