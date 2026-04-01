@@ -66,7 +66,7 @@ Output format:
 ```
 
 ## Notes
-- Modular policy files: `SOUL.md`, `TOOLS.md`, `TASK_LOOP.md`, `RESEARCH_POLICY.md`, `USER.md`, `MAINTENANCE.md`, `assets/USER_TEMPLATE.md`, `assets/MEMORY_INIT.md`, `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`, and local `MEMORY.md`.
-- On-demand modules: `CODING_STYLE.md`, `SCIENTIFIC_WRITING.md`, `TEACHING_STYLE.md`, `MAINTENANCE.md`.
+- Modular policy files: `SOUL.md`, `TOOLS.md`, `USER.md`, `assets/USER_TEMPLATE.md`, `assets/MEMORY_INIT.md`, `modules/TASK_LOOP.md`, `modules/RESEARCH_POLICY.md`, `modules/MAINTENANCE.md`, `modules/CODING_STYLE.md`, `modules/SCIENTIFIC_WRITING.md`, `modules/TEACHING_STYLE.md`, `modules/GUIDANCE.md`, and local `MEMORY.md`.
+- On-demand modules: `modules/CODING_STYLE.md`, `modules/SCIENTIFIC_WRITING.md`, `modules/TEACHING_STYLE.md`, `modules/MAINTENANCE.md`, `modules/GUIDANCE.md`, `modules/RESEARCH_POLICY.md`, `modules/TASK_LOOP.md`.
 - `USER.md` and `MEMORY.md` are private (gitignored).
 - `USER.md` should primarily capture user knowledge, ability, and stable working preferences that materially affect collaboration; avoid broadening a specific user preference into a more general policy unless the user explicitly wants that.

@@ -6,8 +6,8 @@
 - Prefer deterministic, non-interactive commands.
 
 ## Verification
-- For research claims, follow `~/agent/RESEARCH_POLICY.md`.
-- For coding validation, follow the testing policy in `~/agent/CODING_STYLE.md`.
+- For research claims, follow `~/agent/modules/RESEARCH_POLICY.md`.
+- For coding validation, follow the testing policy in `~/agent/modules/CODING_STYLE.md`.
 - For non-coding tasks, do only the minimal verification needed to support claims.
 
 ## Safety
