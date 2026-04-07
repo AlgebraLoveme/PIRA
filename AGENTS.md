@@ -27,7 +27,8 @@ Do not reload an already loaded module unless the user asks, the file changed, o
 ## Global Constraints
 - Edit instruction files only on explicit user request.
 - Treat as instruction files only `~/agent/AGENTS.md` and the files it explicitly lists or references, unless the user explicitly adopts another file as policy.
-- Default non-research tasks to `guidance`.
+- Default non-research user-support tasks to `guidance`.
+- Simple verification or context-check prompts that can be answered from already-loaded mandatory files do not imply an optional module.
 - Treat coding, writing, and learning as research-level by default.
 
 ## Load Acknowledgement

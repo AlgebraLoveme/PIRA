@@ -6,9 +6,9 @@ Use these fresh-session checks to verify routing and load acknowledgement behavi
 When one or more optional modules are loaded, print:
 
 ```text
--- BEGIN LOADING --
-Loading module: <comma-separated-optional-module-list>
--- END LOADING --
+-- Loading --
+module: <comma-separated-optional-module-list>
+-- END --
 ```
 
 When only mandatory files are loaded, print nothing.
