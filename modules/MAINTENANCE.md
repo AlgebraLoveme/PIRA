@@ -2,7 +2,7 @@
 
 ## Maintenance Rules
 - `AGENT_WORKBOOK.md` at the active workspace root is the default store for project-specific memory.
-- For ordinary memory updates, write concise durable notes to `AGENT_WORKBOOK.md`; create it first if needed.
+- For ordinary memory updates, write concise durable notes to `AGENT_WORKBOOK.md`; create it only when there is durable project-specific context worth storing.
 - When files are removed from the active scheme in the future, add them to `~/agent/assets/LEGACY_LIST.md`.
 - Overwrite with current policy text only: no timestamps, question IDs, changelogs, or override chains.
 - After every write, check for cross-file conflicts and raise any immediately.
