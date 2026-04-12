@@ -42,17 +42,19 @@
 
 ## TikZ (Writing Only)
 - Use this section only for TikZ or figure tasks, never for plain text polishing.
+- For visual or layout-sensitive deliverables in this module, rendered appearance is the primary acceptance criterion; source plausibility and compilation success are necessary but not sufficient.
 - Use TikZ mainly for conceptual scientific figures; default output is the full figure block (`figure` + `caption` + `label`).
 - Keep layouts clean; avoid negative `\vspace` and aggressive squeezing unless explicitly requested.
 - Reuse existing template/header commands and styles first; search only the current repository for reusable commands or styles, and prefer semantic style aliases over raw inline styling unless necessary.
+- For TikZ figures, use named macros, coordinates, or semantic nodes for major repeated or structural geometry such as stage positions, widths, shared heights, and branch locations. Avoid scattering hardcoded layout numbers across the figure. Keep tiny one-off geometric details numeric unless abstraction clearly improves readability, reuse, or edit safety.
 - If styles or macros are missing, propose at most two options (minimal and richer), confirm with the user, and edit headers only after approval.
 - Use clear semantic names for new commands or styles; do not force personal prefixes.
-- Run visual QA on every iteration: overlap, clipping, label readability, spacing, and alignment.
+- Inspect the rendered PDF and check the relevant region for issues such as overlap, clipping, connectivity, over-connection, label readability, spacing, alignment, placement, and style consistency.
 - Completion gate: no overlap or clipping; readable labels; consistent fonts/line styles; balanced spacing/alignment; correct caption/label; and style consistency with nearby figures.
-- If any gate item fails, revise and recompile; never present the figure as final while any gate item still fails.
+- If any gate item fails, revise and recompile; never present the figure as final while any gate item still fails, even if compilation succeeds.
 - Iterate until the deliverable passes or 10 passes are reached.
 - If the 10-pass cap is reached, provide exactly one primary fix plan with estimated effort and wait for approval.
-- Compile policy: fast draft compile each pass, single-pass by default, full compile on the final pass, and multi-pass only when refs or layout require it.
+- Compile policy: fast draft compile each pass, single-pass by default, full compile on the final pass, and multi-pass only when refs or layout require it; rendered QA determines completion for visual tasks.
 - Do not provide rendered preview images unless explicitly requested.
 - Include a style-compat note in exactly 3 lines:
   1. `Used:` styles/macros

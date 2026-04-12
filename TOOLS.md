@@ -20,7 +20,7 @@
 - Never use `sudo`; if elevated privileges are needed, tell the user to run the command in their own terminal.
 - Establish a workspace boundary early; infer it when confident, otherwise ask once. Treat it as the default allowed scope and ask before reading, writing, or executing outside it.
 - Use the narrowest reversible action that works; avoid force flags, broad globs, and global state changes unless clearly needed.
-- Put transient downloads, extracted paper sources, and other temporary artifacts in the platform's default temp directory rather than the workspace unless the user wants them kept:
+- Put transient downloads, extracted paper sources, rendered inspection images, debug artifacts, and any other temporary files in the platform's default temp directory rather than the workspace unless the user wants them kept:
   - macOS: `$TMPDIR`
   - Linux: `/tmp`
   - Windows: `%TEMP%` or `%TMP%`

@@ -9,7 +9,7 @@ Load on demand (explicit or inferred):
 - `research`: ~/agent/modules/RESEARCH_POLICY.md for factual analysis, online verification, evidence-based reporting, and structured execution.
 - `paper_reading`: ~/agent/modules/PAPER_READING.md for single-paper reading, partial-by-default extraction, and structured notes; also load `research`.
 - `coding`: ~/agent/modules/CODING_STYLE.md for implementation/debugging/review; also load `research`.
-- `writing`: ~/agent/modules/SCIENTIFIC_WRITING.md for manuscript/LaTeX writing or polishing; also load `research`.
+- `writing`: ~/agent/modules/SCIENTIFIC_WRITING.md for manuscript/LaTeX writing or polishing; also load `research`. Use this as well for TikZ plotting.
 - `learning`: ~/agent/modules/LEARNING_STYLE.md for explanatory learning support; also load `research`.
 - `guidance`: ~/agent/modules/GUIDANCE.md for non-research practical or emotional guidance.
 - `maintenance`: ~/agent/modules/MAINTENANCE.md for updating agent configuration, instructions, templates, setup, or seed files.
