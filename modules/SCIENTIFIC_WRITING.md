@@ -50,6 +50,9 @@
 - If styles or macros are missing, propose at most two options (minimal and richer), confirm with the user, and edit headers only after approval.
 - Use clear semantic names for new commands or styles; do not force personal prefixes.
 - Inspect the rendered PDF and check the relevant region for issues such as overlap, clipping, connectivity, over-connection, label readability, spacing, alignment, placement, and style consistency.
+- For reference-matching figure tasks, judge both structural correctness and stylistic fidelity; do not treat technically correct content alone as success when the user asked for a specific visual style, resemblance, or design language.
+- If two iterations in a row miss the intended style or structure, explicitly acknowledge the mismatch and switch strategy instead of continuing the same generation loop; prefer editing a user-provided sketch or artifact, or ask for one, before further full redraws.
+- Once the user provides a manually drawn or manually adjusted figure, treat it as the primary visual source of truth and bias toward support work such as cleanup, cropping, placement, notation alignment, and manuscript integration unless the user explicitly asks for a replacement.
 - Completion gate: no overlap or clipping; readable labels; consistent fonts/line styles; balanced spacing/alignment; correct caption/label; and style consistency with nearby figures.
 - If any gate item fails, revise and recompile; never present the figure as final while any gate item still fails, even if compilation succeeds.
 - Iterate until the deliverable passes or 10 passes are reached.
