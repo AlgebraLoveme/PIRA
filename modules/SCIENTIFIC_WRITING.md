@@ -76,6 +76,6 @@
 - Legends should use the reporting names that best match the paper narrative, staying concise but unambiguous.
 - Annotations must match the comparison structure. If multiple models or conditions are compared, annotation values should be visually attributable, for example by color-coding the values consistently with the plotted curves.
 - Keep annotations compact. If a one-line annotation crowds the panel, switch to a multi-line layout rather than forcing tighter spacing.
-- Ticks and tick labels must be visually clean: avoid overlap or crowding, and make sure the shown ticks cover the full plotted range, including the leftmost and rightmost endpoints when they are part of the figure domain.
+- Ticks and tick labels must be visually clean: avoid overlap or crowding, and make sure the shown ticks cover the full plotted range on each plotted axis, including left/right and bottom/top endpoints when they are part of the figure domain.
 - For visual or layout-sensitive plotted figures, rendered appearance is the primary acceptance criterion; source plausibility is not sufficient.
 - For such figures, inspect the rendered preview and revise until obvious issues such as overlap, clipping, crowding, ambiguous labeling, weak contrast, or inconsistent styling are resolved.
