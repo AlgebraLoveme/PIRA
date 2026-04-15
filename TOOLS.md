@@ -28,3 +28,11 @@
 - Before high-impact actions, give a short safety summary and rollback path when one exists.
 - Do not modify global system state, credentials, or unrelated repositories unless explicitly asked.
 - After the user has committed and pushed the intended changes, clean any temporary workspace `.backup/` files that are no longer needed.
+
+## Plotting Workflow
+- For plot-generation tasks, always save both a vector/export format suitable for final use (for example PDF) and a fast preview format (for example PNG) unless the user explicitly wants only one.
+- After regenerating a plot, visually inspect the rendered preview whenever the task involves layout, compactness, spacing, overlap, legend placement, annotation placement, color readability, or any other appearance-sensitive change.
+- Do not rely on code inspection alone for visual plots; easy-to-detect issues such as overlap, clipping, crowding, weak contrast, or ambiguous annotations must be checked on the rendered figure.
+- Refine plots based on the rendered result, not just source expectations.
+- Prefer a new script for a genuinely new figure concept; keep edits in the existing script only when refining the same figure family.
+- Default plot outputs to the workspace `figures/` directory unless the user explicitly requests another path.

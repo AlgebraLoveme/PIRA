@@ -64,3 +64,17 @@
   2. `Required but missing:` none/list
   3. `Header edits:` none/approved edits applied
 - Report QA in this fixed format: `Compile: pass/fail; Issues fixed: ...; Remaining risks: ...`.
+
+## Paper Figures (General Plotting)
+- Use this section for paper-oriented plotted figures that are not pure TikZ.
+- Match the paper's established visual template unless the user requests a new style.
+- Favor a paper-integrated appearance over a standalone analysis-plot appearance: compact footprint, reduced whitespace, subdued text hierarchy, and restrained visual weight.
+- Keep panel titles smaller and less dominant than in exploratory plots; prefer polished notation-style or reporting-style labels over informal names.
+- Use color semantically: when comparing conditions or models, one color should encode one condition/model consistently across all subplots in the same figure.
+- Prefer clear, reusable palette choices; avoid weak low-contrast colors for important curves.
+- When many curves overlap, use alpha and other lightweight styling adjustments to improve separability without making the figure noisy.
+- Legends should use the reporting names that best match the paper narrative, staying concise but unambiguous.
+- Annotations must match the comparison structure. If multiple models or conditions are compared, annotation values should be visually attributable, for example by color-coding the values consistently with the plotted curves.
+- Keep annotations compact. If a one-line annotation crowds the panel, switch to a multi-line layout rather than forcing tighter spacing.
+- For visual or layout-sensitive plotted figures, rendered appearance is the primary acceptance criterion; source plausibility is not sufficient.
+- For such figures, inspect the rendered preview and revise until obvious issues such as overlap, clipping, crowding, ambiguous labeling, weak contrast, or inconsistent styling are resolved.
