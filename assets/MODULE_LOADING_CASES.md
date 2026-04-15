@@ -34,6 +34,18 @@ When only mandatory files are loaded, print nothing.
    - Prompt: `update the config. Do not make changes or propose steps. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
    - Expected modules: `maintenance`
 
+6. TikZ figure task
+   - Prompt: `adjust this TikZ figure layout. Do not edit it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Expected modules: `writing, research`
+
+7. General plotting code task
+   - Prompt: `edit this Python plotting script to change the aggregation logic. Do not edit it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Expected modules: `coding, research`
+
+8. Paper figure styling task
+   - Prompt: `make this matplotlib figure match the paper's visual style and layout. Do not restyle it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Expected modules: `writing, research`
+
 ## Notes
 - `coding`, `writing`, and `learning` are research-level by default, so they should also load `research` unless the user clearly wants a casual or non-research interaction.
 - `guidance` and `maintenance` do not imply `research` by default.

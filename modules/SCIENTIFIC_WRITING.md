@@ -3,7 +3,8 @@
 ## Role and Scope
 - Default role: polish user-provided drafts.
 - Assume the user writes first drafts; draft from scratch only on explicit request.
-- Apply TikZ rules only to explicit TikZ or figure tasks; otherwise treat the task as text-only writing.
+- Apply the TikZ rules only to explicit TikZ figure tasks.
+- Apply the paper-figure rules below only to explicit paper-facing figure tasks such as styling, layout refinement, or manuscript integration; otherwise treat the task as text-only writing.
 
 ## Polishing Policy
 - Preserve technical meaning, author intent, core claims, and uncertainty calibration unless correctness or an explicit request requires change.
@@ -40,8 +41,8 @@
 - Never alter equation or definition semantics.
 - Never present pending validation as completed.
 
-## TikZ (Writing Only)
-- Use this section only for TikZ or figure tasks, never for plain text polishing.
+## TikZ Figures
+- Use this section only for explicit TikZ figure tasks, never for plain text polishing or general plotting.
 - For visual or layout-sensitive deliverables in this module, rendered appearance is the primary acceptance criterion; source plausibility and compilation success are necessary but not sufficient.
 - Use TikZ mainly for conceptual scientific figures; default output is the full figure block (`figure` + `caption` + `label`).
 - Keep layouts clean; avoid negative `\vspace` and aggressive squeezing unless explicitly requested.
@@ -59,13 +60,12 @@
 - If the 10-pass cap is reached, provide exactly one primary fix plan with estimated effort and wait for approval.
 - Compile policy: fast draft compile each pass, single-pass by default, full compile on the final pass, and multi-pass only when refs or layout require it; rendered QA determines completion for visual tasks.
 - Do not provide rendered preview images unless explicitly requested.
-- Include a style-compat note in exactly 3 lines:
-  1. `Used:` styles/macros
-  2. `Required but missing:` none/list
-  3. `Header edits:` none/approved edits applied
-- Report QA in this fixed format: `Compile: pass/fail; Issues fixed: ...; Remaining risks: ...`.
+- When useful, briefly note reused styles/macros, missing required styles, and any approved header edits.
+- When useful, briefly report compile status, issues fixed, and remaining visual risks.
+- Keep such reporting concise; omit routine process detail when it does not help the user decide.
 
-## Paper Figures (General Plotting)
+## Paper Figures
+- Use this section only for explicit paper-facing figure tasks or manuscript-integrated visual refinement; do not use it for general plotting code changes, analysis plots, or exploratory plots.
 - Use this section for paper-oriented plotted figures that are not pure TikZ.
 - Match the paper's established visual template unless the user requests a new style.
 - Favor a paper-integrated appearance over a standalone analysis-plot appearance: compact footprint, reduced whitespace, subdued text hierarchy, and restrained visual weight.

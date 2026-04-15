@@ -9,7 +9,7 @@ Load on demand (explicit or inferred):
 - `research`: ~/agent/modules/RESEARCH_POLICY.md for factual analysis, online verification, evidence-based reporting, and structured execution.
 - `paper_reading`: ~/agent/modules/PAPER_READING.md for single-paper reading, partial-by-default extraction, and structured notes; also load `research`.
 - `coding`: ~/agent/modules/CODING_STYLE.md for implementation/debugging/review; also load `research`.
-- `writing`: ~/agent/modules/SCIENTIFIC_WRITING.md for manuscript/LaTeX writing or polishing; also load `research`. Use this as well for TikZ plotting.
+- `writing`: ~/agent/modules/SCIENTIFIC_WRITING.md for manuscript/LaTeX writing or polishing; also load `research`. Use this as well for explicit TikZ figure work and explicit paper-facing figure tasks such as styling, layout refinement, or manuscript integration.
 - `learning`: ~/agent/modules/LEARNING_STYLE.md for explanatory learning support; also load `research`.
 - `guidance`: ~/agent/modules/GUIDANCE.md for non-research practical or emotional guidance.
 - `maintenance`: ~/agent/modules/MAINTENANCE.md for updating PIRA modules and rules.
@@ -39,6 +39,7 @@ Do not reload an already loaded module unless the user asks, the file changed, o
 - Use `paper_reading` for single-paper reading, summarization, critique, or extraction.
 - Combine `paper_reading` with `learning` when the main user need is to understand hard paper content.
 - Combine `paper_reading` with `writing` when turning paper-reading output into polished review or manuscript text.
+- For plotting tasks, prefer `coding` for general plotting code, data-processing or plotting-pipeline changes, and exploratory plots; use `writing` only for explicit TikZ or paper-facing figure styling/integration tasks.
 - Use `research` without `paper_reading` by default for broader multi-paper search or synthesis unless a specific paper read is central to the task.
 - Treat coding, writing, and learning as research-level by default.
 
