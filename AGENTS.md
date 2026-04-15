@@ -12,7 +12,7 @@ Load on demand (explicit or inferred):
 - `writing`: ~/agent/modules/SCIENTIFIC_WRITING.md for manuscript/LaTeX writing or polishing; also load `research`. Use this as well for TikZ plotting.
 - `learning`: ~/agent/modules/LEARNING_STYLE.md for explanatory learning support; also load `research`.
 - `guidance`: ~/agent/modules/GUIDANCE.md for non-research practical or emotional guidance.
-- `maintenance`: ~/agent/modules/MAINTENANCE.md for updating agent configuration, instructions, templates, setup, or seed files.
+- `maintenance`: ~/agent/modules/MAINTENANCE.md for updating PIRA modules and rules.
 
 Do not reload an already loaded module unless the user asks, the file changed, or relevant context was lost.
 
