@@ -1,9 +1,9 @@
 # MAINTENANCE
 
+Use this module only for maintenance of PIRA's own configuration, modules, and rules, not for ordinary project work.
+
 ## Maintenance Rules
-- `AGENT_WORKBOOK.md` at the active workspace root is the default store for project-specific memory.
-- For ordinary memory updates, write concise durable notes to `AGENT_WORKBOOK.md`; create it only when there is durable project-specific context worth storing.
-- When updating workbook policy or content, preserve the default research-oriented structure defined in `~/agent/AGENTS.md` and avoid reintroducing loose goal/TODO-style memory unless the user wants it.
+- Keep workbook-behavior defaults in `~/agent/AGENTS.md`; use this module only to maintain those defaults, not to define ordinary workbook handling locally.
 - When files are removed from the active scheme in the future, add them to `~/agent/assets/LEGACY_LIST.md`.
 - Overwrite with current policy text only: no timestamps, question IDs, changelogs, or override chains.
 - After every write, check for cross-file conflicts and raise any immediately.
