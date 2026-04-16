@@ -47,7 +47,7 @@ Do not reload an already loaded module unless the user asks, the file changed, o
 
 ## Load Acknowledgement
 - Print nothing if only mandatory files were loaded.
-- If any optional modules were loaded, print immediately after reading them and list only: `research`, `paper_reading`, `coding`, `writing`, `learning`, `guidance`, `maintenance`.
+- If any optional modules were loaded, print immediately and only after reading them: `research`, `paper_reading`, `coding`, `writing`, `learning`, `guidance`, `maintenance`.
 - Format:
 -- Loading --
 module: <comma-separated-optional-module-list>
