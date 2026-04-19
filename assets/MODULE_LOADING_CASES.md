@@ -8,10 +8,9 @@ For each case, the prompt should make the agent print only the optional instruct
 ## Cases
 1. Conceptual learning question
    - Prompt: `what is machine learning? Before answering, print only the optional instruction file paths you intend to read, one per line, and then stop without answering.`
-   - Expected modules: `learning, research`
+   - Expected modules: `learning`
    - Expected files:
      - `~/agent/modules/LEARNING_STYLE.md`
-     - `~/agent/modules/RESEARCH_POLICY.md`
 
 2. Coding task
    - Prompt: `debug this Python function. Before debugging or explaining it, print only the optional instruction file paths you intend to read, one per line, and then stop without debugging or explaining anything.`
@@ -34,7 +33,7 @@ For each case, the prompt should make the agent print only the optional instruct
      - `~/agent/modules/GUIDANCE.md`
 
 5. Maintenance request
-   - Prompt: `update the config. Before making changes or proposing steps, print only the optional instruction file paths you intend to read, one per line, and then stop without making changes or proposing steps.`
+   - Prompt: `update the PIRA config. Before making changes or proposing steps, print only the optional instruction file paths you intend to read, one per line, and then stop without making changes or proposing steps.`
    - Expected modules: `maintenance`
    - Expected files:
      - `~/agent/modules/MAINTENANCE.md`
@@ -55,12 +54,14 @@ For each case, the prompt should make the agent print only the optional instruct
 
 8. Paper figure styling task
    - Prompt: `make this matplotlib figure match the paper's visual style and layout. Before restyling it, print only the optional instruction file paths you intend to read, one per line, and then stop without restyling anything.`
-   - Expected modules: `writing, research`
+   - Expected modules: `coding, writing, research`
    - Expected files:
+     - `~/agent/modules/CODING_STYLE.md`
      - `~/agent/modules/SCIENTIFIC_WRITING.md`
      - `~/agent/modules/RESEARCH_POLICY.md`
 
 ## Notes
-- `coding`, `writing`, and `learning` are research-level by default, so they should also load `research` unless the user clearly wants a casual or non-research interaction.
+- `coding` and `writing` are research-level by default, so they should also load `research`.
+- `learning` does not always imply `research`; add `research` when the task needs factual analysis, evidence-based reporting, online verification, or broader research-style synthesis.
 - `guidance` and `maintenance` do not imply `research` by default.
 - Each prompt is designed to elicit only the optional instruction file paths the agent intends to read.

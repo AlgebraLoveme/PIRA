@@ -44,7 +44,7 @@ Verification checklist:
 - Confirm the policy supports per-workspace `AGENT_WORKBOOK.md` memory, does not require a global memory file for startup behavior, and removes files listed in `~/agent/assets/LEGACY_LIST.md` if found.
 - Start or describe a fresh-session check with only mandatory modules and confirm no load acknowledgement is printed.
 - In that fresh session, ask for the verification token and confirm it exactly matches `SOUL.md` (`31415926535897932384626433832795`).
-- Ask whether to run the optional comprehensive module-loading check in `~/agent/assets/MODULE_LOADING_CASES.md`. Run it only if the user says yes, then confirm the prompts report the correct optional instruction file paths.
+- Ask whether to run the optional comprehensive module-loading check in `~/agent/assets/MODULE_LOADING_CASES.md`. Run it only if the user says yes, then confirm the prompts report the correct optional instruction file paths under the current routing policy.
 
 For Codex specifically:
 - Update or create `~/.codex/config.toml` with:
