@@ -1,53 +1,66 @@
 # Module Loading Cases
 
-Use these fresh-session checks to verify routing and load acknowledgement behavior. The prompts suppress task answers so the test isolates module loading.
+Use these fresh-session prompts to verify optional-module routing.
 
-## Expected acknowledgement format
-When one or more optional modules are loaded, print:
-
-```text
--- Loading --
-module: <comma-separated-optional-module-list>
--- END --
-```
-
-When only mandatory files are loaded, print nothing.
+## Expected output
+For each case, the prompt should make the agent print only the optional instruction file paths it intends to read, one per line, and then stop.
 
 ## Cases
 1. Conceptual learning question
-   - Prompt: `what is machine learning? Do not answer the question itself. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `what is machine learning? Before answering, print only the optional instruction file paths you intend to read, one per line, and then stop without answering.`
    - Expected modules: `learning, research`
+   - Expected files:
+     - `~/agent/modules/LEARNING_STYLE.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 2. Coding task
-   - Prompt: `debug this Python function. Do not debug it or explain it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `debug this Python function. Before debugging or explaining it, print only the optional instruction file paths you intend to read, one per line, and then stop without debugging or explaining anything.`
    - Expected modules: `coding, research`
+   - Expected files:
+     - `~/agent/modules/CODING_STYLE.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 3. Writing task
-   - Prompt: `polish this LaTeX paragraph. Do not rewrite it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `polish this LaTeX paragraph. Before rewriting it, print only the optional instruction file paths you intend to read, one per line, and then stop without rewriting anything.`
    - Expected modules: `writing, research`
+   - Expected files:
+     - `~/agent/modules/SCIENTIFIC_WRITING.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 4. Guidance request
-   - Prompt: `I feel stuck about my career. Do not give advice. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `I feel stuck about my career. Before giving advice, print only the optional instruction file paths you intend to read, one per line, and then stop without giving advice.`
    - Expected modules: `guidance`
+   - Expected files:
+     - `~/agent/modules/GUIDANCE.md`
 
 5. Maintenance request
-   - Prompt: `update the config. Do not make changes or propose steps. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `update the config. Before making changes or proposing steps, print only the optional instruction file paths you intend to read, one per line, and then stop without making changes or proposing steps.`
    - Expected modules: `maintenance`
+   - Expected files:
+     - `~/agent/modules/MAINTENANCE.md`
 
 6. TikZ figure task
-   - Prompt: `adjust this TikZ figure layout. Do not edit it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `adjust this TikZ figure layout. Before editing it, print only the optional instruction file paths you intend to read, one per line, and then stop without editing anything.`
    - Expected modules: `writing, research`
+   - Expected files:
+     - `~/agent/modules/SCIENTIFIC_WRITING.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 7. General plotting code task
-   - Prompt: `edit this Python plotting script to change the aggregation logic. Do not edit it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `edit this Python plotting script to change the aggregation logic. Before editing it, print only the optional instruction file paths you intend to read, one per line, and then stop without editing anything.`
    - Expected modules: `coding, research`
+   - Expected files:
+     - `~/agent/modules/CODING_STYLE.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 8. Paper figure styling task
-   - Prompt: `make this matplotlib figure match the paper's visual style and layout. Do not restyle it. If any optional modules are loaded, print only the standard load acknowledgement and nothing else.`
+   - Prompt: `make this matplotlib figure match the paper's visual style and layout. Before restyling it, print only the optional instruction file paths you intend to read, one per line, and then stop without restyling anything.`
    - Expected modules: `writing, research`
+   - Expected files:
+     - `~/agent/modules/SCIENTIFIC_WRITING.md`
+     - `~/agent/modules/RESEARCH_POLICY.md`
 
 ## Notes
 - `coding`, `writing`, and `learning` are research-level by default, so they should also load `research` unless the user clearly wants a casual or non-research interaction.
 - `guidance` and `maintenance` do not imply `research` by default.
-- The acknowledgement should list only optional modules that were actually loaded.
-- The prompts intentionally suppress normal task answers, so any visible output should reflect loading behavior rather than content generation.
+- Each prompt is designed to elicit only the optional instruction file paths the agent intends to read.
