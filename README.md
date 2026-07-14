@@ -173,6 +173,8 @@ Explicit `exact` mode streams unchanged when attached to a terminal. In non-inte
 
 For a non-interactive program still running after about 30 seconds, `pira_ctx` silently publishes a read-only checkpoint. Concurrent inspection uses a consistent snapshot without blocking the program; `exec` receives a private copy. Running captures are protected from verification, deletion, and pruning until completion. See `pira_ctx --help` for the exact contract.
 
+Compact per-workspace command events retain agent-supplied intents without duplicating command output. Intent history can be searched by case-insensitive text or Rust regex over an explicitly bounded newest-event window, with independently bounded newest-first results.
+
 Setup installs a verified native executable in the user's `PATH`. Normal use requires no Python, Rust toolchain, daemon, database, network service, or model call; the optional `exec` command uses an available Python 3 interpreter to analyze a stored capture with explicit code. Captures are private user-cache files with independently compressed blocks and integrity hashes. `pira_ctx` preserves the caller's permissions and does not sandbox commands. Run `pira_ctx --help` to choose a command and `pira_ctx SUBCOMMAND --help` for exact usage. Its Rust source is under `tools/src/pira_ctx`, and verified builds for macOS arm64/x64, Linux arm64/x64, and Windows x64 are under `tools/dist/pira_ctx`.
 
 ### Security design
@@ -202,7 +204,7 @@ PIRA uses `pira_ctx` when a small single-binary wrapper and exact local fallback
 
 ### Comprehensive held-out benchmark
 
-The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports the final `pira_ctx 0.8.0` release candidate on that corpus:
+The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 0.8.0` on that corpus:
 
 | Suite | Cases | Holdout source |
 |---|---:|---|
@@ -230,7 +232,7 @@ The prospective public core covers VCS patches, largest tracked Rust files, recu
 
 The remote extension was fixed before inspecting output content. It reconstructed completed `exec_command` and `write_stdin` sessions from 2.73 GB of authorized Codex logs, streamed 683 category candidates through an in-memory sanitizer, retained 289 eligible unique responses, and selected cases by outcome, size bucket, session diversity, and content hash. The final five-case cap retained three successful and two failed builds, three successful and two failed tests, four setup/install responses, and one static-analysis response. The server contained no LaTeX response above the 2 KiB threshold.
 
-LaTeX coverage therefore uses arXiv sources compiled inside the retained Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
+LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
 Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 0.8.0. The visible aggregate performance figures come from the final no-tuning 0.8.0 replay of the selected 45 fixtures through one persistent automatic store and one persistent `check` store. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`, summarized by the per-case median. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
 
@@ -249,7 +251,7 @@ Each suite's output-quality labels were fixed during the original holdout evalua
 
 #### Context Mode comparison on the final corpus
 
-Context Mode 1.0.169 was installed inside the retained Docker Sandbox and rerun without errors on the exact final 45 sanitized fixtures. Generic passthrough used one persistent server, `ctx_execute_file`, the same category-level intent as PIRA, and JavaScript that printed each fixture while preserving its recorded exit status. Its direct Node emitter produced the same bytes and exit status as its raw baseline, so Docker startup and server initialization are excluded from overhead. It returned 71,621 bytes, classified all 45 statuses correctly, and immediately exposed 9/13 labeled outcomes: 7/8 failure markers and 2/5 changed basenames.
+Context Mode 1.0.169 was installed inside an isolated Linux Docker Sandbox and rerun without errors on the exact final 45 sanitized fixtures. Generic passthrough used one persistent server, `ctx_execute_file`, the same category-level intent as PIRA, and JavaScript that printed each fixture while preserving its recorded exit status. Its direct Node emitter produced the same bytes and exit status as its raw baseline, so Docker startup and server initialization are excluded from overhead. It returned 71,621 bytes, classified all 45 statuses correctly, and immediately exposed 9/13 labeled outcomes: 7/8 failure markers and 2/5 changed basenames.
 
 `ctx_index` used a separate persistent server and returned 7,843 bytes of indexing receipts. It exposed none of the 13 labels immediately, while exact content remained available through later search. Indexing has no equivalent raw operation, so no synthetic latency overhead is reported. Both Context Mode storage figures include its SQLite FTS5 retrieval state after shutdown; installed packages are excluded.
 
@@ -260,6 +262,155 @@ Generic passthrough is the closest automatic wrapper-level comparison, not Conte
 This remains a private implementation benchmark on one arm64 macOS evaluation host, not a universal performance claim. The remote suite is genuinely unseen and post-freeze imported, but its logs predate the freeze and are therefore not prospective outputs. Setup/install and static-analysis coverage remains below the five-case cap because no more eligible unique remote responses were available. Failure markers measure visibility of broad outcome evidence rather than complete diagnostic usefulness. arXiv selection required baseline build availability and includes one intentionally mutated source. Privacy sanitation changes path separators in LaTeX logs. Binary, non-UTF-8, and interactive-terminal behavior are covered by functional tests rather than this corpus. Web-search returns remain excluded because Codex built-in web output is not directly captured by the local command wrapper.
 
 </details>
+
+</details>
+
+## `pira_codenav`: lightweight structural code navigation
+
+<details>
+<summary>How it works, language scope, baseline relationship, and benchmarks</summary>
+
+`pira_codenav` is a read-only native code-inspection tool for agents. It separates broad structural discovery from exact source reading so an agent can inspect a repository without repeatedly loading whole files:
+
+1. `map` returns a bounded, mixed-language repository shape.
+2. `outline` returns declarations and source ranges without implementation bodies; `--match` narrows a file locally.
+3. `show` retrieves exact source for selected items or bounded line ranges.
+4. `imports`, `dependents`, and `deps` expose conservative file-level relationships without invoking a build system.
+
+`pira_codenav` supports Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, and R. PIRA setup installs it as one native executable in the user's `PATH`. Its seventeen Tree-sitter grammars are compiled in, so normal use requires no Python, language server, package manager, daemon, database, network, or runtime grammar download.
+
+### Read-only and semantic boundary
+
+- Repository code and scripts are parsed but never executed. Directory traversal honors ignore rules, does not follow symlinks, and blocks structural dependency targets outside the workspace.
+- Tree-sitter ranges and returned source are exact structural observations. When a bundled grammar lags current syntax, defective files may be reparsed through byte-aligned views: C/C++/CUDA recovery handles common macro and preprocessor scaffolding; Go, TypeScript, and C# recovery covers a small set of broadly specified newer syntax. Candidates must reduce navigation-relevant defects. Because C-family and C# outlines stop at recognized callable bodies, unsupported body-local syntax does not make declaration navigation incomplete. Results distinguish `ok`, `recovered`, and still-incomplete `partial` parses.
+- Import targets marked `structural` are conservative path resolutions. Dynamic, external, ambiguous, build-dependent, and package-dependent targets remain visibly unresolved rather than being guessed.
+- Exact source is framed as untrusted repository data and terminal control characters are escaped. The tool is not a sandbox and does not claim that source text is trustworthy instructions.
+- Definitions, references, hover, type resolution, call hierarchy, diagnostics, rename, and refactoring remain language-server or compiler responsibilities. `pira_codenav` complements those systems rather than reimplementing them heuristically.
+
+### Relationship to ast-outline and Grove
+
+ast-outline and Grove are useful functional baselines for broad-to-narrow code reading. `pira_codenav` retains the useful ideas of compact outlines, repository maps, bounded exact retrieval, and stable item identities while choosing a smaller deployment boundary: one native executable, compile-time grammars, no project initialization, no persistent index, and no runtime grammar engine. It additionally exposes conservative file dependencies, but deliberately leaves semantic navigation to standard language servers.
+
+The performance comparison below covers only operations that produced a semantically checked result. It is not a claim that outputs or feature sets are identical: PIRA location lookup returns one exact item, ast-outline name lookup can return overloads, Grove may return alternate IDs, and C++ parse completeness differs.
+
+### Correctness benchmark
+
+The public corpus combines synthetic edge cases with twelve pinned, unmodified real files and adjacent upstream licenses. Partial parses remain reported rather than counted as complete.
+
+| Property | Result |
+|---|---:|
+| Supported languages | 17 |
+| Files evaluated | 58 |
+| Clean / recovered / partial parses | 51 / 6 / 1 |
+| Emitted structural targets | 585 |
+| Location-to-exact-item round trips | 585/585 |
+| Freshness-selector round trips | 585/585 |
+| Curated essential-target recall | 63/63 |
+
+The recovered fixtures cover CUDA annotation macros, jq conditional entry points, fmt namespace-boundary macros, Go 1.26 value-initializing `new`, TypeScript variance and keyword tuple labels, and C# conditional constraints, ref expressions, extension blocks, and operators. `show` still returns untouched source. The sole partial file is intentionally malformed Python. All six newly added real-language fixtures parse completely. These results establish exact, self-consistent retrieval and curated recall on the public corpus, not universal language-semantic completeness.
+
+### Complete-call latency
+
+Every latency below measures one complete subprocess call—from immediately before process launch until output has been collected—and requires a task-specific semantic token in the response. This is the user-visible product metric, including executable startup, argument parsing, file access, parsing, and rendering. It is not an in-process parser-throughput measurement.
+
+The cross-tool columns were measured together inside the already-running Linux arm64 Docker Sandbox with 2 CPUs and 4 GiB RAM, using 5 warmups and 40 measured calls. The native PIRA column was measured separately on an Apple M1 Pro running macOS arm64, using 10 warmups and 100 measured calls.
+
+| Operation | `pira_codenav` native | `pira_codenav` sandbox | ast-outline 1.8.2 sandbox | Grove 0.3.1 sandbox |
+|---|---:|---:|---:|---:|
+| Python outline | 6.122 ms | 2.234 ms | 52.868 ms | 41.559 ms |
+| Rust outline | 8.076 ms | 3.894 ms | 55.490 ms | 43.172 ms |
+| Python exact item | 6.302 ms | 2.347 ms | 52.096 ms | 42.069 ms |
+| Python repository map | 4.911 ms | 0.996 ms | 51.738 ms | 37.758 ms |
+| Rust repository map | 4.970 ms | 0.964 ms | 51.048 ms | 34.562 ms |
+| Java outline | 4.628 ms | 1.089 ms | 55.466 ms | 32.431 ms |
+| C outline | 7.496 ms | 5.822 ms | unsupported | 91.818 ms |
+| C++ outline | 4.127 ms | 1.247 ms | 51.452 ms | 125.005 ms |
+
+Only the same-sandbox columns support cross-tool speedups: there, `pira_codenav` is 11–41x faster than the fastest available baseline and uses approximately 3.6–5.1 MiB peak RSS, compared with 23.9–25.9 MiB for ast-outline and 16.1–49.1 MiB for Grove. Native macOS values describe the expected direct deployment path but are not used to calculate those speedups.
+
+Every public subcommand is also benchmarked directly. Each warmup and measured call must contain a task-specific semantic marker; a missing or failed result aborts the run. Native measurements use 10 warmups and 100 calls, while the already-running Linux sandbox uses 5 warmups and 40 calls.
+
+| Subcommand | Returned bytes | Context reduction | Native median | Sandbox median | Sandbox peak RSS |
+|---|---:|---:|---:|---:|---:|
+| `outline` | 1,687 | 92.2% | 6.690 ms | 2.263 ms | 3.6 MiB |
+| `show` | 3,380 | 84.4% | 6.121 ms | 2.276 ms | 3.6 MiB |
+| `map` | 551 | 61.5% | 4.629 ms | 0.793 ms | 4.6 MiB |
+| `imports` | 405 | 54.8% | 3.429 ms | 0.445 ms | 3.1 MiB |
+| `dependents` | 234 | 83.7% | 4.619 ms | 0.814 ms | 4.1 MiB |
+| `deps` | 385 | 73.1% | 4.492 ms | 0.843 ms | 4.6 MiB |
+| `languages` | 199 | not applicable | 3.351 ms | 0.250 ms | 2.1 MiB |
+
+`outline` and `show` use the 21,680-byte pinned Click fixture as their full-file baseline. `imports` uses the 896-byte input file; `map`, `dependents`, and `deps` use all 1,433 bytes of supported source scanned in the deterministic synthetic Python repository. These small fixtures exercise complete command behavior rather than repository scaling, so their reductions should not be compared directly with the large-repository table. `languages` has no source-byte baseline. The reproducible runner also records p95, minimum latency, stderr bytes, and exact commands.
+
+The six added languages were measured separately on pinned files from important upstream repositories. Both environments used 10 warmups and 100 complete calls. Reduction compares UTF-8 outline bytes with source bytes; repository code was parsed but never executed.
+
+| Language and pinned repository file | Source | Outline reduction | Native median | Sandbox median | Sandbox peak RSS |
+|---|---:|---:|---:|---:|---:|
+| PowerShell — PowerShell `tools/ResxGen/ResxGen.psm1` | 17,197 B | 90.9% | 5.502 ms | 9.940 ms | 4.1 MiB |
+| PHP — Laravel `Collection.php` | 55,672 B | 86.6% | 9.225 ms | 4.668 ms | 5.1 MiB |
+| Kotlin — kotlinx.coroutines `CoroutineDispatcher.kt` | 17,043 B | 95.1% | 3.593 ms | 0.963 ms | 6.1 MiB |
+| Lua — Neovim `runtime/lua/vim/lsp.lua` | 53,653 B | 96.1% | 8.532 ms | 4.425 ms | 3.6 MiB |
+| HCL — Terraform `apply-multi-var-comprehensive/root.tf` | 2,248 B | 9.3% | 3.406 ms | 0.576 ms | 3.1 MiB |
+| R — dplyr `R/mutate.R` | 15,796 B | 95.3% | 4.996 ms | 1.643 ms | 3.6 MiB |
+
+All six files returned the expected declarations. The HCL fixture is a compact, declaration-dense file: preserving every short block and attribute leaves little removable body text, so its low reduction reflects the input structure rather than truncation.
+
+### Why native macOS is often slower than the sandbox
+
+The sandbox result does not include a Docker boundary on every call. The benchmark driver itself runs inside the already-started container and directly launches the Linux binary; `sbx exec`, Docker startup, environment provisioning, and one-time dependency setup are outside the timed region. A fresh sandbox invocation for every query would add seconds and is neither the benchmark protocol nor intended use.
+
+A separate minimal-call experiment isolates the fixed floor more clearly. After 20 warmups, `pira_codenav --version` was measured for 300 complete subprocess calls in each environment:
+
+| Minimal complete call | Median | p95 |
+|---|---:|---:|
+| Native macOS arm64 | 3.396 ms | 4.175 ms |
+| Already-running Linux arm64 sandbox | 0.229 ms | 0.334 ms |
+
+The approximately 3.17 ms median fixed-cost gap explains most of the apparent native slowdown on operations that finish in only a few milliseconds. It does **not** show that parsing is generally faster in the sandbox. As a diagnostic only, subtracting the independently measured medians suggests that the startup gap fully explains the Kotlin and HCL totals and nearly all of the R difference; PHP and Lua retain modest native disadvantages, while PowerShell is substantially faster natively despite the startup penalty. Subtracting medians is not a rigorous parser benchmark, so these residuals are not reported as parser-throughput results.
+
+The measurement establishes a different fixed call floor but does not isolate one operating-system component as the cause. Plausible contributors include macOS versus Linux process creation and executable loading, Mach-O/dyld versus ELF loader behavior, APFS versus Linux temporary storage, and warmed page-cache differences. The PowerShell reversal confirms that the sandbox CPU is not uniformly faster.
+
+Complete-call latency remains the primary product metric because agents invoke a CLI, not an in-process parser library. Agents can amortize the fixed native cost by passing multiple files or targets to `outline`, `show`, and `imports`; repository `map` and dependency traversal already batch work internally. A persistent daemon could remove repeated launch cost but would conflict with the current lightweight, stateless deployment boundary. An in-process benchmark would characterize grammar throughput separately, but it would not replace the complete-call product results.
+
+### Standard-repository scaling
+
+Complete bounded maps were measured over pinned sparse public checkouts. Each row uses 3 warmups and 20 measured calls inside a Linux arm64 Docker Sandbox; reduction compares the complete map response with all supported source bytes in that checkout.
+
+| Repository subset | Supported files | Clean / recovered / partial | Map reduction | Median | p95 | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| PyTorch `torch/nn` and selected ATen native/CUDA | 425 | 218 / 207 / 0 | 99.1% | 797.860 ms | 814.529 ms | 19.1 MiB |
+| Go standard library `net/http`, `context`, and `io` | 195 | 194 / 1 / 0 | 98.5% | 202.939 ms | 210.103 ms | 14.1 MiB |
+| TypeScript compiler | 77 | 75 / 2 / 0 | 99.8% | 433.184 ms | 454.241 ms | 74.6 MiB |
+| .NET core `String`, `Span`, `List`, and tasks | 27 | 23 / 4 / 0 | 99.6% | 194.412 ms | 201.945 ms | 21.2 MiB |
+
+Every eligible file produced a result without a hard failure or remaining partial parse. On the same PyTorch subset, the unnormalized parser reported 207 partial files; navigation-aware recovery reduced that incomplete set to zero while 401 files produced symbols. Recovery handles broad syntax classes including SFINAE value parameters, balanced preprocessor alternatives, namespace-boundary macros, dispatch macros with inline lambdas, Go value-initializing `new`, TypeScript variance/keyword tuple labels, and C# anti-constraints, conditional compilation, ref/unsafe expressions, C# 14 extension blocks, and null-conditional assignment. Views preserve byte and line offsets, reuse unchanged syntax trees incrementally, accept only structurally justified candidates, and never alter exact source returned by `show`. `recovered` means the supported declaration-navigation contract is complete: either a parser view resolved relevant syntax or remaining raw defects are confined to a recognized callable body that outline traversal intentionally does not inspect. It does not claim macro expansion, compiler-semantic correctness, or correctness of unsupported body syntax. TypeScript's peak memory reflects concurrent parsing of a few unusually large compiler files.
+
+<details>
+<summary>Benchmark method, task differences, and limitations</summary>
+
+#### Cross-tool protocol
+
+The benchmark environment contains the optimized Linux arm64 PIRA binary, ast-outline 1.8.2, and Grove 0.3.1 with the grammars needed by the fixed tasks. Unsupported operations and zero-definition no-ops are omitted rather than credited as fast results. Runtime grammar downloads and initialization required by Grove are setup costs and are excluded from repeated-call latency, as are one-time sandbox and tool provisioning costs.
+
+The operations are closely matched but not identical. PIRA location lookup returns one exact item; ast-outline's Python name lookup can return multiple overloads; Grove may include alternate IDs. The baseline C++ parses are partial, and ast-outline's very small C++ response is not equivalent declaration coverage. Output size must therefore be interpreted together with useful target coverage and parse completeness.
+
+#### New-language real-source protocol
+
+Each added-language fixture is pinned to an immutable upstream commit, stored unmodified with its adjacent license, and SHA-256 recorded in `tests/resources/pira_codenav/SOURCES.md`. The baseline tools in that environment were not provisioned and semantically validated for these six grammars, so their rows are intentionally PIRA-only rather than presenting unsupported or incomparable baseline values.
+
+#### Scaling protocol
+
+The standard-repository rows use sparse, pinned checkouts rather than entire upstream repositories. `map --max-items 1000000` processes every inferred supported file in each checkout and returns explicit eligible, parsed, clean, recovered, partial, failed, shown, and omitted accounting. Repository code is read but never executed. The large TypeScript files and macro-heavy native sources are useful stress cases but do not represent every repository shape.
+
+The four scaling corpora exposed recovery gaps during development, so these rows are not held-out generalization results. Each added syntax class was also checked after implementation on newly fetched, previously unseen source from an independent repository: MQT Core, NVIDIA CCCL, pytorch_scatter, Meta generative-recommenders, and Abseil for C-family recovery; golang/tools and Spacelift's Terraform provider for Go; typescript-eslint and the IMC Prosperity Visualizer for TypeScript; and Stryker.NET, PowerToys, Uno.Themes, Godot, and Microsoft.Unity.Analyzers for C#. Those repositories were parsed but never built or executed. Relative to the same no-recovery implementation (567.905 ms median and 18.1 MiB peak RSS), complete PyTorch recovery costs about 230 ms median and 1.0 MiB peak RSS on that macro-heavy 5.36 MB subset. Recovery work is gated to files that are initially defective, except that a structurally misparsed C# 14 extension block is recognized from the original tree before its aligned view is selected.
+
+#### Limitations
+
+These measurements come from one Apple M1 Pro/macOS host and one Linux arm64 Docker Sandbox on that machine; they are not universal hardware claims. Native and sandbox executables use different operating systems, executable formats, filesystems, and caches. The minimal `--version` experiment measures the fixed floor of a real CLI call, not pure kernel spawn time. Reductions are UTF-8 byte reductions rather than tokenizer-specific token counts. The curated corpus verifies structural extraction and exact identity round trips, not compiler semantics. Binary/non-UTF-8, malformed syntax, path escape, symlink, control-character, and stale-selector behavior are covered by functional and security tests rather than the latency tables.
+
+</details>
+
+The optimized seventeen-grammar macOS arm64 binary is 31.0 MB uncompressed and 3.49 MB with gzip level 9. Benchmark sources and reproducible runners are under `tests/resources/pira_codenav` and `tests/tools`.
 
 </details>
 

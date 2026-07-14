@@ -18,15 +18,18 @@ __pycache__/
 # Private local tool planning
 tool_todo.md
 
-# Keep only the public pira_ctx build inputs, selector, source, and release
+# Keep only public PIRA tool build inputs, selectors, source, and releases.
 # bundles. Setup scripts live under assets/scripts/ and remain public.
 tools/*
 !tools/Cargo.toml
 !tools/Cargo.lock
+!tools/crates/
+!tools/crates/**
 !tools/select_tool_for_platform.py
 !tools/build/
 tools/build/*
 !tools/build/build_pira_ctx_platform_bins.py
+!tools/build/build_pira_codenav_platform_bins.py
 !tools/src/
 !tools/src/**
 !tools/dist/

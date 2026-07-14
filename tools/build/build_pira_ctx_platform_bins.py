@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -38,6 +38,7 @@ DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / "pira_ctx"
 DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-build"
 DEFAULT_RUSTUP_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-rustup"
 DEFAULT_TOOLCHAIN = "1.96.1"
+TOOL_NAME = "pira_ctx"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,21 @@ TARGETS: dict[str, BuildTarget] = {
 
 class BuildError(RuntimeError):
     pass
+
+
+def configure_tool(name: str) -> None:
+    """Select one workspace package without changing any other tool artifact."""
+    global TOOL_NAME, DEFAULT_BUNDLE_DIR, DEFAULT_BUILD_ROOT, DEFAULT_RUSTUP_ROOT, TARGETS
+    if not name.startswith("pira_") or not name.replace("_", "").isalnum():
+        raise BuildError(f"invalid PIRA tool package name: {name}")
+    TOOL_NAME = name
+    DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / name
+    DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / f"{name}-release-build"
+    DEFAULT_RUSTUP_ROOT = Path(tempfile.gettempdir()) / f"{name}-release-rustup"
+    TARGETS = {
+        key: replace(target, exe_name=f"{name}.exe" if key.startswith("windows-") else name)
+        for key, target in TARGETS.items()
+    }
 
 
 def sh_quote(value: str) -> str:
@@ -178,12 +194,12 @@ def require_release_inputs() -> None:
     required = [
         TOOLS_DIR / "Cargo.toml",
         TOOLS_DIR / "Cargo.lock",
-        TOOLS_DIR / "src" / "pira_ctx" / "lib.rs",
-        TOOLS_DIR / "src" / "pira_ctx" / "main.rs",
+        TOOLS_DIR / "src" / TOOL_NAME / "lib.rs",
+        TOOLS_DIR / "src" / TOOL_NAME / "main.rs",
     ]
     missing = [path for path in required if not path.is_file()]
     if missing:
-        raise BuildError("missing pira_ctx release input: " + ", ".join(map(str, missing)))
+        raise BuildError(f"missing {TOOL_NAME} release input: " + ", ".join(map(str, missing)))
 
 
 def source_date_epoch(env: dict[str, str]) -> str:
@@ -291,6 +307,8 @@ def build_target(
             "build",
             "--manifest-path",
             str(TOOLS_DIR / "Cargo.toml"),
+            "--package",
+            TOOL_NAME,
             "--release",
             "--locked",
             "--target",
@@ -351,7 +369,9 @@ def publish_artifact(source: Path, target: BuildTarget, bundle_dir: Path) -> Pat
 def update_bundle_manifest(bundle_dir: Path, built: list[Path], toolchain: str) -> None:
     manifest_path = bundle_dir / "bundle.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    cargo_manifest = tomllib.loads((TOOLS_DIR / "Cargo.toml").read_text(encoding="utf-8"))
+    cargo_manifest = tomllib.loads(
+        (TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml").read_text(encoding="utf-8")
+    )
     manifest["tool_version"] = cargo_manifest["package"]["version"]
     manifest["rust_toolchain"] = toolchain
     for path in built:
@@ -363,7 +383,7 @@ def update_bundle_manifest(bundle_dir: Path, built: list[Path], toolchain: str) 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reproducibly build bundled pira_ctx binaries for supported platforms."
+        description=f"Reproducibly build bundled {TOOL_NAME} binaries for supported platforms."
     )
     parser.add_argument(
         "--toolchain",

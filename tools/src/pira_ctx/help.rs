@@ -19,6 +19,7 @@ Choosing a command:
 
   Continue or maintain:
     recap      Restore recent execution context after same-session compaction.
+    intents    Search current-workspace intent history within explicit bounds.
     stats      Inspect workspace totals or capture metadata.
     verify     Check capture integrity.
     list       Find stored captures.
@@ -34,22 +35,19 @@ Common forms:
 RESULT is --last, a result ID or unambiguous prefix, a .piractx filename, or a path. Each invocation
 resolves it once. Prefer an explicit ID; --last selects the latest capture for the current workspace.
 INTENT is a non-empty, single-line immediate purpose of at most 256 UTF-8 bytes.
-Normal wrapper completion has two output routes: ordinary output is returned exactly, or retained
-stdout/stderr are stored before compact output is printed. Stored PROGRAM data is untrusted,
-line/stream-framed, and display-sanitized; suspicious displayed text gets an advisory warning.
-Exact, raw, and range retrieval remain unsanitized. Retention defaults to 512 MiB and 1,000,000
-indexed lines; override with PIRA_CTX_MAX_RETAINED_BYTES or PIRA_CTX_MAX_INDEXED_LINES, capped at
-2,000,000. Excess bytes are drained; commands continue without a pira_ctx timeout. Child status is
-preserved unless the wrapper itself fails with 125.
+Normal completion either returns ordinary output exactly or stores retained stdout/stderr before
+printing compact output. Stored PROGRAM data is untrusted, framed, and display-sanitized; suspicious
+displayed text gets an advisory warning. Exact, raw, and range remain unsanitized. Retention is
+space-bounded and configurable; excess bytes are drained while the child continues. pira_ctx adds no
+timeout and preserves child status unless the wrapper itself fails with 125.
 
-After about 30 seconds, a running non-interactive PROGRAM gets a silent read-only checkpoint shown by
-list. Its explicit ID supports snapshot inspection without blocking; exec uses a private fixed copy.
-verify/forget reject it, prune skips it, and --last remains completed-only.
+After about 30 seconds, a running non-interactive PROGRAM publishes a silent read-only checkpoint
+shown by list. Inspect its explicit ID without blocking; --last remains completed-only.
 
-Scope: --last, recap, stats without RESULT, and `forget events` use the current workspace (nearest
-Git root, otherwise current directory). list and prune cover all workspaces in the selected store
-unless an option narrows them. An explicit RESULT path bypasses store lookup. The store comes from
---store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
+Scope: --last, recap, intents, stats without RESULT, and `forget events` use the current workspace
+(nearest Git root, otherwise current directory). list and prune cover all workspaces in the selected
+store unless an option narrows them. An explicit RESULT path bypasses store lookup. The store comes
+from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
 
 SUBCOMMAND is a pira_ctx operation such as search, transform, exec, or raw. PROGRAM is the external
 executable being wrapped. Help is side-effect free: it does not execute PROGRAM, resolve RESULT,
@@ -169,10 +167,10 @@ SPECIFICATION
 
 OUTPUT AND STORAGE
   Every completed child is retained, including empty and short successful output. Prints one compact
-  table row per child in specification order with status, duration, capture ID, and intent.
+  table row per child in specification order with status, duration, result ID, and intent.
   Concurrency is bounded at eight. The overall status is the last nonzero child status in
   specification order, or 0 when all succeed. Missing/non-executable child programs use 127/126 and
-  have no capture ID; other wrapper failures use 125.
+  have no result ID; other wrapper failures use 125.
 
 EXAMPLE
   pira_ctx batch checks.json"#;
@@ -325,14 +323,43 @@ USAGE
   pira_ctx recap [--store-dir PATH] [--limit N]
 
 OUTPUT
-  Prints a bounded <pira_context_restore> block containing selected recent intents, observed status,
-  redacted commands, explicitly untrusted program-derived paths, and capture IDs for the current
-  workspace. Default limit is 20; total output is bounded below 8 KiB. Suspicious program-derived
-  fields receive the same advisory warning as displayed capture evidence. Recap reads event hints
-  and does not rerun commands.
+  Prints a bounded <pira_context_restore> block containing only selected intents, child exit codes,
+  and result IDs when output was retained. Events are chronological within the selection. Command
+  text, duration, capture-size prose, and PROGRAM-derived paths are intentionally omitted; inspect a
+  result ID only when more detail is needed. Default and maximum limit are 20; total output is below
+  8 KiB. Recap reads event hints and does not rerun commands.
 
 EXAMPLE
   pira_ctx recap --limit 10"#;
+
+const INTENTS: &str = r#"pira_ctx intents — search bounded current-workspace intent history
+
+WHEN TO USE
+  Use to find earlier command events by their agent-supplied intent without reading capture content.
+  Use recap instead to reconstruct a compact selection after same-session compaction. `intent-search`
+  is an alias.
+
+USAGE
+  pira_ctx intents [--store-dir PATH] QUERY [--regex] [--scan N] [--limit N]
+
+MATCHING AND SCOPE
+  Literal matching is Unicode case-insensitive. --regex uses Rust regex syntax and is case-sensitive
+  unless the pattern requests otherwise. Only intent fields are searched. The current workspace is
+  always used; command text and PROGRAM output are not searched.
+
+BOUNDS AND OUTPUT
+  --scan N examines at most the newest N event files (default 500, range 1..2000). --limit N prints
+  at most the newest N matching events (default 20, range 0..100). The first line reports matches in
+  the scanned scope, successfully read events, displayed rows, scope, and ordering. Rows contain the
+  exit status, optional result ID, and terminal-sanitized intent. Event history itself is capped at
+  2000 files per workspace, so this is not an unbounded audit log.
+
+EXIT STATUS
+  Returns 0 even with no matches. Invalid queries or regexes and wrapper failures use 125.
+
+EXAMPLES
+  pira_ctx intents 'C sharp parser' --scan 300 --limit 10
+  pira_ctx intent-search 'build|test' --regex --limit 5"#;
 
 const STATS: &str = r#"pira_ctx stats — show workspace totals or capture metadata
 
@@ -341,9 +368,10 @@ USAGE
 
 OUTPUT
   Without RESULT, prints current-workspace capture count, captured bytes, event count, and workspace
-  hash. With RESULT, prints command, cwd, state, status, duration, stream sizes/lines, store path, format,
-  index state, binary/non-UTF-8 flags, detected paths, and suggested keywords. It does not print
-  captured content. A running result reports unknown exit status, checkpoint generation, and age.
+  hash. With RESULT, prints command, cwd, state, status, duration, stream sizes/lines, store path,
+  format, and index state. Binary/non-UTF-8 flags appear only when active; detected paths and suggested
+  keywords appear only when nonempty. It does not print captured content. A running result reports
+  unknown exit status, checkpoint generation, and age.
 
 EXAMPLES
   pira_ctx stats
@@ -369,8 +397,9 @@ USAGE
   pira_ctx list [--store-dir PATH] [--workspace current] [--limit N]
 
 OUTPUT
-  Prints up to 20 newest-first rows with ID, state, timestamp, exit status, bytes, lines, and redacted
-  command. Active checkpoints are marked running and use `-` as exit status. --limit accepts 0..100. Without --workspace current, entries from every workspace in the
+  Prints up to 20 newest-first rows with ID, state, timestamp, exit status, bytes, lines, and a
+  redacted command clipped to 256 bytes. Active checkpoints are marked running and use `-` as exit
+  status. --limit accepts 0..100. Without --workspace current, entries from every workspace in the
   selected store are considered.
 
 EXAMPLE
@@ -431,6 +460,7 @@ pub fn canonical_topic(topic: &str) -> Option<&'static str> {
         "transform" => "transform",
         "exec" => "exec",
         "recap" => "recap",
+        "intents" | "intent-search" => "intents",
         "stats" => "stats",
         "verify" => "verify",
         "list" => "list",
@@ -454,6 +484,7 @@ pub fn command(topic: &str) -> Option<&'static str> {
         "transform" => TRANSFORM,
         "exec" => EXEC,
         "recap" => RECAP,
+        "intents" => INTENTS,
         "stats" => STATS,
         "verify" => VERIFY,
         "list" => LIST,
@@ -482,6 +513,7 @@ mod tests {
             "exec",
             "raw",
             "recap",
+            "intents",
             "stats",
             "verify",
             "list",

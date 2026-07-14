@@ -63,6 +63,7 @@ fn real_main() -> Result<i32, String> {
         Mode::Exec => run_python_exec(&config),
         Mode::Transform => run_transform(&config),
         Mode::Recap => run_recap(&config),
+        Mode::Intents => run_intents(&config),
         Mode::Batch => run_batch(&config),
         Mode::List => run_list(&config),
         Mode::Stats => run_stats(&config),
@@ -989,21 +990,31 @@ fn run_stats(config: &Config) -> Result<i32, String> {
         metadata.line_timeline.len(),
         metadata.timeline_truncated
     ))?;
-    util::stdout_line(&format!(
-        "Binary: stdout={} stderr={} non_utf8_stdout={} non_utf8_stderr={}",
-        metadata.binary_stdout,
-        metadata.binary_stderr,
-        metadata.non_utf8_stdout,
-        metadata.non_utf8_stderr
-    ))?;
-    util::stdout_line(&format!(
-        "DetectedPaths: {}",
-        metadata.detected_paths.join(", ")
-    ))?;
-    util::stdout_line(&format!(
-        "Keywords: {}",
-        metadata.suggested_keywords.join(", ")
-    ))?;
+    if metadata.binary_stdout
+        || metadata.binary_stderr
+        || metadata.non_utf8_stdout
+        || metadata.non_utf8_stderr
+    {
+        util::stdout_line(&format!(
+            "Binary: stdout={} stderr={} non_utf8_stdout={} non_utf8_stderr={}",
+            metadata.binary_stdout,
+            metadata.binary_stderr,
+            metadata.non_utf8_stdout,
+            metadata.non_utf8_stderr
+        ))?;
+    }
+    if !metadata.detected_paths.is_empty() {
+        util::stdout_line(&format!(
+            "DetectedPaths: {}",
+            metadata.detected_paths.join(", ")
+        ))?;
+    }
+    if !metadata.suggested_keywords.is_empty() {
+        util::stdout_line(&format!(
+            "Keywords: {}",
+            metadata.suggested_keywords.join(", ")
+        ))?;
+    }
     Ok(0)
 }
 
@@ -1029,6 +1040,7 @@ fn run_list(config: &Config) -> Result<i32, String> {
 }
 
 fn print_listed_entry(entry: &ListedEntry) -> Result<(), String> {
+    let command = table_field(&entry.command, 256);
     util::stdout_line(&format!(
         "{} | {} | {} | {} | {} | {} | {}",
         entry.id,
@@ -1041,7 +1053,7 @@ fn print_listed_entry(entry: &ListedEntry) -> Result<(), String> {
         },
         entry.bytes,
         entry.lines,
-        entry.command
+        command
     ))
 }
 
@@ -1086,38 +1098,79 @@ fn run_transform(config: &Config) -> Result<i32, String> {
 
 fn run_recap(config: &Config) -> Result<i32, String> {
     let dir = effective_store_dir(config.store_dir.as_ref())?;
+    if config.limit == 0 {
+        util::stdout_line("<pira_context_restore scope=\"current-workspace\" selected=\"0\" />")?;
+        return Ok(0);
+    }
     let candidates = events::read_current(&dir, config.limit.saturating_mul(5).clamp(100, 2000))?;
     let events = events::select_recap(&candidates, config.limit);
     let mut output = util::BoundedStdout::new(8 * 1024 - 32);
-    output.line("<pira_context_restore>")?;
-    let recap_risk = security::inspect_combined(
-        events
-            .iter()
-            .flat_map(|event| event.files.iter().map(String::as_str)),
-    );
-    print_content_warnings(&mut output, [(None, recap_risk)])?;
     if events.is_empty() {
-        output.line("No recent pira_ctx command events for this workspace.")?
-    } else {
-        for event in events {
-            let files = event
-                .files
-                .iter()
-                .take(5)
-                .map(|v| util::xml_field(v, 256))
-                .collect::<Vec<_>>()
-                .join(", ");
-            output.line(&format!(
-                "- intent: {}; observed: {}; command: {}; untrusted program-derived paths: {}; capture: {}",
-                util::xml_field(&event.intent, 256),
-                util::xml_field(&event.observed, 512),
-                util::xml_field(&event.command, 1024),
-                files,
-                util::xml_field(event.capture_id.as_deref().unwrap_or("—"), 128)
-            ))?;
-        }
+        output.line("<pira_context_restore scope=\"current-workspace\" selected=\"0\" />")?;
+        return Ok(0);
+    }
+    output.line(&format!(
+        "<pira_context_restore scope=\"current-workspace\" selected=\"{}\" order=\"oldest-first\">",
+        events.len()
+    ))?;
+    for event in events {
+        let result = event.capture_id.as_deref().map_or_else(String::new, |id| {
+            format!(" result={}", util::xml_field(id, 128))
+        });
+        output.line(&format!(
+            "- exit={}{} intent={}",
+            event.exit_code,
+            result,
+            util::xml_field(&event.intent, 256)
+        ))?;
     }
     util::stdout_line("</pira_context_restore>")?;
+    Ok(0)
+}
+
+fn run_intents(config: &Config) -> Result<i32, String> {
+    let dir = effective_store_dir(config.store_dir.as_ref())?;
+    let query = config
+        .query
+        .as_deref()
+        .ok_or_else(|| cli::USAGE.to_string())?;
+    let regex = if config.regex {
+        Some(regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?)
+    } else {
+        None
+    };
+    let query_lower = query.to_lowercase();
+    let candidates = events::read_current(&dir, config.scan)?;
+    let scanned = candidates.len();
+    let mut total_hits = 0_usize;
+    let mut hits = Vec::with_capacity(config.limit.min(scanned));
+    for event in candidates.into_iter().rev() {
+        let matched = regex.as_ref().map_or_else(
+            || event.intent.to_lowercase().contains(&query_lower),
+            |regex| regex.is_match(&event.intent),
+        );
+        if !matched {
+            continue;
+        }
+        total_hits += 1;
+        if hits.len() < config.limit {
+            hits.push(event);
+        }
+    }
+    util::stdout_line(&format!(
+        "intent_hits={total_hits} scanned={scanned} shown={} scope=current-workspace order=newest-first",
+        hits.len()
+    ))?;
+    if hits.is_empty() {
+        return Ok(0);
+    }
+    let mut output = util::BoundedStdout::new(64 * 1024);
+    output.line("exit | result | intent")?;
+    for event in hits {
+        let result = table_field(event.capture_id.as_deref().unwrap_or("-"), 128);
+        let intent = table_field(&event.intent, 256);
+        output.line(&format!("{} | {} | {}", event.exit_code, result, intent))?;
+    }
     Ok(0)
 }
 
@@ -1239,15 +1292,17 @@ fn run_batch(config: &Config) -> Result<i32, String> {
         }
     }
     completed.sort_by_key(|r| r.0);
-    util::stdout_line("index | exit | duration_ms | capture | intent")?;
+    util::stdout_line("index | exit | duration_ms | result | intent")?;
     let mut overall = 0;
     for (index, exit, duration, capture_id, intent) in completed {
+        let result = table_field(capture_id.as_deref().unwrap_or("-"), 128);
+        let intent = table_field(&intent, 256);
         util::stdout_line(&format!(
             "{} | {} | {} | {} | {}",
             index + 1,
             exit,
             duration,
-            capture_id.as_deref().unwrap_or("—"),
+            result,
             intent
         ))?;
         if exit != 0 {
@@ -1271,6 +1326,10 @@ fn format_scored_line(line: &model::LineMeta, score: i64, text: &str) -> String 
     format!("L{} {} score={}: {}", line.line, line.stream, score, text)
 }
 
+fn table_field(value: &str, maximum_bytes: usize) -> String {
+    util::single_line_clip(&util::sanitize_terminal(value), maximum_bytes).replace('|', "\\|")
+}
+
 pub(crate) fn spawn_command(cmd: &[String]) -> Result<std::process::Child, String> {
     Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -1287,6 +1346,17 @@ pub(crate) fn spawn_command(cmd: &[String]) -> Result<std::process::Child, Strin
                 format!("failed to spawn {}: {error}", cmd[0])
             }
         })
+}
+
+#[cfg(test)]
+mod output_format_tests {
+    use super::table_field;
+
+    #[test]
+    fn table_fields_are_single_line_bounded_and_delimiter_safe() {
+        assert_eq!(table_field("alpha|beta\ngamma", 64), "alpha\\|beta gamma");
+        assert!(table_field(&"x".repeat(400), 32).len() <= 32);
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,9 @@ pub const MAX_KEYWORD_BYTES: usize = 256;
 pub const MAX_SEARCH_CONTEXT: usize = 20;
 pub const MAX_QUERY_BYTES: usize = 4096;
 pub const MAX_TRANSFORM_PATTERNS: usize = 16;
+pub const MAX_INTENT_SEARCH_RESULTS: usize = 100;
+pub const MAX_INTENT_SEARCH_SCAN: usize = 2000;
+pub const MAX_RECAP_EVENTS: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -21,6 +24,7 @@ pub enum Mode {
     Exec,
     Transform,
     Recap,
+    Intents,
     Batch,
     List,
     Stats,
@@ -70,6 +74,7 @@ pub struct Config {
     pub max_store_bytes: Option<u64>,
     pub transform: TransformOptions,
     pub limit: usize,
+    pub scan: usize,
     pub batch_file: Option<PathBuf>,
     pub help_topic: Option<String>,
 }
@@ -97,6 +102,7 @@ impl Default for Config {
             max_store_bytes: None,
             transform: TransformOptions::default(),
             limit: 20,
+            scan: 500,
             batch_file: None,
             help_topic: None,
         }
@@ -178,7 +184,11 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
                 p += 1;
                 c.limit = parse_value(args, &mut p, "--limit")?;
             }
+            if c.limit > MAX_RECAP_EVENTS {
+                return Err(format!("recap --limit is capped at {MAX_RECAP_EVENTS}"));
+            }
         }
+        "intents" | "intent-search" => parse_intents(&mut c, args)?,
         "batch" => {
             c.mode = Mode::Batch;
             let mut p = parse_store(&mut c, args, 1)?;
@@ -479,6 +489,46 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn parse_intents(c: &mut Config, args: &[String]) -> Result<(), String> {
+    c.mode = Mode::Intents;
+    let mut p = parse_store(c, args, 1)?;
+    c.query = Some(take(args, &mut p, "QUERY")?.into());
+    while p < args.len() {
+        match args[p].as_str() {
+            "--regex" => {
+                c.regex = true;
+                p += 1;
+            }
+            "--limit" => {
+                p += 1;
+                c.limit = parse_value(args, &mut p, "--limit")?;
+            }
+            "--scan" => {
+                p += 1;
+                c.scan = parse_value(args, &mut p, "--scan")?;
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let query = c.query.as_deref().unwrap_or_default();
+    if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control) {
+        return Err(format!(
+            "intent query must be non-empty, single-line, and at most {MAX_QUERY_BYTES} UTF-8 bytes"
+        ));
+    }
+    if c.limit > MAX_INTENT_SEARCH_RESULTS {
+        return Err(format!(
+            "intents --limit is capped at {MAX_INTENT_SEARCH_RESULTS}"
+        ));
+    }
+    if c.scan == 0 || c.scan > MAX_INTENT_SEARCH_SCAN {
+        return Err(format!(
+            "intents --scan must be between 1 and {MAX_INTENT_SEARCH_SCAN}"
+        ));
+    }
+    Ok(())
+}
 fn parse_raw(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Raw;
     let mut p = parse_store(c, args, 1)?;
@@ -730,6 +780,38 @@ mod tests {
     #[test]
     fn internal_needs_no_intent() {
         assert!(parse_args(&a(&["search", "--last", "x"])).is_ok())
+    }
+
+    #[test]
+    fn recap_limit_preserves_the_structured_output_budget() {
+        assert!(parse_args(&a(&["recap", "--limit", "20"])).is_ok());
+        assert!(parse_args(&a(&["recap", "--limit", "21"])).is_err());
+    }
+
+    #[test]
+    fn intent_search_has_explicit_scan_and_result_bounds() {
+        let config = parse_args(&a(&[
+            "intents",
+            "parser|build",
+            "--regex",
+            "--scan",
+            "750",
+            "--limit",
+            "12",
+        ]))
+        .unwrap();
+        assert_eq!(config.mode, Mode::Intents);
+        assert_eq!(config.query.as_deref(), Some("parser|build"));
+        assert!(config.regex);
+        assert_eq!(config.scan, 750);
+        assert_eq!(config.limit, 12);
+        assert_eq!(
+            parse_args(&a(&["intent-search", "parser"])).unwrap().mode,
+            Mode::Intents
+        );
+        assert!(parse_args(&a(&["intents", "parser", "--scan", "0"])).is_err());
+        assert!(parse_args(&a(&["intents", "parser", "--scan", "2001"])).is_err());
+        assert!(parse_args(&a(&["intents", "parser", "--limit", "101"])).is_err());
     }
 
     #[test]

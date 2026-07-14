@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+
+def from_shebang(value: str) -> str:
+    return value.upper()
