@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build reproducible pira_ctx release binaries for every supported platform.
+"""Build reproducible binaries for one bundled PIRA tool.
 
 The release inputs are the tracked Cargo manifest, lockfile, and Rust source.
 The builder pins Rust by default, uses locked dependencies, disables incremental
@@ -50,26 +50,38 @@ class BuildTarget:
     linker: str | None = None
     rustflags: tuple[str, ...] = ()
     deployment_target: str | None = None
+    min_os: str | None = None
+    linkage: str | None = None
 
 
 TARGETS: dict[str, BuildTarget] = {
     "darwin-arm64": BuildTarget(
-        "aarch64-apple-darwin", "darwin-arm64", "pira_ctx", deployment_target="11.0"
+        "aarch64-apple-darwin",
+        "darwin-arm64",
+        "pira_ctx",
+        deployment_target="11.0",
+        min_os="11.0",
     ),
     "darwin-x64": BuildTarget(
-        "x86_64-apple-darwin", "darwin-x64", "pira_ctx", deployment_target="10.12"
+        "x86_64-apple-darwin",
+        "darwin-x64",
+        "pira_ctx",
+        deployment_target="10.12",
+        min_os="10.12",
     ),
     "linux-arm64": BuildTarget(
         "aarch64-unknown-linux-musl",
         "linux-arm64",
         "pira_ctx",
         rustflags=("-C", "linker=rust-lld"),
+        linkage="static",
     ),
     "linux-x64": BuildTarget(
         "x86_64-unknown-linux-musl",
         "linux-x64",
         "pira_ctx",
         rustflags=("-C", "linker=rust-lld"),
+        linkage="static-pie",
     ),
     "windows-x64": BuildTarget(
         "x86_64-pc-windows-gnu",
@@ -77,6 +89,7 @@ TARGETS: dict[str, BuildTarget] = {
         "pira_ctx.exe",
         linker_env="CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER",
         linker="x86_64-w64-mingw32-gcc",
+        min_os="10",
     ),
 }
 
@@ -88,7 +101,11 @@ class BuildError(RuntimeError):
 def configure_tool(name: str) -> None:
     """Select one workspace package without changing any other tool artifact."""
     global TOOL_NAME, DEFAULT_BUNDLE_DIR, DEFAULT_BUILD_ROOT, DEFAULT_RUSTUP_ROOT, TARGETS
-    if not name.startswith("pira_") or not name.replace("_", "").isalnum():
+    if (
+        not name.isascii()
+        or not name.startswith("pira_")
+        or not name.replace("_", "").isalnum()
+    ):
         raise BuildError(f"invalid PIRA tool package name: {name}")
     TOOL_NAME = name
     DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / name
@@ -194,6 +211,7 @@ def require_release_inputs() -> None:
     required = [
         TOOLS_DIR / "Cargo.toml",
         TOOLS_DIR / "Cargo.lock",
+        TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml",
         TOOLS_DIR / "src" / TOOL_NAME / "lib.rs",
         TOOLS_DIR / "src" / TOOL_NAME / "main.rs",
     ]
@@ -327,7 +345,11 @@ def build_target(
 def forbidden_host_paths(
     args: argparse.Namespace, base_env: dict[str, str], run_roots: list[Path]
 ) -> set[str]:
-    paths = {str(REPO_ROOT.resolve()), str(args.build_root.resolve()), str(args.rustup_root.resolve())}
+    paths = {
+        str(REPO_ROOT.resolve()),
+        str(args.build_root.resolve()),
+        str(args.rustup_root.resolve()),
+    }
     paths.update(str(path.resolve()) for path in run_roots)
     for name in ("HOME", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR"):
         if base_env.get(name):
@@ -366,19 +388,90 @@ def publish_artifact(source: Path, target: BuildTarget, bundle_dir: Path) -> Pat
     return destination
 
 
+def manifest_record(target: BuildTarget, digest: str) -> dict[str, str]:
+    record = {
+        "path": f"{target.platform_dir}/{target.exe_name}",
+        "target": target.rust_target,
+        "sha256": digest,
+    }
+    if target.min_os:
+        record["min_os"] = target.min_os
+    if target.linkage:
+        record["linkage"] = target.linkage
+    return record
+
+
 def update_bundle_manifest(bundle_dir: Path, built: list[Path], toolchain: str) -> None:
     manifest_path = bundle_dir / "bundle.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise BuildError(f"cannot read bundle manifest {manifest_path}: {error}") from error
+        if manifest.get("schema_version") != 1 or not isinstance(
+            manifest.get("binaries"), dict
+        ):
+            raise BuildError(f"unsupported bundle manifest: {manifest_path}")
+        recorded_name = manifest.get("tool_name")
+        if recorded_name is not None and recorded_name != TOOL_NAME:
+            raise BuildError(
+                f"bundle manifest tool mismatch: expected {TOOL_NAME}, found {recorded_name}"
+            )
+    else:
+        manifest = {"schema_version": 1, "binaries": {}}
     cargo_manifest = tomllib.loads(
         (TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml").read_text(encoding="utf-8")
     )
-    manifest["tool_version"] = cargo_manifest["package"]["version"]
+    new_version = cargo_manifest["package"]["version"]
+    built_platforms = {path.parent.name for path in built}
+    if (
+        manifest.get("tool_version") not in (None, new_version)
+        and built_platforms != set(TARGETS)
+    ):
+        raise BuildError(
+            f"{TOOL_NAME} version changed from {manifest.get('tool_version')} to {new_version}; "
+            "rebuild every platform so one manifest never describes mixed versions"
+        )
+    manifest["tool_name"] = TOOL_NAME
+    manifest["tool_version"] = new_version
     manifest["rust_toolchain"] = toolchain
     for path in built:
-        manifest["binaries"][path.parent.name]["sha256"] = sha256(path)
+        platform_name = path.parent.name
+        target = TARGETS.get(platform_name)
+        if target is None:
+            raise BuildError(f"unexpected artifact platform directory: {platform_name}")
+        manifest["binaries"][platform_name] = manifest_record(target, sha256(path))
+    bundle_dir.mkdir(parents=True, exist_ok=True)
     temporary = manifest_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, manifest_path)
+
+
+def validate_bundle_plan(bundle_dir: Path, selected: list[str]) -> None:
+    """Reject a partial rebuild that would mix tool versions in one bundle."""
+    manifest_path = bundle_dir / "bundle.json"
+    if not manifest_path.exists():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        cargo_manifest = tomllib.loads(
+            (TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
+        raise BuildError(f"cannot validate release metadata: {error}") from error
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("binaries"), dict):
+        raise BuildError(f"unsupported bundle manifest: {manifest_path}")
+    recorded_name = manifest.get("tool_name")
+    if recorded_name is not None and recorded_name != TOOL_NAME:
+        raise BuildError(
+            f"bundle manifest tool mismatch: expected {TOOL_NAME}, found {recorded_name}"
+        )
+    new_version = cargo_manifest["package"]["version"]
+    if manifest.get("tool_version") != new_version and set(selected) != set(TARGETS):
+        raise BuildError(
+            f"{TOOL_NAME} version changed from {manifest.get('tool_version')} to {new_version}; "
+            "select every platform for this release"
+        )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -432,13 +525,14 @@ def main(argv: list[str] | None = None) -> int:
     args.rustup_root = args.rustup_root.resolve()
     args.bundle_dir = args.bundle_dir.resolve()
     require_release_inputs()
-    rustup, base_env = rust_tools(args)
     selected = args.platform or sorted(TARGETS)
+    validate_bundle_plan(args.bundle_dir, selected)
+    rustup, base_env = rust_tools(args)
     prepare_toolchain(selected, args, rustup, base_env)
     args.build_root.mkdir(parents=True, exist_ok=True)
 
     run_roots: list[Path] = []
-    published: list[Path] = []
+    verified: list[tuple[Path, BuildTarget]] = []
     try:
         for name in selected:
             target = TARGETS[name]
@@ -460,8 +554,11 @@ def main(argv: list[str] | None = None) -> int:
 
             forbidden = forbidden_host_paths(args, base_env, run_roots)
             assert_no_host_paths(first, forbidden)
-            published.append(publish_artifact(first, target, args.bundle_dir))
+            verified.append((first, target))
 
+        published = [
+            publish_artifact(source, target, args.bundle_dir) for source, target in verified
+        ]
         update_bundle_manifest(args.bundle_dir, published, args.toolchain)
         print("\nPublished binaries:")
         for path in published:

@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
@@ -19,6 +20,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
+
+
+@dataclass(frozen=True)
+class ToolSelection:
+    name: str
+    manifest: dict[str, object]
+    source: Path
+    record: dict[str, object]
+    destination: Path
+    expected_hash: str
+    existing_hash: str | None
+    action: str
 
 
 def default_install_dir() -> Path:
@@ -48,8 +61,9 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def executable_path(directory: Path) -> Path:
-    return directory / ("pira_ctx.exe" if os.name == "nt" else "pira_ctx")
+def executable_path(directory: Path, tool_name: str) -> Path:
+    suffix = ".exe" if os.name == "nt" else ""
+    return directory / f"{tool_name}{suffix}"
 
 
 def shell_profiles() -> list[Path]:
@@ -122,7 +136,9 @@ def windows_user_path(directory: Path, dry_run: bool) -> bool:
             return True
         winreg.SetValueEx(key, "Path", 0, kind, updated)
     try:
-        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None)
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None
+        )
     except Exception:
         pass
     print(f"Updated Windows user PATH with {directory}")
@@ -168,80 +184,162 @@ def path_is_configured(directory: Path) -> bool:
 
 def direct_version(binary: Path) -> str:
     result = subprocess.run(
-        [str(binary), "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        [str(binary), "--version"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     return result.stdout.strip()
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install or refresh bundled PIRA tools for this user.")
+    parser = argparse.ArgumentParser(
+        description="Install or refresh bundled PIRA tools for this user."
+    )
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
-    parser.add_argument("--verify", action="store_true", help="Verify the installed tool without changing it.")
-    parser.add_argument("--no-path", action="store_true", help="Do not persist the install directory in PATH.")
-    parser.add_argument("--force", action="store_true", help="Refresh even when the installed hash already matches.")
+    parser.add_argument(
+        "--verify", action="store_true", help="Verify installed tools without changing them."
+    )
+    parser.add_argument(
+        "--no-path", action="store_true", help="Do not persist the install directory in PATH."
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Refresh even when installed hashes already match."
+    )
+    parser.add_argument(
+        "--tool",
+        action="append",
+        dest="tools",
+        help="Install or verify only this bundled tool; repeatable. Default: all bundled tools.",
+    )
     return parser
+
+
+def selected_tools(selector: ModuleType, requested: list[str] | None) -> list[str]:
+    bundled = selector.discover_tools()
+    if not bundled:
+        raise RuntimeError("no bundled PIRA tools were found")
+    if requested is None:
+        return bundled
+    tools = sorted(set(requested))
+    missing = [name for name in tools if name not in bundled]
+    if missing:
+        raise RuntimeError(
+            f"requested tool is not bundled: {', '.join(missing)}; "
+            f"available: {', '.join(bundled)}"
+        )
+    return tools
+
+
+def version_matches(tool_name: str, manifest: dict[str, object], version: str) -> bool:
+    expected = manifest.get("tool_version")
+    return not expected or version == f"{tool_name} {expected}"
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selector = load_selector()
     install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
-    manifest = selector.load_manifest()
-    source, record = selector.select_binary(manifest=manifest)
-    destination = executable_path(install_dir)
-    expected = record["sha256"]
-    existing_hash = sha256(destination) if destination.is_file() and not destination.is_symlink() else None
-    action = "unchanged" if existing_hash == expected else ("refresh" if destination.exists() or destination.is_symlink() else "install")
+    tools = selected_tools(selector, args.tools)
+    selections: list[ToolSelection] = []
+    for tool_name in tools:
+        manifest = selector.load_manifest(tool_name=tool_name)
+        source, record = selector.select_binary(tool_name=tool_name, manifest=manifest)
+        source_version = direct_version(source)
+        if not version_matches(tool_name, manifest, source_version):
+            raise RuntimeError(f"unexpected bundled version for {tool_name}: {source_version}")
+        destination = executable_path(install_dir, tool_name)
+        expected = record["sha256"].lower()
+        existing_hash = (
+            sha256(destination)
+            if destination.is_file() and not destination.is_symlink()
+            else None
+        )
+        action = (
+            "unchanged"
+            if existing_hash == expected
+            else ("refresh" if destination.exists() or destination.is_symlink() else "install")
+        )
+        selections.append(
+            ToolSelection(
+                name=tool_name,
+                manifest=manifest,
+                source=source,
+                record=record,
+                destination=destination,
+                expected_hash=expected,
+                existing_hash=existing_hash,
+                action=action,
+            )
+        )
 
     print(f"Platform: {selector.current_platform()}")
-    print(f"Bundled:  {source}")
-    print(f"Target:   {destination}")
 
     if args.verify:
         failures: list[str] = []
-        if existing_hash != expected:
-            failures.append("installed binary is missing or stale")
+        for selection in selections:
+            if selection.existing_hash != selection.expected_hash:
+                failures.append(f"{selection.name}: installed binary is missing or stale")
+                continue
+            version = direct_version(selection.destination)
+            if not version_matches(selection.name, selection.manifest, version):
+                failures.append(f"{selection.name}: unexpected version: {version}")
         if not args.no_path and not path_is_configured(install_dir):
             failures.append("install directory is not configured in the user PATH")
-        if not failures:
-            version = direct_version(destination)
-            if manifest.get("tool_version") and manifest["tool_version"] not in version:
-                failures.append(f"unexpected version: {version}")
         if failures:
             for failure in failures:
                 print(f"FAIL: {failure}", file=sys.stderr)
             return 1
-        print(f"OK: {direct_version(destination)}; SHA-256 verified")
+        for selection in selections:
+            print(f"OK: {direct_version(selection.destination)}; SHA-256 verified")
         return 0
 
-    if action == "unchanged" and not args.force:
-        print("OK: installed tool already matches the bundled release")
-    elif args.dry_run:
-        print(f"DRY-RUN: would {action} {destination}")
-    else:
-        installed = selector.install_binary(source, record, install_dir)
-        actual = sha256(installed)
-        if actual != expected:
-            raise RuntimeError("installed tool hash does not match bundle manifest")
-        completed_action = {
-            "install": "Installed",
-            "refresh": "Refreshed",
-            "unchanged": "Refreshed",
-        }[action]
-        print(f"{completed_action}: {installed}")
+    for selection in selections:
+        print(f"\nTool:     {selection.name}")
+        print(f"Bundled:  {selection.source}")
+        print(f"Target:   {selection.destination}")
+        if selection.action == "unchanged" and not args.force:
+            print("OK: installed tool already matches the bundled release")
+        elif args.dry_run:
+            print(f"DRY-RUN: would {selection.action} {selection.destination}")
+        else:
+            installed = selector.install_binary(
+                selection.source,
+                selection.record,
+                install_dir,
+                tool_name=selection.name,
+            )
+            actual = sha256(installed)
+            if actual != selection.expected_hash:
+                raise RuntimeError(
+                    f"installed {selection.name} hash does not match bundle manifest"
+                )
+            completed_action = {
+                "install": "Installed",
+                "refresh": "Refreshed",
+                "unchanged": "Refreshed",
+            }[selection.action]
+            print(f"{completed_action}: {installed}")
 
     if not args.no_path:
         ensure_path(install_dir, args.dry_run)
 
     if not args.dry_run:
-        version = direct_version(destination)
-        print(f"Verified: {version}; SHA-256 {expected}")
-        resolved = shutil.which("pira_ctx")
-        if resolved and Path(resolved).resolve() != destination.resolve():
-            print(f"NOTE: current process still resolves pira_ctx to {resolved}; restart the shell to activate {destination}")
-        elif not resolved:
-            print("NOTE: restart the shell or agent process to activate the updated PATH")
+        restart_needed = False
+        for selection in selections:
+            version = direct_version(selection.destination)
+            if not version_matches(selection.name, selection.manifest, version):
+                raise RuntimeError(
+                    f"unexpected installed version for {selection.name}: {version}"
+                )
+            print(f"Verified: {version}; SHA-256 {selection.expected_hash}")
+            resolved = shutil.which(selection.name)
+            if not resolved or Path(resolved).resolve() != selection.destination.resolve():
+                restart_needed = True
+        if restart_needed:
+            print("NOTE: restart the shell or agent process to activate the updated tools in PATH")
     return 0
 
 

@@ -132,7 +132,7 @@ py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the same bundled r
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
 ```
 
-Use `--force` to reinstall even when the installed hash already matches the bundled release. Use `--install-dir PATH` to override the tools-only default (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows), and `--no-path` when PATH persistence is managed separately. Restart the shell or agent process if setup reports that PATH changes are not yet active.
+By default, the tools-only setup discovers every valid bundle under `tools/dist`, verifies all selected artifacts before writing, and installs each executable independently. Use `--tool pira_ctx` or `--tool pira_codenav` to operate on one tool; repeat `--tool` to select several. Use `--force` to reinstall even when an installed hash already matches, `--install-dir PATH` to override the default (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows), and `--no-path` when PATH persistence is managed separately. Restart the shell or agent process if setup reports that PATH changes are not yet active.
 
 </details>
 
@@ -521,9 +521,12 @@ Subagents should load the same bootstrap policy as the main agent. This is handl
 - `USER.md` — user-specific knowledge and working preferences; keep this private
 - `modules/` — optional task-specific modules for research, coding, writing, learning, guidance, and maintenance
 - `assets/scripts/` — setup and helper scripts
-- `tools/build/build_pira_ctx_platform_bins.py` — pinned, reproducibility-checking multi-platform release builder
-- `tools/src/pira_ctx/` — public Rust implementation of `pira_ctx`; future tools use separate source directories
-- `tools/dist/pira_ctx/` — verified prebuilt `pira_ctx` executables and bundle manifest
+- `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
+- `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
+- `tools/build/build_pira_codenav_platform_bins.py` — package-isolated release entry point for `pira_codenav`
+- `tools/src/pira_ctx/` and `tools/src/pira_codenav/` — public Rust implementations
+- `tools/dist/pira_ctx/` and `tools/dist/pira_codenav/` — verified platform executables and per-tool bundle manifests
+- `tests/tools/` and `tests/resources/pira_codenav/` — public codenav checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
 </details>

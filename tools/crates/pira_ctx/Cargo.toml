@@ -1,6 +1,6 @@
 [package]
 name = "pira_ctx"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Lightweight command-output capture, synopsis, and retrieval for PIRA agents"
 license = "Apache-2.0"
