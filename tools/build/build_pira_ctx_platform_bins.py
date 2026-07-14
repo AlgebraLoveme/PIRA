@@ -23,9 +23,11 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from dataclasses import dataclass, replace
@@ -38,7 +40,29 @@ DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / "pira_ctx"
 DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-build"
 DEFAULT_RUSTUP_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-rustup"
 DEFAULT_TOOLCHAIN = "1.96.1"
+DEFAULT_ZIG_VERSION = "0.16.0"
+DEFAULT_ZIG_ROOT = Path(tempfile.gettempdir()) / f"pira-release-zig-{DEFAULT_ZIG_VERSION}"
 TOOL_NAME = "pira_ctx"
+USES_C_COMPILER = False
+
+ZIG_RELEASES = {
+    ("darwin", "arm64"): (
+        "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz",
+        "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+    ),
+    ("darwin", "x86_64"): (
+        "https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz",
+        "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
+    ),
+    ("linux", "arm64"): (
+        "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz",
+        "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+    ),
+    ("linux", "x86_64"): (
+        "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz",
+        "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -52,6 +76,7 @@ class BuildTarget:
     deployment_target: str | None = None
     min_os: str | None = None
     linkage: str | None = None
+    zig_target: str | None = None
 
 
 TARGETS: dict[str, BuildTarget] = {
@@ -75,6 +100,7 @@ TARGETS: dict[str, BuildTarget] = {
         "pira_ctx",
         rustflags=("-C", "linker=rust-lld"),
         linkage="static",
+        zig_target="aarch64-linux-musl",
     ),
     "linux-x64": BuildTarget(
         "x86_64-unknown-linux-musl",
@@ -82,6 +108,7 @@ TARGETS: dict[str, BuildTarget] = {
         "pira_ctx",
         rustflags=("-C", "linker=rust-lld"),
         linkage="static-pie",
+        zig_target="x86_64-linux-musl",
     ),
     "windows-x64": BuildTarget(
         "x86_64-pc-windows-gnu",
@@ -98,9 +125,10 @@ class BuildError(RuntimeError):
     pass
 
 
-def configure_tool(name: str) -> None:
+def configure_tool(name: str, *, uses_c_compiler: bool = False) -> None:
     """Select one workspace package without changing any other tool artifact."""
-    global TOOL_NAME, DEFAULT_BUNDLE_DIR, DEFAULT_BUILD_ROOT, DEFAULT_RUSTUP_ROOT, TARGETS
+    global TOOL_NAME, USES_C_COMPILER, DEFAULT_BUNDLE_DIR, DEFAULT_BUILD_ROOT
+    global DEFAULT_RUSTUP_ROOT, TARGETS
     if (
         not name.isascii()
         or not name.startswith("pira_")
@@ -108,6 +136,7 @@ def configure_tool(name: str) -> None:
     ):
         raise BuildError(f"invalid PIRA tool package name: {name}")
     TOOL_NAME = name
+    USES_C_COMPILER = uses_c_compiler
     DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / name
     DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / f"{name}-release-build"
     DEFAULT_RUSTUP_ROOT = Path(tempfile.gettempdir()) / f"{name}-release-rustup"
@@ -191,6 +220,82 @@ def bootstrap_rustup(rustup_root: Path, toolchain: str) -> tuple[Path, dict[str,
     return rustup, env
 
 
+def host_zig_release() -> tuple[str, str]:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    machine = {"aarch64": "arm64", "amd64": "x86_64"}.get(machine, machine)
+    release = ZIG_RELEASES.get((system, machine))
+    if release is None:
+        raise BuildError(f"no pinned Zig {DEFAULT_ZIG_VERSION} archive for {system}-{machine}")
+    return release
+
+
+def check_zig_version(zig: Path) -> None:
+    try:
+        version = subprocess.check_output([str(zig), "version"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise BuildError(f"cannot run Zig compiler {zig}: {error}") from error
+    if version != DEFAULT_ZIG_VERSION:
+        raise BuildError(
+            f"Zig {DEFAULT_ZIG_VERSION} is required for reproducible C cross-builds; found {version}"
+        )
+
+
+def bootstrap_zig(zig_root: Path) -> Path:
+    installed = zig_root / "zig"
+    if installed.is_file():
+        check_zig_version(installed)
+        return installed
+
+    url, expected = host_zig_release()
+    zig_root.parent.mkdir(parents=True, exist_ok=True)
+    archive = zig_root.with_suffix(".tar.xz")
+    temporary = archive.with_suffix(".tar.xz.tmp")
+    print(f"Downloading official Zig {DEFAULT_ZIG_VERSION}: {url}")
+    digest = hashlib.sha256()
+    with urlopen(url, timeout=120) as response, temporary.open("wb") as output_file:
+        for block in iter(lambda: response.read(1024 * 1024), b""):
+            digest.update(block)
+            output_file.write(block)
+    actual = digest.hexdigest()
+    if actual != expected:
+        temporary.unlink(missing_ok=True)
+        raise BuildError(f"Zig archive checksum mismatch: expected {expected}, got {actual}")
+    os.replace(temporary, archive)
+
+    extraction = Path(tempfile.mkdtemp(prefix="pira-zig-extract-", dir=zig_root.parent))
+    try:
+        with tarfile.open(archive, mode="r:xz") as source:
+            source.extractall(extraction, filter="data")
+        roots = [path for path in extraction.iterdir() if path.is_dir()]
+        if len(roots) != 1 or not (roots[0] / "zig").is_file():
+            raise BuildError("unexpected Zig archive layout")
+        os.replace(roots[0], zig_root)
+    finally:
+        shutil.rmtree(extraction, ignore_errors=True)
+    check_zig_version(installed)
+    return installed
+
+
+def zig_tools(args: argparse.Namespace, selected: list[str]) -> Path | None:
+    needs_zig = any(uses_zig_for_target(TARGETS[name]) for name in selected)
+    if not needs_zig:
+        return None
+    if args.zig:
+        zig = args.zig.expanduser().resolve()
+        check_zig_version(zig)
+        return zig
+    if not args.bootstrap_zig:
+        raise BuildError(
+            "Linux C cross-compilation requires Zig; pass --zig PATH or --bootstrap-zig"
+        )
+    return bootstrap_zig(args.zig_root.expanduser().resolve())
+
+
+def uses_zig_for_target(target: BuildTarget) -> bool:
+    return USES_C_COMPILER and target.zig_target is not None
+
+
 def rust_tools(args: argparse.Namespace) -> tuple[Path, dict[str, str]]:
     env = os.environ.copy()
     if args.rustup_home:
@@ -265,12 +370,46 @@ def remap_flags(paths: list[Path]) -> list[str]:
     return flags
 
 
+def c_remap_flags(paths: list[Path]) -> list[str]:
+    """Keep C compiler diagnostics and __FILE__ independent of host paths."""
+    flags: list[str] = []
+    seen: set[str] = set()
+    for index, path in enumerate(paths):
+        value = str(path.resolve())
+        if value in seen:
+            continue
+        seen.add(value)
+        flags.append(f"-ffile-prefix-map={value}=/pira-build/c-path-{index}")
+    return flags
+
+
+def zig_cc_wrapper_source(zig: Path, zig_target: str) -> str:
+    """Return a shim that replaces cc-rs's Rust triple with Zig's target syntax."""
+    return (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        f"zig = {str(zig)!r}\n"
+        "args = []\n"
+        "skip = False\n"
+        "for arg in sys.argv[1:]:\n"
+        "    if skip:\n"
+        "        skip = False\n"
+        "    elif arg == '--target':\n"
+        "        skip = True\n"
+        "    elif not arg.startswith('--target='):\n"
+        "        args.append(arg)\n"
+        f"os.execv(zig, [zig, 'cc', '-target', {zig_target!r}, *args])\n"
+    )
+
+
 def deterministic_env(
     base_env: dict[str, str],
     target: BuildTarget,
     run_root: Path,
     args: argparse.Namespace,
     rustup: Path,
+    zig: Path | None,
 ) -> dict[str, str]:
     env = base_env.copy()
     env.update(
@@ -289,6 +428,28 @@ def deterministic_env(
         env[target.linker_env] = str(Path(linker).resolve())
     if target.deployment_target:
         env["MACOSX_DEPLOYMENT_TARGET"] = target.deployment_target
+    if uses_zig_for_target(target):
+        if zig is None:
+            raise BuildError(f"Zig is required for target {target.rust_target}")
+        zig_target = target.zig_target
+        if zig_target is None:
+            raise BuildError(f"missing Zig target for {target.rust_target}")
+        cc_wrapper = run_root / "zig-cc"
+        ar_wrapper = run_root / "zig-ar"
+        cc_wrapper.write_text(
+            zig_cc_wrapper_source(zig, zig_target),
+            encoding="utf-8",
+        )
+        ar_wrapper.write_text(
+            f"#!/bin/sh\nexec {sh_quote(str(zig))} ar \"$@\"\n", encoding="utf-8"
+        )
+        cc_wrapper.chmod(0o755)
+        ar_wrapper.chmod(0o755)
+        target_key = target.rust_target.replace("-", "_")
+        env[f"CC_{target_key}"] = str(cc_wrapper)
+        env[f"AR_{target_key}"] = str(ar_wrapper)
+        env["ZIG_GLOBAL_CACHE_DIR"] = str(run_root / "zig-global-cache")
+        env["ZIG_LOCAL_CACHE_DIR"] = str(run_root / "zig-local-cache")
 
     sysroot = Path(
         output(
@@ -305,6 +466,9 @@ def deterministic_env(
         path_inputs.extend((home / ".cargo", home / ".rustup"))
     flags = [*target.rustflags, *remap_flags(path_inputs)]
     env["RUSTFLAGS"] = " ".join(flags)
+    if USES_C_COMPILER:
+        target_key = target.rust_target.replace("-", "_")
+        env[f"CFLAGS_{target_key}"] = shlex.join(c_remap_flags(path_inputs))
     return env
 
 
@@ -314,8 +478,9 @@ def build_target(
     rustup: Path,
     base_env: dict[str, str],
     run_root: Path,
+    zig: Path | None,
 ) -> Path:
-    env = deterministic_env(base_env, target, run_root, args, rustup)
+    env = deterministic_env(base_env, target, run_root, args, rustup, zig)
     run(
         [
             str(rustup),
@@ -504,6 +669,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rustup-home", type=Path, help="existing RUSTUP_HOME")
     parser.add_argument("--cargo-home", type=Path, help="existing CARGO_HOME")
     parser.add_argument(
+        "--zig",
+        type=Path,
+        help=f"existing Zig {DEFAULT_ZIG_VERSION} executable for Linux C cross-builds",
+    )
+    parser.add_argument(
+        "--zig-root",
+        type=Path,
+        default=DEFAULT_ZIG_ROOT,
+        help="isolated directory used by --bootstrap-zig",
+    )
+    parser.add_argument(
+        "--bootstrap-zig",
+        action="store_true",
+        help=f"download pinned official Zig {DEFAULT_ZIG_VERSION} when required",
+    )
+    parser.add_argument(
         "--bootstrap-rustup",
         action="store_true",
         help="install official isolated rustup when rustup is absent",
@@ -528,10 +709,13 @@ def main(argv: list[str] | None = None) -> int:
     selected = args.platform or sorted(TARGETS)
     validate_bundle_plan(args.bundle_dir, selected)
     rustup, base_env = rust_tools(args)
+    zig = zig_tools(args, selected)
     prepare_toolchain(selected, args, rustup, base_env)
     args.build_root.mkdir(parents=True, exist_ok=True)
 
     run_roots: list[Path] = []
+    staging_root = Path(tempfile.mkdtemp(prefix="verified-", dir=args.build_root))
+    run_roots.append(staging_root)
     verified: list[tuple[Path, BuildTarget]] = []
     try:
         for name in selected:
@@ -539,12 +723,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n=== {name} ({target.rust_target}) ===")
             first_root = Path(tempfile.mkdtemp(prefix=f"{name}-a-", dir=args.build_root))
             run_roots.append(first_root)
-            first = build_target(target, args, rustup, base_env, first_root)
+            first = build_target(target, args, rustup, base_env, first_root, zig)
+            platform_roots = [first_root]
 
             if not args.skip_reproducibility_check:
                 second_root = Path(tempfile.mkdtemp(prefix=f"{name}-b-", dir=args.build_root))
                 run_roots.append(second_root)
-                second = build_target(target, args, rustup, base_env, second_root)
+                platform_roots.append(second_root)
+                second = build_target(target, args, rustup, base_env, second_root, zig)
                 first_hash, second_hash = sha256(first), sha256(second)
                 if first_hash != second_hash:
                     raise BuildError(
@@ -554,7 +740,11 @@ def main(argv: list[str] | None = None) -> int:
 
             forbidden = forbidden_host_paths(args, base_env, run_roots)
             assert_no_host_paths(first, forbidden)
-            verified.append((first, target))
+            staged = publish_artifact(first, target, staging_root)
+            verified.append((staged, target))
+            if not args.keep_build_roots:
+                for path in platform_roots:
+                    shutil.rmtree(path, ignore_errors=True)
 
         published = [
             publish_artifact(source, target, args.bundle_dir) for source, target in verified

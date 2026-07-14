@@ -10,6 +10,8 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -175,6 +177,55 @@ class PiraToolDistributionTests(unittest.TestCase):
         (bundle / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaisesRegex(BUILDER.BuildError, "select every platform"):
             BUILDER.validate_bundle_plan(bundle, ["darwin-arm64"])
+
+    @unittest.skipIf(os.name == "nt", "fixture executable is a POSIX shell script")
+    def test_zig_cc_shim_replaces_only_rust_target_argument(self) -> None:
+        fake_zig = self.root / "zig"
+        fake_zig.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        fake_zig.chmod(0o755)
+        wrapper = self.root / "zig-cc"
+        wrapper.write_text(
+            BUILDER.zig_cc_wrapper_source(fake_zig, "aarch64-linux-musl"),
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        result = subprocess.run(
+            [
+                str(wrapper),
+                "--target=aarch64-unknown-linux-musl",
+                "-O3",
+                "--target",
+                "ignored-second-form",
+                "-c",
+                "parser.c",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(
+            ["cc", "-target", "aarch64-linux-musl", "-O3", "-c", "parser.c"],
+            result.stdout.splitlines(),
+        )
+
+    def test_zig_is_required_only_for_tools_with_c_compilation(self) -> None:
+        BUILDER.configure_tool("pira_ctx")
+        self.assertFalse(BUILDER.uses_zig_for_target(BUILDER.TARGETS["linux-arm64"]))
+        BUILDER.configure_tool("pira_codenav", uses_c_compiler=True)
+        self.assertTrue(BUILDER.uses_zig_for_target(BUILDER.TARGETS["linux-arm64"]))
+
+    def test_c_remap_flags_are_stable_and_shell_safe(self) -> None:
+        source = self.root / "source tree"
+        flags = BUILDER.c_remap_flags([source, source, self.root / "cargo"])
+        self.assertEqual(2, len(flags))
+        self.assertEqual(
+            f"-ffile-prefix-map={source.resolve()}=/pira-build/c-path-0",
+            flags[0],
+        )
+        self.assertEqual(flags, shlex.split(shlex.join(flags)))
+        self.assertNotIn(
+            str(self.root), " ".join(value.rsplit("=", 1)[1] for value in flags)
+        )
 
 
 if __name__ == "__main__":

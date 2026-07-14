@@ -148,9 +148,9 @@ The setup script:
 3. Moves legacy files listed in `assets/LEGACY_LIST.md` into `.backup/setup_pira_legacy/` when approved.
 4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536`.
 5. Optionally links or copies `~/.codex/AGENTS.md` for Codex's global AGENTS discovery path.
-6. Selects and verifies the bundled native tool for the current platform, then installs or refreshes it in a per-user PATH directory. Existing stale copies are atomically replaced; matching copies are left unchanged.
+6. Selects and verifies the bundled native tools for the current platform, then installs or refreshes them in a per-user PATH directory. Existing stale copies are atomically replaced; matching copies are left unchanged.
 7. Optionally delegates audio setup to the platform-specific audio helper.
-8. Verifies the setup, including the PIRA verification token and installed native tool.
+8. Verifies the setup, including the PIRA verification token and installed native tools.
 
 If setup cannot safely handle an existing conflicting file or Codex setting, it stops or skips that action with a warning instead of silently overwriting it.
 
@@ -277,7 +277,7 @@ This remains a private implementation benchmark on one arm64 macOS evaluation ho
 3. `show` retrieves exact source for selected items or bounded line ranges.
 4. `imports`, `dependents`, and `deps` expose conservative file-level relationships without invoking a build system.
 
-`pira_codenav` supports Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, and R. PIRA setup installs it as one native executable in the user's `PATH`. Its seventeen Tree-sitter grammars are compiled in, so normal use requires no Python, language server, package manager, daemon, database, network, or runtime grammar download.
+`pira_codenav` supports Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, and R. PIRA setup installs it as one native executable in the user's `PATH`. Its seventeen Tree-sitter grammars are compiled in, so normal use requires no Python, language server, package manager, daemon, database, network, or runtime grammar download. Verified builds for macOS arm64/x64, Linux arm64/x64, and Windows x64 are bundled under `tools/dist/pira_codenav`.
 
 ### Read-only and semantic boundary
 
