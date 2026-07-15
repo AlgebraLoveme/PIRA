@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -6,18 +6,114 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
+use crate::command::{
+    CommandResult, input_error, language_for, lsp_error, output_error, parse_location,
+    positive_usize,
+};
 use crate::deps;
 use crate::language::Language;
-use crate::model::{ParseState, Symbol};
-use crate::parse::{ParsedFile, parse_file};
+use crate::lsp_options::{self, LspOptions};
+use crate::model::{ImportEdge, ParseBackend, Symbol};
+use crate::parse::{ParsedFile, parse_file, parse_syntax};
+use crate::semantic;
+use crate::structural::StructuralResolver;
 use crate::util::{
-    DEFAULT_MAX_ITEMS, absolute_lexical, display_path, hash16, percent_decode, quote_metadata,
-    read_source,
+    DEFAULT_MAX_ITEMS, absolute_lexical, display_path, escape_untrusted_text, hash16,
+    percent_decode, quote_metadata, read_source, sanitize_metadata,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SHOW_MAX_ITEMS: usize = 20;
 const DEFAULT_SHOW_MAX_BYTES: usize = 64 * 1024;
+const MAX_REPORTED_FAILURES: usize = 20;
+const MAX_FAILURE_SUBJECT_BYTES: usize = 512;
+const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
+
+type ParsedFileCache = BTreeMap<(PathBuf, Language), Result<ParsedFile, (i32, String)>>;
+
+struct CommandFailure {
+    subject: String,
+    code: i32,
+    message: String,
+}
+
+#[derive(Default)]
+struct FailureCollector {
+    total: usize,
+    first_code: Option<i32>,
+    shown: Vec<CommandFailure>,
+}
+
+impl FailureCollector {
+    fn record(&mut self, subject: String, code: i32, message: String) {
+        debug_assert!(code >= 2, "output errors must not become target failures");
+        self.total += 1;
+        self.first_code.get_or_insert(code);
+        if self.shown.len() < MAX_REPORTED_FAILURES {
+            self.shown.push(CommandFailure {
+                subject: bounded_metadata(&subject, MAX_FAILURE_SUBJECT_BYTES),
+                code,
+                message: bounded_metadata(&message, MAX_FAILURE_MESSAGE_BYTES),
+            });
+        }
+    }
+
+    fn complete(&self) -> usize {
+        usize::from(self.total == 0)
+    }
+
+    fn omitted(&self) -> usize {
+        self.total.saturating_sub(self.shown.len())
+    }
+
+    fn first_code(&self) -> i32 {
+        self.first_code
+            .expect("a non-empty failure collector has a first code")
+    }
+
+    fn merge_sorted(mut self, other: Self) -> Self {
+        self.total += other.total;
+        if self.first_code.is_none() {
+            self.first_code = other.first_code;
+        }
+        self.shown.extend(other.shown);
+        self.shown.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then_with(|| left.code.cmp(&right.code))
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        self.shown.truncate(MAX_REPORTED_FAILURES);
+        self
+    }
+}
+
+fn bounded_metadata(value: &str, max_bytes: usize) -> String {
+    let mut value = sanitize_metadata(value);
+    if value.len() > max_bytes {
+        let mut end = max_bytes.saturating_sub('…'.len_utf8());
+        while !value.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        value.truncate(end);
+        value.push('…');
+    }
+    value
+}
+
+fn finish_partial_result(
+    attempted: usize,
+    successful: usize,
+    failures: &FailureCollector,
+    all_failed_message: &str,
+    output: &mut dyn Write,
+) -> CommandResult {
+    if attempted > 0 && successful == 0 && failures.total > 0 {
+        output.flush().map_err(output_error)?;
+        return Err((failures.first_code(), all_failed_message.into()));
+    }
+    Ok(())
+}
 
 pub fn run<I>(arguments: I) -> i32
 where
@@ -81,10 +177,17 @@ where
         Ok(path) => path,
         Err(error) => return fail(2, format!("cannot determine current directory: {error}")),
     };
+    let (values, lsp) = match lsp_options::parse(&values, &command, &cwd) {
+        Ok(parsed) => parsed,
+        Err(error) => return fail(error.0, error.1),
+    };
     let result = match command.as_str() {
-        "outline" => command_outline(&values, explicit_language, &cwd, &mut output),
-        "show" => command_show(&values, explicit_language, &cwd, &mut output),
-        "map" => command_map(&values, explicit_language, &cwd, &mut output),
+        "outline" => command_outline(&values, explicit_language, &cwd, &lsp, &mut output),
+        "show" => command_show(&values, explicit_language, &cwd, &lsp, &mut output),
+        "map" => command_map(&values, explicit_language, &cwd, &lsp, &mut output),
+        "definition" => semantic::definition(&values, explicit_language, &cwd, &lsp, &mut output),
+        "references" => semantic::references(&values, explicit_language, &cwd, &lsp, &mut output),
+        "hover" => semantic::hover(&values, explicit_language, &cwd, &lsp, &mut output),
         "imports" => command_imports(&values, explicit_language, &cwd, &mut output),
         "dependents" => command_dependents(&values, explicit_language, &cwd, &mut output),
         "deps" => command_deps(&values, explicit_language, &cwd, &mut output),
@@ -100,12 +203,11 @@ where
     }
 }
 
-type CommandResult = Result<(), (i32, String)>;
-
 fn command_outline(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_outline_options(args)?;
@@ -113,12 +215,15 @@ fn command_outline(
         return usage("outline requires at least one file");
     }
     let total = options.paths.len();
-    let mut failures = 0;
+    let mut failures = FailureCollector::default();
+    let mut resolver = StructuralResolver::new(lsp.config(cwd)?);
     for path in options.paths {
         let absolute = absolute_lexical(Path::new(&path), cwd);
         let result = (|| {
             let language = language_for(&absolute, explicit)?;
-            let parsed = parse_file(&absolute, language).map_err(input_error)?;
+            let parsed = resolver
+                .resolve(parse_file(&absolute, language).map_err(input_error)?)
+                .map_err(lsp_error)?;
             render_outline(
                 &parsed,
                 cwd,
@@ -128,32 +233,45 @@ fn command_outline(
                 &options.matches,
                 output,
             )?;
-            warn_partial(&parsed);
             Ok(())
         })();
         if let Err((code, message)) = result {
-            if total == 1 {
+            if total == 1 || code <= 1 {
                 return Err((code, message));
             }
-            failures += 1;
-            writeln!(
-                output,
-                "# pira_codenav outline error file={} code={} message={}",
-                quote_metadata(&path),
-                code,
-                quote_metadata(&message)
-            )
-            .map_err(output_error)?;
+            failures.record(path, code, message);
         }
     }
-    if failures == total {
-        output.flush().map_err(output_error)?;
-        return Err((
-            3,
-            "all outline files failed; inspect the reported file errors".into(),
-        ));
+    for failure in &failures.shown {
+        writeln!(
+            output,
+            "# pira_codenav outline error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
     }
-    Ok(())
+    if total > 1 {
+        writeln!(
+            output,
+            "# pira_codenav outline batch files={} succeeded={} failed={} complete={} errors_shown={} errors_omitted={}",
+            total,
+            total.saturating_sub(failures.total),
+            failures.total,
+            failures.complete(),
+            failures.shown.len(),
+            failures.omitted()
+        )
+        .map_err(output_error)?;
+    }
+    finish_partial_result(
+        total,
+        total.saturating_sub(failures.total),
+        &failures,
+        "all outline files failed; inspect the reported file errors",
+        output,
+    )
 }
 
 struct OutlineOptions {
@@ -214,9 +332,12 @@ fn command_show(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_show_options(args)?;
+    let mut parsed_files = ParsedFileCache::new();
+    let mut resolver = StructuralResolver::new(lsp.config(cwd)?);
     if options.targets.len() == 1
         && let Some((path_text, start, end)) = parse_line_range(&options.targets[0])
     {
@@ -240,9 +361,18 @@ fn command_show(
         return Ok(());
     }
     if options.targets.len() == 1 && options.max_bytes.is_none() {
-        let (parsed, symbol_index) = resolve_show_target(&options.targets[0], explicit, cwd)?;
-        render_source(&parsed, &parsed.symbols[symbol_index], cwd, output)?;
-        warn_partial(&parsed);
+        let (key, symbol_index) = resolve_show_target(
+            &options.targets[0],
+            explicit,
+            cwd,
+            &mut parsed_files,
+            &mut resolver,
+        )?;
+        let parsed = parsed_files
+            .get(&key)
+            .and_then(|result| result.as_ref().ok())
+            .expect("resolved show target has a cached parse");
+        render_source(parsed, &parsed.symbols[symbol_index], cwd, output)?;
         return Ok(());
     }
 
@@ -252,24 +382,27 @@ fn command_show(
     let mut identities = HashSet::new();
     let mut duplicates = 0;
     let mut byte_limited = 0;
-    let mut failures = Vec::new();
+    let mut failures = FailureCollector::default();
+    let mut resolved = 0;
     let mut considered = 0;
     let mut payload_bytes = 0;
     for target in &options.targets {
         if considered >= max_items {
             break;
         }
-        let (parsed, symbol_index) = match resolve_show_target(target, explicit, cwd) {
-            Ok(resolved) => resolved,
-            Err((code, message)) => {
-                failures.push(ShowFailure {
-                    target: target.clone(),
-                    code,
-                    message,
-                });
-                continue;
-            }
-        };
+        let (key, symbol_index) =
+            match resolve_show_target(target, explicit, cwd, &mut parsed_files, &mut resolver) {
+                Ok(resolved) => resolved,
+                Err((code, message)) => {
+                    failures.record(target.clone(), code, message);
+                    continue;
+                }
+            };
+        resolved += 1;
+        let parsed = parsed_files
+            .get(&key)
+            .and_then(|result| result.as_ref().ok())
+            .expect("resolved show target has a cached parse");
         let symbol = &parsed.symbols[symbol_index];
         let identity = (parsed.path.clone(), symbol.start_byte, symbol.end_byte);
         if !identities.insert(identity) {
@@ -278,8 +411,7 @@ fn command_show(
         }
         considered += 1;
         let mut item = Vec::new();
-        render_source(&parsed, symbol, cwd, &mut item)?;
-        warn_partial(&parsed);
+        render_source(parsed, symbol, cwd, &mut item)?;
         if item.len() > max_bytes.saturating_sub(payload_bytes) {
             byte_limited += 1;
             continue;
@@ -290,26 +422,29 @@ fn command_show(
     let omitted = options
         .targets
         .len()
-        .saturating_sub(rendered.len() + duplicates + failures.len());
+        .saturating_sub(rendered.len() + duplicates + failures.total);
     writeln!(
         output,
-        "# pira_codenav show targets={} shown={} failed={} duplicates={} omitted={} byte_limited={} payload_bytes={} max_items={} max_bytes={}",
+        "# pira_codenav show targets={} shown={} failed={} complete={} duplicates={} omitted={} byte_limited={} payload_bytes={} max_items={} max_bytes={} errors_shown={} errors_omitted={}",
         options.targets.len(),
         rendered.len(),
-        failures.len(),
+        failures.total,
+        failures.complete(),
         duplicates,
         omitted,
         byte_limited,
         payload_bytes,
         max_items,
-        max_bytes
+        max_bytes,
+        failures.shown.len(),
+        failures.omitted()
     )
     .map_err(output_error)?;
-    for failure in &failures {
+    for failure in &failures.shown {
         writeln!(
             output,
             "error target={} code={} message={}",
-            quote_metadata(&failure.target),
+            quote_metadata(&failure.subject),
             failure.code,
             quote_metadata(&failure.message)
         )
@@ -318,20 +453,13 @@ fn command_show(
     for item in rendered {
         output.write_all(&item).map_err(output_error)?;
     }
-    if failures.len() == options.targets.len() {
-        output.flush().map_err(output_error)?;
-        return Err((
-            3,
-            "all show targets failed; inspect the reported target errors".into(),
-        ));
-    }
-    Ok(())
-}
-
-struct ShowFailure {
-    target: String,
-    code: i32,
-    message: String,
+    finish_partial_result(
+        options.targets.len(),
+        resolved,
+        &failures,
+        "all show targets failed; inspect the reported target errors",
+        output,
+    )
 }
 
 struct ShowOptions {
@@ -387,7 +515,9 @@ fn resolve_show_target(
     target: &str,
     explicit: Option<Language>,
     cwd: &Path,
-) -> Result<(ParsedFile, usize), (i32, String)> {
+    parsed_files: &mut ParsedFileCache,
+    resolver: &mut StructuralResolver,
+) -> Result<((PathBuf, Language), usize), (i32, String)> {
     let (path, language, selector) = if target.starts_with("pira://") {
         let decoded = parse_selector(target).map_err(input_error)?;
         if explicit.is_some_and(|value| value != decoded.language) {
@@ -413,7 +543,20 @@ fn resolve_show_target(
         let language = language_for(&path, explicit)?;
         (path, language, None)
     };
-    let parsed = parse_file(&path, language).map_err(input_error)?;
+    let key = (path, language);
+    if !parsed_files.contains_key(&key) {
+        let parsed = parse_file(&key.0, key.1)
+            .map_err(input_error)
+            .and_then(|parsed| resolver.resolve(parsed).map_err(lsp_error));
+        parsed_files.insert(key.clone(), parsed);
+    }
+    let parsed = match parsed_files
+        .get(&key)
+        .expect("show parse was inserted before target resolution")
+    {
+        Ok(parsed) => parsed,
+        Err(error) => return Err(error.clone()),
+    };
     let symbol_index = if let Some(selector) = &selector {
         parsed
             .symbols
@@ -497,7 +640,7 @@ fn resolve_show_target(
             .map(|(index, _)| index)
             .ok_or_else(|| (3, format!("no named source item contains line {line}")))?
     };
-    Ok((parsed, symbol_index))
+    Ok((key, symbol_index))
 }
 
 fn qualified_suffix_matches(candidate: &str, query: &str) -> bool {
@@ -511,6 +654,7 @@ fn command_map(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let (paths, max_items, _) = parse_paths_and_limit(args, false)?;
@@ -524,75 +668,97 @@ fn command_map(
             root.display()
         )));
     }
-    let discovery = discover_files(&root, explicit);
+    let discovery = discover_files(
+        &root,
+        explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+    );
     let parsed = discovery
         .files
         .par_iter()
-        .map(|(path, language)| {
-            parse_file(path, *language).map(|parsed| FileSummary {
-                path: parsed.path,
-                language: parsed.language,
-                state: parsed.state,
-                names: top_level_map_names(&parsed.symbols),
-            })
-        })
+        .map(|(path, language)| parse_file(path, *language))
         .collect::<Vec<_>>();
-    let failed = parsed.iter().filter(|result| result.is_err()).count();
-    let summaries = parsed
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
+    let mut failures = FailureCollector::default();
+    let mut summaries = Vec::with_capacity(parsed.len());
+    let mut resolver = StructuralResolver::new(lsp.config(&root)?);
+    for ((path, _), result) in discovery.files.iter().zip(parsed) {
+        match result {
+            Ok(parsed) => match resolver.resolve(parsed) {
+                Ok(parsed) => summaries.push(FileSummary {
+                    path: parsed.path,
+                    language: parsed.language,
+                    backend: parsed.backend,
+                    names: top_level_map_names(&parsed.symbols),
+                }),
+                Err(message) => failures.record(display_path(path, &root), 3, message),
+            },
+            Err(message) => failures.record(display_path(path, &root), 2, message),
+        }
+    }
     let parsed_count = summaries.len();
-    let ok = summaries
+    let tree_sitter = summaries
         .iter()
-        .filter(|summary| summary.state == ParseState::Ok)
+        .filter(|summary| summary.backend == ParseBackend::TreeSitter)
         .count();
-    let recovered = summaries
+    let lsp_count = summaries
         .iter()
-        .filter(|summary| summary.state == ParseState::Recovered)
-        .count();
-    let partial = summaries
-        .iter()
-        .filter(|summary| summary.state == ParseState::Partial)
+        .filter(|summary| summary.backend == ParseBackend::Lsp)
         .count();
     let shown_summaries = balanced_summaries(summaries, &root, max_items);
     let shown = shown_summaries.len();
     writeln!(
         output,
-        "# pira_codenav map root={} discovered={} eligible={} parsed={} ok={} recovered={} partial={} failed={} unsupported={} ambiguous={} shown={} omitted={}",
+        "# pira_codenav map root={} discovered={} eligible={} parsed={} tree_sitter={} lsp={} failed={} complete={} unsupported={} ambiguous={} shown={} omitted={} errors_shown={} errors_omitted={}",
         display_path(&root, cwd),
         discovery.discovered,
         discovery.files.len(),
         parsed_count,
-        ok,
-        recovered,
-        partial,
-        failed,
+        tree_sitter,
+        lsp_count,
+        failures.total,
+        failures.complete(),
         discovery.unsupported,
         discovery.ambiguous,
         shown,
-        parsed_count.saturating_sub(shown)
+        parsed_count.saturating_sub(shown),
+        failures.shown.len(),
+        failures.omitted()
     )
     .map_err(output_error)?;
+    for failure in &failures.shown {
+        writeln!(
+            output,
+            "error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
+    }
     for file in shown_summaries {
         let names = file.names.join(",");
         writeln!(
             output,
-            "file={} language={} parse={} symbols={}",
+            "file={} language={} backend={} symbols={}",
             display_path(&file.path, cwd),
             file.language.name(),
-            file.state.as_str(),
+            file.backend.as_str(),
             names
         )
         .map_err(output_error)?;
     }
-    Ok(())
+    finish_partial_result(
+        discovery.files.len(),
+        parsed_count,
+        &failures,
+        "all eligible map files failed; inspect the reported file errors",
+        output,
+    )
 }
 
 struct FileSummary {
     path: PathBuf,
     language: Language,
-    state: ParseState,
+    backend: ParseBackend,
     names: Vec<String>,
 }
 
@@ -613,18 +779,9 @@ fn top_level_map_names(symbols: &[Symbol]) -> Vec<String> {
     names
 }
 
-fn compact_map_name(mut name: String) -> String {
+fn compact_map_name(name: String) -> String {
     const MAX_BYTES: usize = 96;
-    if name.len() <= MAX_BYTES {
-        return name;
-    }
-    let mut end = MAX_BYTES;
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    name.truncate(end);
-    name.push('…');
-    name
+    bounded_metadata(&name, MAX_BYTES)
 }
 
 fn balanced_summaries(
@@ -676,12 +833,12 @@ fn command_imports(
     if args.is_empty() {
         return usage("imports requires at least one file");
     }
-    let mut failures = 0;
+    let mut failures = FailureCollector::default();
     for value in args {
         let path = absolute_lexical(Path::new(value), cwd);
         let result = (|| {
             let language = language_for(&path, explicit)?;
-            let parsed = parse_file(&path, language).map_err(input_error)?;
+            let parsed = parse_syntax(&path, language).map_err(input_error)?;
             let edges = deps::imports(&parsed, cwd);
             writeln!(
                 output,
@@ -696,38 +853,51 @@ fn command_imports(
                     output,
                     "import line={} target={} resolution={} text={}",
                     edge.line,
-                    edge.target_label,
+                    sanitize_metadata(&edge.target_label),
                     edge.resolution,
                     quote_metadata(&edge.text)
                 )
                 .map_err(output_error)?;
             }
-            warn_partial(&parsed);
             Ok(())
         })();
         if let Err((code, message)) = result {
-            if args.len() == 1 {
+            if args.len() == 1 || code <= 1 {
                 return Err((code, message));
             }
-            failures += 1;
-            writeln!(
-                output,
-                "# pira_codenav imports error file={} code={} message={}",
-                quote_metadata(value),
-                code,
-                quote_metadata(&message)
-            )
-            .map_err(output_error)?;
+            failures.record(value.clone(), code, message);
         }
     }
-    if failures == args.len() {
-        output.flush().map_err(output_error)?;
-        return Err((
-            3,
-            "all imports files failed; inspect the reported file errors".into(),
-        ));
+    for failure in &failures.shown {
+        writeln!(
+            output,
+            "# pira_codenav imports error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
     }
-    Ok(())
+    if args.len() > 1 {
+        writeln!(
+            output,
+            "# pira_codenav imports batch files={} succeeded={} failed={} complete={} errors_shown={} errors_omitted={}",
+            args.len(),
+            args.len().saturating_sub(failures.total),
+            failures.total,
+            failures.complete(),
+            failures.shown.len(),
+            failures.omitted()
+        )
+        .map_err(output_error)?;
+    }
+    finish_partial_result(
+        args.len(),
+        args.len().saturating_sub(failures.total),
+        &failures,
+        "all imports files failed; inspect the reported file errors",
+        output,
+    )
 }
 
 fn command_dependents(
@@ -748,41 +918,59 @@ fn command_dependents(
         return Err(input_error("dependency target must be inside --root"));
     }
     let target_language = language_for(&target, explicit)?;
-    let discovery = discover_files(&root, explicit.or(Some(target_language)));
-    let mut edges = discovery
-        .files
-        .par_iter()
-        .filter(|(path, _)| *path != target)
-        .filter_map(|(path, language)| {
-            let parsed = parse_file(path, *language).ok()?;
-            Some(deps::imports(&parsed, &root))
-        })
-        .flatten()
-        .filter(|edge| edge.target.as_deref() == Some(target.as_path()))
-        .collect::<Vec<_>>();
-    edges.sort_by_key(|edge| (display_path(&edge.source, &root), edge.line));
+    let discovery = discover_files(&root, DiscoverySelection::Dependencies(target_language));
+    let extracted = extract_dependencies(&discovery.files, &root, Some(&target), |edge| {
+        (edge.target.as_deref() == Some(target.as_path())).then_some(edge)
+    });
+    let mut edges = extracted.edges;
+    edges.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.line.cmp(&right.line))
+    });
     writeln!(
         output,
-        "# pira_codenav dependents target={} root={} language={} count={}",
+        "# pira_codenav dependents target={} root={} language={} scanned={} failed={} complete={} count={} errors_shown={} errors_omitted={}",
         display_path(&target, &root),
         display_path(&root, cwd),
         target_language.name(),
-        edges.len()
+        extracted.scanned,
+        extracted.failures.total,
+        extracted.failures.complete(),
+        edges.len(),
+        extracted.failures.shown.len(),
+        extracted.failures.omitted()
     )
     .map_err(output_error)?;
+    for failure in &extracted.failures.shown {
+        writeln!(
+            output,
+            "error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
+    }
     for edge in edges {
         writeln!(
             output,
             "dependent={} line={} target={} resolution={} import={}",
             display_path(&edge.source, &root),
             edge.line,
-            edge.target_label,
+            sanitize_metadata(&edge.target_label),
             edge.resolution,
             quote_metadata(&edge.text)
         )
         .map_err(output_error)?;
     }
-    Ok(())
+    finish_partial_result(
+        extracted.scanned,
+        extracted.scanned.saturating_sub(extracted.failures.total),
+        &extracted.failures,
+        "all dependents files failed; inspect the reported file errors",
+        output,
+    )
 }
 
 fn parse_rooted_target(
@@ -853,6 +1041,87 @@ struct LocalDependencyEdge {
     line: usize,
 }
 
+struct DependencyExtraction<T> {
+    scanned: usize,
+    failures: FailureCollector,
+    edges: Vec<T>,
+}
+
+fn extract_dependencies<T, F>(
+    files: &[(PathBuf, Language)],
+    root: &Path,
+    skip: Option<&Path>,
+    map_edge: F,
+) -> DependencyExtraction<T>
+where
+    T: Send,
+    F: Fn(ImportEdge) -> Option<T> + Sync,
+{
+    files
+        .par_iter()
+        .filter(|(path, _)| skip != Some(path.as_path()))
+        .fold(
+            || DependencyExtraction {
+                scanned: 0,
+                failures: FailureCollector::default(),
+                edges: Vec::new(),
+            },
+            |mut output, (path, language)| {
+                output.scanned += 1;
+                match parse_syntax(path, *language) {
+                    Ok(parsed) => output.edges.extend(
+                        deps::imports(&parsed, root)
+                            .into_iter()
+                            .filter_map(&map_edge),
+                    ),
+                    Err(message) => {
+                        output.failures.record(display_path(path, root), 2, message);
+                    }
+                }
+                output
+            },
+        )
+        .reduce(
+            || DependencyExtraction {
+                scanned: 0,
+                failures: FailureCollector::default(),
+                edges: Vec::new(),
+            },
+            |mut left, mut right| {
+                left.scanned += right.scanned;
+                left.failures = left.failures.merge_sorted(right.failures);
+                left.edges.append(&mut right.edges);
+                left
+            },
+        )
+}
+
+struct DependencyGraph<'a> {
+    forward: BTreeMap<&'a Path, Vec<usize>>,
+    reverse: BTreeMap<&'a Path, Vec<usize>>,
+}
+
+impl<'a> DependencyGraph<'a> {
+    fn new(edges: &'a [LocalDependencyEdge]) -> Self {
+        let mut forward = BTreeMap::<&Path, Vec<usize>>::new();
+        let mut reverse = BTreeMap::<&Path, Vec<usize>>::new();
+        for (index, edge) in edges.iter().enumerate() {
+            forward.entry(&edge.source).or_default().push(index);
+            reverse.entry(&edge.target).or_default().push(index);
+        }
+        Self { forward, reverse }
+    }
+
+    fn adjacent(&self, node: &Path, forward: bool) -> &[usize] {
+        let selected = if forward {
+            &self.forward
+        } else {
+            &self.reverse
+        };
+        selected.get(node).map(Vec::as_slice).unwrap_or_default()
+    }
+}
+
 struct DependencyOptions {
     target: String,
     root: PathBuf,
@@ -892,61 +1161,89 @@ fn command_deps(
         return Err(input_error("dependency target must be inside --root"));
     }
     let target_language = language_for(&target, explicit)?;
-    let discovery = discover_files(&options.root, explicit.or(Some(target_language)));
-    let extracted = discovery
-        .files
-        .par_iter()
-        .map(|(path, language)| {
-            parse_file(path, *language).map(|parsed| {
-                deps::imports(&parsed, &options.root)
-                    .into_iter()
-                    .filter_map(|edge| {
-                        edge.target.map(|target| LocalDependencyEdge {
-                            source: edge.source,
-                            target,
-                            line: edge.line,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
+    let discovery = discover_files(
+        &options.root,
+        DiscoverySelection::Dependencies(target_language),
+    );
+    let extracted = extract_dependencies(&discovery.files, &options.root, None, |edge| {
+        edge.target.map(|target| LocalDependencyEdge {
+            source: edge.source,
+            target,
+            line: edge.line,
         })
-        .collect::<Vec<_>>();
-    let failed = extracted.iter().filter(|item| item.is_err()).count();
-    let edges = extracted
-        .into_iter()
-        .filter_map(Result::ok)
-        .flatten()
-        .collect::<Vec<_>>();
-    let mut traversed = Vec::new();
+    });
+    let DependencyExtraction {
+        scanned,
+        failures,
+        edges,
+    } = extracted;
+    let graph = DependencyGraph::new(&edges);
+    let mut imports = Vec::with_capacity(options.max_items);
+    let mut dependents = Vec::with_capacity(options.max_items);
+    let mut traversed_count = 0;
     if matches!(
         options.direction,
         DependencyDirection::Imports | DependencyDirection::Both
     ) {
-        traverse_dependencies(&edges, &target, true, options.depth, &mut traversed);
+        traversed_count += traverse_dependencies(
+            &graph,
+            &edges,
+            &target,
+            true,
+            options.depth,
+            options.max_items,
+            &mut imports,
+        );
     }
     if matches!(
         options.direction,
         DependencyDirection::Dependents | DependencyDirection::Both
     ) {
-        traverse_dependencies(&edges, &target, false, options.depth, &mut traversed);
+        traversed_count += traverse_dependencies(
+            &graph,
+            &edges,
+            &target,
+            false,
+            options.depth,
+            options.max_items,
+            &mut dependents,
+        );
     }
-    let shown = traversed.len().min(options.max_items);
+    let traversed = match options.direction {
+        DependencyDirection::Imports => imports,
+        DependencyDirection::Dependents => dependents,
+        DependencyDirection::Both => alternate_dependencies(imports, dependents, options.max_items),
+    };
+    let shown = traversed.len();
     writeln!(
         output,
-        "# pira_codenav deps target={} root={} language={} direction={} depth={} files={} failed={} edges={} shown={} omitted={}",
+        "# pira_codenav deps target={} root={} language={} direction={} depth={} files={} failed={} complete={} edges={} shown={} omitted={} errors_shown={} errors_omitted={}",
         display_path(&target, &options.root),
         display_path(&options.root, cwd),
         target_language.name(),
         options.direction.as_str(),
         options.depth,
         discovery.files.len(),
-        failed,
-        traversed.len(),
+        failures.total,
+        failures.complete(),
+        traversed_count,
         shown,
-        traversed.len().saturating_sub(shown)
+        traversed_count.saturating_sub(shown),
+        failures.shown.len(),
+        failures.omitted()
     )
     .map_err(output_error)?;
-    for edge in traversed.iter().take(shown) {
+    for failure in &failures.shown {
+        writeln!(
+            output,
+            "error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
+    }
+    for edge in &traversed {
         writeln!(
             output,
             "edge depth={} direction={} from={} to={} line={}",
@@ -958,7 +1255,42 @@ fn command_deps(
         )
         .map_err(output_error)?;
     }
-    Ok(())
+    finish_partial_result(
+        scanned,
+        scanned.saturating_sub(failures.total),
+        &failures,
+        "all deps files failed; inspect the reported file errors",
+        output,
+    )
+}
+
+fn alternate_dependencies(
+    imports: Vec<DependencyTraversal>,
+    dependents: Vec<DependencyTraversal>,
+    max_items: usize,
+) -> Vec<DependencyTraversal> {
+    let mut imports = imports.into_iter();
+    let mut dependents = dependents.into_iter();
+    let mut selected = Vec::with_capacity(max_items);
+    loop {
+        let before = selected.len();
+        if let Some(edge) = imports.next() {
+            selected.push(edge);
+            if selected.len() == max_items {
+                break;
+            }
+        }
+        if let Some(edge) = dependents.next() {
+            selected.push(edge);
+            if selected.len() == max_items {
+                break;
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    selected
 }
 
 fn parse_dependency_options(
@@ -1011,52 +1343,54 @@ fn parse_dependency_options(
     })
 }
 
-fn positive_usize(value: &str, option: &str) -> Result<usize, (i32, String)> {
-    value
-        .parse::<usize>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| (2, format!("{option} requires a positive integer")))
-}
-
 fn traverse_dependencies(
+    graph: &DependencyGraph<'_>,
     edges: &[LocalDependencyEdge],
     start: &Path,
     forward: bool,
     max_depth: usize,
+    max_items: usize,
     output: &mut Vec<DependencyTraversal>,
-) {
+) -> usize {
     let direction = if forward { "import" } else { "dependent" };
-    let mut frontier = HashSet::from([start.to_path_buf()]);
+    let mut frontier = BTreeSet::from([start.to_path_buf()]);
     let mut visited_nodes = frontier.clone();
     let mut visited_edges = HashSet::new();
+    let mut total = 0;
     for depth in 1..=max_depth {
-        let mut candidates = edges
+        let mut candidates = frontier
             .iter()
-            .filter_map(|edge| {
-                let target = &edge.target;
-                let matches = if forward {
-                    frontier.contains(&edge.source)
-                } else {
-                    frontier.contains(target)
-                };
-                matches.then_some((edge, target))
-            })
+            .flat_map(|node| graph.adjacent(node, forward).iter().copied())
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(edge, target)| (&edge.source, *target, edge.line));
-        let mut next = HashSet::new();
-        for (edge, target) in candidates {
-            let key = (edge.source.clone(), target.clone(), edge.line);
-            if visited_edges.insert(key) {
-                output.push(DependencyTraversal {
-                    depth,
-                    direction,
-                    source: edge.source.clone(),
-                    target: target.clone(),
-                    line: edge.line,
-                });
+        candidates.sort_by(|left, right| {
+            let left = &edges[*left];
+            let right = &edges[*right];
+            left.source
+                .cmp(&right.source)
+                .then_with(|| left.target.cmp(&right.target))
+                .then_with(|| left.line.cmp(&right.line))
+        });
+        candidates.dedup_by(|left, right| {
+            let left = &edges[*left];
+            let right = &edges[*right];
+            left.source == right.source && left.target == right.target && left.line == right.line
+        });
+        let mut next = BTreeSet::new();
+        for index in candidates {
+            let edge = &edges[index];
+            if visited_edges.insert(index) {
+                total += 1;
+                if output.len() < max_items {
+                    output.push(DependencyTraversal {
+                        depth,
+                        direction,
+                        source: edge.source.clone(),
+                        target: edge.target.clone(),
+                        line: edge.line,
+                    });
+                }
             }
-            let adjacent = if forward { target } else { &edge.source };
+            let adjacent = if forward { &edge.target } else { &edge.source };
             if visited_nodes.insert(adjacent.clone()) {
                 next.insert(adjacent.clone());
             }
@@ -1066,24 +1400,7 @@ fn traverse_dependencies(
         }
         frontier = next;
     }
-}
-
-fn language_for(path: &Path, explicit: Option<Language>) -> Result<Language, (i32, String)> {
-    let detected = Language::infer(path);
-    match (explicit, detected) {
-        (Some(explicit), Ok(detected)) if explicit != detected => Err((
-            2,
-            format!(
-                "language mismatch: explicit {} but `{}` is {}",
-                explicit.name(),
-                path.display(),
-                detected.name()
-            ),
-        )),
-        (Some(explicit), _) => Ok(explicit),
-        (None, Ok(detected)) => Ok(detected),
-        (None, Err(error)) => Err((2, error)),
-    }
+    total
 }
 
 fn render_outline(
@@ -1114,10 +1431,10 @@ fn render_outline(
     if matches.is_empty() {
         writeln!(
             output,
-            "# pira_codenav outline file={} language={} parse={} symbols={} shown={} omitted={}",
+            "# pira_codenav outline file={} language={} backend={} symbols={} shown={} omitted={}",
             shown_path,
             parsed.language.name(),
-            parsed.state.as_str(),
+            parsed.backend.as_str(),
             parsed.symbols.len(),
             shown,
             selected.len().saturating_sub(shown)
@@ -1126,10 +1443,10 @@ fn render_outline(
     } else {
         writeln!(
             output,
-            "# pira_codenav outline file={} language={} parse={} symbols={} matched={} shown={} omitted={}",
+            "# pira_codenav outline file={} language={} backend={} symbols={} matched={} shown={} omitted={}",
             shown_path,
             parsed.language.name(),
-            parsed.state.as_str(),
+            parsed.backend.as_str(),
             parsed.symbols.len(),
             selected.len(),
             shown,
@@ -1143,7 +1460,7 @@ fn render_outline(
             output,
             "{indent}{} {} L{}:{}-{}:{}",
             symbol.kind,
-            symbol.qualified_name,
+            sanitize_metadata(&symbol.qualified_name),
             symbol.start_row + 1,
             symbol.start_column + 1,
             symbol.end_row + 1,
@@ -1190,9 +1507,10 @@ fn render_source(
         .unwrap_or_default();
     writeln!(
         output,
-        "# pira_codenav show file={} language={} item={} kind={} range=L{}:{}-{}:{} bytes={} hash={}",
+        "# pira_codenav show file={} language={} backend={} item={} kind={} range=L{}:{}-{}:{} bytes={} hash={}",
         display_path(&parsed.path, cwd),
         parsed.language.name(),
+        parsed.backend.as_str(),
         symbol.qualified_name,
         symbol.kind,
         symbol.start_row + 1,
@@ -1203,7 +1521,7 @@ fn render_source(
         hash16(source.as_bytes())
     )
     .map_err(output_error)?;
-    let (rendered, escaped_controls) = render_untrusted_source(source);
+    let (rendered, escaped_controls) = escape_untrusted_text(source);
     render_source_boundary(output, escaped_controls)?;
     write!(output, "{rendered}").map_err(output_error)?;
     if !rendered.ends_with('\n') {
@@ -1225,13 +1543,21 @@ fn render_line_range(
         return Err((2, "line range must satisfy 1 <= START <= END".into()));
     }
     let source = read_source(path).map_err(input_error)?;
-    let mut starts = vec![0];
+    let mut line_count = usize::from(!source.is_empty());
+    let mut start_byte = (start == 1 && !source.is_empty()).then_some(0);
+    let mut requested_end_byte = None;
     for (index, byte) in source.bytes().enumerate() {
         if byte == b'\n' && index + 1 < source.len() {
-            starts.push(index + 1);
+            if line_count == requested_end {
+                requested_end_byte = Some(index + 1);
+                break;
+            }
+            line_count += 1;
+            if line_count == start {
+                start_byte = Some(index + 1);
+            }
         }
     }
-    let line_count = usize::from(!source.is_empty()) * starts.len();
     if start > line_count {
         return Err((
             2,
@@ -1242,9 +1568,12 @@ fn render_line_range(
             ),
         ));
     }
-    let end = requested_end.min(line_count);
-    let start_byte = starts[start - 1];
-    let end_byte = starts.get(end).copied().unwrap_or(source.len());
+    let start_byte = start_byte.expect("validated source line has a byte offset");
+    let (end, end_byte) = if let Some(end_byte) = requested_end_byte {
+        (requested_end, end_byte)
+    } else {
+        (requested_end.min(line_count), source.len())
+    };
     let selected = &source[start_byte..end_byte];
     let final_line = selected
         .trim_end_matches(['\n', '\r'])
@@ -1267,7 +1596,7 @@ fn render_line_range(
         hash16(selected.as_bytes())
     )
     .map_err(output_error)?;
-    let (rendered, escaped_controls) = render_untrusted_source(selected);
+    let (rendered, escaped_controls) = escape_untrusted_text(selected);
     render_source_boundary(output, escaped_controls)?;
     write!(output, "{rendered}").map_err(output_error)?;
     if !rendered.ends_with('\n') {
@@ -1289,48 +1618,6 @@ fn render_source_boundary(output: &mut dyn Write, escaped_controls: usize) -> Co
     }
 }
 
-fn render_untrusted_source(source: &str) -> (String, usize) {
-    let mut escaped = 0;
-    let mut output = String::with_capacity(source.len());
-    for character in source.chars() {
-        if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
-            use std::fmt::Write as _;
-            let _ = write!(output, "\\u{{{:x}}}", character as u32);
-            escaped += 1;
-        } else {
-            output.push(character);
-        }
-    }
-    (output, escaped)
-}
-
-fn warn_partial(parsed: &ParsedFile) {
-    match parsed.state {
-        crate::model::ParseState::Ok => {}
-        crate::model::ParseState::Recovered if parsed.original_defects == 0 => eprintln!(
-            "warning: parse recovered for {}: remaining parser gaps are confined to recognized function bodies",
-            parsed.path.display()
-        ),
-        crate::model::ParseState::Recovered => eprintln!(
-            "warning: parse recovered for {}: resolved {} navigation-relevant ERROR/MISSING node(s) ({} raw)",
-            parsed.path.display(),
-            parsed.original_defects,
-            parsed.raw_defects
-        ),
-        crate::model::ParseState::Partial if parsed.defects < parsed.original_defects => eprintln!(
-            "warning: parse is partial for {}: {} ERROR/MISSING node(s) remain after macro recovery (originally {})",
-            parsed.path.display(),
-            parsed.defects,
-            parsed.original_defects
-        ),
-        crate::model::ParseState::Partial => eprintln!(
-            "warning: parse is partial for {}: {} ERROR/MISSING node(s)",
-            parsed.path.display(),
-            parsed.defects
-        ),
-    }
-}
-
 struct FileDiscovery {
     files: Vec<(PathBuf, Language)>,
     discovered: usize,
@@ -1338,7 +1625,71 @@ struct FileDiscovery {
     ambiguous: usize,
 }
 
-fn discover_files(root: &Path, filter: Option<Language>) -> FileDiscovery {
+#[derive(Clone, Copy)]
+enum DiscoverySelection {
+    Any,
+    Exact(Language),
+    Dependencies(Language),
+}
+
+enum DiscoveredLanguage {
+    Eligible(Language),
+    Unsupported,
+    Ambiguous,
+}
+
+fn dependency_languages_are_compatible(target: Language, candidate: Language) -> bool {
+    target == candidate
+        || matches!(
+            (target, candidate),
+            (
+                Language::C | Language::Cpp | Language::Cuda,
+                Language::C | Language::Cpp | Language::Cuda
+            ) | (
+                Language::JavaScript | Language::TypeScript,
+                Language::JavaScript | Language::TypeScript
+            )
+        )
+}
+
+fn classify_discovered_path(path: &Path, selection: DiscoverySelection) -> DiscoveredLanguage {
+    match selection {
+        DiscoverySelection::Any => {
+            if Language::is_ambiguous_path(path) {
+                DiscoveredLanguage::Ambiguous
+            } else {
+                Language::infer(path)
+                    .map(DiscoveredLanguage::Eligible)
+                    .unwrap_or(DiscoveredLanguage::Unsupported)
+            }
+        }
+        DiscoverySelection::Exact(language) => {
+            if language.matches_path(path) {
+                DiscoveredLanguage::Eligible(language)
+            } else {
+                DiscoveredLanguage::Unsupported
+            }
+        }
+        DiscoverySelection::Dependencies(target) => {
+            if Language::is_ambiguous_path(path) {
+                if matches!(target, Language::C | Language::Cpp | Language::Cuda) {
+                    DiscoveredLanguage::Eligible(target)
+                } else {
+                    DiscoveredLanguage::Unsupported
+                }
+            } else {
+                match Language::infer(path) {
+                    Ok(candidate) if dependency_languages_are_compatible(target, candidate) => {
+                        DiscoveredLanguage::Eligible(candidate)
+                    }
+                    _ => DiscoveredLanguage::Unsupported,
+                }
+            }
+        }
+    }
+}
+
+fn discover_files(root: &Path, selection: DiscoverySelection) -> FileDiscovery {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -1358,18 +1709,10 @@ fn discover_files(root: &Path, filter: Option<Language>) -> FileDiscovery {
         }
         discovered += 1;
         let path = absolute_lexical(entry.path(), root);
-        if let Some(language) = filter {
-            if language.matches_path(&path) {
-                files.push((path, language));
-            } else {
-                unsupported += 1;
-            }
-        } else if Language::is_ambiguous_path(&path) {
-            ambiguous += 1;
-        } else if let Ok(language) = Language::infer(&path) {
-            files.push((path, language));
-        } else {
-            unsupported += 1;
+        match classify_discovered_path(&path, selection) {
+            DiscoveredLanguage::Eligible(language) => files.push((path, language)),
+            DiscoveredLanguage::Unsupported => unsupported += 1,
+            DiscoveredLanguage::Ambiguous => ambiguous += 1,
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1459,17 +1802,6 @@ fn target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     split_existing_symbol_target(target, cwd).map(|(path, _)| path)
 }
 
-fn parse_location(value: &str) -> Option<(&str, usize, Option<usize>)> {
-    let (prefix, last) = value.rsplit_once(':')?;
-    let last_number = last.parse::<usize>().ok()?;
-    if let Some((path, line)) = prefix.rsplit_once(':')
-        && let Ok(line) = line.parse::<usize>()
-    {
-        return Some((path, line, Some(last_number)));
-    }
-    Some((prefix, last_number, None))
-}
-
 fn parse_line_range(value: &str) -> Option<(&str, usize, usize)> {
     let (path, range) = value.rsplit_once(':')?;
     let (start, end) = range.split_once('-')?;
@@ -1489,7 +1821,7 @@ fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, St
 fn print_global_help(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "pira_codenav {VERSION} — read-only structural source navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] <SUBCOMMAND> [ARGS...]\n\nSUBCOMMANDS\n  outline FILE...       compact declarations; use --match to filter\n  show TARGET...        exact source for bounded outlined items or locations\n  map DIRECTORY         bounded mixed-language repository shape\n  imports FILE...       import/include statements and structural targets\n  dependents FILE       direct reverse file/module dependencies\n  deps FILE             bounded transitive local file dependencies\n  languages             installed language capabilities\n\nTYPICAL FLOW\n  Start with `map DIRECTORY --max-items 200`, outline a relevant file with --match, then show only\n  the needed item or line span. Use imports/dependents/deps only when file relationships matter.\n\nLANGUAGE\n  Normally inferred from path suffix or shebang. Supported: python, rust, java, c, cpp, cuda, bash,\n  go, javascript, typescript, csharp, powershell, php, kotlin, lua, hcl, r. Use an explicit language\n  for extensionless or ambiguous .h files, or to filter directory operations. TypeScript includes\n  TSX; HCL includes Terraform files.\n\nBOUNDARY\n  This tool is read-only and structural. Use a language server or compiler for definitions,\n  references, types, calls, diagnostics, or macro/build semantics.\n\nRun `pira_codenav <SUBCOMMAND> --help` or `pira_codenav <LANGUAGE> --help` for details."
+        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] <SUBCOMMAND> [ARGS...]\n\nNATIVE STRUCTURE\n  outline FILE...       compact declarations; use --match to filter\n  show TARGET...        exact source for bounded outlined items or locations\n  map DIRECTORY         bounded mixed-language repository shape\n  imports FILE...       import/include statements and structural targets\n  dependents FILE       direct reverse file/module dependencies\n  deps FILE             bounded transitive local file dependencies\n  languages             installed language capabilities\n\nLSP SEMANTICS\n  definition LOCATION   definitions for FILE:LINE:COLUMN\n  references LOCATION   bounded references for FILE:LINE:COLUMN\n  hover LOCATION        bounded type/documentation text for FILE:LINE:COLUMN\n\nTYPICAL FLOW\n  Start with `map DIRECTORY --max-items 200`, outline a relevant file with --match, then show only\n  the needed item. Use definition/references/hover with an explicit --lsp when semantic navigation\n  is needed. Native commands remain independent of LSP whenever their Tree-sitter result is clean.\n\nBACKENDS\n  Tree-sitter is the native fast path. outline, show, and map request an optional LSP only after a\n  parser defect; imports/dependents/deps require clean native syntax. Semantic commands always require\n  `--lsp /absolute/server/path` and a precise source location; they never guess. Mixed-language\n  structural input may repeat `--lsp LANGUAGE=/absolute/path`. Servers are lazy and invocation-local.\n\nPARTIAL RESULTS\n  Bounded batch/repository commands preserve useful successes. complete=0 and failed/error fields\n  make skipped selected files explicit; intentional max-items/max-bytes omissions remain separate.\n  Partial evidence returns success; if every attempted file/target fails, the underlying failure class\n  is returned after the bounded evidence is printed.\n\nLANGUAGE\n  Normally inferred from path suffix or shebang. Supported: python, rust, java, c, cpp, cuda, bash,\n  go, javascript, typescript, csharp, powershell, php, kotlin, lua, hcl, r. Use an explicit language\n  for extensionless or ambiguous .h files, or to filter directory operations. TypeScript includes\n  TSX; HCL includes Terraform files.\n\nBOUNDARY\n  PIRA never edits source and rejects LSP edit requests. A caller-supplied server is an external\n  executable and may maintain its own caches; trust and configure it as you would an IDE server.\n\nRun `pira_codenav <SUBCOMMAND> --help` or `pira_codenav <LANGUAGE> --help` for details."
     )
     .map_err(output_error)
 }
@@ -1497,7 +1829,7 @@ fn print_global_help(output: &mut dyn Write) -> CommandResult {
 fn print_language_help(language: Language, output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "pira_codenav {} — read-only structural operations\n\nUSAGE\n  pira_codenav {} <outline|show|map|imports|dependents|deps> [ARGS...]\n\nAn explicit language parses extensionless files and filters directory operations. A conflicting recognized suffix is an error.",
+        "pira_codenav {} — read-only native and LSP-backed operations\n\nUSAGE\n  pira_codenav {} <outline|show|map|imports|dependents|deps|definition|references|hover> [ARGS...]\n\nAn explicit language parses extensionless files, filters directory operations, or selects a semantic adapter. A conflicting recognized suffix is an error.",
         language.name(),
         language.name()
     )
@@ -1511,18 +1843,24 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] outline FILE... [--match TEXT]... [--max-items N]
-    [--signatures] [--selectors]
+    [--signatures] [--selectors] [--lsp [LANGUAGE=]ABSOLUTE_PATH]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
 
 OUTPUT AND FILTERING
-  Prints parse completeness, nested declaration kinds/names, and exact source ranges. Bodies and
-  signatures are omitted by default. --signatures adds overload/type detail. Repeated --match values
+  Prints the selected structural backend, nested declaration kinds/names, and exact source ranges.
+  Bodies and signatures are omitted by default. --signatures adds overload/type detail. Repeated --match values
   are case-insensitive OR filters over kind, qualified name, and signature; they are not regexes.
   Exact qualified-name matches take precedence over broader substring matches.
+
+PARSER
+  Clean files use Tree-sitter without starting an LSP. If Tree-sitter reports any syntax defect,
+  supply an absolute --lsp executable path; its document symbols replace the incomplete outline.
+  Use LANGUAGE=PATH mappings when one invocation spans languages.
 
 BOUNDS AND HANDOFF
   The default is 1,000 items per file. Use FILE:LINE with show for the compact normal handoff. Add
   --selectors only when a freshness-checked identity must survive edits or later turns. Multiple-file
-  errors do not discard successful outlines."#;
+  errors do not discard successful outlines; a compact batch trailer reports complete and failed."#;
 
 const SHOW_HELP: &str = r#"pira_codenav show — retrieve one exact structural item or line span
 
@@ -1531,16 +1869,22 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] show TARGET... [--max-items N] [--max-bytes N]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
 
 TARGETS
   TARGET is an outline selector, FILE:LINE[:COLUMN], FILE::QUALIFIED-NAME, or—only for a single
   target—FILE:START-END. A location selects the smallest enclosing named item. A line span is exact,
   inclusive, and stops at EOF when END is larger. There is no --symbol option.
 
+PARSER
+  Exact line spans need no parser. Structural targets use clean Tree-sitter output, or document
+  symbols from a caller-supplied absolute --lsp path when Tree-sitter reports syntax defects.
+
 BOUNDS AND OUTPUT
   One target without --max-bytes returns the whole selected item; use a line span for an unusually
   large item. Multi-target output is deduplicated and defaults to 20 whole items and 64 KiB. Limits
-  omit whole items rather than truncating source. Selectors reject stale source. Source is framed as
+  omit whole items rather than truncating source. complete=0 marks resolution failures, not bounded
+  omissions. Selectors reject stale source. Source is framed as
   untrusted repository data; printable text is preserved, while unsafe control characters are escaped
   and reported in the boundary metadata."#;
 
@@ -1550,14 +1894,18 @@ WHEN TO USE
   Start here when the relevant files are unknown.
 
 USAGE
-  pira_codenav [LANGUAGE] map DIRECTORY [--max-items N]
+  pira_codenav [LANGUAGE] map DIRECTORY [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
 
 OUTPUT AND BOUNDS
-  Prints one accounting header and compact file rows with language, parse state, and representative
+  Prints one accounting header and compact file rows with language, backend, and representative
   top-level names. The default ceiling is 1,000 files; start with --max-items 200 or a narrower
   directory for broad repositories. Selection is deterministic and balanced across parent directories.
   Without LANGUAGE, each supported file is detected independently; an explicit language filters the
-  walk. Git ignore rules are honored and symlinked directories are not followed."#;
+  walk. Git ignore rules are honored and symlinked directories are not followed. Clean files use
+  Tree-sitter; files with parser defects require a caller-supplied LSP. Mixed-language maps should
+  provide repeated LANGUAGE=PATH mappings; each needed server starts once. Per-file failures are
+  bounded and do not discard clean summaries; complete=0 makes the partial map explicit."#;
 
 const IMPORTS_HELP: &str = r#"pira_codenav imports — inspect direct import/include statements
 
@@ -1571,21 +1919,28 @@ USAGE
 OUTPUT
   Prints exact import text, source line, resolution status, and a structurally resolved local target
   when available. External, dynamic, ambiguous, package-dependent, and build-dependent targets remain
-  visibly unresolved. Multiple-file errors do not discard successful results.
+  visibly unresolved. Multiple-file errors do not discard successful results; a batch trailer reports
+  complete and failed while all-failed batches preserve the first underlying error class.
+  Requires a clean native Tree-sitter parse because LSP has no portable import-graph result.
   Never invokes a package manager or build system, and never executes a source file."#;
 
 const DEPENDENTS_HELP: &str = r#"pira_codenav dependents — inspect direct reverse file dependencies
 
 WHEN TO USE
-  Use to find files whose imports structurally resolve to one known file. Narrow --root when possible.
+  Use to find files whose imports structurally resolve to one known file. Narrow --root when
+  possible.
 
 USAGE
   pira_codenav [LANGUAGE] dependents FILE [--root DIRECTORY]
 
 OUTPUT AND SCOPE
-  FILE is relative to --root, which defaults to the current directory. The command scans inferred
-  files of the target language under that root and prints every direct matching import with source
-  line and resolution. This is conservative file navigation, not compiler-semantic reference search."#;
+  FILE is relative to --root, which defaults to the current directory. The command scans the target
+  language plus the narrow C/C++/CUDA or JavaScript/TypeScript compatibility group when applicable,
+  and prints every direct matching import with source line and resolution. complete=0 and bounded
+  errors identify selected files that could not be parsed. If every scanned file fails, the command
+  prints that bounded evidence and returns the underlying failure class. This is file navigation,
+  not reference search.
+  Requires clean native Tree-sitter syntax; standard LSP has no portable import-graph result."#;
 
 const DEPS_HELP: &str = r#"pira_codenav deps — traverse bounded local structural file dependencies
 
@@ -1597,11 +1952,56 @@ USAGE
     [--root DIRECTORY] [--max-items N]
 
 OUTPUT AND BOUNDS
-  FILE is a path relative to --root, not FILE:LINE or a symbol target. The command builds an in-memory
-  same-language graph from conservative local import targets and prints bounded depth/direction edges.
-  Defaults: direction=both, depth=2, root=current directory, max-items=1,000. Pass a lower --max-items
-  or narrower --root for broad repositories. It does not infer symbol references, calls, build-system
-  edges, package resolution, or dynamic imports."#;
+  FILE is a path relative to --root, not FILE:LINE or a symbol target. The command builds an
+  in-memory compatibility-group graph from conservative local import targets and prints bounded
+  depth/direction edges. Defaults: direction=both, depth=2, root=current directory,
+  max-items=1,000. Pass a lower --max-items or narrower --root for broad repositories. `both`
+  alternates import and dependent edges within the shared bound. complete=0 marks parse gaps.
+  If every scanned file fails, the command prints that bounded evidence and returns the underlying
+  failure class. It does not infer symbol references,
+  calls, build-system edges, package resolution, or dynamic imports. It requires clean native
+  Tree-sitter syntax because standard LSP has no portable import-graph result."#;
+
+const DEFINITION_HELP: &str = r#"pira_codenav definition — locate semantic definitions through LSP
+
+WHEN TO USE
+  Use when the exact definition behind a source use matters. This command is LSP-only and never guesses.
+
+USAGE
+  pira_codenav [LANGUAGE] definition FILE:LINE:COLUMN [--max-items N]
+    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+
+INPUT AND OUTPUT
+  LINE/COLUMN are one-based; COLUMN is a UTF-8 byte column, matching outline/show coordinates. The
+  default result limit is 20. Local readable file locations are normalized to PIRA coordinates;
+  other locations retain explicit LSP coordinates and encoding. No source body is printed."#;
+
+const REFERENCES_HELP: &str = r#"pira_codenav references — locate bounded semantic references through LSP
+
+WHEN TO USE
+  Use after identifying an exact source use. This command is LSP-only and never performs text search.
+
+USAGE
+  pira_codenav [LANGUAGE] references FILE:LINE:COLUMN [--include-declaration]
+    [--max-items N] --lsp [LANGUAGE=]ABSOLUTE_PATH
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+
+INPUT AND OUTPUT
+  LINE/COLUMN are one-based UTF-8 byte coordinates. Declarations are excluded by default. The default
+  limit is 200; the header reports total, shown, and omitted locations. Source bodies are not printed."#;
+
+const HOVER_HELP: &str = r#"pira_codenav hover — retrieve bounded semantic type or documentation text through LSP
+
+WHEN TO USE
+  Use for concise type/signature/documentation context at an exact source position. This is LSP-only.
+
+USAGE
+  pira_codenav [LANGUAGE] hover FILE:LINE:COLUMN [--max-bytes N]
+    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+
+INPUT AND OUTPUT
+  LINE/COLUMN are one-based UTF-8 byte coordinates. Output defaults to 16 KiB, is truncated only at a
+  UTF-8 boundary, and is framed as untrusted LSP data. The header reports format, bytes, and truncation."#;
 
 const LANGUAGES_HELP: &str = r#"pira_codenav languages — list installed language capabilities
 
@@ -1622,6 +2022,9 @@ fn print_command_help(command: &str, output: &mut dyn Write) -> CommandResult {
         "imports" => IMPORTS_HELP,
         "dependents" => DEPENDENTS_HELP,
         "deps" => DEPS_HELP,
+        "definition" => DEFINITION_HELP,
+        "references" => REFERENCES_HELP,
+        "hover" => HOVER_HELP,
         "languages" => LANGUAGES_HELP,
         other => {
             return Err((
@@ -1636,7 +2039,7 @@ fn print_command_help(command: &str, output: &mut dyn Write) -> CommandResult {
 fn print_languages(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "# pira_codenav languages count={} parser=native capabilities=outline,show,map,imports,dependents,deps",
+        "# pira_codenav languages count={} parser=tree-sitter lsp=optional capabilities=outline,show,map,imports,dependents,deps,definition,references,hover",
         Language::ALL.len()
     )
     .map_err(output_error)?;
@@ -1648,18 +2051,6 @@ fn print_languages(output: &mut dyn Write) -> CommandResult {
 
 fn usage<T: Into<String>>(message: T) -> CommandResult {
     Err((2, message.into()))
-}
-
-fn input_error<T: Into<String>>(message: T) -> (i32, String) {
-    (2, message.into())
-}
-
-fn output_error(error: io::Error) -> (i32, String) {
-    if error.kind() == io::ErrorKind::BrokenPipe {
-        (0, String::new())
-    } else {
-        (1, format!("cannot write output: {error}"))
-    }
 }
 
 fn finish_output(result: CommandResult, output: &mut dyn Write) -> i32 {
@@ -1677,8 +2068,14 @@ fn fail<T: AsRef<str>>(code: i32, message: T) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_location, parse_selector, render_untrusted_source};
+    use std::path::PathBuf;
+
+    use super::{
+        DependencyTraversal, alternate_dependencies, dependency_languages_are_compatible,
+        parse_location, parse_selector,
+    };
     use crate::language::Language;
+    use crate::util::escape_untrusted_text;
 
     #[test]
     fn selector_decodes_unicode_and_delimiters() {
@@ -1706,8 +2103,47 @@ mod tests {
 
     #[test]
     fn source_renderer_escapes_only_dangerous_controls() {
-        let (rendered, count) = render_untrusted_source("a\tb\n\u{1b}c\0");
+        let (rendered, count) = escape_untrusted_text("a\tb\n\u{1b}c\0");
         assert_eq!(rendered, "a\tb\n\\u{1b}c\\u{0}");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn dependency_compatibility_is_narrow_and_symmetric() {
+        assert!(dependency_languages_are_compatible(
+            Language::C,
+            Language::Cuda
+        ));
+        assert!(dependency_languages_are_compatible(
+            Language::TypeScript,
+            Language::JavaScript
+        ));
+        assert!(!dependency_languages_are_compatible(
+            Language::Python,
+            Language::TypeScript
+        ));
+    }
+
+    #[test]
+    fn bidirectional_dependencies_alternate_within_the_shared_bound() {
+        let edge = |direction| DependencyTraversal {
+            depth: 1,
+            direction,
+            source: PathBuf::from(direction),
+            target: PathBuf::from("target"),
+            line: 1,
+        };
+        let selected = alternate_dependencies(
+            vec![edge("import"), edge("import")],
+            vec![edge("dependent"), edge("dependent")],
+            3,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|edge| edge.direction)
+                .collect::<Vec<_>>(),
+            ["import", "dependent", "import"]
+        );
     }
 }

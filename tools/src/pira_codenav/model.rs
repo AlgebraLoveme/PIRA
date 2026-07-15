@@ -1,18 +1,16 @@
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ParseState {
-    Ok,
-    Recovered,
-    Partial,
+pub enum ParseBackend {
+    TreeSitter,
+    Lsp,
 }
 
-impl ParseState {
+impl ParseBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Ok => "ok",
-            Self::Recovered => "recovered",
-            Self::Partial => "partial",
+            Self::TreeSitter => "tree-sitter",
+            Self::Lsp => "lsp",
         }
     }
 }

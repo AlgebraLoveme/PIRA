@@ -41,7 +41,7 @@ SUPPORTED_SUFFIXES = {
     ".cts",
     ".cs",
 }
-HEADER_FIELD = re.compile(r"\b([a-z]+)=(\d+)")
+HEADER_FIELD = re.compile(r"\b([a-z_]+)=(\d+)")
 
 
 def arguments() -> argparse.Namespace:
@@ -56,6 +56,9 @@ def arguments() -> argparse.Namespace:
     )
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument("--lsp", action="append", default=[])
+    parser.add_argument("--lsp-arg", action="append", default=[])
+    parser.add_argument("--lsp-root")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -94,9 +97,21 @@ def peak_rss_kib(command: list[str], cwd: Path) -> int | None:
 
 
 def repository_result(
-    binary: Path, root: Path, runs: int, warmups: int
+    binary: Path,
+    root: Path,
+    runs: int,
+    warmups: int,
+    lsp: list[str],
+    lsp_args: list[str],
+    lsp_root: str | None,
 ) -> dict[str, object]:
     command = [str(binary), "map", ".", "--max-items", "1000000"]
+    for server in lsp:
+        command.extend(("--lsp", server))
+    for argument in lsp_args:
+        command.extend(("--lsp-arg", argument))
+    if lsp_root:
+        command.extend(("--lsp-root", lsp_root))
     for _ in range(warmups):
         completed = run(command, root)
         if completed.returncode:
@@ -123,8 +138,6 @@ def repository_result(
     ]
     source_bytes = sum(path.stat().st_size for path in supported_files)
     output_bytes = len(completed.stdout) + len(completed.stderr)
-    partial = sum(" parse=partial " in line for line in lines[1:])
-    recovered = sum(" parse=recovered " in line for line in lines[1:])
     symbol_files = sum(
         bool(line.rsplit(" symbols=", 1)[-1]) for line in lines[1:] if " symbols=" in line
     )
@@ -140,8 +153,8 @@ def repository_result(
         "map_output_bytes": output_bytes,
         "context_reduction_pct": round((1 - output_bytes / source_bytes) * 100, 1),
         "parsed_files": fields.get("parsed", 0),
-        "partial_files": partial,
-        "recovered_files": recovered,
+        "tree_sitter_files": fields.get("tree_sitter", 0),
+        "lsp_files": fields.get("lsp", 0),
         "files_with_symbols": symbol_files,
         "failed_files": fields.get("failed", 0),
         "ambiguous_files": fields.get("ambiguous", 0),
@@ -163,7 +176,13 @@ def main() -> int:
         if not separator or not name or not root.is_dir():
             raise SystemExit(f"invalid --repo {spec!r}; expected NAME=PATH")
         repositories[name] = repository_result(
-            binary, root, args.runs, args.warmups
+            binary,
+            root,
+            args.runs,
+            args.warmups,
+            args.lsp,
+            args.lsp_arg,
+            args.lsp_root,
         )
     report = {
         "schema": 1,

@@ -122,6 +122,10 @@ def main() -> int:
         "ast_outline": str(args.ast_outline.resolve()) if args.ast_outline else "",
         "grove": str(args.grove.resolve()) if args.grove else "",
     }
+    fake_lsp = Path(__file__).with_name("fake_lsp_server.py").resolve()
+    python = Path(sys.executable).resolve()
+    if not fake_lsp.is_file():
+        raise SystemExit(f"missing semantic benchmark fixture: {fake_lsp}")
     for name, path in tools.items():
         if args.pira_only and name != "pira_codenav":
             continue
@@ -202,19 +206,69 @@ def main() -> int:
         "languages": {
             "pira_codenav": [tools["pira_codenav"], "languages"],
         },
+        "python_definition": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "definition",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
+        "python_references": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "references",
+                "real/python_click/decorators.py:168:5",
+                "--max-items",
+                "20",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
+        "python_hover": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "hover",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
         "java_outline": {
             "pira_codenav": [tools["pira_codenav"], "outline", "real/java_junit/StringUtils.java"],
             "ast_outline": [tools["ast_outline"], "real/java_junit/StringUtils.java"],
             "grove": [tools["grove"], "outline", "real/java_junit/StringUtils.java"],
         },
         "c_outline": {
-            "pira_codenav": [tools["pira_codenav"], "outline", "real/c_jq/main.c"],
-            "grove": [tools["grove"], "outline", "real/c_jq/main.c"],
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "synthetic/c_project/src/app.c",
+            ],
+            "grove": [tools["grove"], "outline", "synthetic/c_project/src/app.c"],
         },
         "cpp_outline": {
-            "pira_codenav": [tools["pira_codenav"], "outline", "real/cpp_fmt/format.cc"],
-            "ast_outline": [tools["ast_outline"], "real/cpp_fmt/format.cc"],
-            "grove": [tools["grove"], "outline", "real/cpp_fmt/format.cc"],
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "synthetic/cpp_project/include/widget.hpp",
+            ],
+            "ast_outline": [
+                tools["ast_outline"],
+                "synthetic/cpp_project/include/widget.hpp",
+            ],
+            "grove": [
+                tools["grove"],
+                "outline",
+                "synthetic/cpp_project/include/widget.hpp",
+            ],
         },
         "bash_outline": {
             "pira_codenav": [tools["pira_codenav"], "outline", "real/bash_bats/bats.sh"],
@@ -230,7 +284,7 @@ def main() -> int:
             "pira_codenav": [
                 tools["pira_codenav"],
                 "outline",
-                "synthetic/go_project/model/user.go",
+                "synthetic/go_project/main.go",
             ],
         },
         "javascript_outline": {
@@ -244,7 +298,7 @@ def main() -> int:
             "pira_codenav": [
                 tools["pira_codenav"],
                 "outline",
-                "synthetic/typescript_project/model.ts",
+                "synthetic/typescript_project/app.ts",
             ],
         },
         "csharp_outline": {
@@ -307,14 +361,17 @@ def main() -> int:
         "python_dependents": b"dependent=package/api.py",
         "python_deps": b"edge depth=1 direction=import",
         "languages": b"\nr\n",
+        "python_definition": b"location file=real/python_click/decorators.py range=L138:5-138:12",
+        "python_references": b"backend=lsp count=",
+        "python_hover": b"**command**",
         "java_outline": b"StringUtils",
         "c_outline": b"main",
-        "cpp_outline": b"detail",
+        "cpp_outline": b"Widget",
         "bash_outline": b"bats_tee",
         "cuda_outline": b"scale_kernel",
-        "go_outline": b"User.Label",
+        "go_outline": b"function main",
         "javascript_outline": b"normalizeName",
-        "typescript_outline": b"Store.add",
+        "typescript_outline": b"register.validate",
         "csharp_outline": b"Program.Main",
         "powershell_outline": b"EventMessage",
         "php_outline": b"Illuminate\\Support\\Collection",

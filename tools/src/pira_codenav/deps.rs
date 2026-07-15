@@ -5,14 +5,23 @@ use tree_sitter::Node;
 
 use crate::language::Language;
 use crate::model::ImportEdge;
-use crate::parse::ParsedFile;
+use crate::parse::ParsedSyntax;
 use crate::util::{absolute_lexical, display_path, one_line, source_slice};
 
-pub fn imports(parsed: &ParsedFile, cwd: &Path) -> Vec<ImportEdge> {
+pub fn imports(parsed: &ParsedSyntax, cwd: &Path) -> Vec<ImportEdge> {
     let mut output = Vec::new();
     match parsed.language {
         Language::Python => collect_python(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Rust => collect_rust(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Rust => {
+            let crate_root = find_crate_root(&parsed.path, cwd);
+            collect_rust(
+                parsed.tree.root_node(),
+                parsed,
+                cwd,
+                &crate_root,
+                &mut output,
+            )
+        }
         Language::Java => collect_java(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::C | Language::Cpp | Language::Cuda => {
             collect_c_family(parsed.tree.root_node(), parsed, cwd, &mut output)
@@ -32,11 +41,15 @@ pub fn imports(parsed: &ParsedFile, cwd: &Path) -> Vec<ImportEdge> {
         Language::Hcl => collect_hcl(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::R => collect_r(parsed.tree.root_node(), parsed, cwd, &mut output),
     }
-    output.sort_by_key(|edge| (edge.line, edge.text.clone()));
+    output.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.text.cmp(&right.text))
+    });
     output
 }
 
-fn collect_java(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_java(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "import_declaration" {
         let text = node_text(node, parsed);
         let module = text
@@ -63,7 +76,12 @@ fn collect_java(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
     recurse(node, |child| collect_java(child, parsed, cwd, output));
 }
 
-fn collect_c_family(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_c_family(
+    node: Node<'_>,
+    parsed: &ParsedSyntax,
+    cwd: &Path,
+    output: &mut Vec<ImportEdge>,
+) {
     if node.kind() == "preproc_include" {
         let text = node_text(node, parsed);
         let include = text
@@ -81,7 +99,7 @@ fn collect_c_family(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mu
     recurse(node, |child| collect_c_family(child, parsed, cwd, output));
 }
 
-fn collect_bash(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_bash(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "command" {
         let text = node_text(node, parsed);
         if text.starts_with("source ") || text.starts_with(". ") {
@@ -105,7 +123,7 @@ fn collect_bash(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
     recurse(node, |child| collect_bash(child, parsed, cwd, output));
 }
 
-fn collect_go(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_go(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "import_spec"
         && let Some(path_node) = node.child_by_field_name("path")
     {
@@ -124,7 +142,7 @@ fn collect_go(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<
 
 fn collect_ecmascript(
     node: Node<'_>,
-    parsed: &ParsedFile,
+    parsed: &ParsedSyntax,
     cwd: &Path,
     output: &mut Vec<ImportEdge>,
 ) {
@@ -161,7 +179,7 @@ fn collect_ecmascript(
     recurse(node, |child| collect_ecmascript(child, parsed, cwd, output));
 }
 
-fn collect_csharp(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_csharp(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "using_directive" {
         let text = node_text(node, parsed);
         let module = text
@@ -178,7 +196,7 @@ fn collect_csharp(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut 
 
 fn collect_powershell(
     node: Node<'_>,
-    parsed: &ParsedFile,
+    parsed: &ParsedSyntax,
     cwd: &Path,
     output: &mut Vec<ImportEdge>,
 ) {
@@ -215,7 +233,7 @@ fn collect_powershell(
     recurse(node, |child| collect_powershell(child, parsed, cwd, output));
 }
 
-fn collect_php(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_php(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "namespace_use_declaration" {
         let text = node_text(node, parsed);
         let module = text.trim_start_matches("use ").trim_end_matches(';').trim();
@@ -247,7 +265,7 @@ fn collect_php(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec
     recurse(node, |child| collect_php(child, parsed, cwd, output));
 }
 
-fn collect_kotlin(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_kotlin(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "import_header" {
         let text = node_text(node, parsed);
         let module = text
@@ -275,7 +293,7 @@ fn collect_kotlin(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut 
     recurse(node, |child| collect_kotlin(child, parsed, cwd, output));
 }
 
-fn collect_lua(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_lua(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "function_call"
         && node
             .child_by_field_name("name")
@@ -316,7 +334,7 @@ fn collect_lua(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec
     recurse(node, |child| collect_lua(child, parsed, cwd, output));
 }
 
-fn collect_hcl(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_hcl(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "block" {
         let first_identifier = first_named_kind(node, "identifier");
         if first_identifier.is_some_and(|identifier| node_text(identifier, parsed) == "module")
@@ -354,7 +372,7 @@ fn collect_hcl(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec
     recurse(node, |child| collect_hcl(child, parsed, cwd, output));
 }
 
-fn collect_r(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_r(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if node.kind() == "call"
         && let Some(function) = node.child_by_field_name("function")
     {
@@ -442,7 +460,7 @@ fn descendant_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> 
     None
 }
 
-fn node_text(node: Node<'_>, parsed: &ParsedFile) -> String {
+fn node_text(node: Node<'_>, parsed: &ParsedSyntax) -> String {
     one_line(&source_slice(
         &parsed.source,
         node.start_byte(),
@@ -451,7 +469,7 @@ fn node_text(node: Node<'_>, parsed: &ParsedFile) -> String {
 }
 
 fn edge(
-    parsed: &ParsedFile,
+    parsed: &ParsedSyntax,
     node: Node<'_>,
     text: String,
     target: Option<PathBuf>,
@@ -486,7 +504,7 @@ fn recurse(node: Node<'_>, mut visit: impl FnMut(Node<'_>)) {
     }
 }
 
-fn collect_python(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_python(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
     if matches!(node.kind(), "import_statement" | "import_from_statement") {
         let text = one_line(&source_slice(
             &parsed.source,
@@ -574,7 +592,13 @@ fn existing_module(base: &Path, extension: &str) -> Option<PathBuf> {
     package.is_file().then_some(package)
 }
 
-fn collect_rust(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Vec<ImportEdge>) {
+fn collect_rust(
+    node: Node<'_>,
+    parsed: &ParsedSyntax,
+    cwd: &Path,
+    crate_root: &Path,
+    output: &mut Vec<ImportEdge>,
+) {
     if node.kind() == "mod_item" && node.child_by_field_name("body").is_none() {
         let text = one_line(&source_slice(
             &parsed.source,
@@ -585,6 +609,11 @@ fn collect_rust(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
             let name = source_slice(&parsed.source, name_node.start_byte(), name_node.end_byte());
             let base = parsed.path.parent().unwrap_or(cwd).join(name.as_ref());
             let target = existing_rust_module(&base).map(|path| absolute_lexical(&path, cwd));
+            let resolution = if target.is_some() {
+                "structural"
+            } else {
+                "unresolved"
+            };
             let label = target
                 .as_deref()
                 .map(|path| display_path(path, cwd))
@@ -595,11 +624,7 @@ fn collect_rust(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
                 text,
                 target,
                 target_label: label,
-                resolution: if existing_rust_module(&base).is_some() {
-                    "structural"
-                } else {
-                    "unresolved"
-                },
+                resolution,
             });
         }
         return;
@@ -614,7 +639,7 @@ fn collect_rust(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
             .trim_start_matches("pub ")
             .trim_start_matches("use ")
             .trim_end_matches(';');
-        let (target, label, resolution) = resolve_rust(&parsed.path, path_text, cwd);
+        let (target, label, resolution) = resolve_rust(&parsed.path, path_text, cwd, crate_root);
         output.push(ImportEdge {
             source: parsed.path.clone(),
             line: node.start_position().row + 1,
@@ -627,7 +652,7 @@ fn collect_rust(node: Node<'_>, parsed: &ParsedFile, cwd: &Path, output: &mut Ve
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_rust(child, parsed, cwd, output);
+        collect_rust(child, parsed, cwd, crate_root, output);
     }
 }
 
@@ -640,7 +665,12 @@ fn existing_rust_module(base: &Path) -> Option<PathBuf> {
     module.is_file().then_some(module)
 }
 
-fn resolve_rust(path: &Path, raw: &str, cwd: &Path) -> (Option<PathBuf>, String, &'static str) {
+fn resolve_rust(
+    path: &Path,
+    raw: &str,
+    cwd: &Path,
+    crate_root: &Path,
+) -> (Option<PathBuf>, String, &'static str) {
     let normalized = raw.replace(' ', "");
     let prefix = normalized
         .split(['{', '*'])
@@ -652,7 +682,6 @@ fn resolve_rust(path: &Path, raw: &str, cwd: &Path) -> (Option<PathBuf>, String,
     if matches!(first, "std" | "core" | "alloc") {
         return (None, format!("external:{first}"), "unresolved");
     }
-    let crate_root = find_crate_root(path, cwd);
     let base;
     let mut segments = Vec::new();
     match first {

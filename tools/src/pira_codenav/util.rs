@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -8,7 +9,10 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_ITEMS: usize = 1_000;
 
 pub fn read_source(path: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(path)
+    let file =
+        File::open(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("not a regular file: {}", path.display()));
@@ -20,7 +24,18 @@ pub fn read_source(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    fs::read_to_string(path).map_err(|error| {
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_FILE_BYTES) as usize);
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "source file exceeds the {} MiB safety limit: {}",
+            MAX_FILE_BYTES / (1024 * 1024),
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
         format!(
             "source is not valid UTF-8 or cannot be read: {}: {error}",
             path.display()
@@ -85,6 +100,27 @@ pub fn sanitize_metadata(value: &str) -> String {
         }
     }
     result
+}
+
+pub fn escape_untrusted_text(value: &str) -> (Cow<'_, str>, usize) {
+    let unsafe_control =
+        |character: char| character.is_control() && !matches!(character, '\n' | '\r' | '\t');
+    if !value.chars().any(unsafe_control) {
+        return (Cow::Borrowed(value), 0);
+    }
+
+    let mut escaped = 0;
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if unsafe_control(character) {
+            use std::fmt::Write as _;
+            let _ = write!(output, "\\u{{{:x}}}", character as u32);
+            escaped += 1;
+        } else {
+            output.push(character);
+        }
+    }
+    (Cow::Owned(output), escaped)
 }
 
 pub fn quote_metadata(value: &str) -> String {

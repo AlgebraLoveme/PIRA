@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,6 +20,7 @@ SYNTHETIC_ROOT = RESOURCE_ROOT / "synthetic"
 REAL_ROOT = RESOURCE_ROOT / "real"
 DEFAULT_BINARY = REPO_ROOT / "tools" / "target" / "debug" / "pira_codenav"
 SELECTOR_RE = re.compile(r"selector=(pira://[^\s]+)")
+FAKE_LSP = Path(__file__).with_name("fake_lsp_server.py")
 
 
 def binary_path() -> Path:
@@ -73,6 +75,13 @@ class PiraCodeNavTests(unittest.TestCase):
         return result
 
     @staticmethod
+    def fake_lsp_args(*extra: str) -> tuple[str, ...]:
+        arguments = ["--lsp", sys.executable, "--lsp-arg", str(FAKE_LSP)]
+        for value in extra:
+            arguments.extend(("--lsp-arg", value))
+        return tuple(arguments)
+
+    @staticmethod
     def line_of(path: Path, needle: str) -> int:
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if needle in line:
@@ -81,19 +90,22 @@ class PiraCodeNavTests(unittest.TestCase):
 
     def test_global_help_and_languages_are_small_and_focused(self) -> None:
         help_result = self.run_cli("--help")
-        self.assertIn("read-only structural", help_result.stdout)
+        self.assertIn("read-only code navigation", help_result.stdout)
         self.assertIn("outline", help_result.stdout)
         self.assertIn("dependents", help_result.stdout)
         self.assertIn("deps", help_result.stdout)
+        self.assertIn("--lsp", help_result.stdout)
         self.assertIn("TYPICAL FLOW", help_result.stdout)
         self.assertIn("--max-items 200", help_result.stdout)
-        for removed in ("references", "callers", "definition"):
+        for added in ("definition", "references", "hover"):
+            self.assertIn(f"  {added} ", help_result.stdout)
+        for removed in ("callers", "calls", "workspace-symbol"):
             self.assertNotIn(f"  {removed} ", help_result.stdout)
 
         languages = self.run_cli("languages")
         self.assertIn(
-            "# pira_codenav languages count=17 parser=native "
-            "capabilities=outline,show,map,imports,dependents,deps",
+            "# pira_codenav languages count=17 parser=tree-sitter lsp=optional "
+            "capabilities=outline,show,map,imports,dependents,deps,definition,references,hover",
             languages.stdout,
         )
         listed = set(languages.stdout.splitlines()[1:])
@@ -124,6 +136,9 @@ class PiraCodeNavTests(unittest.TestCase):
             "imports",
             "dependents",
             "deps",
+            "definition",
+            "references",
+            "hover",
             "languages",
         ):
             detailed = self.run_cli(command, "--help")
@@ -143,6 +158,7 @@ class PiraCodeNavTests(unittest.TestCase):
         outline_help = self.run_cli("outline", "--help")
         self.assertIn("--signatures", outline_help.stdout)
         self.assertIn("--match", outline_help.stdout)
+        self.assertIn("--lsp [LANGUAGE=]ABSOLUTE_PATH", outline_help.stdout)
         imports_help = self.run_cli("help", "imports")
         self.assertIn("Never invokes a package manager", imports_help.stdout)
         deps_help = self.run_cli("help", "deps")
@@ -199,31 +215,18 @@ class PiraCodeNavTests(unittest.TestCase):
         dependents = self.run_cli("dependents", "include/kernel.cuh", cwd=root)
         self.assertIn("src/kernel.cu", dependents.stdout)
 
-    def test_cuda_macro_recovery_preserves_exact_source(self) -> None:
+    def test_unclean_cuda_requires_lsp(self) -> None:
         root = SYNTHETIC_ROOT / "cuda_project"
-        outline = self.run_cli("outline", "src/macro_kernel.cu", cwd=root)
-        self.assertIn("parse=recovered", outline.stdout)
-        self.assertRegex(outline.stdout, r"function\s+annotated_kernel\b")
-        self.assertIn("parse recovered", outline.stderr)
-
-        shown = self.run_cli("show", "src/macro_kernel.cu::annotated_kernel", cwd=root)
-        self.assertIn("__global__ void annotated_kernel", shown.stdout)
-        self.assertIn("PIRA_DEVICE_LAMBDA", shown.stdout)
-        self.assertIn("RESTRICT", shown.stdout)
+        outline = self.run_cli(
+            "outline", "src/macro_kernel.cu", cwd=root, expected=3
+        )
+        self.assertIn("Tree-sitter", outline.stderr)
+        self.assertIn("--lsp", outline.stderr)
 
     def test_go_outline_and_imports(self) -> None:
         root = SYNTHETIC_ROOT / "go_project"
-        outline = self.run_cli("outline", "model/user.go", cwd=root)
-        self.assertIn("parse=recovered", outline.stdout)
-        self.assertRegex(outline.stdout, r"binding\s+DefaultName\b")
-        self.assertRegex(outline.stdout, r"binding\s+MaxUsers\b")
-        self.assertRegex(outline.stdout, r"binding\s+DefaultNamePointer\b")
-        self.assertRegex(outline.stdout, r"interface\s+Labeler\b")
-        self.assertRegex(outline.stdout, r"method\s+Labeler\.Label\b")
-        self.assertRegex(outline.stdout, r"struct\s+User\b")
-        self.assertRegex(outline.stdout, r"field\s+User\.Name\b")
-        self.assertRegex(outline.stdout, r"function\s+NewUser\b")
-        self.assertRegex(outline.stdout, r"method\s+User\.Label\b")
+        outline = self.run_cli("outline", "model/user.go", cwd=root, expected=3)
+        self.assertIn("--lsp", outline.stderr)
 
         imports = self.run_cli("imports", "main.go", cwd=root)
         self.assertIn("external:fmt", imports.stdout)
@@ -245,16 +248,8 @@ class PiraCodeNavTests(unittest.TestCase):
 
     def test_typescript_and_tsx_outline_imports_and_dependents(self) -> None:
         root = SYNTHETIC_ROOT / "typescript_project"
-        outline = self.run_cli("outline", "model.ts", cwd=root)
-        self.assertIn("parse=recovered", outline.stdout)
-        self.assertRegex(outline.stdout, r"type\s+UserId\b")
-        self.assertRegex(outline.stdout, r"type\s+TrackedUser\b")
-        self.assertRegex(outline.stdout, r"interface\s+InvariantBox\b")
-        self.assertRegex(outline.stdout, r"enum\s+Status\b")
-        self.assertRegex(outline.stdout, r"variant\s+Status\.Disabled\b")
-        self.assertRegex(outline.stdout, r"interface\s+User\b")
-        self.assertRegex(outline.stdout, r"class\s+Store\b")
-        self.assertRegex(outline.stdout, r"method\s+Store\.add\b")
+        outline = self.run_cli("outline", "model.ts", cwd=root, expected=3)
+        self.assertIn("--lsp", outline.stderr)
 
         tsx = self.run_cli("outline", "view.tsx", cwd=root)
         self.assertIn("language=typescript", tsx.stdout)
@@ -288,21 +283,10 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("external:System", imports.stdout)
         self.assertIn("external:Pira.Models", imports.stdout)
 
-        recovery = self.run_cli("outline", "Models/Recovery.cs", cwd=root)
-        self.assertIn("parse=recovered", recovery.stdout)
-        self.assertRegex(recovery.stdout, r"struct\s+Pira\.Models\.RefBox\b")
-        self.assertRegex(recovery.stdout, r"constructor\s+Pira\.Models\.RefBox\.RefBox\b")
-        self.assertRegex(recovery.stdout, r"method\s+Pira\.Models\.RefBox\.Identity\b")
-        self.assertRegex(recovery.stdout, r"method\s+Pira\.Models\.RefBox\.Read\b")
-        self.assertRegex(recovery.stdout, r"class\s+Pira\.Models\.RefBoxExtensions\b")
-        self.assertRegex(
-            recovery.stdout,
-            r"property\s+Pira\.Models\.RefBoxExtensions\.IsValid\b",
+        recovery = self.run_cli(
+            "outline", "Models/Recovery.cs", cwd=root, expected=3
         )
-        self.assertIn("operator Pira.Models.RefBoxExtensions.operator+", recovery.stdout)
-        self.assertNotRegex(recovery.stdout, r"class\s+Pira\.Models\.RefBoxExtensions\.i\b")
-        shown = self.run_cli("show", "Models/Recovery.cs::RefBox.Read", cwd=root)
-        self.assertIn("return *(T*)pointer;", shown.stdout)
+        self.assertIn("--lsp", recovery.stderr)
 
     def test_powershell_outline_imports_and_dependents(self) -> None:
         root = SYNTHETIC_ROOT / "powershell_project"
@@ -464,7 +448,6 @@ class PiraCodeNavTests(unittest.TestCase):
     def test_real_world_additional_languages_have_useful_outlines(self) -> None:
         cases = [
             ("java_junit/StringUtils.java", "java", r"class\s+StringUtils\b"),
-            ("c_jq/main.c", "c", r"function\s+main\b"),
             ("bash_bats/bats.sh", "bash", r"function\s+bats_tee\b"),
             (
                 "powershell_powershell/ResxGen.psm1",
@@ -494,9 +477,12 @@ class PiraCodeNavTests(unittest.TestCase):
                 result = self.run_cli(language, "outline", str(REAL_ROOT / relative))
                 self.assertRegex(result.stdout, expected)
 
-        cpp = self.run_cli("cpp", "outline", str(REAL_ROOT / "cpp_fmt/format.cc"))
-        self.assertRegex(cpp.stdout, r"namespace\s+detail\b")
-        self.assertRegex(cpp.stdout, r"(?:method|function)\s+detail::.*to_decimal\b")
+        for language, relative in (("c", "c_jq/main.c"), ("cpp", "cpp_fmt/format.cc")):
+            result = self.run_cli(
+                language, "outline", str(REAL_ROOT / relative), expected=3
+            )
+            self.assertIn("Tree-sitter found", result.stderr)
+            self.assertIn("--lsp", result.stderr)
 
     def test_show_by_position_returns_smallest_named_item(self) -> None:
         source = SYNTHETIC_ROOT / "python_project" / "package" / "api.py"
@@ -529,6 +515,17 @@ class PiraCodeNavTests(unittest.TestCase):
         )
         self.assertIn("starts at 999", beyond_start.stderr)
 
+    def test_show_line_range_handles_newline_dense_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lines-") as temp:
+            root = Path(temp)
+            (root / "dense.py").write_text("\n" * 10_000, encoding="utf-8")
+            first = self.run_cli("show", "dense.py:1-1", cwd=root)
+            self.assertIn("item=lines:1-1", first.stdout.splitlines()[0])
+            self.assertIn("bytes=1", first.stdout.splitlines()[0])
+            result = self.run_cli("show", "dense.py:9999-10000", cwd=root)
+            self.assertIn("item=lines:9999-10000", result.stdout.splitlines()[0])
+            self.assertIn("bytes=2", result.stdout.splitlines()[0])
+
     def test_show_uses_column_to_disambiguate_same_line_items(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-column-") as temp:
             root = Path(temp)
@@ -546,6 +543,16 @@ class PiraCodeNavTests(unittest.TestCase):
         )
         self.assertIn("@dataclass(frozen=True)", result.stdout)
         self.assertIn("class User:", result.stdout)
+
+    def test_show_preserves_attached_rust_attributes_and_positions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-rust-attrs-") as temp:
+            root = Path(temp)
+            (root / "item.rs").write_text(
+                "#[derive(Debug)]\npub struct Item;\n", encoding="utf-8"
+            )
+            result = self.run_cli("show", "item.rs::Item", cwd=root)
+            self.assertIn("range=L1:1-2:17", result.stdout.splitlines()[0])
+            self.assertIn("#[derive(Debug)]", result.stdout)
 
     def test_show_accepts_bounded_multiple_targets_and_deduplicates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-show-many-") as temp:
@@ -630,6 +637,17 @@ class PiraCodeNavTests(unittest.TestCase):
             stale = self.run_cli("show", selector, cwd=root, expected=4)
             self.assertIn("stale selector", stale.stderr.lower())
 
+            client_selector = next(
+                match.group(1)
+                for line in outline.stdout.splitlines()
+                if line.startswith("class Client ") and (match := SELECTOR_RE.search(line))
+            )
+            all_stale = self.run_cli(
+                "show", selector, client_selector, cwd=root, expected=4
+            )
+            self.assertIn("failed=2", all_stale.stdout.splitlines()[0])
+            self.assertIn("complete=0", all_stale.stdout.splitlines()[0])
+
     def test_all_overloaded_selectors_round_trip_to_distinct_items(self) -> None:
         source = REAL_ROOT / "python_click" / "decorators.py"
         outline = self.run_cli("outline", str(source), "--selectors")
@@ -688,6 +706,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 cwd=root,
             )
             header = result.stdout.splitlines()[0]
+            self.assertIn("complete=0", header)
             self.assertIn("shown=2", header)
             self.assertIn("failed=1", header)
             self.assertIn("def alpha", result.stdout)
@@ -719,6 +738,10 @@ class PiraCodeNavTests(unittest.TestCase):
             outline.stdout,
             r'outline error file="missing\.py" code=2 message="cannot inspect',
         )
+        self.assertIn(
+            "# pira_codenav outline batch files=2 succeeded=1 failed=1 complete=0",
+            outline.stdout,
+        )
 
         imports = self.run_cli(
             "imports",
@@ -730,15 +753,25 @@ class PiraCodeNavTests(unittest.TestCase):
             imports.stdout,
             r'imports error file="missing\.js" code=2 message="cannot inspect',
         )
+        self.assertIn(
+            "# pira_codenav imports batch files=2 succeeded=1 failed=1 complete=0",
+            imports.stdout,
+        )
 
         failed = self.run_cli(
             "outline",
             "missing.py",
             "also_missing.py",
-            expected=3,
+            expected=2,
         )
         self.assertEqual(2, failed.stdout.count("outline error file="))
         self.assertIn("all outline files failed", failed.stderr)
+
+        imports_failed = self.run_cli(
+            "imports", "missing.js", "also_missing.js", expected=2
+        )
+        self.assertEqual(2, imports_failed.stdout.count("imports error file="))
+        self.assertIn("complete=0", imports_failed.stdout)
 
     def test_python_module_bindings_are_navigable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-bindings-") as temp:
@@ -819,9 +852,12 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("deps --help", deps.stderr)
 
     def test_map_is_mixed_language_bounded_and_gitignore_aware(self) -> None:
-        result = self.run_cli("map", ".", "--max-items", "50")
+        result = self.run_cli(
+            "map", ".", "--max-items", "50", *self.fake_lsp_args()
+        )
         self.assertIn("language=python", result.stdout)
         self.assertIn("language=rust", result.stdout)
+        self.assertRegex(result.stdout.splitlines()[0], r"\blsp=[1-9]\d*\b")
         self.assertIn("omitted=", result.stdout)
         self.assertNotIn("ignored_generated.py", result.stdout)
         self.assertNotIn("target/", result.stdout)
@@ -849,17 +885,18 @@ class PiraCodeNavTests(unittest.TestCase):
                 "discovered=10",
                 "eligible=8",
                 "parsed=7",
-                "ok=7",
-                "recovered=0",
-                "partial=0",
+                "tree_sitter=7",
+                "lsp=0",
                 "failed=1",
                 "unsupported=1",
                 "ambiguous=1",
                 "shown=3",
                 "omitted=4",
+                "complete=0",
             ):
                 self.assertIn(expected, header)
-            shown = result.stdout.splitlines()[1:]
+            self.assertIn('error file="broken.py" code=2', result.stdout)
+            shown = [line for line in result.stdout.splitlines()[1:] if line.startswith("file=")]
             self.assertTrue(any("file=a/" in line for line in shown))
             self.assertTrue(any("file=b/" in line for line in shown))
             self.assertTrue(any("file=c/" in line for line in shown))
@@ -944,6 +981,96 @@ class PiraCodeNavTests(unittest.TestCase):
         )
         self.assertIn("package/api.py", rooted.stdout)
         self.assertIn("target=package/models.py", rooted.stdout)
+
+    def test_dependents_reports_files_that_could_not_be_parsed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-dependent-errors-") as temp:
+            root = Path(temp)
+            (root / "model.py").write_text("class Model: pass\n", encoding="utf-8")
+            (root / "good.py").write_text("from model import Model\n", encoding="utf-8")
+            (root / "broken.py").write_bytes(b"\xff")
+            result = self.run_cli("dependents", "model.py", cwd=root)
+            header = result.stdout.splitlines()[0]
+            self.assertIn("scanned=2", header)
+            self.assertIn("failed=1", header)
+            self.assertIn("complete=0", header)
+            self.assertIn("count=1", header)
+            self.assertIn("dependent=good.py", result.stdout)
+
+    def test_dependency_commands_fail_when_every_scanned_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-all-deps-fail-") as temp:
+            root = Path(temp)
+            (root / "target.py").write_text("class Target: pass\n", encoding="utf-8")
+            (root / "broken.py").write_bytes(b"\xff")
+
+            dependents = self.run_cli(
+                "dependents", "target.py", cwd=root, expected=2
+            )
+            self.assertIn("scanned=1", dependents.stdout.splitlines()[0])
+            self.assertIn("failed=1", dependents.stdout.splitlines()[0])
+            self.assertIn("complete=0", dependents.stdout.splitlines()[0])
+            self.assertIn("all dependents files failed", dependents.stderr)
+
+            (root / "target.py").write_bytes(b"\xff")
+            deps = self.run_cli("deps", "target.py", cwd=root, expected=2)
+            self.assertIn("files=2", deps.stdout.splitlines()[0])
+            self.assertIn("failed=2", deps.stdout.splitlines()[0])
+            self.assertIn("complete=0", deps.stdout.splitlines()[0])
+            self.assertIn("all deps files failed", deps.stderr)
+
+    def test_dependency_discovery_uses_narrow_cross_language_groups(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-cross-language-") as temp:
+            root = Path(temp)
+            (root / "target.js").write_text("export const value = 1;\n", encoding="utf-8")
+            (root / "consumer.ts").write_text(
+                'import { value } from "./target.js";\nconsole.log(value);\n',
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "javascript", "dependents", "target.js", "--root", ".", cwd=root
+            )
+            self.assertIn("dependent=consumer.ts", result.stdout)
+            self.assertIn("complete=1", result.stdout.splitlines()[0])
+
+    def test_c_family_dependency_group_includes_all_three_dialects(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-c-family-deps-") as temp:
+            root = Path(temp)
+            (root / "api.h").write_text("int api(void);\n", encoding="utf-8")
+            for name in ("consumer.c", "consumer.cpp", "consumer.cu"):
+                (root / name).write_text('#include "api.h"\n', encoding="utf-8")
+
+            result = self.run_cli(
+                "cpp", "dependents", "api.h", "--root", ".", cwd=root
+            )
+            for name in ("consumer.c", "consumer.cpp", "consumer.cu"):
+                self.assertIn(f"dependent={name}", result.stdout)
+            self.assertIn("complete=1", result.stdout.splitlines()[0])
+
+    def test_both_direction_dependency_output_is_balanced(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-balanced-deps-") as temp:
+            root = Path(temp)
+            for name in ("a", "b", "c", "d"):
+                (root / f"{name}.py").write_text(f"{name.upper()} = 1\n", encoding="utf-8")
+            (root / "target.py").write_text(
+                "import a\nimport b\nimport c\nimport d\n", encoding="utf-8"
+            )
+            (root / "consumer.py").write_text("import target\n", encoding="utf-8")
+
+            result = self.run_cli(
+                "deps",
+                "target.py",
+                "--direction",
+                "both",
+                "--depth",
+                "1",
+                "--max-items",
+                "2",
+                cwd=root,
+            )
+            edges = [line for line in result.stdout.splitlines() if line.startswith("edge ")]
+            self.assertEqual(2, len(edges))
+            self.assertTrue(any("direction=import" in line for line in edges))
+            self.assertTrue(any("direction=dependent" in line for line in edges))
+            self.assertIn("complete=1", result.stdout.splitlines()[0])
 
     def test_transitive_file_dependencies_are_bounded_and_directional(self) -> None:
         root = SYNTHETIC_ROOT / "python_project"
@@ -1035,11 +1162,344 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertEqual(0, return_code, stderr)
         self.assertNotIn("panicked", stderr)
 
-    def test_malformed_file_returns_partial_outline_with_warning(self) -> None:
-        result = self.run_cli("outline", "malformed.py")
-        self.assertRegex(result.stdout, r"parse=(partial|error)")
-        self.assertRegex(result.stdout, r"class\s+Incomplete\b")
-        self.assertIn("parse", result.stderr.lower())
+    def test_closed_output_consumer_stops_before_later_lsp_work(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-closed-output-") as temp:
+            root = Path(temp)
+            (root / "many.py").write_text(
+                "".join(f"def item_{index}(): return {index}\n" for index in range(5_000)),
+                encoding="utf-8",
+            )
+            (root / "dirty.py").write_text(
+                "def dirty():\n    return (\n", encoding="utf-8"
+            )
+            starts = root / "starts.log"
+            process = subprocess.Popen(
+                [
+                    str(self.binary),
+                    "outline",
+                    "many.py",
+                    "dirty.py",
+                    "--max-items",
+                    "5000",
+                    *self.fake_lsp_args("--startup-log", str(starts)),
+                ],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert process.stdout is not None
+            self.assertTrue(process.stdout.readline().startswith("# pira_codenav outline"))
+            process.stdout.close()
+            assert process.stderr is not None
+            stderr = process.stderr.read()
+            process.stderr.close()
+            self.assertEqual(0, process.wait(timeout=10), stderr)
+            self.assertFalse(starts.exists(), "closed output should prevent later LSP startup")
+
+    def test_unclean_file_requires_lsp_and_lsp_restores_outline_and_show(self) -> None:
+        missing = self.run_cli("outline", "malformed.py", expected=3)
+        self.assertEqual("", missing.stdout)
+        self.assertIn("Tree-sitter found", missing.stderr)
+        self.assertIn("rerun with --lsp", missing.stderr)
+
+        outline = self.run_cli(
+            "outline", "malformed.py", *self.fake_lsp_args()
+        )
+        self.assertIn("backend=lsp", outline.stdout.splitlines()[0])
+        self.assertRegex(outline.stdout, r"class\s+Incomplete\b")
+        self.assertRegex(outline.stdout, r"method\s+Incomplete\.still_visible\b")
+
+        shown = self.run_cli(
+            "show", "malformed.py::Incomplete", *self.fake_lsp_args()
+        )
+        self.assertIn("class Incomplete:", shown.stdout)
+        self.assertIn("return 0", shown.stdout)
+        self.assertNotIn("broken =", shown.stdout)
+
+    def test_lsp_is_lazy_and_utf16_ranges_return_exact_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-") as temp:
+            root = Path(temp)
+            clean = root / "clean.py"
+            clean.write_text("def native(): return 1\n", encoding="utf-8")
+            log = root / "requests.log"
+            native = self.run_cli(
+                "outline",
+                "clean.py",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn("backend=tree-sitter", native.stdout.splitlines()[0])
+            self.assertFalse(log.exists(), "clean native parsing must not start the LSP")
+
+            dirty = root / "dirty.py"
+            dirty.write_text(
+                'class UnicodeBox:\n    value = "é😀"\n\n\nbroken = (\n',
+                encoding="utf-8",
+            )
+            shown = self.run_cli(
+                "show",
+                "dirty.py::UnicodeBox",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn('value = "é😀"', shown.stdout)
+            self.assertNotIn("broken =", shown.stdout)
+            methods = log.read_text(encoding="utf-8")
+            self.assertIn("initialize", methods)
+            self.assertIn("textDocument/documentSymbol", methods)
+
+    def test_lsp_configuration_and_capability_failures_are_concise(self) -> None:
+        relative = self.run_cli(
+            "outline", "malformed.py", "--lsp", "fake-server", expected=2
+        )
+        self.assertIn("absolute path", relative.stderr)
+
+        missing_server = self.run_cli(
+            "outline",
+            "malformed.py",
+            *self.fake_lsp_args("--disable-symbols"),
+            expected=3,
+        )
+        self.assertIn("document symbols", missing_server.stderr.lower())
+
+        orphan_arg = self.run_cli(
+            "outline", "malformed.py", "--lsp-arg", "--stdio", expected=2
+        )
+        self.assertIn("requires a matching --lsp", orphan_arg.stderr)
+
+    def test_semantic_commands_require_lsp_and_precise_locations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-semantics-") as temp:
+            root = Path(temp)
+            source = root / "sample.py"
+            source.write_text(
+                "class Target: pass\n\n"
+                "def first():\n    return Target()\n\n"
+                "def second():\n    return Target()\n",
+                encoding="utf-8",
+            )
+            missing = self.run_cli("definition", "sample.py:4:12", cwd=root, expected=2)
+            self.assertIn("requires --lsp", missing.stderr)
+            imprecise = self.run_cli(
+                "definition", "sample.py:4", *self.fake_lsp_args(), cwd=root, expected=2
+            )
+            self.assertIn("LINE:COLUMN", imprecise.stderr)
+
+            definition = self.run_cli(
+                "definition", "sample.py:4:12", *self.fake_lsp_args(), cwd=root
+            )
+            self.assertIn("count=1 shown=1 omitted=0", definition.stdout.splitlines()[0])
+            self.assertIn("file=sample.py range=L1:7-1:13", definition.stdout)
+
+            references = self.run_cli(
+                "references",
+                "sample.py:4:12",
+                "--max-items",
+                "1",
+                *self.fake_lsp_args(),
+                cwd=root,
+            )
+            self.assertIn("count=2 shown=1 omitted=1", references.stdout.splitlines()[0])
+            self.assertNotIn("range=L1:7-1:13", references.stdout)
+            including = self.run_cli(
+                "references",
+                "sample.py:4:12",
+                "--include-declaration",
+                *self.fake_lsp_args(),
+                cwd=root,
+            )
+            self.assertIn("count=3 shown=3 omitted=0", including.stdout.splitlines()[0])
+            self.assertIn("range=L1:7-1:13", including.stdout)
+
+            hover = self.run_cli(
+                "hover", "sample.py:4:12", *self.fake_lsp_args(), cwd=root
+            )
+            self.assertIn("format=markdown", hover.stdout.splitlines()[0])
+            self.assertIn("begin untrusted LSP hover", hover.stdout)
+            self.assertIn("**Target**", hover.stdout)
+            self.assertIn("end LSP hover", hover.stdout)
+
+    def test_semantic_lsp_position_conversion_and_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-semantic-unicode-") as temp:
+            root = Path(temp)
+            source = root / "unicode.py"
+            line = 'value = "😀"; Target()'
+            source.write_text("class Target: pass\n" + line + "\n", encoding="utf-8")
+            byte_column = len(line[: line.index("Target")].encode()) + 1
+            result = self.run_cli(
+                "definition",
+                f"unicode.py:2:{byte_column}",
+                *self.fake_lsp_args(),
+                cwd=root,
+            )
+            self.assertIn("range=L1:7-1:13", result.stdout)
+
+            no_outline_capability = self.run_cli(
+                "definition",
+                f"unicode.py:2:{byte_column}",
+                *self.fake_lsp_args("--disable-symbols"),
+                cwd=root,
+            )
+            self.assertIn("range=L1:7-1:13", no_outline_capability.stdout)
+
+            unsupported = self.run_cli(
+                "definition",
+                f"unicode.py:2:{byte_column}",
+                *self.fake_lsp_args("--disable-semantics"),
+                cwd=root,
+                expected=3,
+            )
+            self.assertIn("does not advertise definition", unsupported.stderr)
+
+            duplicate_limit = self.run_cli(
+                "definition",
+                f"unicode.py:2:{byte_column}",
+                "--max-items",
+                "1",
+                "--max-items",
+                "2",
+                *self.fake_lsp_args(),
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("only once", duplicate_limit.stderr)
+
+    def test_lsp_server_edit_request_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-edit-") as temp:
+            root = Path(temp)
+            source = root / "dirty.py"
+            source.write_text("class Safe:\n    pass\n\n\nbroken = (\n", encoding="utf-8")
+            before = source.read_bytes()
+            result = self.run_cli(
+                "outline",
+                "dirty.py",
+                *self.fake_lsp_args("--request-edit"),
+                cwd=root,
+            )
+            self.assertIn("backend=lsp", result.stdout.splitlines()[0])
+            self.assertEqual(before, source.read_bytes())
+            self.assertNotIn("MUST_NOT_APPEAR", source.read_text(encoding="utf-8"))
+
+    def test_map_reuses_one_lazy_lsp_process(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-map-") as temp:
+            root = Path(temp)
+            for index in range(3):
+                (root / f"dirty_{index}.py").write_text(
+                    f"class Item{index}:\n    pass\n\n\nbroken = (\n",
+                    encoding="utf-8",
+                )
+            log = root / "requests.log"
+            result = self.run_cli(
+                "map",
+                ".",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn("tree_sitter=0", result.stdout.splitlines()[0])
+            self.assertIn("lsp=3", result.stdout.splitlines()[0])
+            methods = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, methods.count("initialize"))
+            self.assertEqual(3, methods.count("textDocument/documentSymbol"))
+
+    def test_map_preserves_clean_results_when_an_lsp_is_required(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-partial-map-") as temp:
+            root = Path(temp)
+            (root / "clean.py").write_text("def clean(): return 1\n", encoding="utf-8")
+            (root / "dirty.py").write_text("def dirty():\n    return (\n", encoding="utf-8")
+
+            partial = self.run_cli("map", ".", cwd=root)
+            header = partial.stdout.splitlines()[0]
+            self.assertIn("parsed=1", header)
+            self.assertIn("failed=1", header)
+            self.assertIn("complete=0", header)
+            self.assertIn("file=clean.py", partial.stdout)
+            self.assertIn('error file="dirty.py" code=3', partial.stdout)
+
+            (root / "clean.py").unlink()
+            failed = self.run_cli("map", ".", cwd=root, expected=3)
+            self.assertIn("parsed=0", failed.stdout.splitlines()[0])
+            self.assertIn("complete=0", failed.stdout.splitlines()[0])
+            self.assertIn('error file="dirty.py" code=3', failed.stdout)
+
+    def test_map_caches_lsp_startup_failure_per_invocation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-failed-lsp-") as temp:
+            root = Path(temp)
+            for index in range(3):
+                (root / f"dirty_{index}.py").write_text(
+                    f"def item_{index}():\n    return (\n", encoding="utf-8"
+                )
+            starts = root / "starts.log"
+            result = self.run_cli(
+                "map",
+                ".",
+                *self.fake_lsp_args(
+                    "--startup-log", str(starts), "--exit-on-initialize"
+                ),
+                cwd=root,
+                expected=3,
+            )
+            self.assertIn("failed=3", result.stdout.splitlines()[0])
+            self.assertEqual(["start"], starts.read_text(encoding="utf-8").splitlines())
+
+    def test_show_caches_structural_failure_per_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-failed-show-") as temp:
+            root = Path(temp)
+            (root / "dirty.py").write_text(
+                "class Item:\n    pass\n\nbroken = (\n", encoding="utf-8"
+            )
+            requests = root / "requests.log"
+            result = self.run_cli(
+                "show",
+                "dirty.py:1",
+                "dirty.py:2",
+                *self.fake_lsp_args("--log", str(requests), "--invalid-range"),
+                cwd=root,
+                expected=3,
+            )
+            self.assertIn("failed=2", result.stdout.splitlines()[0])
+            methods = requests.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, methods.count("initialize"))
+            self.assertEqual(1, methods.count("textDocument/documentSymbol"))
+
+    def test_mixed_map_uses_per_language_lsp_servers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-mixed-") as temp:
+            root = Path(temp)
+            (root / "dirty.py").write_text(
+                "class PythonItem:\n    pass\n\n\nbroken = (\n", encoding="utf-8"
+            )
+            (root / "dirty.cpp").write_text(
+                "#define REGISTER(name) int registered_##name = 0;\n"
+                "REGISTER(item)\n",
+                encoding="utf-8",
+            )
+            python_log = root / "python.log"
+            cpp_log = root / "cpp.log"
+            result = self.run_cli(
+                "map",
+                ".",
+                "--lsp",
+                f"python={sys.executable}",
+                "--lsp-arg",
+                f"python={FAKE_LSP}",
+                "--lsp-arg",
+                "python=--log",
+                "--lsp-arg",
+                f"python={python_log}",
+                "--lsp",
+                f"cpp={sys.executable}",
+                "--lsp-arg",
+                f"cpp={FAKE_LSP}",
+                "--lsp-arg",
+                "cpp=--log",
+                "--lsp-arg",
+                f"cpp={cpp_log}",
+                cwd=root,
+            )
+            self.assertIn("lsp=2", result.stdout.splitlines()[0])
+            for log in (python_log, cpp_log):
+                methods = log.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(1, methods.count("initialize"))
+                self.assertEqual(1, methods.count("textDocument/documentSymbol"))
 
     def test_unknown_language_and_explicit_mismatch_fail_concisely(self) -> None:
         unknown = self.run_cli("outline", "unknown.source", expected=2)
@@ -1049,8 +1509,8 @@ class PiraCodeNavTests(unittest.TestCase):
         mismatch = self.run_cli("rust", "outline", "python_project/app.py", expected=2)
         self.assertIn("language mismatch", mismatch.stderr.lower())
 
-    def test_removed_lsp_duplicates_are_not_commands(self) -> None:
-        for command in ("symbols", "definition", "references", "calls", "callers"):
+    def test_unimplemented_semantic_operations_are_not_commands(self) -> None:
+        for command in ("symbols", "type-definition", "implementation", "calls", "callers"):
             result = self.run_cli(command, "anything", expected=2)
             self.assertIn("unknown subcommand", result.stderr.lower())
 
@@ -1067,7 +1527,7 @@ class PiraCodeNavTests(unittest.TestCase):
                     "python_project/package/api.py:11",
                     "python_project/package/models.py:4",
                 ),
-                ("map", ".", "--max-items", "30"),
+                ("map", ".", "--max-items", "30", *self.fake_lsp_args()),
                 ("imports", "rust_project/src/lib.rs"),
                 ("dependents", "rust_project/src/parser.rs"),
                 (

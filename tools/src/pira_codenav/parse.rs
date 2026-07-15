@@ -1,29 +1,27 @@
 use std::path::{Path, PathBuf};
 
-use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
+use tree_sitter::{Node, Point, Tree};
 
-use crate::c_family_recovery::{
-    aggressive_parser_view, conditional_branch_parser_views, conditional_branch_parser_views_plain,
-    focused_parser_views, macro_lambda_statement_parser_view, normalized_parser_view,
-};
 use crate::language::Language;
-use crate::language_recovery::{
-    csharp_recent_syntax_parser_view, go_new_value_parser_view,
-    typescript_recent_syntax_parser_view,
-};
-use crate::model::{ParseState, Symbol};
+use crate::model::{ParseBackend, Symbol};
 use crate::util::{hash16, one_line, percent_encode, read_source, source_slice};
+
+const MAX_SYNTAX_DEPTH: usize = 256;
 
 pub struct ParsedFile {
     pub path: PathBuf,
     pub language: Language,
     pub source: String,
-    pub tree: Tree,
     pub symbols: Vec<Symbol>,
-    pub state: ParseState,
-    pub defects: usize,
-    pub original_defects: usize,
-    pub raw_defects: usize,
+    pub backend: ParseBackend,
+    pub syntax_defects: usize,
+}
+
+pub struct ParsedSyntax {
+    pub path: PathBuf,
+    pub language: Language,
+    pub source: String,
+    pub tree: Tree,
 }
 
 impl ParsedFile {
@@ -45,181 +43,12 @@ impl ParsedFile {
 }
 
 pub fn parse_file(path: &Path, language: Language) -> Result<ParsedFile, String> {
-    let source = read_source(path)?;
-    let mut parser = language.parser(path)?;
-    let original_tree = parser
-        .parse(source.as_bytes(), None)
-        .ok_or_else(|| format!("{} parser returned no tree", language.name()))?;
-    let raw_defects = count_defects(original_tree.root_node());
-    let original_defects = count_navigation_defects(original_tree.root_node(), language);
-    let mut tree = original_tree.clone();
-    let mut defects = original_defects;
-    let mut recovered_tree = false;
-    let mut branch_symbol_sets = Vec::<(usize, Vec<Symbol>)>::new();
-    let force_csharp_extension_view = language == Language::CSharp
-        && has_misparsed_csharp_extension_block(original_tree.root_node(), &source);
-    if original_defects > 0 && matches!(language, Language::C | Language::Cpp | Language::Cuda) {
-        let normalized = normalized_parser_view(&source);
-        let normalized_source = normalized.as_deref().unwrap_or(&source);
-        let mut normalized_defects = original_defects;
-        let mut normalized_tree = original_tree.clone();
-        if normalized.is_some()
-            && let Some(candidate) =
-                parse_aligned_view(&mut parser, &source, normalized_source, &original_tree)
-        {
-            normalized_defects = count_navigation_defects(candidate.root_node(), language);
-            normalized_tree = candidate.clone();
-            select_better_tree(
-                candidate,
-                normalized_defects,
-                &mut tree,
-                &mut defects,
-                &mut recovered_tree,
-            );
-        }
-
-        if normalized_defects > 0
-            && let Some(aggressive) = aggressive_parser_view(&source, normalized_source)
-            && let Some(candidate) = parse_aligned_view(
-                &mut parser,
-                normalized_source,
-                &aggressive,
-                &normalized_tree,
-            )
-        {
-            let aggressive_defects = count_navigation_defects(candidate.root_node(), language);
-            select_better_tree(
-                candidate,
-                aggressive_defects,
-                &mut tree,
-                &mut defects,
-                &mut recovered_tree,
-            );
-        }
-
-        // Combining independent masking passes can occasionally hide a
-        // construct that one focused pass preserves. Focused candidates are
-        // available even when no combined view was needed or generated.
-        if defects > 0 {
-            for focused in focused_parser_views(&source, normalized_source) {
-                let Some(candidate) =
-                    parse_aligned_view(&mut parser, normalized_source, &focused, &normalized_tree)
-                else {
-                    continue;
-                };
-                let candidate_defects = count_navigation_defects(candidate.root_node(), language);
-                select_better_tree(
-                    candidate,
-                    candidate_defects,
-                    &mut tree,
-                    &mut defects,
-                    &mut recovered_tree,
-                );
-            }
-        }
-
-        if defects > 0 {
-            for branch in conditional_branch_parser_views(&source, normalized_source) {
-                let Some(candidate) =
-                    parse_aligned_view(&mut parser, normalized_source, &branch, &normalized_tree)
-                else {
-                    continue;
-                };
-                let candidate_defects = count_navigation_defects(candidate.root_node(), language);
-                branch_symbol_sets.push((
-                    candidate_defects,
-                    collect_symbols(&candidate, language, &source),
-                ));
-                select_better_tree(
-                    candidate,
-                    candidate_defects,
-                    &mut tree,
-                    &mut defects,
-                    &mut recovered_tree,
-                );
-            }
-        }
-
-        if defects > 0
-            && let Some(macro_lambda) =
-                macro_lambda_statement_parser_view(&source, normalized_source)
-            && let Some(candidate) = parse_aligned_view(
-                &mut parser,
-                normalized_source,
-                &macro_lambda,
-                &normalized_tree,
-            )
-        {
-            let candidate_defects = count_navigation_defects(candidate.root_node(), language);
-            select_better_tree(
-                candidate,
-                candidate_defects,
-                &mut tree,
-                &mut defects,
-                &mut recovered_tree,
-            );
-        }
-    }
-    let recent_view = (original_defects > 0 || force_csharp_extension_view)
-        .then(|| match language {
-            Language::Go => go_new_value_parser_view(&source),
-            Language::TypeScript => typescript_recent_syntax_parser_view(&source),
-            Language::CSharp => csharp_recent_syntax_parser_view(&source),
-            _ => None,
-        })
-        .flatten();
-    if let Some(view) = recent_view.as_deref()
-        && let Some(candidate) = parse_aligned_view(&mut parser, &source, view, &original_tree)
-    {
-        let candidate_defects = count_navigation_defects(candidate.root_node(), language);
-        if force_csharp_extension_view && candidate_defects <= defects {
-            tree = candidate;
-            defects = candidate_defects;
-            recovered_tree = true;
-        } else {
-            select_better_tree(
-                candidate,
-                candidate_defects,
-                &mut tree,
-                &mut defects,
-                &mut recovered_tree,
-            );
-        }
-    }
-    if defects > 0 && language == Language::CSharp {
-        let base = recent_view.as_deref().unwrap_or(&source);
-        for branch in conditional_branch_parser_views_plain(&source, base) {
-            let Some(candidate) = parse_aligned_view(&mut parser, &source, &branch, &original_tree)
-            else {
-                continue;
-            };
-            let candidate_defects = count_navigation_defects(candidate.root_node(), language);
-            branch_symbol_sets.push((
-                candidate_defects,
-                collect_symbols(&candidate, language, &source),
-            ));
-            select_better_tree(
-                candidate,
-                candidate_defects,
-                &mut tree,
-                &mut defects,
-                &mut recovered_tree,
-            );
-        }
-    }
-    let state = classify_parse_state(raw_defects, defects, recovered_tree);
-    let mut symbols = collect_symbols(&tree, language, &source);
-    for (candidate_defects, candidate_symbols) in branch_symbol_sets {
-        if candidate_defects == defects {
-            symbols.extend(candidate_symbols);
-        }
-    }
-    if recovered_tree && matches!(language, Language::C | Language::Cpp | Language::Cuda) {
-        merge_original_symbols(
-            &mut symbols,
-            collect_symbols(&original_tree, language, &source),
-        );
-    }
+    let (syntax, syntax_defects) = parse_native(path, language)?;
+    let mut symbols = if syntax_defects == 0 {
+        collect_symbols(&syntax.tree, language, &syntax.source)
+    } else {
+        Vec::new()
+    };
     symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     symbols.dedup_by(|left, right| {
         left.start_byte == right.start_byte
@@ -228,183 +57,47 @@ pub fn parse_file(path: &Path, language: Language) -> Result<ParsedFile, String>
             && left.qualified_name == right.qualified_name
     });
     Ok(ParsedFile {
-        path: path.to_path_buf(),
-        language,
-        source,
-        tree,
+        path: syntax.path,
+        language: syntax.language,
+        source: syntax.source,
         symbols,
-        state,
-        defects,
-        original_defects,
-        raw_defects,
+        backend: ParseBackend::TreeSitter,
+        syntax_defects,
     })
 }
 
-fn classify_parse_state(
-    raw_defects: usize,
-    navigation_defects: usize,
-    recovered_tree: bool,
-) -> ParseState {
-    if navigation_defects > 0 {
-        ParseState::Partial
-    } else if raw_defects == 0 && !recovered_tree {
-        ParseState::Ok
-    } else {
-        ParseState::Recovered
+pub fn parse_syntax(path: &Path, language: Language) -> Result<ParsedSyntax, String> {
+    let (syntax, defects) = parse_native(path, language)?;
+    if defects > 0 {
+        return Err(format!(
+            "Tree-sitter found {defects} syntax defect(s) in {}; imports and dependency commands require a clean native parse",
+            path.display()
+        ));
     }
+    Ok(syntax)
 }
 
-fn merge_original_symbols(recovered: &mut Vec<Symbol>, original: Vec<Symbol>) {
-    for source_symbol in original {
-        if is_callable_symbol(&source_symbol) && symbol_leaf_name(&source_symbol) == "namespace" {
-            continue;
-        }
-        if recovered.iter().any(|candidate| {
-            candidate.kind == source_symbol.kind
-                && candidate.start_byte == source_symbol.start_byte
-                && candidate.end_byte == source_symbol.end_byte
-                && symbol_leaf_name(candidate) == symbol_leaf_name(&source_symbol)
-        }) {
-            continue;
-        }
-        if let Some(candidate) = recovered.iter_mut().find(|candidate| {
-            is_callable_symbol(candidate)
-                && is_callable_symbol(&source_symbol)
-                && candidate.start_byte < source_symbol.end_byte
-                && source_symbol.start_byte < candidate.end_byte
-                && symbol_leaf_name(candidate) == symbol_leaf_name(&source_symbol)
-        }) {
-            if candidate.end_byte == source_symbol.end_byte
-                && source_symbol.start_byte < candidate.start_byte
-            {
-                candidate.signature = source_symbol.signature;
-                candidate.start_byte = source_symbol.start_byte;
-                candidate.start_row = source_symbol.start_row;
-                candidate.start_column = source_symbol.start_column;
-            }
-            continue;
-        }
-        if looks_like_macro_symbol(&source_symbol)
-            && recovered.iter().any(|candidate| {
-                is_callable_symbol(candidate)
-                    && candidate.start_byte < source_symbol.end_byte
-                    && source_symbol.start_byte < candidate.end_byte
-            })
-        {
-            continue;
-        }
-        recovered.push(source_symbol);
-    }
-}
-
-fn is_callable_symbol(symbol: &Symbol) -> bool {
-    matches!(
-        symbol.kind,
-        "function" | "method" | "constructor" | "destructor"
-    )
-}
-
-fn symbol_leaf_name(symbol: &Symbol) -> &str {
-    symbol
-        .qualified_name
-        .rsplit([':', '.'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(&symbol.qualified_name)
-}
-
-fn looks_like_macro_symbol(symbol: &Symbol) -> bool {
-    let name = symbol_leaf_name(symbol).as_bytes();
-    name.len() >= 3
-        && name.iter().any(u8::is_ascii_uppercase)
-        && name
-            .iter()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
-}
-
-fn parse_aligned_view(
-    parser: &mut Parser,
-    previous_source: &str,
-    source: &str,
-    previous_tree: &Tree,
-) -> Option<Tree> {
-    const MAX_INCREMENTAL_EDITS: usize = 4_096;
-
-    if previous_source.len() != source.len() {
-        return parser.parse(source.as_bytes(), None);
-    }
-
-    let previous = previous_source.as_bytes();
-    let next = source.as_bytes();
-    let line_starts = line_starts(previous);
-    let mut ranges = Vec::new();
-    let mut index = 0usize;
-    while index < previous.len() {
-        if previous[index] == next[index] {
-            index += 1;
-            continue;
-        }
-        if previous[index] == b'\n' || next[index] == b'\n' {
-            return parser.parse(source.as_bytes(), None);
-        }
-        let start = index;
-        index += 1;
-        while index < previous.len() && previous[index] != next[index] {
-            if previous[index] == b'\n' || next[index] == b'\n' {
-                return parser.parse(source.as_bytes(), None);
-            }
-            index += 1;
-        }
-        ranges.push((start, index));
-        if ranges.len() > MAX_INCREMENTAL_EDITS {
-            return parser.parse(source.as_bytes(), None);
-        }
-    }
-    if ranges.is_empty() {
-        return Some(previous_tree.clone());
-    }
-
-    let mut edited = previous_tree.clone();
-    for (start, end) in ranges.into_iter().rev() {
-        edited.edit(&InputEdit {
-            start_byte: start,
-            old_end_byte: end,
-            new_end_byte: end,
-            start_position: point_at(start, &line_starts),
-            old_end_position: point_at(end, &line_starts),
-            new_end_position: point_at(end, &line_starts),
-        });
-    }
-    parser.parse(source.as_bytes(), Some(&edited))
-}
-
-fn line_starts(source: &[u8]) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(source.len() / 40 + 1);
-    starts.push(0);
-    for (index, byte) in source.iter().enumerate() {
-        if *byte == b'\n' {
-            starts.push(index + 1);
-        }
-    }
-    starts
-}
-
-fn point_at(byte: usize, line_starts: &[usize]) -> Point {
-    let row = line_starts.partition_point(|start| *start <= byte) - 1;
-    Point::new(row, byte - line_starts[row])
-}
-
-fn select_better_tree(
-    candidate: Tree,
-    candidate_defects: usize,
-    tree: &mut Tree,
-    defects: &mut usize,
-    recovered_tree: &mut bool,
-) {
-    if candidate_defects < *defects {
-        *tree = candidate;
-        *defects = candidate_defects;
-        *recovered_tree = true;
-    }
+fn parse_native(path: &Path, language: Language) -> Result<(ParsedSyntax, usize), String> {
+    let source = read_source(path)?;
+    let mut parser = language.parser(path)?;
+    let tree = parser
+        .parse(source.as_bytes(), None)
+        .ok_or_else(|| format!("{} parser returned no tree", language.name()))?;
+    let defects = inspect_tree(tree.root_node()).map_err(|depth| {
+        format!(
+            "syntax tree nesting exceeds supported depth of {MAX_SYNTAX_DEPTH} in {} (observed at least {depth})",
+            path.display()
+        )
+    })?;
+    Ok((
+        ParsedSyntax {
+            path: path.to_path_buf(),
+            language,
+            source,
+            tree,
+        },
+        defects,
+    ))
 }
 
 fn collect_symbols(tree: &Tree, language: Language, source: &str) -> Vec<Symbol> {
@@ -956,41 +649,6 @@ fn walk_ecmascript(
     });
 }
 
-fn original_line_starts_with(source: &str, byte: usize, prefix: &str) -> bool {
-    let line_start = source
-        .get(..byte)
-        .and_then(|head| head.rfind('\n').map(|position| position + 1))
-        .unwrap_or(0);
-    let line_end = source
-        .get(byte..)
-        .and_then(|tail| tail.find('\n').map(|offset| byte + offset))
-        .unwrap_or(source.len());
-    source
-        .get(line_start..line_end)
-        .is_some_and(|line| line.trim_start().starts_with(prefix))
-}
-
-fn has_misparsed_csharp_extension_block(node: Node<'_>, source: &str) -> bool {
-    if node.kind() == "constructor_declaration"
-        && node.child_by_field_name("name").is_some_and(|name| {
-            source_slice(source, name.start_byte(), name.end_byte()) == "extension"
-        })
-    {
-        let mut ancestor = node.parent();
-        while let Some(parent) = ancestor {
-            if parent.kind() == "class_declaration" {
-                return parent.child_by_field_name("name").is_some_and(|name| {
-                    source_slice(source, name.start_byte(), name.end_byte()) != "extension"
-                });
-            }
-            ancestor = parent.parent();
-        }
-    }
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| has_misparsed_csharp_extension_block(child, source))
-}
-
 fn walk_csharp_root(node: Node<'_>, source: &str, output: &mut Vec<Symbol>) {
     let mut namespace = None;
     let mut cursor = node.walk();
@@ -1038,16 +696,6 @@ fn walk_csharp(
     if let Some(kind) = container_kind
         && let Some(name_node) = node.child_by_field_name("name")
     {
-        if node.kind() == "class_declaration"
-            && original_line_starts_with(source, node.start_byte(), "extension")
-        {
-            if let Some(body) = node.child_by_field_name("body") {
-                walk_named_children(body, |child| {
-                    walk_csharp(child, source, parent, depth, output)
-                });
-            }
-            return;
-        }
         let qualified = push_symbol(node, name_node, source, (parent, "."), kind, depth, output);
         if let Some(body) = node.child_by_field_name("body") {
             walk_named_children(body, |child| {
@@ -1579,47 +1227,31 @@ fn inside_class_like(node: Node<'_>) -> bool {
     false
 }
 
-fn count_defects(node: Node<'_>) -> usize {
-    let mut count = usize::from(node.is_error() || node.is_missing());
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        count += count_defects(child);
-    }
-    count
-}
+fn inspect_tree(root: Node<'_>) -> Result<usize, usize> {
+    let mut cursor = root.walk();
+    let mut depth = 0;
+    let mut defects = 0;
+    loop {
+        let node = cursor.node();
+        if depth > MAX_SYNTAX_DEPTH {
+            return Err(depth);
+        }
+        defects += usize::from(node.is_error() || node.is_missing());
 
-fn count_navigation_defects(node: Node<'_>, language: Language) -> usize {
-    let mut count = usize::from(node.is_error() || node.is_missing());
-    let outlined_c_family_callable =
-        matches!(language, Language::C | Language::Cpp | Language::Cuda)
-            && node.kind() == "function_definition"
-            && node
-                .child_by_field_name("declarator")
-                .and_then(declarator_name)
-                .is_some();
-    let outlined_csharp_member = language == Language::CSharp
-        && matches!(
-            node.kind(),
-            "method_declaration"
-                | "constructor_declaration"
-                | "property_declaration"
-                | "operator_declaration"
-                | "conversion_operator_declaration"
-        )
-        && (node.child_by_field_name("name").is_some()
-            || node.child_by_field_name("operator").is_some()
-            || node.child_by_field_name("type").is_some());
-    let body = (outlined_c_family_callable || outlined_csharp_member)
-        .then(|| node.child_by_field_name("body"))
-        .flatten();
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if body == Some(child) {
+        if cursor.goto_first_child() {
+            depth += 1;
             continue;
         }
-        count += count_navigation_defects(child, language);
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(defects);
+            }
+            depth -= 1;
+        }
     }
-    count
 }
 
 fn walk_python(
@@ -1657,7 +1289,7 @@ fn walk_python(
         {
             add_python_definition(
                 definition,
-                Some(node.start_byte()),
+                Some((node.start_byte(), node.start_position())),
                 source,
                 parent,
                 parent_is_class,
@@ -1706,7 +1338,7 @@ fn add_python_bindings(
 
 fn add_python_definition(
     node: Node<'_>,
-    range_start: Option<usize>,
+    range_start: Option<(usize, Point)>,
     source: &str,
     parent: Option<&str>,
     parent_is_class: bool,
@@ -1725,21 +1357,16 @@ fn add_python_definition(
     } else {
         "function"
     };
-    let start_byte = range_start.unwrap_or(node.start_byte());
-    let (start_row, start_column) = if start_byte == node.start_byte() {
-        let point = node.start_position();
-        (point.row, point.column)
-    } else {
-        byte_to_point(source, start_byte)
-    };
+    let (start_byte, start_position) =
+        range_start.unwrap_or_else(|| (node.start_byte(), node.start_position()));
     output.push(Symbol {
         kind,
         qualified_name: qualified.clone(),
         signature: signature(node, source, start_byte),
         start_byte,
         end_byte: node.end_byte(),
-        start_row,
-        start_column,
+        start_row: start_position.row,
+        start_column: start_position.column,
         end_row: node.end_position().row,
         end_column: node.end_position().column,
         depth,
@@ -1801,8 +1428,7 @@ fn walk_rust(
             let name =
                 source_slice(source, name_node.start_byte(), name_node.end_byte()).into_owned();
             let qualified = qualify(parent, &name, "::");
-            let start_byte = rust_attached_start(node, source);
-            let (start_row, start_column) = byte_to_point(source, start_byte);
+            let (start_byte, start_position) = rust_attached_start(node, source);
             output.push(Symbol {
                 kind,
                 qualified_name: qualified.clone(),
@@ -1810,8 +1436,8 @@ fn walk_rust(
                 signature: signature(node, source, node.start_byte()),
                 start_byte,
                 end_byte: node.end_byte(),
-                start_row,
-                start_column,
+                start_row: start_position.row,
+                start_column: start_position.column,
                 end_row: node.end_position().row,
                 end_column: node.end_position().column,
                 depth,
@@ -1840,8 +1466,8 @@ fn signature(node: Node<'_>, source: &str, start_byte: usize) -> String {
     one_line(&source_slice(source, start_byte, end))
 }
 
-fn rust_attached_start(node: Node<'_>, source: &str) -> usize {
-    let mut start = node.start_byte();
+fn rust_attached_start(node: Node<'_>, source: &str) -> (usize, Point) {
+    let mut start_node = node;
     let mut previous = node.prev_named_sibling();
     while let Some(candidate) = previous {
         let text = source_slice(source, candidate.start_byte(), candidate.end_byte());
@@ -1851,14 +1477,14 @@ fn rust_attached_start(node: Node<'_>, source: &str) -> usize {
         if !attachable {
             break;
         }
-        let gap = source_slice(source, candidate.end_byte(), start);
+        let gap = source_slice(source, candidate.end_byte(), start_node.start_byte());
         if gap.bytes().filter(|byte| *byte == b'\n').count() > 1 {
             break;
         }
-        start = candidate.start_byte();
+        start_node = candidate;
         previous = candidate.prev_named_sibling();
     }
-    start
+    (start_node.start_byte(), start_node.start_position())
 }
 
 fn first_line_end(node: Node<'_>, source: &str) -> usize {
@@ -1881,84 +1507,19 @@ fn qualify(parent: Option<&str>, name: &str, separator: &str) -> String {
     }
 }
 
-fn byte_to_point(source: &str, byte: usize) -> (usize, usize) {
-    let prefix = source.get(..byte).unwrap_or_default();
-    let row = prefix.bytes().filter(|value| *value == b'\n').count();
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.len(), |(_, tail)| tail.len());
-    (row, column)
-}
-
 #[cfg(test)]
 mod parse_completeness_tests {
-    use super::{
-        classify_parse_state, count_defects, count_navigation_defects, merge_original_symbols,
-    };
-    use crate::language::Language;
-    use crate::model::{ParseState, Symbol};
+    use super::inspect_tree;
     use tree_sitter::Parser;
 
-    fn symbol(name: &str, start: usize, end: usize) -> Symbol {
-        Symbol {
-            kind: "function",
-            qualified_name: name.into(),
-            signature: name.into(),
-            start_byte: start,
-            end_byte: end,
-            start_row: 0,
-            start_column: start,
-            end_row: 0,
-            end_column: end,
-            depth: 0,
-        }
-    }
-
     #[test]
-    fn c_family_function_body_errors_do_not_mark_navigation_partial() {
-        let source = "__global__ void run(int n) {\n\
-  for (auto i = decltype(n){0}; i < n; ++i) {}\n\
-}\n";
+    fn defects_are_counted_even_inside_function_bodies() {
+        let source = "def broken():\n    value = (\n";
         let mut parser = Parser::new();
         parser
-            .set_language(&tree_sitter_cuda::LANGUAGE.into())
-            .expect("cuda grammar");
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("python grammar");
         let tree = parser.parse(source.as_bytes(), None).expect("tree");
-        assert!(count_defects(tree.root_node()) > 0);
-        assert_eq!(
-            count_navigation_defects(tree.root_node(), Language::Cuda),
-            0
-        );
-    }
-
-    #[test]
-    fn parse_state_never_calls_remaining_navigation_defects_recovered() {
-        assert_eq!(classify_parse_state(5, 1, true), ParseState::Partial);
-        assert_eq!(classify_parse_state(0, 0, false), ParseState::Ok);
-        assert_eq!(classify_parse_state(2, 0, false), ParseState::Recovered);
-        assert_eq!(classify_parse_state(0, 0, true), ParseState::Recovered);
-    }
-
-    #[test]
-    fn recovery_symbol_merge_keeps_conditional_alternatives_and_drops_cascades() {
-        let mut recovered = vec![symbol("umain", 0, 100), symbol("actual", 120, 220)];
-        merge_original_symbols(
-            &mut recovered,
-            vec![
-                symbol("main", 10, 100),
-                symbol("SMALL_INDEX", 140, 400),
-                symbol("actual", 125, 130),
-                symbol("namespace", 230, 260),
-            ],
-        );
-        let names = recovered
-            .iter()
-            .map(|item| item.qualified_name.as_str())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"umain"));
-        assert!(names.contains(&"main"));
-        assert_eq!(names.iter().filter(|name| **name == "actual").count(), 1);
-        assert!(!names.contains(&"SMALL_INDEX"));
-        assert!(!names.contains(&"namespace"));
+        assert!(inspect_tree(tree.root_node()).expect("bounded tree") > 0);
     }
 }

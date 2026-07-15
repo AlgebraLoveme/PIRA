@@ -58,6 +58,15 @@ EXPLICIT_LANGUAGE = {
     "synthetic/extensionless_python": "python",
     "synthetic/extensionless_bash": "bash",
 }
+EXPECTED_LSP_REQUIRED = {
+    "real/c_jq/main.c",
+    "real/cpp_fmt/format.cc",
+    "synthetic/csharp_project/Models/Recovery.cs",
+    "synthetic/cuda_project/src/macro_kernel.cu",
+    "synthetic/go_project/model/user.go",
+    "synthetic/malformed.py",
+    "synthetic/typescript_project/model.ts",
+}
 CURATED = {
     "python": {
         ("synthetic/python_project/package/api.py", "class", "Client"),
@@ -88,31 +97,17 @@ CURATED = {
         ("synthetic/cuda_project/include/kernel.cuh", "struct", "ScaleConfig"),
         ("synthetic/cuda_project/src/kernel.cu", "function", "kernels::scale_kernel"),
         ("synthetic/cuda_project/src/kernel.cu", "function", "kernels::launch_scale"),
-        (
-            "synthetic/cuda_project/src/macro_kernel.cu",
-            "function",
-            "annotated_kernel",
-        ),
     },
     "bash": {
         ("synthetic/bash_project/app.sh", "function", "main"),
     },
-    "go": {
-        ("synthetic/go_project/model/user.go", "interface", "Labeler"),
-        ("synthetic/go_project/model/user.go", "struct", "User"),
-        ("synthetic/go_project/model/user.go", "function", "NewUser"),
-        ("synthetic/go_project/model/user.go", "method", "User.Label"),
-    },
+    "go": set(),
     "javascript": {
         ("synthetic/javascript_project/lib/model.js", "class", "User"),
         ("synthetic/javascript_project/lib/model.js", "method", "User.label"),
         ("synthetic/javascript_project/lib/model.js", "function", "normalizeName"),
     },
     "typescript": {
-        ("synthetic/typescript_project/model.ts", "type", "UserId"),
-        ("synthetic/typescript_project/model.ts", "variant", "Status.Disabled"),
-        ("synthetic/typescript_project/model.ts", "interface", "User"),
-        ("synthetic/typescript_project/model.ts", "method", "Store.add"),
         ("synthetic/typescript_project/view.tsx", "function", "UserName"),
         ("synthetic/typescript_project/app.ts", "function", "register.validate"),
         ("synthetic/typescript_project/app.ts", "function", "register.normalized"),
@@ -211,8 +206,8 @@ def main() -> int:
     )
     records: list[tuple[str, str, str, int, int, str]] = []
     failures: list[dict[str, object]] = []
-    partial = 0
-    recovered = 0
+    lsp_required: set[str] = set()
+    backend_counts: Counter[str] = Counter()
     language_counts: Counter[str] = Counter()
 
     for relative in files:
@@ -229,15 +224,17 @@ def main() -> int:
             data,
         )
         if result.returncode:
+            if "Tree-sitter found" in result.stderr and "rerun with --lsp" in result.stderr:
+                lsp_required.add(relative)
+                continue
             failures.append(
                 {"operation": "outline", "target": relative, "stderr": result.stderr}
             )
             continue
         header = result.stdout.splitlines()[0]
-        if "parse=partial" in header:
-            partial += 1
-        elif "parse=recovered" in header:
-            recovered += 1
+        backend = re.search(r"\bbackend=(\S+)", header)
+        if backend:
+            backend_counts[backend.group(1)] += 1
         language = re.search(r"\blanguage=(\S+)", header)
         if language:
             language_counts[language.group(1)] += 1
@@ -258,6 +255,11 @@ def main() -> int:
                 failures.append(
                     {"operation": "parse-outline", "target": relative, "line": line}
                 )
+
+    for relative in sorted(lsp_required - EXPECTED_LSP_REQUIRED):
+        failures.append({"operation": "unexpected-lsp-required", "target": relative})
+    for relative in sorted(EXPECTED_LSP_REQUIRED - lsp_required):
+        failures.append({"operation": "missing-lsp-required", "target": relative})
 
     emitted = {(path, kind, name) for path, kind, name, *_ in records}
     curated_results: dict[str, dict[str, int]] = {}
@@ -309,8 +311,9 @@ def main() -> int:
         "schema": 1,
         "files": len(files),
         "files_by_language": dict(sorted(language_counts.items())),
-        "partial_files": partial,
-        "recovered_files": recovered,
+        "files_by_backend": dict(sorted(backend_counts.items())),
+        "lsp_required_files": len(lsp_required),
+        "lsp_required_paths": sorted(lsp_required),
         "targets": len(records),
         "location_round_trips": location_ok,
         "selector_round_trips": selector_ok,

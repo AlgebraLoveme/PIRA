@@ -205,7 +205,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "pira_codenav"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ignore",
  "rayon",
@@ -271,6 +271,7 @@ dependencies = [
 
 [[package]]
 name = "rayon-core"
+ "serde_json",
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"

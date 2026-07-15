@@ -6,12 +6,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BINARY = REPO_ROOT / "tools" / "target" / "debug" / "pira_codenav"
+FAKE_LSP = Path(__file__).with_name("fake_lsp_server.py")
 
 
 class PiraCodeNavSecurityTests(unittest.TestCase):
@@ -38,6 +40,91 @@ class PiraCodeNavSecurityTests(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         return result
+
+    @staticmethod
+    def fake_lsp_args(*extra: str) -> tuple[str, ...]:
+        arguments = ["--lsp", sys.executable, "--lsp-arg", str(FAKE_LSP)]
+        for value in extra:
+            arguments.extend(("--lsp-arg", value))
+        return tuple(arguments)
+
+    @staticmethod
+    def dirty_source(root: Path) -> None:
+        (root / "dirty.py").write_text(
+            "class Safe:\n    pass\n\n\nbroken = (\n", encoding="utf-8"
+        )
+
+    def test_pathological_syntax_depth_is_rejected_without_abort(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-deep-tree-") as temp:
+            root = Path(temp)
+            depth = 30_000
+            (root / "deep.py").write_text(
+                "value = " + "(" * depth + "1" + ")" * depth + "\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(root, "outline", "deep.py", expected=2)
+            self.assertIn("syntax tree nesting exceeds", result.stderr)
+            self.assertLess(len(result.stderr), 1_000)
+
+    def test_lsp_oversized_response_is_rejected_from_headers(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-size-") as temp:
+            root = Path(temp)
+            self.dirty_source(root)
+            result = self.run_cli(
+                root,
+                "outline",
+                "dirty.py",
+                *self.fake_lsp_args("--oversized-response"),
+                expected=3,
+            )
+            self.assertIn("response exceeds", result.stderr)
+            self.assertLess(len(result.stderr), 2_000)
+
+    def test_lsp_out_of_source_range_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-range-") as temp:
+            root = Path(temp)
+            self.dirty_source(root)
+            result = self.run_cli(
+                root,
+                "outline",
+                "dirty.py",
+                *self.fake_lsp_args("--invalid-range"),
+                expected=3,
+            )
+            self.assertIn("outside the source", result.stderr)
+
+    def test_lsp_symbol_controls_are_escaped(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-controls-") as temp:
+            root = Path(temp)
+            self.dirty_source(root)
+            result = self.run_cli(
+                root,
+                "outline",
+                "dirty.py",
+                *self.fake_lsp_args("--hostile-name"),
+            )
+            self.assertNotIn("\x1b", result.stdout)
+            self.assertIn(r"\u{1b}", result.stdout)
+
+    def test_lsp_hover_is_bounded_framed_and_control_safe(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-hover-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "class Target: pass\nvalue = Target()\n", encoding="utf-8"
+            )
+            result = self.run_cli(
+                root,
+                "hover",
+                "sample.py:2:9",
+                "--max-bytes",
+                "64",
+                *self.fake_lsp_args("--hostile-hover"),
+            )
+            self.assertIn("begin untrusted LSP hover", result.stdout)
+            self.assertIn("end LSP hover", result.stdout)
+            self.assertNotIn("\x1b", result.stdout)
+            self.assertIn(r"\u{1b}", result.stdout)
+            self.assertIn("truncated=1", result.stdout.splitlines()[0])
 
     def test_prompt_like_source_is_delimited_not_interpreted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-sec-") as temp:
@@ -71,6 +158,26 @@ class PiraCodeNavSecurityTests(unittest.TestCase):
             self.assertNotIn("\x1b", ranged.stdout)
             self.assertIn(r"\u{1b}", ranged.stdout)
             self.assertIn("controls_escaped=1", ranged.stdout)
+
+    def test_native_symbol_and_dependency_metadata_escape_controls(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-native-controls-") as temp:
+            root = Path(temp)
+            (root / "control.R").write_bytes(
+                b"`unsafe\x1bname` <- function(x) x\n"
+            )
+            outline = self.run_cli(root, "outline", "control.R")
+            mapped = self.run_cli(root, "map", ".")
+            self.assertNotIn("\x1b", outline.stdout)
+            self.assertNotIn("\x1b", mapped.stdout)
+            self.assertIn(r"\u{1b}", outline.stdout)
+            self.assertIn(r"\u{1b}", mapped.stdout)
+
+            (root / "main.js").write_bytes(
+                b'import value from "./unsafe\x1bname.js";\n'
+            )
+            imports = self.run_cli(root, "imports", "main.js")
+            self.assertNotIn("\x1b", imports.stdout)
+            self.assertIn(r"\u{1b}", imports.stdout)
 
     def test_relative_import_cannot_resolve_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-sec-parent-") as parent:
@@ -133,6 +240,21 @@ class PiraCodeNavSecurityTests(unittest.TestCase):
                 file.truncate(16 * 1024 * 1024 + 1)
             result = self.run_cli(root, "outline", "oversized.py", expected=2)
             self.assertIn("exceeds the 16 MiB safety limit", result.stderr)
+
+    def test_hostile_lsp_error_is_control_safe_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-sec-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text("def target(): pass\ntarget()\n", encoding="utf-8")
+            result = self.run_cli(
+                root,
+                "definition",
+                "sample.py:2:1",
+                *self.fake_lsp_args("--hostile-error"),
+                expected=3,
+            )
+            self.assertNotIn("\x1b", result.stderr)
+            self.assertIn(r"\u{1b}", result.stderr)
+            self.assertLess(len(result.stderr.encode()), 2_300)
 
     def test_malformed_selector_is_rejected_without_path_access(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-sec-") as temp:
