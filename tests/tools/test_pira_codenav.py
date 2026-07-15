@@ -104,7 +104,7 @@ class PiraCodeNavTests(unittest.TestCase):
 
         languages = self.run_cli("languages")
         self.assertIn(
-            "# pira_codenav languages count=17 parser=tree-sitter lsp=optional "
+            "# pira_codenav languages count=23 parser=tree-sitter lsp=optional "
             "capabilities=outline,show,map,imports,dependents,deps,definition,references,hover",
             languages.stdout,
         )
@@ -127,6 +127,12 @@ class PiraCodeNavTests(unittest.TestCase):
             "lua",
             "hcl",
             "r",
+            "ruby",
+            "swift",
+            "scala",
+            "dart",
+            "elixir",
+            "julia",
         })
 
         for command in (
@@ -365,6 +371,137 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("external:stats", imports.stdout)
         dependents = self.run_cli("dependents", "helpers.R", cwd=root)
         self.assertIn("dependent=app.R", dependents.stdout)
+
+    def test_next_language_batch_outlines_imports_and_exact_show(self) -> None:
+        cases = (
+            (
+                "ruby_project",
+                "model.rb",
+                "Demo::User.label",
+                "def label",
+                "app.rb",
+                "target=model.rb",
+                "model.rb",
+            ),
+            (
+                "swift_project",
+                "Model.swift",
+                "User.render",
+                "func render",
+                "Model.swift",
+                "external:Foundation",
+                None,
+            ),
+            (
+                "scala_project",
+                "Model.scala",
+                "Helpers.normalize",
+                "def normalize",
+                "Model.scala",
+                "external:scala.collection.mutable",
+                None,
+            ),
+            (
+                "dart_project",
+                "model.dart",
+                "User.label",
+                "String get label",
+                "app.dart",
+                "target=model.dart",
+                "model.dart",
+            ),
+            (
+                "elixir_project",
+                "model.ex",
+                "Demo.User.label",
+                "def label",
+                "app.exs",
+                "external:Demo.User",
+                None,
+            ),
+            (
+                "julia_project",
+                "Model.jl",
+                "Demo.normalize",
+                "function normalize",
+                "App.jl",
+                "target=Model.jl",
+                "Model.jl",
+            ),
+        )
+        for project, source, qualified, source_marker, importer, import_marker, local in cases:
+            with self.subTest(project=project):
+                root = SYNTHETIC_ROOT / project
+                outline = self.run_cli(
+                    "outline",
+                    source,
+                    "--match",
+                    qualified,
+                    "--selectors",
+                    cwd=root,
+                )
+                self.assertIn(qualified, outline.stdout)
+                selector = SELECTOR_RE.search(outline.stdout)
+                self.assertIsNotNone(selector)
+                shown = self.run_cli("show", selector.group(1), cwd=root)
+                self.assertIn(source_marker, shown.stdout)
+
+                imports = self.run_cli("imports", importer, cwd=root)
+                self.assertIn(import_marker, imports.stdout)
+                if local is not None:
+                    dependents = self.run_cli("dependents", local, cwd=root)
+                    self.assertIn(f"dependent={importer}", dependents.stdout)
+                    dependencies = self.run_cli("deps", importer, cwd=root)
+                    self.assertIn(f"to={local}", dependencies.stdout)
+
+    def test_next_language_batch_shebangs_and_explicit_language(self) -> None:
+        scripts = (
+            ("ruby", "#!/usr/bin/env ruby\ndef hello\n  1\nend\n", "hello"),
+            (
+                "elixir",
+                "#!/usr/bin/env elixir\ndefmodule Demo do\n  def hello, do: 1\nend\n",
+                "Demo.hello",
+            ),
+            (
+                "julia",
+                "#!/usr/bin/env julia\nfunction hello()\n    1\nend\n",
+                "hello",
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-shebang-") as temp:
+            root = Path(temp)
+            for language, source, expected in scripts:
+                with self.subTest(language=language):
+                    path = root / f"run-{language}"
+                    path.write_text(source, encoding="utf-8")
+                    inferred = self.run_cli("outline", path.name, cwd=root)
+                    self.assertIn(f"language={language}", inferred.stdout.splitlines()[0])
+                    self.assertIn(expected, inferred.stdout)
+
+            explicit = self.run_cli(
+                "ruby", "outline", "run-ruby", "--match", "hello", cwd=root
+            )
+            self.assertIn("function hello", explicit.stdout)
+
+    def test_new_language_can_use_language_qualified_lsp(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-ruby-lsp-") as temp:
+            root = Path(temp)
+            source = root / "dirty.rb"
+            source.write_text("def native\n  1\nend\nbroken = (\n", encoding="utf-8")
+            missing = self.run_cli("outline", source.name, cwd=root, expected=3)
+            self.assertIn("--lsp ruby=ABSOLUTE_SERVER_PATH", missing.stderr)
+
+            restored = self.run_cli(
+                "outline",
+                source.name,
+                "--lsp",
+                f"ruby={sys.executable}",
+                "--lsp-arg",
+                f"ruby={FAKE_LSP}",
+                cwd=root,
+            )
+            self.assertIn("backend=lsp", restored.stdout.splitlines()[0])
+            self.assertIn("LspFile", restored.stdout)
 
     def test_extensionless_python_uses_shebang(self) -> None:
         result = self.run_cli("outline", "extensionless_python")

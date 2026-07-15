@@ -40,6 +40,12 @@ pub fn imports(parsed: &ParsedSyntax, cwd: &Path) -> Vec<ImportEdge> {
         Language::Lua => collect_lua(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::Hcl => collect_hcl(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::R => collect_r(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Ruby => collect_ruby(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Swift => collect_swift(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Scala => collect_scala(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Dart => collect_dart(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Elixir => collect_elixir(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Julia => collect_julia(parsed.tree.root_node(), parsed, cwd, &mut output),
     }
     output.sort_by(|left, right| {
         left.line
@@ -403,6 +409,155 @@ fn collect_r(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec
         }
     }
     recurse(node, |child| collect_r(child, parsed, cwd, output));
+}
+
+fn collect_ruby(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if node.kind() == "call"
+        && let Some(method) = node.child_by_field_name("method")
+    {
+        let method = node_text(method, parsed);
+        if matches!(method.as_str(), "require" | "require_relative" | "load")
+            && let Some(arguments) = first_named_kind(node, "argument_list")
+            && let Some(string) = descendant_kind(arguments, "string")
+        {
+            let module = unquote(&node_text(string, parsed));
+            let target = if method == "require_relative" {
+                resolve_relative_source(&parsed.path, &module, "rb")
+            } else {
+                None
+            };
+            let (target, label, resolution) = resolved_or_external(target, &module, cwd);
+            output.push(edge(
+                parsed,
+                node,
+                node_text(node, parsed),
+                target,
+                label,
+                resolution,
+            ));
+            return;
+        }
+    }
+    recurse(node, |child| collect_ruby(child, parsed, cwd, output));
+}
+
+fn collect_swift(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if node.kind() == "import_declaration" {
+        let text = node_text(node, parsed);
+        let module = text.strip_prefix("import ").unwrap_or(&text).trim();
+        let (target, label, resolution) = resolved_or_external(None, module, cwd);
+        output.push(edge(parsed, node, text, target, label, resolution));
+        return;
+    }
+    recurse(node, |child| collect_swift(child, parsed, cwd, output));
+}
+
+fn collect_scala(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if node.kind() == "import_declaration" {
+        let text = node_text(node, parsed);
+        let module = text.strip_prefix("import ").unwrap_or(&text).trim();
+        let (target, label, resolution) = resolved_or_external(None, module, cwd);
+        output.push(edge(parsed, node, text, target, label, resolution));
+        return;
+    }
+    recurse(node, |child| collect_scala(child, parsed, cwd, output));
+}
+
+fn collect_dart(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if matches!(
+        node.kind(),
+        "library_import" | "library_export" | "part_directive"
+    ) && let Some(string) = descendant_kind(node, "string_literal")
+    {
+        let module = unquote(&node_text(string, parsed));
+        let target = if module.starts_with("dart:") || module.starts_with("package:") {
+            None
+        } else {
+            resolve_relative_source(&parsed.path, &module, "dart")
+        };
+        let (target, label, resolution) = resolved_or_external(target, &module, cwd);
+        output.push(edge(
+            parsed,
+            node,
+            node_text(node, parsed),
+            target,
+            label,
+            resolution,
+        ));
+        return;
+    }
+    recurse(node, |child| collect_dart(child, parsed, cwd, output));
+}
+
+fn collect_elixir(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if node.kind() == "call"
+        && let Some(target_node) = node.child_by_field_name("target")
+    {
+        let target_name = node_text(target_node, parsed);
+        if matches!(target_name.as_str(), "alias" | "import" | "require" | "use")
+            && let Some(arguments) = first_named_kind(node, "arguments")
+            && let Some(module) = arguments.named_child(0)
+        {
+            let module = node_text(module, parsed);
+            let (target, label, resolution) = resolved_or_external(None, &module, cwd);
+            output.push(edge(
+                parsed,
+                node,
+                node_text(node, parsed),
+                target,
+                label,
+                resolution,
+            ));
+            return;
+        }
+    }
+    recurse(node, |child| collect_elixir(child, parsed, cwd, output));
+}
+
+fn collect_julia(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
+    if matches!(node.kind(), "using_statement" | "import_statement") {
+        let text = node_text(node, parsed);
+        let module = text
+            .split_once(char::is_whitespace)
+            .map_or(text.as_str(), |(_, module)| module)
+            .trim();
+        let (target, label, resolution) = resolved_or_external(None, module, cwd);
+        output.push(edge(parsed, node, text, target, label, resolution));
+        return;
+    }
+    if node.kind() == "call_expression"
+        && let Some(function) = node.named_child(0)
+        && node_text(function, parsed) == "include"
+        && let Some(string) = descendant_kind(node, "string_literal")
+    {
+        let module = unquote(&node_text(string, parsed));
+        let target = resolve_relative_source(&parsed.path, &module, "jl");
+        let (target, label, resolution) = resolved_or_external(target, &module, cwd);
+        output.push(edge(
+            parsed,
+            node,
+            node_text(node, parsed),
+            target,
+            label,
+            resolution,
+        ));
+        return;
+    }
+    recurse(node, |child| collect_julia(child, parsed, cwd, output));
+}
+
+fn resolve_relative_source(path: &Path, module: &str, default_extension: &str) -> Option<PathBuf> {
+    let base = path.parent()?.join(module);
+    if base.is_file() {
+        return Some(base);
+    }
+    if base.extension().is_none() {
+        let with_extension = base.with_extension(default_extension);
+        if with_extension.is_file() {
+            return Some(with_extension);
+        }
+    }
+    None
 }
 
 fn resolve_ecmascript(

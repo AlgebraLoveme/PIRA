@@ -40,6 +40,16 @@ SUPPORTED_SUFFIXES = {
     ".mts",
     ".cts",
     ".cs",
+    ".rb",
+    ".rake",
+    ".gemspec",
+    ".swift",
+    ".scala",
+    ".sc",
+    ".dart",
+    ".ex",
+    ".exs",
+    ".jl",
 }
 HEADER_FIELD = re.compile(r"\b([a-z_]+)=(\d+)")
 

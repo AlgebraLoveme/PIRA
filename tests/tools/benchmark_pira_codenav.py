@@ -350,6 +350,48 @@ def main() -> int:
                 "real/r_dplyr/mutate.R",
             ],
         },
+        "ruby_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/ruby_rails/base.rb",
+            ],
+        },
+        "swift_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/swift_argument_parser/ParsableCommand.swift",
+            ],
+        },
+        "scala_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/scala_cats_effect/IO.scala",
+            ],
+        },
+        "dart_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/dart_http/base_client.dart",
+            ],
+        },
+        "elixir_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/elixir_elixir/access.ex",
+            ],
+        },
+        "julia_outline": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "outline",
+                "real/julia_http/HTTP.jl",
+            ],
+        },
     }
     expected = {
         "python_outline": b"command",
@@ -379,6 +421,12 @@ def main() -> int:
         "lua_outline": b"lsp.start",
         "hcl_outline": b"resource.test_thing.source",
         "r_outline": b"mutate.data.frame",
+        "ruby_outline": b"ActiveRecord::Base",
+        "swift_outline": b"ParsableCommand",
+        "scala_outline": b"class IO",
+        "dart_outline": b"BaseClient",
+        "elixir_outline": b"module Access",
+        "julia_outline": b"module HTTP",
     }
 
     selected_tasks = list(tasks)

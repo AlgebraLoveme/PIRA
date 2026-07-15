@@ -52,6 +52,16 @@ SUPPORTED_SUFFIXES = {
     ".tf",
     ".tfvars",
     ".r",
+    ".rb",
+    ".rake",
+    ".gemspec",
+    ".swift",
+    ".scala",
+    ".sc",
+    ".dart",
+    ".ex",
+    ".exs",
+    ".jl",
 }
 EXPLICIT_LANGUAGE = {
     "synthetic/c_project/include/model.h": "c",
@@ -162,6 +172,36 @@ CURATED = {
         ("synthetic/r_project/helpers.R", "function", "normalize_name"),
         ("synthetic/r_project/helpers.R", "function", "normalize_name.trim"),
         ("synthetic/r_project/helpers.R", "function", "double_value"),
+    },
+    "ruby": {
+        ("synthetic/ruby_project/model.rb", "module", "Demo"),
+        ("synthetic/ruby_project/model.rb", "class", "Demo::User"),
+        ("synthetic/ruby_project/model.rb", "method", "Demo::User.label"),
+    },
+    "swift": {
+        ("synthetic/swift_project/Model.swift", "protocol", "Labelled"),
+        ("synthetic/swift_project/Model.swift", "struct", "User"),
+        ("synthetic/swift_project/Model.swift", "method", "User.render"),
+    },
+    "scala": {
+        ("synthetic/scala_project/Model.scala", "trait", "Labelled"),
+        ("synthetic/scala_project/Model.scala", "class", "User"),
+        ("synthetic/scala_project/Model.scala", "method", "Helpers.normalize"),
+    },
+    "dart": {
+        ("synthetic/dart_project/model.dart", "class", "User"),
+        ("synthetic/dart_project/model.dart", "method", "User.label"),
+        ("synthetic/dart_project/model.dart", "function", "normalize"),
+    },
+    "elixir": {
+        ("synthetic/elixir_project/model.ex", "module", "Demo.User"),
+        ("synthetic/elixir_project/model.ex", "function", "Demo.User.label"),
+        ("synthetic/elixir_project/model.ex", "protocol", "Demo.Labelled"),
+    },
+    "julia": {
+        ("synthetic/julia_project/Model.jl", "module", "Demo"),
+        ("synthetic/julia_project/Model.jl", "struct", "Demo.User"),
+        ("synthetic/julia_project/Model.jl", "function", "Demo.normalize"),
     },
 }
 

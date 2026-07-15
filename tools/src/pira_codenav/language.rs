@@ -24,10 +24,16 @@ pub enum Language {
     Lua,
     Hcl,
     R,
+    Ruby,
+    Swift,
+    Scala,
+    Dart,
+    Elixir,
+    Julia,
 }
 
 impl Language {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 23] = [
         Self::Python,
         Self::Rust,
         Self::Java,
@@ -45,6 +51,12 @@ impl Language {
         Self::Lua,
         Self::Hcl,
         Self::R,
+        Self::Ruby,
+        Self::Swift,
+        Self::Scala,
+        Self::Dart,
+        Self::Elixir,
+        Self::Julia,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -66,6 +78,12 @@ impl Language {
             Self::Lua => "lua",
             Self::Hcl => "hcl",
             Self::R => "r",
+            Self::Ruby => "ruby",
+            Self::Swift => "swift",
+            Self::Scala => "scala",
+            Self::Dart => "dart",
+            Self::Elixir => "elixir",
+            Self::Julia => "julia",
         }
     }
 
@@ -88,6 +106,12 @@ impl Language {
             "lua" => Some(Self::Lua),
             "hcl" | "terraform" | "tf" => Some(Self::Hcl),
             "r" => Some(Self::R),
+            "ruby" | "rb" => Some(Self::Ruby),
+            "swift" => Some(Self::Swift),
+            "scala" => Some(Self::Scala),
+            "dart" => Some(Self::Dart),
+            "elixir" | "ex" | "exs" => Some(Self::Elixir),
+            "julia" | "jl" => Some(Self::Julia),
             _ => None,
         }
     }
@@ -119,6 +143,12 @@ impl Language {
             Self::Lua => tree_sitter_lua::LANGUAGE.into(),
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::R => tree_sitter_r::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Scala => tree_sitter_scala::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
+            Self::Julia => tree_sitter_julia::LANGUAGE.into(),
         }
     }
 
@@ -150,6 +180,12 @@ impl Language {
                 "lua" => Ok(Self::Lua),
                 "hcl" | "tf" | "tfvars" => Ok(Self::Hcl),
                 "r" => Ok(Self::R),
+                "rb" | "rake" | "gemspec" => Ok(Self::Ruby),
+                "swift" => Ok(Self::Swift),
+                "scala" | "sc" => Ok(Self::Scala),
+                "dart" => Ok(Self::Dart),
+                "ex" | "exs" => Ok(Self::Elixir),
+                "jl" => Ok(Self::Julia),
                 "h" => Err(format!(
                     "ambiguous C/C++/CUDA header `{}`; rerun with explicit `c`, `cpp`, or `cuda`",
                     path.display()
@@ -183,6 +219,15 @@ impl Language {
         }
         if first_line.starts_with("#!") && first_line.contains("rscript") {
             return Ok(Self::R);
+        }
+        if first_line.starts_with("#!") && first_line.contains("ruby") {
+            return Ok(Self::Ruby);
+        }
+        if first_line.starts_with("#!") && first_line.contains("elixir") {
+            return Ok(Self::Elixir);
+        }
+        if first_line.starts_with("#!") && first_line.contains("julia") {
+            return Ok(Self::Julia);
         }
         Err(Self::inference_error(path))
     }

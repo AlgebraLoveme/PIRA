@@ -124,6 +124,12 @@ fn collect_symbols(tree: &Tree, language: Language, source: &str) -> Vec<Symbol>
         Language::Lua => walk_lua(tree.root_node(), source, None, 0, true, &mut symbols),
         Language::Hcl => walk_hcl(tree.root_node(), source, None, 0, &mut symbols),
         Language::R => walk_r(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Ruby => walk_ruby(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Swift => walk_swift(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Scala => walk_scala(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Dart => walk_dart(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Elixir => walk_elixir(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Julia => walk_julia(tree.root_node(), source, None, 0, &mut symbols),
     }
     symbols
 }
@@ -1130,6 +1136,527 @@ fn unwrap_r_parentheses(mut node: Node<'_>) -> Node<'_> {
         node = body;
     }
     node
+}
+
+fn walk_ruby(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    if matches!(node.kind(), "module" | "class")
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        let qualified = push_symbol(
+            node,
+            name,
+            source,
+            (parent, "::"),
+            node.kind(),
+            depth,
+            output,
+        );
+        if let Some(body) = node.child_by_field_name("body") {
+            walk_ruby(body, source, Some(&qualified), depth + 1, output);
+        }
+        return;
+    }
+    if matches!(node.kind(), "method" | "singleton_method")
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() {
+                "method"
+            } else {
+                "function"
+            },
+            depth,
+            output,
+        );
+        return;
+    }
+    if parent.is_none()
+        && node.kind() == "assignment"
+        && let Some(name) = node.child_by_field_name("left")
+        && name.kind() == "constant"
+    {
+        push_symbol(node, name, source, (None, "::"), "constant", depth, output);
+        return;
+    }
+    walk_named_children(node, |child| {
+        walk_ruby(child, source, parent, depth, output)
+    });
+}
+
+fn walk_swift(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    let declaration = match node.kind() {
+        "protocol_declaration" => Some(("protocol", node.child_by_field_name("name"))),
+        "class_declaration" => {
+            let head = signature(node, source, node.start_byte());
+            let kind = if head.trim_start().starts_with("extension ") {
+                "extension"
+            } else if head.contains(" enum ") || head.trim_start().starts_with("enum ") {
+                "enum"
+            } else if head.contains(" struct ") || head.trim_start().starts_with("struct ") {
+                "struct"
+            } else if head.contains(" actor ") || head.trim_start().starts_with("actor ") {
+                "actor"
+            } else {
+                "class"
+            };
+            Some((kind, node.child_by_field_name("name")))
+        }
+        "typealias_declaration" => Some(("type", node.child_by_field_name("name"))),
+        _ => None,
+    };
+    if let Some((kind, Some(name))) = declaration {
+        let qualified = push_symbol(node, name, source, (parent, "."), kind, depth, output);
+        walk_named_children(node, |child| {
+            if child != name {
+                walk_swift(child, source, Some(&qualified), depth + 1, output);
+            }
+        });
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "function_declaration" | "protocol_function_declaration"
+    ) && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() {
+                "method"
+            } else {
+                "function"
+            },
+            depth,
+            output,
+        );
+        return;
+    }
+    if matches!(node.kind(), "init_declaration" | "deinit_declaration") {
+        push_symbol_name(
+            node,
+            if node.kind() == "init_declaration" {
+                "init"
+            } else {
+                "deinit"
+            },
+            source,
+            (parent, "."),
+            "method",
+            depth,
+            output,
+        );
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "property_declaration" | "protocol_property_declaration"
+    ) && let Some(container) = node.child_by_field_name("name")
+        && let Some(name) = if container.kind() == "simple_identifier" {
+            Some(container)
+        } else {
+            descendant_with_kind(container, "simple_identifier")
+        }
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() {
+                "property"
+            } else {
+                "binding"
+            },
+            depth,
+            output,
+        );
+        return;
+    }
+    if node.kind() == "enum_entry"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "variant", depth, output);
+        return;
+    }
+    walk_named_children(node, |child| {
+        walk_swift(child, source, parent, depth, output)
+    });
+}
+
+fn walk_scala(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    let kind = match node.kind() {
+        "class_definition" => "class",
+        "trait_definition" => "trait",
+        "object_definition" => "object",
+        "enum_definition" => "enum",
+        _ => "",
+    };
+    if !kind.is_empty()
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        let qualified = push_symbol(node, name, source, (parent, "."), kind, depth, output);
+        walk_named_children(node, |child| {
+            if child != name {
+                walk_scala(child, source, Some(&qualified), depth + 1, output);
+            }
+        });
+        return;
+    }
+    if matches!(node.kind(), "function_definition" | "function_declaration")
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() {
+                "method"
+            } else {
+                "function"
+            },
+            depth,
+            output,
+        );
+        return;
+    }
+    if node.kind() == "type_definition"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "type", depth, output);
+        return;
+    }
+    if matches!(node.kind(), "val_definition" | "var_definition")
+        && let Some(name) = node
+            .child_by_field_name("pattern")
+            .or_else(|| named_child_with_kind(&node, &["identifier"]))
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() { "field" } else { "binding" },
+            depth,
+            output,
+        );
+        return;
+    }
+    if node.kind() == "class_parameter"
+        && parent.is_some()
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "field", depth, output);
+        return;
+    }
+    if matches!(node.kind(), "simple_enum_case" | "class_enum_case")
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "variant", depth, output);
+        return;
+    }
+    walk_named_children(node, |child| {
+        walk_scala(child, source, parent, depth, output)
+    });
+}
+
+fn walk_dart(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    let kind = match node.kind() {
+        "class_declaration" => "class",
+        "enum_declaration" => "enum",
+        "mixin_declaration" => "mixin",
+        "extension_declaration" => "extension",
+        "extension_type_declaration" => "extension-type",
+        _ => "",
+    };
+    if !kind.is_empty()
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        let qualified = push_symbol(node, name, source, (parent, "."), kind, depth, output);
+        walk_named_children(node, |child| {
+            if child != name {
+                walk_dart(child, source, Some(&qualified), depth + 1, output);
+            }
+        });
+        return;
+    }
+    if matches!(
+        node.kind(),
+        "function_declaration" | "getter_declaration" | "setter_declaration"
+    ) && let Some(name) = descendant_with_kind(node, "identifier")
+    {
+        push_symbol(node, name, source, (parent, "."), "function", depth, output);
+        return;
+    }
+    if node.kind() == "method_declaration"
+        && let Some(signature_node) = node
+            .child_by_field_name("signature")
+            .or_else(|| named_child_with_kind(&node, &["method_signature"]))
+        && let Some(name) = descendant_with_kind(signature_node, "identifier")
+    {
+        push_symbol(node, name, source, (parent, "."), "method", depth, output);
+        return;
+    }
+    if matches!(node.kind(), "getter_signature" | "setter_signature")
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "method", depth, output);
+        return;
+    }
+    if node.kind() == "constructor_signature"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            "constructor",
+            depth,
+            output,
+        );
+        return;
+    }
+    if node.kind() == "initialized_identifier"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(
+            node,
+            name,
+            source,
+            (parent, "."),
+            if parent.is_some() { "field" } else { "binding" },
+            depth,
+            output,
+        );
+        return;
+    }
+    if node.kind() == "type_alias"
+        && let Some(name) = named_child_with_kind(&node, &["type_identifier", "identifier"])
+    {
+        push_symbol(node, name, source, (parent, "."), "type", depth, output);
+        return;
+    }
+    if node.kind() == "enum_constant"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (parent, "."), "variant", depth, output);
+        return;
+    }
+    walk_named_children(node, |child| {
+        walk_dart(child, source, parent, depth, output)
+    });
+}
+
+fn walk_elixir(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    if node.kind() == "call"
+        && let Some(target) = node.child_by_field_name("target")
+    {
+        let target_text = one_line(&source_slice(
+            source,
+            target.start_byte(),
+            target.end_byte(),
+        ));
+        if matches!(
+            target_text.as_str(),
+            "defmodule" | "defprotocol" | "defimpl"
+        ) && let Some(arguments) = named_child_with_kind(&node, &["arguments"])
+            && let Some(name) = arguments.named_child(0)
+        {
+            let kind = match target_text.as_str() {
+                "defmodule" => "module",
+                "defprotocol" => "protocol",
+                _ => "implementation",
+            };
+            let qualified = push_symbol(node, name, source, (parent, "."), kind, depth, output);
+            if let Some(body) = named_child_with_kind(&node, &["do_block"]) {
+                walk_elixir(body, source, Some(&qualified), depth + 1, output);
+            }
+            return;
+        }
+        if matches!(
+            target_text.as_str(),
+            "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp"
+        ) && let Some(arguments) = named_child_with_kind(&node, &["arguments"])
+            && let Some(head) = arguments.named_child(0)
+            && let Some(name) = elixir_head_name(head)
+        {
+            push_symbol(
+                node,
+                name,
+                source,
+                (parent, "."),
+                if target_text.contains("macro") {
+                    "macro"
+                } else {
+                    "function"
+                },
+                depth,
+                output,
+            );
+            return;
+        }
+    }
+    walk_named_children(node, |child| {
+        walk_elixir(child, source, parent, depth, output)
+    });
+}
+
+fn elixir_head_name(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "call"
+        && let Some(target) = node.child_by_field_name("target")
+        && target.kind() == "identifier"
+    {
+        return Some(target);
+    }
+    if node.kind() == "identifier" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = elixir_head_name(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn walk_julia(
+    node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut Vec<Symbol>,
+) {
+    if node.kind() == "module_definition"
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        let qualified = push_symbol(node, name, source, (parent, "."), "module", depth, output);
+        walk_named_children(node, |child| {
+            if child != name {
+                walk_julia(child, source, Some(&qualified), depth + 1, output);
+            }
+        });
+        return;
+    }
+    let type_kind = match node.kind() {
+        "struct_definition" => "struct",
+        "abstract_definition" => "abstract-type",
+        "primitive_definition" => "primitive-type",
+        _ => "",
+    };
+    if !type_kind.is_empty()
+        && let Some(head) = named_child_with_kind(&node, &["type_head"])
+        && let Some(name) = descendant_with_kind(head, "identifier")
+    {
+        let qualified = push_symbol(node, name, source, (parent, "."), type_kind, depth, output);
+        if node.kind() == "struct_definition" {
+            walk_named_children(node, |child| {
+                if child.kind() == "typed_expression"
+                    && let Some(field) = named_child_with_kind(&child, &["identifier"])
+                {
+                    push_symbol(
+                        child,
+                        field,
+                        source,
+                        (Some(&qualified), "."),
+                        "field",
+                        depth + 1,
+                        output,
+                    );
+                }
+            });
+        }
+        return;
+    }
+    if node.kind() == "function_definition"
+        && let Some(signature_node) = named_child_with_kind(&node, &["signature"])
+        && let Some(name) = julia_callable_name(signature_node)
+    {
+        push_symbol(node, name, source, (parent, "."), "function", depth, output);
+        return;
+    }
+    if node.kind() == "assignment"
+        && let Some(left) = node.named_child(0)
+        && left.kind() == "call_expression"
+        && let Some(name) = julia_callable_name(left)
+    {
+        push_symbol(node, name, source, (parent, "."), "function", depth, output);
+        return;
+    }
+    if node.kind() == "macro_definition"
+        && let Some(signature_node) = named_child_with_kind(&node, &["signature"])
+        && let Some(name) = julia_callable_name(signature_node)
+    {
+        let text = source_slice(source, name.start_byte(), name.end_byte());
+        push_symbol_name(
+            node,
+            &format!("@{}", one_line(&text)),
+            source,
+            (parent, "."),
+            "macro",
+            depth,
+            output,
+        );
+        return;
+    }
+    walk_named_children(node, |child| {
+        walk_julia(child, source, parent, depth, output)
+    });
+}
+
+fn julia_callable_name(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "call_expression" {
+        return node
+            .named_child(0)
+            .and_then(|function| match function.kind() {
+                "identifier" | "field_expression" => Some(function),
+                _ => julia_callable_name(function),
+            });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = julia_callable_name(child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn descendant_type_name(node: Node<'_>) -> Option<Node<'_>> {
