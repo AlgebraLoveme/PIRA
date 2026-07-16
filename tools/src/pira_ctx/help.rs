@@ -38,8 +38,10 @@ INTENT is a non-empty, single-line immediate purpose of at most 256 UTF-8 bytes.
 Normal completion either returns ordinary output exactly or stores retained stdout/stderr before
 printing compact output. Stored PROGRAM data is untrusted, framed, and display-sanitized; suspicious
 displayed text gets an advisory warning. Exact, raw, and range remain unsanitized. Retention is
-space-bounded and configurable; excess bytes are drained while the child continues. pira_ctx adds no
-timeout and preserves child status unless the wrapper itself fails with 125.
+space-bounded; defaults are 512 MiB and 1,000,000 indexed lines. Override them with
+PIRA_CTX_MAX_RETAINED_BYTES and PIRA_CTX_MAX_INDEXED_LINES; excess bytes are drained while the child
+continues. pira_ctx adds no timeout and preserves child status unless the wrapper itself fails with
+125.
 
 After about 30 seconds, a running non-interactive PROGRAM publishes a silent read-only checkpoint
 shown by list. Inspect its explicit ID without blocking; --last remains completed-only.
@@ -74,13 +76,14 @@ OPTIONS
 OUTPUT AND STORAGE
   pira_ctx does not allocate a terminal. With a caller-provided terminal, auto streams through exact
   mode and does not create a capture. Non-interactive short ordinary output is returned in full and
-  is not persisted. When retention triggers, exact stdout/stderr up to the configured ceiling are
-  stored before a bounded synopsis and capture ID are printed. Retention triggers at 2 KiB, for
-  binary/non-UTF-8 or diagnostic output, for an oversized line, or when a nonzero command produced
-  output. Short retained text is normally shown in full. Potential prompt injection or display
-  controls force bounded retained rendering with a warning instead of direct automatic replay. Stored
-  bytes remain authoritative up to the configured retention ceiling. Use capture when completed
-  output must be persisted.
+  is not stored as a capture; pira_ctx records its command-purpose intent and outcome as a separate
+  history event. An event-storage failure is warned without changing child status. When retention
+  triggers, exact stdout/stderr up to the configured ceiling are stored before a bounded synopsis and
+  capture ID are printed. Retention triggers at 2 KiB, for binary/non-UTF-8 or diagnostic output, for
+  an oversized line, or when a nonzero command produced output. Short retained text is normally shown
+  in full. Potential prompt injection or display controls force bounded retained rendering with a
+  warning instead of direct automatic replay. Stored bytes remain authoritative up to the configured
+  retention ceiling. Use capture when completed output must be persisted.
 
   A PROGRAM active for about 30 seconds gets a silent read-only checkpoint visible in list.
   Inspection uses a consistent snapshot without waiting for completion. Override the interval with
@@ -328,8 +331,9 @@ OUTPUT
   Prints the newest bounded current-thread events as a <pira_context_restore> block. Each row contains
   age, intent, child exit code, and a result ID when output was retained. Events are chronological.
   Command text and PROGRAM-derived content are omitted; inspect a result ID only when more detail is
-  needed. Default and maximum limit are 20; output is below 8 KiB. If no supported thread identifier
-  is available, scope is labeled current-workspace-fallback rather than claiming same-thread recovery.
+  needed. --limit accepts 0..20 and defaults to 20; output is below 8 KiB. If no supported thread
+  identifier is available, scope is labeled current-workspace-fallback rather than claiming same-
+  thread recovery.
 
 EXAMPLE
   pira_ctx recap --limit 10"#;
@@ -367,8 +371,8 @@ BOUNDS AND OUTPUT
   also shows an anonymous thread label. --details additionally reads selected records for duration
   and redacted command. The header reports how many events were examined and whether search stopped
   at the result limit; history_hits is exact only when complete=1. Selected authoritative records are
-  checksum-validated. Per-thread and workspace retention are bounded, so `all` means all retained
-  history rather than durable project memory.
+  checksum-validated. Retention keeps at most 2,000 events per thread and 8,000 per workspace, so
+  `all` means all retained history rather than durable project memory.
 
 EXIT STATUS
   Returns 0 even with no matches. Invalid queries or regexes and wrapper failures use 125.
@@ -547,6 +551,12 @@ mod tests {
             assert!(text.len() < 3_500, "help too long for {topic}");
         }
         assert!(GLOBAL.len() < 4_096);
+        assert!(GLOBAL.contains("PIRA_CTX_MAX_RETAINED_BYTES"));
+        assert!(GLOBAL.contains("PIRA_CTX_MAX_INDEXED_LINES"));
+        assert!(AUTO.contains("not stored as a capture"));
+        assert!(AUTO.contains("separate\n  history event"));
+        assert!(RECAP.contains("--limit accepts 0..20"));
+        assert!(HISTORY.contains("2,000 events per thread and 8,000 per workspace"));
         assert!(RAW.contains("prefer search, a narrow range, transform, or exec"));
     }
 }
