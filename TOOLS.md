@@ -10,7 +10,10 @@
 ## `pira_ctx`
 - Use `pira_ctx` for every shell/exec invocation; invoke `pira_ctx` commands directly.
 - Consult `pira_ctx --help` for command selection and `pira_ctx SUBCOMMAND --help` for exact usage. If `pira_ctx` is unavailable, ask for setup.
-- After same-session context compaction, run `pira_ctx recap` before further shell/exec work.
+- Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose so history and recap remain distinguishable. Do not put secrets, generic wording, or claims of completed success in intents.
+- When uncertain whether relevant work already ran or how it exited—especially before repeating expensive or state-changing work—query bounded `pira_ctx history`. Use explicit workspace scope only when cross-thread operational history is genuinely needed.
+- During a staged source/install upgrade, if the installed help does not yet expose `history`, use its documented read-only intent-event lookup rather than replacing the binary mid-thread.
+- After the platform reports context compaction of the continuing thread, run `pira_ctx recap` before further substantive shell/exec work. Do not use recap merely because time passed or a new or temporary thread started.
 
 ## Error Fighting
 - On errors, first analyze the message and pattern, then locate the root cause before fixing. For repeated or unfamiliar errors, search online before the next fix attempt.

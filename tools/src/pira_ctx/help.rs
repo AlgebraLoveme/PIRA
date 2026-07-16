@@ -18,8 +18,8 @@ Choosing a command:
                Prefer the targeted commands above for agent analysis.
 
   Continue or maintain:
-    recap      Restore recent execution context after same-session compaction.
-    intents    Search current-workspace intent history within explicit bounds.
+    history    Review current-thread command-purpose events; workspace scope is explicit.
+    recap      Restore recent current-thread events after platform-reported compaction.
     stats      Inspect workspace totals or capture metadata.
     verify     Check capture integrity.
     list       Find stored captures.
@@ -44,9 +44,10 @@ timeout and preserves child status unless the wrapper itself fails with 125.
 After about 30 seconds, a running non-interactive PROGRAM publishes a silent read-only checkpoint
 shown by list. Inspect its explicit ID without blocking; --last remains completed-only.
 
-Scope: --last, recap, intents, stats without RESULT, and `forget events` use the current workspace
-(nearest Git root, otherwise current directory). list and prune cover all workspaces in the selected
-store unless an option narrows them. An explicit RESULT path bypasses store lookup. The store comes
+Scope: workspace identity is the nearest Git root, otherwise current directory. --last and capture
+operations use that workspace. history, recap, stats without RESULT, and `forget history`
+additionally use an automatically detected thread scope when available. list and prune cover all
+workspaces in the selected store unless an option narrows them. An explicit RESULT path bypasses store lookup. The store comes
 from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
 
 SUBCOMMAND is a pira_ctx operation such as search, transform, exec, or raw. PROGRAM is the external
@@ -313,53 +314,71 @@ EXAMPLES
   pira_ctx exec --last --intent "Count failures" --code 'print(MSG.count("FAILED"))'
   pira_ctx exec RESULT --intent "Extract errors" --file analysis.py"#;
 
-const RECAP: &str = r#"pira_ctx recap — restore recent same-session execution context after compaction
+const RECAP: &str = r#"pira_ctx recap — restore recent same-thread command events after compaction
 
 WHEN TO USE
-  Run immediately after model context compaction before further substantive shell/exec work. It is
-  not intended to reconstruct a separate new session.
+  Run only after the platform reports compaction of the continuing thread and before further
+  substantive shell/exec work. Do not use for a new or temporary thread. Recap covers only commands
+  routed through pira_ctx; verify live state when that distinction matters.
 
 USAGE
   pira_ctx recap [--store-dir PATH] [--limit N]
 
 OUTPUT
-  Prints a bounded <pira_context_restore> block containing only selected intents, child exit codes,
-  and result IDs when output was retained. Events are chronological within the selection. Command
-  text, duration, capture-size prose, and PROGRAM-derived paths are intentionally omitted; inspect a
-  result ID only when more detail is needed. Default and maximum limit are 20; total output is below
-  8 KiB. Recap reads event hints and does not rerun commands.
+  Prints the newest bounded current-thread events as a <pira_context_restore> block. Each row contains
+  age, intent, child exit code, and a result ID when output was retained. Events are chronological.
+  Command text and PROGRAM-derived content are omitted; inspect a result ID only when more detail is
+  needed. Default and maximum limit are 20; output is below 8 KiB. If no supported thread identifier
+  is available, scope is labeled current-workspace-fallback rather than claiming same-thread recovery.
 
 EXAMPLE
   pira_ctx recap --limit 10"#;
 
-const INTENTS: &str = r#"pira_ctx intents — search bounded current-workspace intent history
+const HISTORY: &str = r#"pira_ctx history — review bounded command-purpose event history
 
 WHEN TO USE
-  Use to find earlier command events by their agent-supplied intent without reading capture content.
-  Use recap instead to reconstruct a compact selection after same-session compaction. `intent-search`
-  is an alias.
+  Use when uncertain which command purposes were attempted or how they exited, especially before
+  repeating expensive or state-changing work. With QUERY, only matching agent-supplied intents are
+  shown. Use recap only after platform-reported compaction of the continuing thread. Keep durable
+  project state, decisions, validated results, and reusable lessons in AGENT_WORKBOOK.md.
 
 USAGE
-  pira_ctx intents [--store-dir PATH] QUERY [--regex] [--scan N] [--limit N]
+  pira_ctx history [--store-dir PATH] [QUERY] [--regex] [--scope current|workspace]
+                   [--since TIME] [--until TIME] [--offset N]
+                   [--lookback N|all] [--limit N] [--details]
 
 MATCHING AND SCOPE
-  Literal matching is Unicode case-insensitive. --regex uses Rust regex syntax and is case-sensitive
-  unless the pattern requests otherwise. Only intent fields are searched. The current workspace is
-  always used; command text and PROGRAM output are not searched.
+  Without QUERY, newest events are shown. Literal QUERY matching lowercases Unicode text before
+  substring comparison; it is not fuzzy, normalized, or semantic search. --regex uses Rust regex
+  syntax and is case-sensitive unless the pattern requests otherwise. Filters inspect only intent.
+  --scope current is the default and uses PIRA_CTX_THREAD_ID, then CODEX_THREAD_ID, without storing
+  either raw value. With neither, it uses a labeled workspace-local unscoped fallback that cannot
+  guarantee thread isolation. --scope workspace explicitly merges anonymous thread catalogs.
 
 BOUNDS AND OUTPUT
-  --scan N examines at most the newest N event files (default 500, range 1..2000). --limit N prints
-  at most the newest N matching events (default 20, range 0..100). The first line reports matches in
-  the scanned scope, successfully read events, displayed rows, scope, and ordering. Rows contain the
-  exit status, optional result ID, and terminal-sanitized intent. Event history itself is capped at
-  2000 files per workspace, so this is not an unbounded audit log.
+  Search covers all retained events by default and always returns a bounded result. --limit N stops
+  after the newest N matches (default 10, range 1..100). --since TIME includes events at or after its
+  bound; --until TIME excludes events at or after its bound. TIME is RFC 3339, `now`, or an age such
+  as 30m, 24h, or 7d. --offset N skips the newest N events inside the time window before matching;
+  --lookback N examines only the next N events, while --lookback all is the default. Number bounds are
+  applied before QUERY. N is at most 8000.
+
+  Rows contain age, exit status, optional result ID, and terminal-sanitized intent; workspace scope
+  also shows an anonymous thread label. --details additionally reads selected records for duration
+  and redacted command. The header reports how many events were examined and whether search stopped
+  at the result limit; history_hits is exact only when complete=1. Selected authoritative records are
+  checksum-validated. Per-thread and workspace retention are bounded, so `all` means all retained
+  history rather than durable project memory.
 
 EXIT STATUS
   Returns 0 even with no matches. Invalid queries or regexes and wrapper failures use 125.
 
 EXAMPLES
-  pira_ctx intents 'C sharp parser' --scan 300 --limit 10
-  pira_ctx intent-search 'build|test' --regex --limit 5"#;
+  pira_ctx history --limit 10
+  pira_ctx history build --since 2026-07-14T00:00:00+08:00 --until 2026-07-15T00:00:00+08:00
+  pira_ctx history parser --scope workspace --offset 2000 --limit 10
+  pira_ctx history 'C sharp parser' --lookback 300 --limit 10
+  pira_ctx history 'build|test' --regex --scope workspace --details --limit 5"#;
 
 const STATS: &str = r#"pira_ctx stats — show workspace totals or capture metadata
 
@@ -367,8 +386,8 @@ USAGE
   pira_ctx stats [--store-dir PATH] [RESULT]
 
 OUTPUT
-  Without RESULT, prints current-workspace capture count, captured bytes, event count, and workspace
-  hash. With RESULT, prints command, cwd, state, status, duration, stream sizes/lines, store path,
+  Without RESULT, prints current-workspace capture totals, current-thread event count and scope,
+  ignored legacy-event count, and workspace hash. With RESULT, prints command, cwd, state, status, duration, stream sizes/lines, store path,
   format, and index state. Binary/non-UTF-8 flags appear only when active; detected paths and suggested
   keywords appear only when nonempty. It does not print captured content. A running result reports
   unknown exit status, checkpoint generation, and age.
@@ -408,35 +427,38 @@ EXAMPLE
 const PRUNE: &str = r#"pira_ctx prune — enforce capture age or total-storage limits
 
 USAGE
-  pira_ctx prune [--store-dir PATH] [--max-age-days N] [--max-store-bytes N]
+  pira_ctx prune [--store-dir PATH] [--max-age-days N] [--max-store-bytes N] [--legacy-events]
 
 BEHAVIOR
-  At least one limit is required. prune covers every workspace in the selected store and skips
+  At least one limit or --legacy-events is required. prune covers every workspace in the selected store and skips
   running checkpoints. Completed captures whose
   start time is strictly older than N*24 hours are removed first; if remaining capture-container file
   bytes exceed the limit, oldest captures are removed until within budget. Age pruning also removes
-  old event files across the store. Prints removed and remaining capture-file counts/bytes. Deletion
+  old PIRAEVT1 records across the store. --legacy-events explicitly removes ignored pre-1.0 JSON
+  ledgers; they are otherwise preserved. Prints removed and remaining capture-file counts/bytes. Deletion
   is immediate; use list or stats before pruning when the scope needs inspection.
 
 EXAMPLE
   pira_ctx prune --max-age-days 30 --max-store-bytes 1073741824"#;
 
-const FORGET: &str = r#"pira_ctx forget — remove one capture or current-workspace event history
+const FORGET: &str = r#"pira_ctx forget — remove one capture or bounded operational history
 
 USAGE
   pira_ctx forget [--store-dir PATH] RESULT
-  pira_ctx forget [--store-dir PATH] events
+  pira_ctx forget [--store-dir PATH] history [--scope current|workspace]
 
 BEHAVIOR
   RESULT resolves using normal ID/prefix/filename/path rules. An explicit path bypasses store lookup
   and may identify a valid capture outside --store-dir. The target must pass capture structure and
-  integrity verification before removal. Running captures are rejected. `events` is reserved here and removes only recap event
-  files for the current workspace, not captures. Deletion is immediate; this operation is not
+  integrity verification before removal. Running captures are rejected. `history` removes only event
+  records: current automatically detected thread by default, or every thread in the current workspace
+  with explicit --scope workspace. Captures and ignored pre-1.0 JSON events are unaffected. Deletion is immediate and not
   transactional across filesystem failures. The removed path or event count is printed.
 
 EXAMPLES
   pira_ctx forget 20260712-052432
-  pira_ctx forget events"#;
+  pira_ctx forget history
+  pira_ctx forget history --scope workspace"#;
 
 const VERSION: &str = r#"pira_ctx version — print the installed pira_ctx version
 
@@ -460,7 +482,7 @@ pub fn canonical_topic(topic: &str) -> Option<&'static str> {
         "transform" => "transform",
         "exec" => "exec",
         "recap" => "recap",
-        "intents" | "intent-search" => "intents",
+        "history" => "history",
         "stats" => "stats",
         "verify" => "verify",
         "list" => "list",
@@ -484,7 +506,7 @@ pub fn command(topic: &str) -> Option<&'static str> {
         "transform" => TRANSFORM,
         "exec" => EXEC,
         "recap" => RECAP,
-        "intents" => INTENTS,
+        "history" => HISTORY,
         "stats" => STATS,
         "verify" => VERIFY,
         "list" => LIST,
@@ -513,7 +535,7 @@ mod tests {
             "exec",
             "raw",
             "recap",
-            "intents",
+            "history",
             "stats",
             "verify",
             "list",

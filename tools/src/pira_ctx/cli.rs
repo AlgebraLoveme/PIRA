@@ -8,8 +8,8 @@ pub const MAX_KEYWORD_BYTES: usize = 256;
 pub const MAX_SEARCH_CONTEXT: usize = 20;
 pub const MAX_QUERY_BYTES: usize = 4096;
 pub const MAX_TRANSFORM_PATTERNS: usize = 16;
-pub const MAX_INTENT_SEARCH_RESULTS: usize = 100;
-pub const MAX_INTENT_SEARCH_SCAN: usize = 2000;
+pub const MAX_HISTORY_RESULTS: usize = 100;
+pub const MAX_HISTORY_WINDOW: usize = 8_000;
 pub const MAX_RECAP_EVENTS: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum Mode {
     Exec,
     Transform,
     Recap,
-    Intents,
+    History,
     Batch,
     List,
     Stats,
@@ -39,6 +39,12 @@ pub enum Mode {
 pub enum RawStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    Current,
+    Workspace,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -62,6 +68,8 @@ pub struct Config {
     pub target: Option<String>,
     pub query: Option<String>,
     pub regex: bool,
+    pub history_scope: HistoryScope,
+    pub history_details: bool,
     pub context: usize,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
@@ -72,9 +80,13 @@ pub struct Config {
     pub python: Option<String>,
     pub max_age_days: Option<u64>,
     pub max_store_bytes: Option<u64>,
+    pub prune_legacy_events: bool,
     pub transform: TransformOptions,
     pub limit: usize,
-    pub scan: usize,
+    pub history_lookback: Option<usize>,
+    pub history_offset: usize,
+    pub history_since: Option<String>,
+    pub history_until: Option<String>,
     pub batch_file: Option<PathBuf>,
     pub help_topic: Option<String>,
 }
@@ -90,6 +102,8 @@ impl Default for Config {
             target: None,
             query: None,
             regex: false,
+            history_scope: HistoryScope::Current,
+            history_details: false,
             context: 0,
             start_line: None,
             end_line: None,
@@ -100,9 +114,13 @@ impl Default for Config {
             python: None,
             max_age_days: None,
             max_store_bytes: None,
+            prune_legacy_events: false,
             transform: TransformOptions::default(),
             limit: 20,
-            scan: 500,
+            history_lookback: None,
+            history_offset: 0,
+            history_since: None,
+            history_until: None,
             batch_file: None,
             help_topic: None,
         }
@@ -188,7 +206,7 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
                 return Err(format!("recap --limit is capped at {MAX_RECAP_EVENTS}"));
             }
         }
-        "intents" | "intent-search" => parse_intents(&mut c, args)?,
+        "history" => parse_history(&mut c, args)?,
         "batch" => {
             c.mode = Mode::Batch;
             let mut p = parse_store(&mut c, args, 1)?;
@@ -242,11 +260,20 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
         "prune" => parse_prune(&mut c, args)?,
         "forget" => {
             c.mode = Mode::Forget;
-            let p = parse_store(&mut c, args, 1)?;
-            if p + 1 != args.len() {
-                return Err(USAGE.into());
+            let mut p = parse_store(&mut c, args, 1)?;
+            c.target = Some(take(args, &mut p, "RESULT|history")?.into());
+            while p < args.len() {
+                match args[p].as_str() {
+                    "--scope" => {
+                        p += 1;
+                        c.history_scope = parse_history_scope(take(args, &mut p, "--scope")?)?;
+                    }
+                    _ => return Err(USAGE.into()),
+                }
             }
-            c.target = Some(args[p].clone());
+            if c.target.as_deref() != Some("history") && c.history_scope != HistoryScope::Current {
+                return Err("forget --scope is valid only with history".into());
+            }
         }
         _ => {
             let p = parse_exec_options(&mut c, args, 0, true)?;
@@ -490,10 +517,10 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_intents(c: &mut Config, args: &[String]) -> Result<(), String> {
-    c.mode = Mode::Intents;
+fn parse_history(c: &mut Config, args: &[String]) -> Result<(), String> {
+    c.mode = Mode::History;
+    c.limit = 10;
     let mut p = parse_store(c, args, 1)?;
-    c.query = Some(take(args, &mut p, "QUERY")?.into());
     while p < args.len() {
         match args[p].as_str() {
             "--regex" => {
@@ -504,30 +531,95 @@ fn parse_intents(c: &mut Config, args: &[String]) -> Result<(), String> {
                 p += 1;
                 c.limit = parse_value(args, &mut p, "--limit")?;
             }
-            "--scan" => {
+            "--lookback" => {
                 p += 1;
-                c.scan = parse_value(args, &mut p, "--scan")?;
+                let value = take(args, &mut p, "--lookback")?;
+                c.history_lookback = if value == "all" {
+                    None
+                } else {
+                    Some(parse_bounded_usize(value, "--lookback")?)
+                };
+            }
+            "--offset" => {
+                p += 1;
+                c.history_offset = parse_value(args, &mut p, "--offset")?;
+            }
+            "--since" => {
+                p += 1;
+                c.history_since = Some(take(args, &mut p, "--since")?.into());
+            }
+            "--until" => {
+                p += 1;
+                c.history_until = Some(take(args, &mut p, "--until")?.into());
+            }
+            "--scope" => {
+                p += 1;
+                c.history_scope = parse_history_scope(take(args, &mut p, "--scope")?)?;
+            }
+            "--details" => {
+                c.history_details = true;
+                p += 1;
+            }
+            value if !value.starts_with("--") && c.query.is_none() => {
+                c.query = Some(take(args, &mut p, "QUERY")?.into());
             }
             _ => return Err(USAGE.into()),
         }
     }
-    let query = c.query.as_deref().unwrap_or_default();
-    if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control) {
+    if let Some(query) = c.query.as_deref() {
+        if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "history query must be non-empty, single-line, and at most {MAX_QUERY_BYTES} UTF-8 bytes"
+            ));
+        }
+    } else if c.regex {
+        return Err("history --regex requires QUERY".into());
+    }
+    if c.limit == 0 || c.limit > MAX_HISTORY_RESULTS {
         return Err(format!(
-            "intent query must be non-empty, single-line, and at most {MAX_QUERY_BYTES} UTF-8 bytes"
+            "history --limit must be between 1 and {MAX_HISTORY_RESULTS}"
         ));
     }
-    if c.limit > MAX_INTENT_SEARCH_RESULTS {
+    if c.history_lookback
+        .is_some_and(|value| value == 0 || value > MAX_HISTORY_WINDOW)
+    {
         return Err(format!(
-            "intents --limit is capped at {MAX_INTENT_SEARCH_RESULTS}"
+            "history --lookback must be all or between 1 and {MAX_HISTORY_WINDOW}"
         ));
     }
-    if c.scan == 0 || c.scan > MAX_INTENT_SEARCH_SCAN {
+    if c.history_offset > MAX_HISTORY_WINDOW {
         return Err(format!(
-            "intents --scan must be between 1 and {MAX_INTENT_SEARCH_SCAN}"
+            "history --offset must be between 0 and {MAX_HISTORY_WINDOW}"
         ));
+    }
+    for (name, value) in [
+        ("--since", c.history_since.as_deref()),
+        ("--until", c.history_until.as_deref()),
+    ] {
+        if value.is_some_and(|value| {
+            value.is_empty() || value.len() > 64 || value.chars().any(char::is_control)
+        }) {
+            return Err(format!(
+                "history {name} must be non-empty, single-line, and at most 64 UTF-8 bytes"
+            ));
+        }
     }
     Ok(())
+}
+
+fn parse_bounded_usize(value: &str, name: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{name} requires a non-negative integer or `all`"))
+}
+
+fn parse_history_scope(value: &str) -> Result<HistoryScope, String> {
+    match value {
+        "current" => Ok(HistoryScope::Current),
+        "workspace" => Ok(HistoryScope::Workspace),
+        _ => Err("--scope must be current or workspace".into()),
+    }
 }
 fn parse_raw(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Raw;
@@ -623,10 +715,14 @@ fn parse_prune(c: &mut Config, args: &[String]) -> Result<(), String> {
                 p += 1;
                 c.max_store_bytes = Some(parse_value(args, &mut p, "--max-store-bytes")?)
             }
+            "--legacy-events" => {
+                c.prune_legacy_events = true;
+                p += 1;
+            }
             _ => return Err(USAGE.into()),
         }
     }
-    if c.max_age_days.is_none() && c.max_store_bytes.is_none() {
+    if c.max_age_days.is_none() && c.max_store_bytes.is_none() && !c.prune_legacy_events {
         return Err("prune requires a limit".into());
     }
     Ok(())
@@ -789,29 +885,60 @@ mod tests {
     }
 
     #[test]
-    fn intent_search_has_explicit_scan_and_result_bounds() {
+    fn history_has_optional_filter_and_explicit_bounds() {
         let config = parse_args(&a(&[
-            "intents",
+            "history",
             "parser|build",
             "--regex",
-            "--scan",
+            "--lookback",
             "750",
             "--limit",
             "12",
         ]))
         .unwrap();
-        assert_eq!(config.mode, Mode::Intents);
+        assert_eq!(config.mode, Mode::History);
         assert_eq!(config.query.as_deref(), Some("parser|build"));
         assert!(config.regex);
-        assert_eq!(config.scan, 750);
+        assert_eq!(config.history_lookback, Some(750));
         assert_eq!(config.limit, 12);
-        assert_eq!(
-            parse_args(&a(&["intent-search", "parser"])).unwrap().mode,
-            Mode::Intents
-        );
-        assert!(parse_args(&a(&["intents", "parser", "--scan", "0"])).is_err());
-        assert!(parse_args(&a(&["intents", "parser", "--scan", "2001"])).is_err());
-        assert!(parse_args(&a(&["intents", "parser", "--limit", "101"])).is_err());
+        let recent = parse_args(&a(&["history", "--limit", "5"])).unwrap();
+        assert_eq!(recent.mode, Mode::History);
+        assert_eq!(recent.query, None);
+        assert_eq!(recent.limit, 5);
+        assert_eq!(recent.history_lookback, None);
+        let all = parse_args(&a(&[
+            "history",
+            "parser",
+            "--lookback",
+            "all",
+            "--offset",
+            "2000",
+            "--since",
+            "48h",
+            "--until",
+            "24h",
+        ]))
+        .unwrap();
+        assert_eq!(all.limit, 10);
+        assert_eq!(all.history_lookback, None);
+        assert_eq!(all.history_offset, 2000);
+        assert_eq!(all.history_since.as_deref(), Some("48h"));
+        assert_eq!(all.history_until.as_deref(), Some("24h"));
+        assert_eq!(config.history_scope, HistoryScope::Current);
+        let workspace = parse_args(&a(&["history", "--scope", "workspace", "--details"])).unwrap();
+        assert_eq!(workspace.history_scope, HistoryScope::Workspace);
+        assert!(workspace.history_details);
+        let reordered = parse_args(&a(&["history", "--scope", "workspace", "parser"])).unwrap();
+        assert_eq!(reordered.query.as_deref(), Some("parser"));
+        assert_eq!(reordered.history_scope, HistoryScope::Workspace);
+        assert!(parse_args(&a(&["intents", "parser"])).is_err());
+        assert!(parse_args(&a(&["intent-search", "parser"])).is_err());
+        assert!(parse_args(&a(&["history", "--regex"])).is_err());
+        assert!(parse_args(&a(&["history", "parser", "--lookback", "0"])).is_err());
+        assert!(parse_args(&a(&["history", "parser", "--lookback", "8001"])).is_err());
+        assert!(parse_args(&a(&["history", "parser", "--offset", "8001"])).is_err());
+        assert!(parse_args(&a(&["history", "parser", "--limit", "0"])).is_err());
+        assert!(parse_args(&a(&["history", "parser", "--limit", "101"])).is_err());
     }
 
     #[test]

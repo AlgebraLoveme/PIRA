@@ -13,9 +13,9 @@ mod util;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
-use cli::{Config, Mode, RawStream};
+use cli::{Config, HistoryScope, Mode, RawStream};
 use model::{CaptureResult, ListedEntry, Metadata, StreamKind};
 use storage::{StoredResult, effective_store_dir};
 
@@ -63,7 +63,7 @@ fn real_main() -> Result<i32, String> {
         Mode::Exec => run_python_exec(&config),
         Mode::Transform => run_transform(&config),
         Mode::Recap => run_recap(&config),
-        Mode::Intents => run_intents(&config),
+        Mode::History => run_history(&config),
         Mode::Batch => run_batch(&config),
         Mode::List => run_list(&config),
         Mode::Stats => run_stats(&config),
@@ -94,13 +94,13 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
     if !should_capture(&capture) {
         let replay_risk = inspect_capture_for_context(&capture)?;
         if replay_risk == security::ContentRisk::default() {
-            replay_capture(&capture)?;
             record_event(
                 &analysis_config,
                 capture.exit_code,
                 capture.duration_ms,
                 None,
             );
+            replay_capture(&capture)?;
             return Ok(capture.exit_code);
         }
     }
@@ -128,6 +128,12 @@ fn run_exact(config: &Config) -> Result<i32, String> {
         summarize::score_timeline(&mut capture, &ranking)?;
         let store_dir = effective_store_dir(config.store_dir.as_ref())?;
         let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
+        record_event(
+            config,
+            capture.exit_code,
+            capture.duration_ms,
+            Some(&stored.metadata),
+        );
         if capture.retention_truncated {
             util::stdout_line(&format!(
                 "Auto-switched exact -> retained report: kept {} of {} observed bytes after the output-space ceiling was reached.",
@@ -147,15 +153,9 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             ))?;
         }
         print_summary(&stored.metadata, &capture)?;
-        record_event(
-            config,
-            capture.exit_code,
-            capture.duration_ms,
-            Some(&stored.metadata),
-        );
     } else {
-        replay_capture(&capture)?;
         record_event(config, capture.exit_code, capture.duration_ms, None);
+        replay_capture(&capture)?;
     }
     Ok(capture.exit_code)
 }
@@ -174,18 +174,18 @@ fn run_streaming_exact(config: &Config) -> Result<i32, String> {
             Ok(code)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            eprintln!("pira_ctx: command not found: {}", cmd[0]);
             let duration = start.elapsed().as_millis();
             record_event(config, 127, duration, None);
+            eprintln!("pira_ctx: command not found: {}", cmd[0]);
             Ok(127)
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let duration = start.elapsed().as_millis();
+            record_event(config, 126, duration, None);
             eprintln!(
                 "pira_ctx: command not executable/permission denied: {}",
                 cmd[0]
             );
-            let duration = start.elapsed().as_millis();
-            record_event(config, 126, duration, None);
             Ok(126)
         }
         Err(error) => Err(format!("failed to spawn {}: {error}", cmd[0])),
@@ -285,8 +285,8 @@ fn run_auto(config: &Config) -> Result<i32, String> {
         inspect_capture_for_context(&capture)?
     };
     if !normally_captured && replay_risk == security::ContentRisk::default() {
-        replay_capture(&capture)?;
         record_event(config, capture.exit_code, capture.duration_ms, None);
+        replay_capture(&capture)?;
         return Ok(capture.exit_code);
     }
     let compact = capture.total_bytes() < AUTO_SUMMARY_THRESHOLD
@@ -319,11 +319,11 @@ fn run_check(config: &Config) -> Result<i32, String> {
     let mut capture = match capture_program(config, &config.cmd)? {
         Ok(capture) => capture,
         Err(code) => {
+            record_event(config, code, 0, None);
             util::stdout_line(&format!(
                 "{} | exit={code} | duration=0ms | result=-",
                 check_label(code)
             ))?;
-            record_event(config, code, 0, None);
             return Ok(code);
         }
     };
@@ -339,6 +339,12 @@ fn run_check(config: &Config) -> Result<i32, String> {
     } else {
         String::new()
     };
+    record_event(
+        config,
+        capture.exit_code,
+        capture.duration_ms,
+        Some(&stored.metadata),
+    );
     util::stdout_line(&format!(
         "{} | exit={} | duration={}ms | result={}{}",
         check_label(capture.exit_code),
@@ -347,12 +353,6 @@ fn run_check(config: &Config) -> Result<i32, String> {
         stored.metadata.result_id,
         retention
     ))?;
-    record_event(
-        config,
-        capture.exit_code,
-        capture.duration_ms,
-        Some(&stored.metadata),
-    );
     Ok(capture.exit_code)
 }
 
@@ -413,17 +413,17 @@ fn store_and_summarize(
 ) -> Result<i32, String> {
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let stored = storage::store_capture(&store_dir, &config.cmd, &ranking_terms(config), capture)?;
-    if compact {
-        print_compact_summary(&stored.metadata, capture)?;
-    } else {
-        print_summary(&stored.metadata, capture)?;
-    }
     record_event(
         config,
         capture.exit_code,
         capture.duration_ms,
         Some(&stored.metadata),
     );
+    if compact {
+        print_compact_summary(&stored.metadata, capture)?;
+    } else {
+        print_summary(&stored.metadata, capture)?;
+    }
     Ok(capture.exit_code)
 }
 
@@ -932,11 +932,14 @@ fn run_stats(config: &Config) -> Result<i32, String> {
         let workspace = storage::current_workspace_hash()?;
         let entries = storage::scan_store(&dir, Some(&workspace))?;
         let bytes: u64 = entries.iter().map(|e| e.bytes).sum();
-        let events = events::read_current(&dir, usize::MAX)?.len();
+        let history = events::read_current(&dir, usize::MAX)?;
+        let legacy_events = events::legacy_count(&dir);
         util::stdout_line(&format!("Workspace: {workspace}"))?;
         util::stdout_line(&format!("Captures: {}", entries.len()))?;
         util::stdout_line(&format!("CapturedBytes: {bytes}"))?;
-        util::stdout_line(&format!("Events: {events}"))?;
+        util::stdout_line(&format!("Events: {}", history.events.len()))?;
+        util::stdout_line(&format!("EventsScope: {}", history.scope_label))?;
+        util::stdout_line(&format!("LegacyEventsIgnored: {legacy_events}"))?;
         return Ok(0);
     }
     let store = open_target(config)?;
@@ -1068,11 +1071,17 @@ fn run_prune(config: &Config) -> Result<i32, String> {
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let result = storage::prune_store(&store_dir, config.max_age_days, config.max_store_bytes)?;
     let event_files = events::prune(&store_dir, config.max_age_days)?;
+    let legacy_events = if config.prune_legacy_events {
+        events::prune_legacy(&store_dir)?
+    } else {
+        0
+    };
     util::stdout_line(&format!(
-        "Pruned: files={} bytes={} events={}; remaining_files={} remaining_bytes={}",
+        "Pruned: files={} bytes={} events={} legacy_events={}; remaining_files={} remaining_bytes={}",
         result.removed_files,
         result.removed_bytes,
         event_files,
+        legacy_events,
         result.remaining_files,
         result.remaining_bytes
     ))?;
@@ -1098,27 +1107,42 @@ fn run_transform(config: &Config) -> Result<i32, String> {
 
 fn run_recap(config: &Config) -> Result<i32, String> {
     let dir = effective_store_dir(config.store_dir.as_ref())?;
+    let history = events::read_current(
+        &dir,
+        config
+            .limit
+            .saturating_mul(5)
+            .clamp(100, cli::MAX_HISTORY_WINDOW),
+    )?;
     if config.limit == 0 {
-        util::stdout_line("<pira_context_restore scope=\"current-workspace\" selected=\"0\" />")?;
+        util::stdout_line(&format!(
+            "<pira_context_restore scope=\"{}\" selected=\"0\" />",
+            history.scope_label
+        ))?;
         return Ok(0);
     }
-    let candidates = events::read_current(&dir, config.limit.saturating_mul(5).clamp(100, 2000))?;
-    let events = events::select_recap(&candidates, config.limit);
+    let selected = events::select_recap(&history.events, config.limit);
     let mut output = util::BoundedStdout::new(8 * 1024 - 32);
-    if events.is_empty() {
-        output.line("<pira_context_restore scope=\"current-workspace\" selected=\"0\" />")?;
+    if selected.is_empty() {
+        output.line(&format!(
+            "<pira_context_restore scope=\"{}\" selected=\"0\" skipped=\"{}\" />",
+            history.scope_label, history.skipped
+        ))?;
         return Ok(0);
     }
     output.line(&format!(
-        "<pira_context_restore scope=\"current-workspace\" selected=\"{}\" order=\"oldest-first\">",
-        events.len()
+        "<pira_context_restore scope=\"{}\" selected=\"{}\" skipped=\"{}\" order=\"oldest-first\">",
+        history.scope_label,
+        selected.len(),
+        history.skipped
     ))?;
-    for event in events {
+    for event in selected {
         let result = event.capture_id.as_deref().map_or_else(String::new, |id| {
             format!(" result={}", util::xml_field(id, 128))
         });
         output.line(&format!(
-            "- exit={}{} intent={}",
+            "- age={} exit={}{} intent={}",
+            event_age(event.timestamp_ms),
             event.exit_code,
             result,
             util::xml_field(&event.intent, 256)
@@ -1128,50 +1152,184 @@ fn run_recap(config: &Config) -> Result<i32, String> {
     Ok(0)
 }
 
-fn run_intents(config: &Config) -> Result<i32, String> {
+fn run_history(config: &Config) -> Result<i32, String> {
     let dir = effective_store_dir(config.store_dir.as_ref())?;
-    let query = config
-        .query
-        .as_deref()
-        .ok_or_else(|| cli::USAGE.to_string())?;
     let regex = if config.regex {
+        let query = config
+            .query
+            .as_deref()
+            .ok_or_else(|| "history --regex requires QUERY".to_string())?;
         Some(regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?)
     } else {
         None
     };
-    let query_lower = query.to_lowercase();
-    let candidates = events::read_current(&dir, config.scan)?;
-    let scanned = candidates.len();
-    let mut total_hits = 0_usize;
-    let mut hits = Vec::with_capacity(config.limit.min(scanned));
-    for event in candidates.into_iter().rev() {
-        let matched = regex.as_ref().map_or_else(
-            || event.intent.to_lowercase().contains(&query_lower),
-            |regex| regex.is_match(&event.intent),
-        );
-        if !matched {
-            continue;
-        }
-        total_hits += 1;
-        if hits.len() < config.limit {
-            hits.push(event);
-        }
+    let query_lower = config.query.as_deref().map(str::to_lowercase);
+    let now_ms = util::millis(SystemTime::now()).min(u128::from(u64::MAX)) as u64;
+    let since_ms = config
+        .history_since
+        .as_deref()
+        .map(|value| parse_history_time(value, now_ms))
+        .transpose()?;
+    let until_ms = config
+        .history_until
+        .as_deref()
+        .map(|value| parse_history_time(value, now_ms))
+        .transpose()?;
+    if since_ms
+        .zip(until_ms)
+        .is_some_and(|(since, until)| since >= until)
+    {
+        return Err("history --since must be earlier than --until".into());
     }
+    let choice = match config.history_scope {
+        HistoryScope::Current => events::ScopeChoice::Current,
+        HistoryScope::Workspace => events::ScopeChoice::Workspace,
+    };
+    let history = events::search_history(
+        &dir,
+        choice,
+        events::HistoryBounds {
+            since_ms,
+            until_ms,
+            offset: config.history_offset,
+            lookback: config.history_lookback,
+            limit: config.limit,
+        },
+        |event| {
+            if let Some(regex) = regex.as_ref() {
+                regex.is_match(&event.intent)
+            } else if let Some(query) = query_lower.as_deref() {
+                event.intent.to_lowercase().contains(query)
+            } else {
+                true
+            }
+        },
+    )?;
+    let hits = history.events;
+    let lookback = config
+        .history_lookback
+        .map_or_else(|| "all".into(), |value| value.to_string());
+    let since = since_ms.map_or_else(|| "none".into(), |value| value.to_string());
+    let until = until_ms.map_or_else(|| "none".into(), |value| value.to_string());
     util::stdout_line(&format!(
-        "intent_hits={total_hits} scanned={scanned} shown={} scope=current-workspace order=newest-first",
-        hits.len()
+        "history_hits={} scanned={} shown={} complete={} skipped={} omitted_scopes=0 scope={} offset={} lookback={} since_ms={} until_ms={} order=newest-first",
+        hits.len(),
+        history.scanned,
+        hits.len(),
+        usize::from(!history.stopped_by_limit),
+        history.skipped,
+        history.scope_label,
+        config.history_offset,
+        lookback,
+        since,
+        until
     ))?;
     if hits.is_empty() {
         return Ok(0);
     }
     let mut output = util::BoundedStdout::new(64 * 1024);
-    output.line("exit | result | intent")?;
+    let workspace_scope = config.history_scope == HistoryScope::Workspace;
+    if config.history_details {
+        output.line(if workspace_scope {
+            "age | thread | exit | result | duration_ms | intent | command"
+        } else {
+            "age | exit | result | duration_ms | intent | command"
+        })?;
+    } else {
+        output.line(if workspace_scope {
+            "age | thread | exit | result | intent"
+        } else {
+            "age | exit | result | intent"
+        })?;
+    }
     for event in hits {
         let result = table_field(event.capture_id.as_deref().unwrap_or("-"), 128);
         let intent = table_field(&event.intent, 256);
-        output.line(&format!("{} | {} | {}", event.exit_code, result, intent))?;
+        let prefix = if workspace_scope {
+            format!(
+                "{} | {} | {} | {}",
+                event_age(event.timestamp_ms),
+                event.scope_label(),
+                event.exit_code,
+                result
+            )
+        } else {
+            format!(
+                "{} | {} | {}",
+                event_age(event.timestamp_ms),
+                event.exit_code,
+                result
+            )
+        };
+        if config.history_details {
+            if let Some((duration_ms, command)) = event.loaded_details() {
+                output.line(&format!(
+                    "{} | {} | {} | {}",
+                    prefix,
+                    duration_ms,
+                    intent,
+                    table_field(command, 512)
+                ))?;
+            } else {
+                match events::read_details(&event) {
+                    Ok(details) => output.line(&format!(
+                        "{} | {} | {} | {}",
+                        prefix,
+                        details.duration_ms,
+                        intent,
+                        table_field(&details.command, 512)
+                    ))?,
+                    Err(_) => output.line(&format!(
+                        "{} | - | {} | [details unavailable]",
+                        prefix, intent
+                    ))?,
+                }
+            }
+        } else {
+            output.line(&format!("{} | {}", prefix, intent))?;
+        }
     }
     Ok(0)
+}
+
+fn parse_history_time(value: &str, now_ms: u64) -> Result<u64, String> {
+    if value == "now" {
+        return Ok(now_ms);
+    }
+    if let Some((amount, multiplier)) = parse_history_age(value)? {
+        let age_ms = amount
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("history time `{value}` is too large"))?;
+        return Ok(now_ms.saturating_sub(age_ms));
+    }
+    let timestamp = value.parse::<jiff::Timestamp>().map_err(|_| {
+        format!(
+            "history time `{value}` must be RFC 3339, `now`, or a relative age such as 30m, 24h, or 7d"
+        )
+    })?;
+    u64::try_from(timestamp.as_millisecond())
+        .map_err(|_| "history timestamps before 1970 are unsupported".into())
+}
+
+fn parse_history_age(value: &str) -> Result<Option<(u64, u64)>, String> {
+    let Some((amount, unit)) = value.split_at_checked(value.len().saturating_sub(1)) else {
+        return Ok(None);
+    };
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return Ok(None),
+    };
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let amount = amount
+        .parse()
+        .map_err(|_| format!("history time `{value}` is too large"))?;
+    Ok(Some((amount, multiplier)))
 }
 
 fn run_forget(config: &Config) -> Result<i32, String> {
@@ -1180,8 +1338,12 @@ fn run_forget(config: &Config) -> Result<i32, String> {
         .target
         .as_deref()
         .ok_or_else(|| cli::USAGE.to_string())?;
-    if target == "events" {
-        let count = events::forget_current(&dir)?;
+    if target == "history" {
+        let choice = match config.history_scope {
+            HistoryScope::Current => events::ScopeChoice::Current,
+            HistoryScope::Workspace => events::ScopeChoice::Workspace,
+        };
+        let count = events::forget(&dir, choice)?;
         util::stdout_line(&format!("forgot {count} event files"))?;
         return Ok(0);
     }
@@ -1192,6 +1354,20 @@ fn run_forget(config: &Config) -> Result<i32, String> {
     std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
     util::stdout_line(&format!("forgot {}", path.display()))?;
     Ok(0)
+}
+
+fn event_age(timestamp_ms: u64) -> String {
+    let now = util::millis(std::time::SystemTime::now()).min(u128::from(u64::MAX)) as u64;
+    let seconds = now.saturating_sub(timestamp_ms) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 172_800 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1361,7 +1537,9 @@ mod output_format_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_repetition_key, is_highly_repetitive, stream_description};
+    use super::{
+        exact_repetition_key, is_highly_repetitive, parse_history_time, stream_description,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -1397,5 +1575,17 @@ mod tests {
             stream_description("stderr", 9, 1, true, true),
             "stderr=9 B/1 lines [binary, non-UTF-8]"
         );
+    }
+
+    #[test]
+    fn history_time_accepts_relative_ages_and_rfc3339() {
+        let now = 10 * 86_400_000;
+        assert_eq!(parse_history_time("24h", now).unwrap(), now - 86_400_000);
+        assert_eq!(parse_history_time("now", now).unwrap(), now);
+        assert_eq!(
+            parse_history_time("1970-01-01T00:00:01Z", now).unwrap(),
+            1_000
+        );
+        assert!(parse_history_time("yesterday-ish", now).is_err());
     }
 }

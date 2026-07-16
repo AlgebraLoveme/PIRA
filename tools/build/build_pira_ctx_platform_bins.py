@@ -23,13 +23,13 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.request import urlopen
@@ -566,6 +566,29 @@ def manifest_record(target: BuildTarget, digest: str) -> dict[str, str]:
     return record
 
 
+def cargo_package_version() -> str:
+    """Read the controlled package version without requiring Python 3.11 tomllib."""
+    manifest_path = TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml"
+    try:
+        lines = manifest_path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise BuildError(f"cannot read Cargo manifest {manifest_path}: {error}") from error
+    in_package = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "[package]":
+            in_package = True
+            continue
+        if in_package and stripped.startswith("["):
+            break
+        if not in_package:
+            continue
+        match = re.fullmatch(r'version\s*=\s*"([0-9A-Za-z.+-]+)"\s*', stripped)
+        if match:
+            return match.group(1)
+    raise BuildError(f"missing [package] version in {manifest_path}")
+
+
 def update_bundle_manifest(bundle_dir: Path, built: list[Path], toolchain: str) -> None:
     manifest_path = bundle_dir / "bundle.json"
     if manifest_path.exists():
@@ -584,10 +607,7 @@ def update_bundle_manifest(bundle_dir: Path, built: list[Path], toolchain: str) 
             )
     else:
         manifest = {"schema_version": 1, "binaries": {}}
-    cargo_manifest = tomllib.loads(
-        (TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml").read_text(encoding="utf-8")
-    )
-    new_version = cargo_manifest["package"]["version"]
+    new_version = cargo_package_version()
     built_platforms = {path.parent.name for path in built}
     if (
         manifest.get("tool_version") not in (None, new_version)
@@ -619,10 +639,8 @@ def validate_bundle_plan(bundle_dir: Path, selected: list[str]) -> None:
         return
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        cargo_manifest = tomllib.loads(
-            (TOOLS_DIR / "crates" / TOOL_NAME / "Cargo.toml").read_text(encoding="utf-8")
-        )
-    except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
+        new_version = cargo_package_version()
+    except (OSError, json.JSONDecodeError, BuildError) as error:
         raise BuildError(f"cannot validate release metadata: {error}") from error
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("binaries"), dict):
         raise BuildError(f"unsupported bundle manifest: {manifest_path}")
@@ -631,7 +649,6 @@ def validate_bundle_plan(bundle_dir: Path, selected: list[str]) -> None:
         raise BuildError(
             f"bundle manifest tool mismatch: expected {TOOL_NAME}, found {recorded_name}"
         )
-    new_version = cargo_manifest["package"]["version"]
     if manifest.get("tool_version") != new_version and set(selected) != set(TARGETS):
         raise BuildError(
             f"{TOOL_NAME} version changed from {manifest.get('tool_version')} to {new_version}; "

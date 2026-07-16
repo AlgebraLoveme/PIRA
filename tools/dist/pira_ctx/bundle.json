@@ -1,36 +1,36 @@
 {
   "schema_version": 1,
-  "tool_version": "0.9.0",
+  "tool_version": "1.0.0",
   "rust_toolchain": "1.96.1",
   "binaries": {
     "darwin-arm64": {
       "path": "darwin-arm64/pira_ctx",
       "target": "aarch64-apple-darwin",
-      "sha256": "cbc0a6a9e28fca3a8c72728655c5330be49c0e2753055d3b575a9265751d08aa",
+      "sha256": "d3e4d5ecc530ae49580ca07f925cec9e937608339784b1d5b64003ba87b8e475",
       "min_os": "11.0"
     },
     "darwin-x64": {
       "path": "darwin-x64/pira_ctx",
       "target": "x86_64-apple-darwin",
-      "sha256": "2f01143c1c71f741fb639ee59b335359dc505dca6c4c9b9eefe119c32e943cfa",
+      "sha256": "85c6569880aa0fb62208ea5dba94ab511ebe3c17bbe741c6f5c1bd99ea9295eb",
       "min_os": "10.12"
     },
     "linux-arm64": {
       "path": "linux-arm64/pira_ctx",
       "target": "aarch64-unknown-linux-musl",
-      "sha256": "92dccb59718f8db7494ea3965ebcb65007f020f0c6f57b8ba93e6329f9259c7b",
+      "sha256": "1574e0caa8c6c48d4d9f1fd560f8aad2640485d3f927da8c25e7d4eaeca4d310",
       "linkage": "static"
     },
     "linux-x64": {
       "path": "linux-x64/pira_ctx",
       "target": "x86_64-unknown-linux-musl",
-      "sha256": "94939137cb974f9b8af4893b876ee96093135d04a667c0a638da7203829bffc3",
+      "sha256": "78d94208cd65f41fe07713040dff0ca96c37cdaa06b411359c19477760811360",
       "linkage": "static-pie"
     },
     "windows-x64": {
       "path": "windows-x64/pira_ctx.exe",
       "target": "x86_64-pc-windows-gnu",
-      "sha256": "f760ed84c24060f68f2b79ad7aea1006e3c44323bb37d2fb7c0825218acdb68e",
+      "sha256": "0337d97fcfc7d42f6b6dcf4919172e9eadc5de3728a162cc894b950b3ceb02b8",
       "min_os": "10"
     }
   },

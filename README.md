@@ -156,6 +156,35 @@ If setup cannot safely handle an existing conflicting file or Codex setting, it 
 
 </details>
 
+## Memory hierarchy
+
+**Within its retention boundary, routed command history is not summarized away: events remain searchable.** PIRA stores operational history outside the prompt and retrieves it when needed, while keeping durable project understanding in a compact human-readable form.
+
+| Level | Memory | Closest human analogue | Role |
+|---|---|---|---|
+| Project-global memory | `AGENT_WORKBOOK.md` | A project journal | Keeps durable actions, results, decisions, and lessons that should guide future work. |
+| Event memory | `pira_ctx` storage | A detailed action log | Keeps command history and available evidence searchable without loading the full history into context. |
+| Recovery view | `pira_ctx recap` | Memory of the last few steps | Restores the recent current-thread events needed after context compaction. |
+
+<details>
+<summary><strong>Difference from a Codex session log</strong></summary>
+
+A Codex session log is **session-centered and chronological**: it preserves the conversation and activity of one thread so that the thread can be reviewed or continued. PIRA memory is **project-centered and retrieval-oriented**: it preserves useful operational evidence across threads and promotes durable understanding into the workspace workbook. It does not copy the conversation, hidden reasoning, or every transient interaction into a second transcript.
+
+| Difference | Codex session log | PIRA memory hierarchy |
+|---|---|---|
+| Organizing unit | One conversation or thread | One workspace, with automatically scoped thread events |
+| Primary content | Chronological conversation and session activity | Searchable command-purpose events and curated project knowledge |
+| Retrieval model | Reopen or continue the session | Search relevant events, recap recent work, or read durable conclusions |
+| Cross-session value | Preserves the history of each session | Carries project decisions and lessons into future sessions |
+| Noise policy | Retains the conversational sequence | Keeps event detail in storage and promotes only lasting conclusions |
+
+The two are complementary. A session log answers **“what happened in this conversation?”** PIRA answers **“what has been done in this project, what evidence remains available, and what should future work remember?”**
+
+</details>
+
+Memory moves upward by **promotion, not replacement**. Events remain in `pira_ctx` storage, and only conclusions with lasting value are promoted to the workbook. Agents therefore search detailed history instead of summarizing it away, and read global memory only when the task needs project continuity. Retention and explicit pruning still define how long event history remains available; anything that must outlive those bounds belongs in the workbook.
+
 ## `pira_ctx`: lightweight command context
 
 <details>
@@ -173,7 +202,9 @@ Explicit `exact` mode streams unchanged when attached to a terminal. In non-inte
 
 For a non-interactive program still running after about 30 seconds, `pira_ctx` silently publishes a read-only checkpoint. Concurrent inspection uses a consistent snapshot without blocking the program; `exec` receives a private copy. Running captures are protected from verification, deletion, and pruning until completion. See `pira_ctx --help` for the exact contract.
 
-Compact per-workspace command events retain agent-supplied intents without duplicating command output. Intent history can be searched by case-insensitive text or Rust regex over an explicitly bounded newest-event window, with independently bounded newest-first results.
+Compact command-purpose events retain agent-supplied intents without duplicating command output. `pira_ctx` automatically hashes `PIRA_CTX_THREAD_ID`, then `CODEX_THREAD_ID`, together with the workspace identity; raw thread identifiers are never stored. `pira_ctx history` reviews the current thread by default, while explicit `--scope workspace` merges anonymously labeled threads. Search covers all retained events by default but always stops at a bounded result limit of 10 unless changed. `--since`/`--until` select relative or RFC 3339 time bounds, while `--offset` and `--lookback` select event-number windows before intent matching—for example, the events before the newest 2,000. Literal intent matching is case-insensitive; fuzzy or semantic retrieval is not implicit, and regular expressions require `--regex`. With neither supported thread ID, current scope uses a labeled workspace-local unscoped fallback rather than claiming thread isolation.
+
+Version 1.0 stores immutable checked `PIRAEVT1` records under a hidden `.events` namespace and builds disposable per-thread `PIRAEIX1` catalogs. The bounded checked retention journal also carries the history-facing summaries, letting a search scan one ordered index and validate only selected records instead of sorting and fingerprinting every event file. It rebuilds from authoritative records if missing or corrupt. Selected `history --details` rows additionally load duration and redacted command. Pre-1.0 JSON ledgers are ignored and preserved until explicit `prune --legacy-events` cleanup.
 
 Setup installs a verified native executable in the user's `PATH`. Normal use requires no Python, Rust toolchain, daemon, database, network service, or model call; the optional `exec` command uses an available Python 3 interpreter to analyze a stored capture with explicit code. Captures are private user-cache files with independently compressed blocks and integrity hashes. `pira_ctx` preserves the caller's permissions and does not sandbox commands. Run `pira_ctx --help` to choose a command and `pira_ctx SUBCOMMAND --help` for exact usage. Its Rust source is under `tools/src/pira_ctx`, and verified builds for macOS arm64/x64, Linux arm64/x64, and Windows x64 are under `tools/dist/pira_ctx`.
 
@@ -197,14 +228,14 @@ Security checks are separate from ordinary functional tests and run as fixed, no
 | Integration | Native wrapper for explicit external commands | MCP server plus platform plugins and hooks |
 | Runtime and storage | One Rust executable and self-contained checked capture files | Node/Bun integration with a SQLite FTS5 knowledge base |
 | Reach | Commands deliberately routed through the wrapper | Broader shell, file, web, and MCP routing where integrations support it |
-| Continuity | Bounded same-session recap after compaction | Explicit session lifecycle and continuation support |
+| Continuity | Bounded current-thread recap after compaction | Explicit session lifecycle and continuation support |
 | Safety scope | Preserves caller permissions; does not sandbox children | Adds sandbox and permission-policy integration |
 
 PIRA uses `pira_ctx` when a small single-binary wrapper and exact local fallback are preferable. Context Mode is the more comprehensive option when broader interception, hooks, sandboxing, or database-backed retrieval are needed.
 
 ### Comprehensive held-out benchmark
 
-The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 0.8.0` on that corpus:
+The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.0.0` on that corpus:
 
 | Suite | Cases | Holdout source |
 |---|---:|---|
@@ -216,12 +247,12 @@ The remote importer scanned raw logs in memory and persisted only fixed-point sa
 
 | Mode on the same 2,248,456 raw bytes | Returned context | Complete stored state | Median overhead | Immediate labeled evidence |
 |---|---:|---:|---:|---:|
-| `pira_ctx 0.8.0` automatic synopsis | 44,222 B (98.0% reduction) | 602,349 B (73.2% reduction) | +14.3 ms | 5/13 |
+| `pira_ctx 1.0.0` automatic synopsis | 44,222 B (98.0% reduction) | 615,047 B (72.6% reduction) | +24.4 ms | 5/13 |
 | Context Mode generic passthrough | 71,621 B (96.8% reduction) | 17,039,820 B (657.8% overhead) | +16.1 ms | 9/13 |
-| `pira_ctx 0.8.0 check` | 3,064 B (99.9% reduction) | 602,484 B (73.2% reduction) | +13.2 ms | N/A—status only |
+| `pira_ctx 1.0.0 check` | 3,064 B (99.9% reduction) | 615,182 B (72.6% reduction) | +23.6 ms | N/A—status only |
 | Context Mode `ctx_index` receipt | 7,843 B (99.7% reduction) | 13,992,387 B (522.3% overhead) | N/A—no corresponding raw baseline | 0/13 |
 
-All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 0.8.0 does not change selection or scoring: the same fixed replay gives identical quality counts with 0.7.1. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
+All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.0.0 retains the same selection and quality counts as the earlier replay. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
 
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
@@ -234,7 +265,7 @@ The remote extension was fixed before inspecting output content. It reconstructe
 
 LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
-Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 0.8.0. The visible aggregate performance figures come from the final no-tuning 0.8.0 replay of the selected 45 fixtures through one persistent automatic store and one persistent `check` store. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`, summarized by the per-case median. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
+Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.0.0. The visible aggregate performance figures come from a 1.0.0 replay of the selected 45 fixtures through one persistent automatic store and one persistent `check` store. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`, summarized by the per-case median. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
 
 | Held-out category | Cases | Outcomes | Immediate quality | Context reduction |
 |---|---:|---:|---:|---:|

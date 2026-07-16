@@ -166,7 +166,7 @@ class PiraToolDistributionTests(unittest.TestCase):
         BUILDER.update_bundle_manifest(bundle, [artifact], "1.96.1")
         manifest = json.loads((bundle / "bundle.json").read_text(encoding="utf-8"))
         self.assertEqual("pira_codenav", manifest["tool_name"])
-        self.assertEqual("0.1.0", manifest["tool_version"])
+        self.assertEqual(BUILDER.cargo_package_version(), manifest["tool_version"])
         self.assertEqual("aarch64-apple-darwin", manifest["binaries"]["darwin-arm64"]["target"])
         self.assertEqual("11.0", manifest["binaries"]["darwin-arm64"]["min_os"])
         self.assertEqual(
