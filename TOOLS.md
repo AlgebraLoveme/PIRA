@@ -8,12 +8,15 @@
 - Existing tools should be extended before creating new ones when compatible.
 
 ## `pira_ctx`
-- Use `pira_ctx` for every shell/exec invocation; invoke `pira_ctx` commands directly.
-- Consult `pira_ctx --help` for command selection and `pira_ctx SUBCOMMAND --help` for exact usage. If `pira_ctx` is unavailable, ask for setup.
-- Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose so history and recap remain distinguishable. Do not put secrets, generic wording, or claims of completed success in intents.
-- When uncertain whether relevant work already ran or how it exited—especially before repeating expensive or state-changing work—query bounded `pira_ctx history`. Use explicit workspace scope only when cross-thread operational history is genuinely needed.
-- During a staged source/install upgrade, if the installed help does not yet expose `history`, use its documented read-only intent-event lookup rather than replacing the binary mid-thread.
-- After the platform reports context compaction of the continuing thread, run `pira_ctx recap` before further substantive shell/exec work. Do not use recap merely because time passed or a new or temporary thread started.
+- Use `pira_ctx` for every shell/exec invocation. If it is unavailable, ask for setup rather than silently bypassing it.
+- Use automatic mode by default, `check` when only trustworthy process status is needed, and `capture` when complete output must remain recoverable. Prefer targeted `search`, `range`, `transform`, or `exec` retrieval over loading an entire capture with `raw`.
+- Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose. Do not include secrets, generic wording, or claims that the action has already succeeded.
+- Before repeating expensive, state-changing, or uncertain work, query `pira_ctx history`. Search all retained events with the default bounded result limit unless a meaningful time or event-number window would reduce irrelevant work.
+- History is operational evidence, not authoritative current state. After recovering an earlier action, inspect the relevant files, repository, process, or external state when freshness matters.
+- Use current-thread history by default. Use `--scope workspace` only when cross-thread operational history is genuinely relevant. Do not manually set or override thread identifiers except in focused tool tests; rely on automatic thread detection.
+- Remember that event history covers commands routed through `pira_ctx`, not conversation, reasoning, file-edit tools, web calls, or other integrations. Put durable project state, decisions, validated results, and reusable lessons in `AGENT_WORKBOOK.md`.
+- After the platform reports compaction of the continuing thread, run `pira_ctx recap` before further substantive shell/exec work. Do not use recap because time passed or for a new or temporary thread. Inspect referenced result IDs only when their evidence is needed.
+- Consult `pira_ctx --help` for command selection and `pira_ctx SUBCOMMAND --help` for exact syntax and bounds.
 
 ## Error Fighting
 - On errors, first analyze the message and pattern, then locate the root cause before fixing. For repeated or unfamiliar errors, search online before the next fix attempt.
