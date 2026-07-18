@@ -10,20 +10,86 @@ USAGE
   pira_decision show ID [--json] [--store-dir PATH]
   pira_decision search --field FIELD --regex PATTERN [--limit N] [--json] [--store-dir PATH]
   pira_decision forget EXACT_ID --yes [--store-dir PATH]
-
-SEARCH FIELDS
-  id, context, choice, decision, maker, timestamp
-
-OPTIONS
-  --store-dir PATH  Override the per-user durable decision store.
-  --json            Emit stable JSON for show or search.
-  --limit N         Return 1..1000 matches; default 20.
-  -h, --help        Show this help.
-  -V, --version     Show the version.
+  pira_decision help [COMMAND]
 
 Records are scoped to the nearest Git root, otherwise the current directory.
 Search is lock-free and may omit a decision published concurrently.
+Run `pira_decision COMMAND --help` for exact fields, options, and behavior.
 "#;
+
+const ADD_HELP: &str = r#"pira_decision add — record one concluded workspace decision
+
+USAGE
+  pira_decision add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
+
+FIELDS
+  --context TEXT    Concise problem and decisive constraints; exactly once.
+  --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
+  --decision N      One-based index selecting one listed choice.
+  --maker VALUE     Decision authority: human or agent; repeat to record a joint decision.
+
+OPTIONS
+  --store-dir PATH  Override the durable per-user store.
+  -h, --help        Show this help.
+"#;
+
+const SHOW_HELP: &str = r#"pira_decision show — display one validated decision record
+
+USAGE
+  pira_decision show ID [--json] [--store-dir PATH]
+
+ID may be complete or an unambiguous prefix. The requested record is integrity-checked before
+display. Use --json for stable programmatic output.
+"#;
+
+const SEARCH_HELP: &str = r#"pira_decision search — regex-search one field across workspace decisions
+
+USAGE
+  pira_decision search --field FIELD --regex PATTERN [--limit N] [--json] [--store-dir PATH]
+
+FIELDS
+  id         Generated decision ID.
+  context    Decision context.
+  choice     Every considered alternative.
+  decision   Selected choice text only.
+  maker      human or agent.
+  timestamp  RFC 3339 UTC timestamp.
+
+Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are newest
+first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records, reports
+them as warnings, and may omit a record published concurrently. Use --json for structured matches
+and skipped-record details.
+"#;
+
+const FORGET_HELP: &str = r#"pira_decision forget — logically delete one exact decision record
+
+USAGE
+  pira_decision forget EXACT_ID --yes [--store-dir PATH]
+
+The complete ID and explicit --yes are required. Deletion removes the managed record but does not
+claim secure physical erasure.
+"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HelpTopic {
+    Global,
+    Add,
+    Show,
+    Search,
+    Forget,
+}
+
+impl HelpTopic {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Global => HELP,
+            Self::Add => ADD_HELP,
+            Self::Show => SHOW_HELP,
+            Self::Search => SEARCH_HELP,
+            Self::Forget => FORGET_HELP,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum SearchField {
@@ -53,7 +119,7 @@ impl SearchField {
 
 #[derive(Debug)]
 pub enum Command {
-    Help,
+    Help(HelpTopic),
     Version,
     Add(DecisionDraft),
     Show {
@@ -81,12 +147,13 @@ pub struct Config {
 pub fn parse_args(args: &[String]) -> Result<Config, String> {
     let Some(command) = args.first().map(String::as_str) else {
         return Ok(Config {
-            command: Command::Help,
+            command: Command::Help(HelpTopic::Global),
             store_dir: None,
         });
     };
     match command {
-        "-h" | "--help" | "help" => simple(Command::Help, &args[1..]),
+        "-h" | "--help" => simple(Command::Help(HelpTopic::Global), &args[1..]),
+        "help" => parse_help(&args[1..]),
         "-V" | "--version" | "version" => simple(Command::Version, &args[1..]),
         "add" => parse_add(&args[1..]),
         "show" => parse_show(&args[1..]),
@@ -96,6 +163,21 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
             "unknown command {command:?}; run pira_decision --help"
         )),
     }
+}
+
+fn parse_help(args: &[String]) -> Result<Config, String> {
+    let topic = match args {
+        [] => HelpTopic::Global,
+        [command] => match command.as_str() {
+            "add" => HelpTopic::Add,
+            "show" => HelpTopic::Show,
+            "search" => HelpTopic::Search,
+            "forget" => HelpTopic::Forget,
+            _ => return Err(format!("unknown help command {command:?}")),
+        },
+        _ => return Err("help accepts at most one command".into()),
+    };
+    simple(Command::Help(topic), &[])
 }
 
 fn simple(command: Command, remaining: &[String]) -> Result<Config, String> {
@@ -110,7 +192,7 @@ fn simple(command: Command, remaining: &[String]) -> Result<Config, String> {
 
 fn parse_add(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
-        return simple(Command::Help, &[]);
+        return simple(Command::Help(HelpTopic::Add), &[]);
     }
     let mut context = None;
     let mut choices = Vec::new();
@@ -155,7 +237,7 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
 
 fn parse_show(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
-        return simple(Command::Help, &[]);
+        return simple(Command::Help(HelpTopic::Show), &[]);
     }
     let mut id = None;
     let mut json = false;
@@ -184,7 +266,7 @@ fn parse_show(args: &[String]) -> Result<Config, String> {
 
 fn parse_search(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
-        return simple(Command::Help, &[]);
+        return simple(Command::Help(HelpTopic::Search), &[]);
     }
     let mut field = None;
     let mut pattern = None;
@@ -241,7 +323,7 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
 
 fn parse_forget(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
-        return simple(Command::Help, &[]);
+        return simple(Command::Help(HelpTopic::Forget), &[]);
     }
     let mut id = None;
     let mut confirmed = false;
@@ -327,5 +409,19 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.contains("1 through 1000"));
+    }
+
+    #[test]
+    fn subcommand_help_selects_specific_topic() {
+        let config = parse_args(&args(&["search", "--help"])).expect("parse help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Search)));
+        assert!(
+            HelpTopic::Search
+                .text()
+                .contains("Selected choice text only")
+        );
+
+        let config = parse_args(&args(&["help", "add"])).expect("parse help alias");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Add)));
     }
 }

@@ -49,24 +49,20 @@
 
 ## PIRA Internal tools
 
-If any of the following PIRA internal tools are needed but not available in the environment, immediately ask for setup and do not bypass the rules.
+If any of the following PIRA internal tools are needed but not available in the environment, immediately ask for setup and do not bypass the rules. Consult each tool's built-in help for commands, options, and syntax.
 
 ### `pira_ctx`
 - Use `pira_ctx` for every shell/exec invocation except PIRA internal tools.
-- Consult `pira_ctx --help` and `pira_ctx SUBCOMMAND --help` when necessary.
 - Use automatic mode by default, `check` when only process status is needed. Prefer targeted `search`, `range`, `transform`, or `exec` retrieval over loading an entire capture with `raw`.
 - Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose.
 
 ### `pira_decision`
-- Consult `pira_decision --help` when necessary and use `--json` for programmatic retrieval.
-- For `add`, repeat `--choice` and `--maker` as needed; `--decision` is the one-based index of the selected choice.
-- For `search`, choose one field from `id`, `context`, `choice`, `decision`, `maker`, or `timestamp`. `choice` searches all alternatives; `decision` searches selected outcomes only. Regex is case-sensitive unless it includes a flag such as `(?i)`.
+- Use `--json` for programmatic retrieval.
 - Treat skipped or corrupt-record warnings as incomplete retrieval. A concurrent search may miss the newest publication; rerun it after writers finish when recency matters.
-- Let the tool determine workspace scope. Do not edit its records or managed storage manually; use `--store-dir` only for setup, migration, or focused tests.
-- `forget` is destructive: require an exact ID, `--yes`, and explicit user permission; use it only for erroneous or sensitive records, never to rewrite history.
+- Do not edit records or managed storage manually; use storage overrides only for setup, migration, or focused tests.
+- Use `forget` only with explicit user permission for erroneous or sensitive records, never to rewrite history.
 
 ### `pira_codenav`
-- For read-only inspection of supported source code (including most program languages except HTML, CSS, SQL, JSON and YAML), use `pira_codenav` as the default navigation tool and do not use generic search or file reading.
-- Consult `pira_codenav --help` and `pira_codenav SUBCOMMAND --help` when necessary.
+- For read-only inspection of source in its supported programming and configuration languages—not HTML, CSS, SQL, JSON, or YAML—use `pira_codenav` instead of generic search or file reading.
 - Work broad-to-narrow: use `map` when the relevant files are unknown, `find` when a declaration name is known, `outline` for a known file, and `show` for the smallest sufficient exact source item.
-- Use the semantic commands with a caller-supplied LSP when definitions, implementations, types, references, calls, or hover information is needed. Do not replace semantic evidence with text matching.
+- For semantic questions, use a caller-supplied LSP rather than text matching.

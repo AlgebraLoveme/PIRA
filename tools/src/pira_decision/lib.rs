@@ -25,8 +25,8 @@ fn real_main() -> Result<i32, String> {
     let config = cli::parse_args(&args)?;
     let store = config.store_dir.as_deref();
     match config.command {
-        Command::Help => {
-            util::stdout_text(cli::HELP)?;
+        Command::Help(topic) => {
+            util::stdout_text(topic.text())?;
             Ok(0)
         }
         Command::Version => {
