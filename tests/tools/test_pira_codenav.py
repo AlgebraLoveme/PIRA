@@ -936,6 +936,20 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("failed=2", failed.stdout.splitlines()[0])
             self.assertIn("all show targets failed", failed.stderr)
 
+    def test_show_batches_exact_line_spans(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-multi-span-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "def alpha(): return 1\n\ndef beta(): return 2\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "show", "sample.py:1-1", "sample.py:3-3", cwd=root
+            )
+            self.assertIn("targets=2 shown=2", result.stdout.splitlines()[0])
+            self.assertIn("def alpha", result.stdout)
+            self.assertIn("def beta", result.stdout)
+
     def test_multi_outline_and_imports_keep_valid_files(self) -> None:
         outline = self.run_cli(
             "outline",

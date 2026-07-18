@@ -396,7 +396,7 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 | Native structural targets | 1,047 |
 | Location / freshness-selector round trips | 1,047/1,047 each |
 | Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 84 / 17 / 14 |
+| Functional / inert security / Rust tests | 85 / 17 / 14 |
 | Reproducible benchmark tasks | 39 |
 
 The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
@@ -494,7 +494,7 @@ The `find` row includes its small unique declaration source by default, trading 
 
 Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
 
-A minimal `pira_codenav --version` call measured 2.537 ms median / 2.867 ms p95 on native macOS. The optimized macOS arm64 binary is 51,257,408 bytes, or 5,758,118 bytes with deterministic gzip level 9.
+A minimal `pira_codenav --version` call measured 2.537 ms median / 2.867 ms p95 on native macOS. The optimized macOS arm64 binary is 51,257,472 bytes, or 5,757,467 bytes with deterministic gzip level 9.
 
 <details>
 <summary>Benchmark method and limitations</summary>

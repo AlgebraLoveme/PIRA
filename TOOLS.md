@@ -45,6 +45,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_ctx`
 - Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations.
 - Default: automatic mode. Status-only → `check`. Prefer targeted `search`, `range`, `transform`, or `exec` over `raw`.
+- Group independent, already-narrow PIRA inspections into one shell turn when this avoids repeated model round trips.
 - Intent: concise, prospective action + target + immediate purpose.
 
 ### `pira_decision`
@@ -54,6 +55,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `forget` requires explicit user permission and is only for erroneous/sensitive records; never use it to rewrite history.
 
 ### `pira_codenav`
-- Consult `pira_codenav --help`. Use the cheapest sufficient retrieval: batched `search` for known body terms, batched `find` for declaration names, `outline` for known-file structure, `show` for known targets, and `map` when relevant files are unknown.
-- Prefer one call that returns enough evidence; `find` includes small unique source automatically. When the exact file/range is already known, a bounded generic search or read is also appropriate.
+- Consult `pira_codenav --help`. Start from the narrowest known path and distinctive declaration name or body text; keep default output bounds and narrow the query before raising them.
+- Batch only closely related precise queries. Use `find` for declaration names, `search` for body text, `outline` for known-file structure, `show` for known targets, and `map` when relevant files are unknown. `find` includes small unique source automatically.
+- Once an exact line range is known, prefer a bounded generic read; use `show` when structural selection, selector validation, line numbering, or batched spans add value.
 - Use LSP subcommands for semantic relationships rather than text matching; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.

@@ -451,6 +451,33 @@ fn command_show(
         if considered >= max_items {
             break;
         }
+        if let Some((path_text, start, end)) = parse_line_range(target) {
+            let path = absolute_lexical(Path::new(path_text), cwd);
+            if let Err((code, message)) = language_for(&path, explicit) {
+                failures.record(target.clone(), code, message);
+                continue;
+            }
+            let identity = (path.clone(), start, end, true);
+            if !identities.insert(identity.clone()) {
+                duplicates += 1;
+                continue;
+            }
+            let mut item = Vec::new();
+            if let Err((code, message)) = render_line_range(&path, start, end, cwd, &mut item) {
+                identities.remove(&identity);
+                failures.record(target.clone(), code, message);
+                continue;
+            }
+            resolved += 1;
+            considered += 1;
+            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+                byte_limited += 1;
+                continue;
+            }
+            payload_bytes += item.len();
+            rendered.push(item);
+            continue;
+        }
         let (key, symbol_index) =
             match resolve_show_target(target, explicit, cwd, &mut parsed_files, &mut resolver) {
                 Ok(resolved) => resolved,
@@ -465,7 +492,12 @@ fn command_show(
             .and_then(|result| result.as_ref().ok())
             .expect("resolved show target has a cached parse");
         let symbol = &parsed.symbols[symbol_index];
-        let identity = (parsed.path.clone(), symbol.start_byte, symbol.end_byte);
+        let identity = (
+            parsed.path.clone(),
+            symbol.start_byte,
+            symbol.end_byte,
+            false,
+        );
         if !identities.insert(identity) {
             duplicates += 1;
             continue;
@@ -3142,7 +3174,7 @@ TARGETS
   FILE:LINE[:COLUMN]       Selects the smallest enclosing named item; coordinates are one-based.
   FILE::QUALIFIED-NAME     Exact declaration name from outline/find.
   pira://...               Freshness-checked selector from --selectors.
-  FILE:START-END           Exact inclusive line span; only as the single target.
+  FILE:START-END           Exact inclusive parser-free line span; spans may be batched or mixed.
 
 OPTIONS
   --window N               For one FILE:LINE[:COLUMN], return N lines before and after that line.
@@ -3150,16 +3182,17 @@ OPTIONS
 
 BOUNDS AND OUTPUT
   A single structural target returns the whole item by default. Multiple targets default to 20
-  deduplicated whole items and 64 KiB; --max-items and --max-bytes omit whole items rather than
-  truncating source. Items over 200 lines carry a bounded-retrieval hint. FILE:START-END is
-  parser-free and clamps END at EOF. Syntax-dirty structural targets need an auto-discovered or
+  deduplicated items or spans and 64 KiB; --max-items and --max-bytes omit whole results rather than
+  truncating source. Items over 200 lines carry a bounded-retrieval hint. FILE:START-END clamps END
+  at EOF. Syntax-dirty structural targets need an auto-discovered or
   explicit LSP. Selectors reject stale source. Returned source is framed as untrusted data.
 
 EXAMPLES
   pira_codenav show src/parser.rs:120
   pira_codenav show src/parser.rs:120 --window 8
   pira_codenav show src/parser.rs::Parser::parse
-  pira_codenav show src/parser.rs:120-145"#;
+  pira_codenav show src/parser.rs:120-145
+  pira_codenav show src/a.rs:10-20 src/b.rs:30-40"#;
 
 const MAP_HELP: &str = r#"pira_codenav map — produce a bounded repository or subsystem shape
 
