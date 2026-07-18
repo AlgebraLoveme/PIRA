@@ -100,11 +100,11 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("dependents", help_result.stdout)
         self.assertIn("deps", help_result.stdout)
         self.assertIn("--lsp", help_result.stdout)
-        self.assertIn("CHOOSE A COMMAND", help_result.stdout)
-        self.assertIn("TYPICAL FLOW", help_result.stdout)
-        self.assertIn("ordinary bounded read", help_result.stdout)
+        self.assertIn("STRUCTURAL COMMANDS", help_result.stdout)
+        self.assertIn("LSP COMMANDS", help_result.stdout)
+        self.assertNotIn("CHOOSE A COMMAND", help_result.stdout)
+        self.assertNotIn("TYPICAL FLOW", help_result.stdout)
         self.assertIn("--no-auto-lsp", help_result.stdout)
-        self.assertIn("do not substitute text matching", help_result.stdout)
         self.assertIn("Predictable success fields are omitted", help_result.stdout)
         for added in (
             "definition",
@@ -169,7 +169,8 @@ class PiraCodeNavTests(unittest.TestCase):
             "languages",
         ):
             detailed = self.run_cli(command, "--help")
-            self.assertIn("WHEN TO USE", detailed.stdout)
+            self.assertIn("DESCRIPTION", detailed.stdout)
+            self.assertNotIn("WHEN TO USE", detailed.stdout)
             self.assertIn("USAGE", detailed.stdout)
             self.assertLess(len(detailed.stdout.encode()), 2_000)
         self.assertEqual(
@@ -187,9 +188,11 @@ class PiraCodeNavTests(unittest.TestCase):
 
         find_help = self.run_cli("find", "--help")
         self.assertIn("--show-unique", find_help.stdout)
+        self.assertIn("--locations-only", find_help.stdout)
+        self.assertIn("default 20", find_help.stdout)
 
         search_help = self.run_cli("search", "--help")
-        self.assertIn("ordinary bounded search", search_help.stdout)
+        self.assertIn("bounded source context", search_help.stdout)
         self.assertIn("Overlapping windows merge", search_help.stdout)
         outline_help = self.run_cli("outline", "--help")
         self.assertIn("--signatures", outline_help.stdout)
@@ -205,7 +208,7 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("transitive", deps_help.stdout)
         self.assertIn("--direction VALUE", deps_help.stdout)
         find_help = self.run_cli("find", "--help")
-        self.assertIn("parsed declarations, not text", find_help.stdout)
+        self.assertIn("parsed declarations, not body text", find_help.stdout)
         self.assertIn("freshness-checked `show` targets", find_help.stdout)
         definition_help = self.run_cli("definition", "--help")
         self.assertIn("--lsp-init", definition_help.stdout)
@@ -1545,9 +1548,33 @@ class PiraCodeNavTests(unittest.TestCase):
             )
 
             literal = self.run_cli("find", ".", "widget", cwd=root)
-            self.assertIn("mode=literal", literal.stdout.splitlines()[0])
+            self.assertIn("mode=exact", literal.stdout.splitlines()[0])
             self.assertIn('name="Widget"', literal.stdout)
-            self.assertIn('name="build_widget"', literal.stdout)
+            self.assertNotIn('name="build_widget"', literal.stdout)
+            self.assertIn("class Widget:", literal.stdout)
+
+            related = self.run_cli(
+                "find", ".", "widget", "--contains", "--locations-only", cwd=root
+            )
+            self.assertIn("mode=contains", related.stdout.splitlines()[0])
+            self.assertIn('name="Widget"', related.stdout)
+            self.assertIn('name="build_widget"', related.stdout)
+            self.assertNotIn("begin untrusted repository source", related.stdout)
+
+            conflicting_match = self.run_cli(
+                "find", ".", "Widget", "--contains", "--exact", cwd=root, expected=2
+            )
+            self.assertIn("mutually exclusive", conflicting_match.stderr)
+            conflicting_source = self.run_cli(
+                "find",
+                ".",
+                "Widget",
+                "--show-unique",
+                "--locations-only",
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("once in total", conflicting_source.stderr)
 
             exact = self.run_cli(
                 "find", ".", "Widget", "--exact", "--kind", "class", cwd=root
@@ -1597,6 +1624,85 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn(
             'name="Illuminate\\\\Support\\\\Collection"', namespace_suffix.stdout
         )
+
+    def test_find_ranks_public_close_matches_before_hidden_results(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-find-ranked-") as temp:
+            root = Path(temp)
+            (root / "a.py").write_text(
+                "def _compile_first(): return 1\n"
+                "def _compile_second(): return 2\n",
+                encoding="utf-8",
+            )
+            (root / "z.py").write_text(
+                "def compile_public(): return 3\n",
+                encoding="utf-8",
+            )
+
+            top = self.run_cli(
+                "find",
+                ".",
+                "compile",
+                "--contains",
+                "--locations-only",
+                "--max-items",
+                "1",
+                cwd=root,
+            )
+            self.assertIn("matches=3 shown=1 omitted=2", top.stdout.splitlines()[0])
+            self.assertIn('name="compile_public"', top.stdout)
+            self.assertNotIn('name="_compile_first"', top.stdout)
+
+            (root / "_internal.py").write_text(
+                "def render_internal_path(): return 1\n", encoding="utf-8"
+            )
+            (root / "public.py").write_text(
+                "def render_public_path(): return 2\n", encoding="utf-8"
+            )
+            path_ranked = self.run_cli(
+                "python",
+                "find",
+                ".",
+                "render",
+                "--contains",
+                "--locations-only",
+                "--max-items",
+                "1",
+                cwd=root,
+            )
+            self.assertIn('name="render_public_path"', path_ranked.stdout)
+            self.assertNotIn('name="render_internal_path"', path_ranked.stdout)
+
+            (root / "Api.java").write_text(
+                "class Api {\n"
+                "  private void compileHidden() {}\n"
+                "  public void compilePublic() {}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            java_top = self.run_cli(
+                "java",
+                "find",
+                ".",
+                "compile",
+                "--contains",
+                "--locations-only",
+                "--max-items",
+                "1",
+                cwd=root,
+            )
+            self.assertIn('name="Api.compilePublic"', java_top.stdout)
+            self.assertNotIn('name="Api.compileHidden"', java_top.stdout)
+
+            (root / "many.py").write_text(
+                "".join(f"def compile_{index}(): return {index}\n" for index in range(25)),
+                encoding="utf-8",
+            )
+            bounded = self.run_cli(
+                "python", "find", ".", "compile", "--locations-only", cwd=root
+            )
+            self.assertIn("mode=contains-fallback", bounded.stdout.splitlines()[0])
+            self.assertIn("matches=28 shown=20", bounded.stdout.splitlines()[0])
+            self.assertIn("omitted=8", bounded.stdout.splitlines()[0])
 
     def test_find_batches_independent_queries_in_one_repository_scan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-find-multi-") as temp:

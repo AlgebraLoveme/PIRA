@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ const MAX_FIND_ITEMS: usize = 100_000;
 const MAX_FIND_QUERIES: usize = 32;
 const MAX_FIND_QUERY_BYTES: usize = 4 * 1024;
 const MAX_FIND_TOTAL_QUERY_BYTES: usize = 32 * 1024;
+const DEFAULT_FIND_MAX_ITEMS: usize = 20;
 const DEFAULT_SEARCH_MAX_ITEMS: usize = 200;
 const DEFAULT_SEARCH_MAX_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_ITEMS: usize = 10_000;
@@ -850,26 +851,48 @@ fn command_map(
 }
 
 enum FindMatcher {
-    Literal(Regex),
+    Auto { exact: Regex, contains: Regex },
+    Contains(Regex),
     Exact(Regex),
     Regex(Regex),
 }
 
+#[derive(Clone, Copy)]
+enum FindMatchClass {
+    Primary,
+    Fallback,
+}
+
 impl FindMatcher {
-    fn matches(&self, symbol: &Symbol) -> bool {
+    fn classify(&self, symbol: &Symbol) -> Option<FindMatchClass> {
         match self {
-            Self::Literal(regex) | Self::Regex(regex) => {
-                regex.is_match(&symbol.qualified_name)
-                    || regex.is_match(&symbol.signature)
-                    || regex.is_match(symbol.kind)
+            Self::Auto { exact, contains } => {
+                if exact.is_match(&symbol.qualified_name) {
+                    Some(FindMatchClass::Primary)
+                } else if contains.is_match(&symbol.qualified_name)
+                    || contains.is_match(&symbol.signature)
+                    || contains.is_match(symbol.kind)
+                {
+                    Some(FindMatchClass::Fallback)
+                } else {
+                    None
+                }
             }
-            Self::Exact(regex) => regex.is_match(&symbol.qualified_name),
+            Self::Contains(regex) | Self::Regex(regex) => (regex.is_match(&symbol.qualified_name)
+                || regex.is_match(&symbol.signature)
+                || regex.is_match(symbol.kind))
+            .then_some(FindMatchClass::Primary),
+            Self::Exact(regex) => regex
+                .is_match(&symbol.qualified_name)
+                .then_some(FindMatchClass::Primary),
         }
     }
 
-    const fn name(&self) -> &'static str {
+    const fn name(&self, fallback_used: bool) -> &'static str {
         match self {
-            Self::Literal(_) => "literal",
+            Self::Auto { .. } if fallback_used => "contains-fallback",
+            Self::Auto { .. } => "exact",
+            Self::Contains(_) => "contains",
             Self::Exact(_) => "exact",
             Self::Regex(_) => "regex",
         }
@@ -888,6 +911,7 @@ struct FindOptions {
 
 struct FindQuery {
     text: String,
+    lowercase: String,
     matcher: FindMatcher,
 }
 
@@ -897,6 +921,167 @@ struct FindRow {
     backend: ParseBackend,
     symbol: Symbol,
     selector: Option<String>,
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct FindRank {
+    visibility_penalty: u8,
+    match_quality: u8,
+    name_bytes: usize,
+    path: PathBuf,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+struct RankedFindRow {
+    rank: FindRank,
+    row: FindRow,
+}
+
+impl PartialEq for RankedFindRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank == other.rank
+    }
+}
+
+impl Eq for RankedFindRow {}
+
+impl PartialOrd for RankedFindRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedFindRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank.cmp(&other.rank)
+    }
+}
+
+struct FindBucket {
+    primary_matched: usize,
+    fallback_matched: usize,
+    primary_rows: BinaryHeap<RankedFindRow>,
+    fallback_rows: BinaryHeap<RankedFindRow>,
+}
+
+impl FindBucket {
+    fn new(max_items: usize) -> Self {
+        Self {
+            primary_matched: 0,
+            fallback_matched: 0,
+            primary_rows: BinaryHeap::with_capacity(max_items.min(1_000)),
+            fallback_rows: BinaryHeap::with_capacity(max_items.min(1_000)),
+        }
+    }
+
+    fn record(&mut self, class: FindMatchClass, row: FindRow, rank: FindRank, max_items: usize) {
+        let (matched, rows) = match class {
+            FindMatchClass::Primary => (&mut self.primary_matched, &mut self.primary_rows),
+            FindMatchClass::Fallback => (&mut self.fallback_matched, &mut self.fallback_rows),
+        };
+        *matched += 1;
+        let ranked = RankedFindRow { rank, row };
+        if rows.len() < max_items {
+            rows.push(ranked);
+        } else if rows.peek().is_some_and(|worst| ranked.rank < worst.rank) {
+            rows.pop();
+            rows.push(ranked);
+        }
+    }
+
+    fn select(self, matcher: &FindMatcher) -> FindSelection {
+        let fallback_used =
+            matches!(matcher, FindMatcher::Auto { .. }) && self.primary_matched == 0;
+        if fallback_used {
+            FindSelection {
+                matched: self.fallback_matched,
+                rows: ranked_rows(self.fallback_rows),
+                fallback_used,
+            }
+        } else {
+            FindSelection {
+                matched: self.primary_matched,
+                rows: ranked_rows(self.primary_rows),
+                fallback_used,
+            }
+        }
+    }
+}
+
+struct FindSelection {
+    matched: usize,
+    rows: Vec<FindRow>,
+    fallback_used: bool,
+}
+
+fn ranked_rows(rows: BinaryHeap<RankedFindRow>) -> Vec<FindRow> {
+    rows.into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.row)
+        .collect()
+}
+
+fn find_rank(query: &FindQuery, row: &FindRow) -> FindRank {
+    let qualified = row.symbol.qualified_name.to_lowercase();
+    let terminal = qualified
+        .rsplit(['.', ':', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(&qualified);
+    let match_quality = if terminal == query.lowercase {
+        0
+    } else if terminal.starts_with(&query.lowercase) {
+        1
+    } else if terminal.contains(&query.lowercase) {
+        2
+    } else if qualified.contains(&query.lowercase) {
+        3
+    } else if row
+        .symbol
+        .signature
+        .to_lowercase()
+        .contains(&query.lowercase)
+    {
+        4
+    } else {
+        5
+    };
+    FindRank {
+        visibility_penalty: symbol_visibility_penalty(&row.symbol)
+            .saturating_add(path_visibility_penalty(&row.path)),
+        match_quality,
+        name_bytes: row.symbol.qualified_name.len(),
+        path: row.path.clone(),
+        start_byte: row.symbol.start_byte,
+        end_byte: row.symbol.end_byte,
+    }
+}
+
+fn symbol_visibility_penalty(symbol: &Symbol) -> u8 {
+    let hidden_name = symbol
+        .qualified_name
+        .split(['.', ':', '\\'])
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            part.starts_with('_')
+                && !(part.len() > 4 && part.starts_with("__") && part.ends_with("__"))
+        });
+    let private_modifier = symbol.signature.split_whitespace().take(6).any(|part| {
+        matches!(
+            part.trim_matches(|character: char| !character.is_alphanumeric()),
+            "private" | "protected" | "internal" | "fileprivate"
+        )
+    });
+    u8::from(hidden_name || private_modifier)
+}
+
+fn path_visibility_penalty(path: &Path) -> u8 {
+    u8::from(path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy();
+        value.starts_with('_')
+            && value != "__init__.py"
+            && !(value.starts_with("__") && value.ends_with("__"))
+    }))
 }
 
 fn command_find(
@@ -922,10 +1107,9 @@ fn command_find(
     let mut failures = FailureCollector::default();
     let mut parsed_count = 0usize;
     let mut lsp_count = 0usize;
-    let mut matched = vec![0usize; options.queries.len()];
-    let mut rows = (0..options.queries.len())
-        .map(|_| Vec::with_capacity(options.max_items.min(1_000)))
-        .collect::<Vec<Vec<FindRow>>>();
+    let mut buckets = (0..options.queries.len())
+        .map(|_| FindBucket::new(options.max_items))
+        .collect::<Vec<_>>();
     for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
         let parsed = batch
             .par_iter()
@@ -959,28 +1143,39 @@ fn command_find(
                     continue;
                 }
                 for (query_index, query) in options.queries.iter().enumerate() {
-                    if !query.matcher.matches(symbol) {
+                    let Some(class) = query.matcher.classify(symbol) else {
                         continue;
-                    }
-                    matched[query_index] += 1;
-                    if rows[query_index].len() < options.max_items {
-                        rows[query_index].push(FindRow {
-                            path: parsed.path.clone(),
-                            language: parsed.language,
-                            backend: parsed.backend,
-                            symbol: symbol.clone(),
-                            selector: options
-                                .selectors
-                                .then(|| parsed.selector(symbol, &shown_path)),
-                        });
-                    }
+                    };
+                    let row = FindRow {
+                        path: parsed.path.clone(),
+                        language: parsed.language,
+                        backend: parsed.backend,
+                        symbol: symbol.clone(),
+                        selector: options
+                            .selectors
+                            .then(|| parsed.selector(symbol, &shown_path)),
+                    };
+                    let rank = find_rank(query, &row);
+                    buckets[query_index].record(class, row, rank, options.max_items);
                 }
             }
         }
     }
+    let selections = buckets
+        .into_iter()
+        .zip(&options.queries)
+        .map(|(bucket, query)| bucket.select(&query.matcher))
+        .collect::<Vec<_>>();
+    let matched = selections
+        .iter()
+        .map(|selection| selection.matched)
+        .collect::<Vec<_>>();
     let multi_query = options.queries.len() > 1;
     let matched_total = matched.iter().sum::<usize>();
-    let shown_total = rows.iter().map(Vec::len).sum::<usize>();
+    let shown_total = selections
+        .iter()
+        .map(|selection| selection.rows.len())
+        .sum::<usize>();
     if multi_query {
         write!(
             output,
@@ -998,7 +1193,7 @@ fn command_find(
             "# pira_codenav find root={} query={} mode={} files={} matches={} shown={}",
             display_path(&root, cwd),
             quote_metadata(&options.queries[0].text),
-            options.queries[0].matcher.name(),
+            options.queries[0].matcher.name(selections[0].fallback_used),
             discovery.files.len(),
             matched_total,
             shown_total
@@ -1040,7 +1235,8 @@ fn command_find(
     }
     let mut unique_source_bytes = 0usize;
     let mut expanded_sources = HashSet::new();
-    for (query_index, query_rows) in rows.into_iter().enumerate() {
+    for (query_index, selection) in selections.into_iter().enumerate() {
+        let query_rows = selection.rows;
         if multi_query {
             let query_omitted = matched[query_index].saturating_sub(query_rows.len());
             write!(
@@ -1048,13 +1244,18 @@ fn command_find(
                 "query index={} text={} mode={} matches={} shown={}",
                 query_index + 1,
                 quote_metadata(&options.queries[query_index].text),
-                options.queries[query_index].matcher.name(),
+                options.queries[query_index]
+                    .matcher
+                    .name(selection.fallback_used),
                 matched[query_index],
                 query_rows.len()
             )
             .map_err(output_error)?;
             if query_omitted > 0 {
                 write!(output, " omitted={query_omitted}").map_err(output_error)?;
+                if selection.fallback_used {
+                    write!(output, " hint=use-qualified-name-or-search").map_err(output_error)?;
+                }
             }
             writeln!(output).map_err(output_error)?;
         }
@@ -1147,12 +1348,13 @@ fn command_find(
 fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
     let mut positional = Vec::new();
     let mut exact = false;
+    let mut contains = false;
     let mut regex = false;
     let mut kind = None;
-    let mut max_items = 200usize;
+    let mut max_items = DEFAULT_FIND_MAX_ITEMS;
     let mut selectors = false;
     let mut signatures = false;
-    let mut show_unique = false;
+    let mut source_mode = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1168,6 +1370,13 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
                     return Err((2, "--regex may be specified only once".into()));
                 }
                 regex = true;
+                index += 1;
+            }
+            "--contains" => {
+                if contains {
+                    return Err((2, "--contains may be specified only once".into()));
+                }
+                contains = true;
                 index += 1;
             }
             "--kind" => {
@@ -1203,10 +1412,25 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
                 index += 1;
             }
             "--show-unique" => {
-                if show_unique {
-                    return Err((2, "--show-unique may be specified only once".into()));
+                if source_mode.is_some() {
+                    return Err((
+                        2,
+                        "--show-unique and --locations-only may be specified only once in total"
+                            .into(),
+                    ));
                 }
-                show_unique = true;
+                source_mode = Some(true);
+                index += 1;
+            }
+            "--locations-only" => {
+                if source_mode.is_some() {
+                    return Err((
+                        2,
+                        "--show-unique and --locations-only may be specified only once in total"
+                            .into(),
+                    ));
+                }
+                source_mode = Some(false);
                 index += 1;
             }
             value if value.starts_with('-') => {
@@ -1224,8 +1448,11 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
             format!("find requires DIRECTORY and 1..{MAX_FIND_QUERIES} QUERY arguments"),
         ));
     }
-    if exact && regex {
-        return Err((2, "--exact and --regex are mutually exclusive".into()));
+    if usize::from(exact) + usize::from(contains) + usize::from(regex) > 1 {
+        return Err((
+            2,
+            "--exact, --contains, and --regex are mutually exclusive".into(),
+        ));
     }
     let root = positional.remove(0);
     if positional
@@ -1254,10 +1481,17 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
             } else if exact {
                 let pattern = format!(r"(?:^|\.|::|\\){}$", regex::escape(&query));
                 FindMatcher::Exact(build_find_regex(&pattern, true)?)
+            } else if contains {
+                FindMatcher::Contains(build_find_regex(&regex::escape(&query), true)?)
             } else {
-                FindMatcher::Literal(build_find_regex(&regex::escape(&query), true)?)
+                let exact_pattern = format!(r"(?:^|\.|::|\\){}$", regex::escape(&query));
+                FindMatcher::Auto {
+                    exact: build_find_regex(&exact_pattern, true)?,
+                    contains: build_find_regex(&regex::escape(&query), true)?,
+                }
             };
             Ok(FindQuery {
+                lowercase: query.to_lowercase(),
                 text: query,
                 matcher,
             })
@@ -1270,7 +1504,7 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
         max_items,
         selectors,
         signatures,
-        show_unique,
+        show_unique: source_mode.unwrap_or(true),
     })
 }
 
@@ -2846,7 +3080,7 @@ fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, St
 fn print_global_help(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nCHOOSE A COMMAND\n  map DIRECTORY             relevant files unknown; bounded repository shape\n  find DIRECTORY QUERY...   declaration names known; one parsed repository scan\n  search DIRECTORY PATTERN... implementation/body text known; bounded contextual matches\n  outline FILE...           file known; declarations and ranges without bodies\n  show TARGET...            exact source for selected items, line spans, or windows\n  imports FILE...           direct import/include statements from known files\n  dependents FILE           files that directly import/include one known file\n  deps FILE                 bounded transitive local file dependencies\n  languages                 supported language names\n\nLSP SEMANTICS\n  definition LOCATION...       definition behind a use\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declaration\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nTYPICAL FLOW\n  Use map only while relevant files are unknown. Batch related find/search queries, then request the\n  smallest needed source with show. For an already known file/range, an ordinary bounded read or\n  search can be cheaper. Use LSP semantics for exact relationships; do not substitute text matching.\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; semantic commands use LSP directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT CONTRACT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for exact targets, options, defaults, and examples."
+        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nSTRUCTURAL COMMANDS\n  map DIRECTORY             bounded repository shape\n  find DIRECTORY QUERY...   ranked declaration lookup with bounded unique source\n  search DIRECTORY PATTERN... bounded implementation-text matches and context\n  outline FILE...           declarations and ranges without bodies\n  show TARGET...            exact selected source, line spans, or windows\n  imports FILE...           direct import/include statements\n  dependents FILE           direct reverse file dependencies\n  deps FILE                 bounded transitive local file dependencies\n  languages                 compiled language capabilities\n\nLSP COMMANDS\n  definition LOCATION...       semantic definitions\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declarations\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; LSP commands use a server directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for command syntax, options, defaults, and examples."
     )
     .map_err(output_error)
 }
@@ -2865,8 +3099,8 @@ fn print_language_help(language: Language, output: &mut dyn Write) -> CommandRes
 
 const OUTLINE_HELP: &str = r#"pira_codenav outline — inspect declarations without implementation bodies
 
-WHEN TO USE
-  The file is known and you need its structure before reading source.
+DESCRIPTION
+  Lists parsed declarations, signatures, ranges, and optional selectors for one or more files.
 
 USAGE
   pira_codenav [LANGUAGE] outline FILE... [--match TEXT]... [--max-items N]
@@ -2886,17 +3120,13 @@ OUTPUT AND BACKEND
   bundled Tree-sitter. A syntax-dirty file uses a conventional server on PATH or an explicit --lsp;
   backend=lsp marks that result. --no-auto-lsp disables discovery. Peer successes remain visible.
 
-NEXT
-  Use `pira_codenav show FILE:LINE` for the smallest enclosing named item. Use --selectors only when
-  the handoff must remain freshness-checked across edits or later turns.
-
 EXAMPLE
   pira_codenav outline src/parser.rs --match parse --signatures"#;
 
 const SHOW_HELP: &str = r#"pira_codenav show — retrieve one exact structural item or line span
 
-WHEN TO USE
-  You know the relevant item or range and need the smallest sufficient exact source.
+DESCRIPTION
+  Prints source selected by position, qualified name, selector, line span, or line window.
 
 USAGE
   pira_codenav [LANGUAGE] show TARGET... [--window N] [--max-items N] [--max-bytes N]
@@ -2916,7 +3146,7 @@ OPTIONS
 BOUNDS AND OUTPUT
   A single structural target returns the whole item by default. Multiple targets default to 20
   deduplicated whole items and 64 KiB; --max-items and --max-bytes omit whole items rather than
-  truncating source. Items over 200 lines carry a hint to use search or --window. FILE:START-END is
+  truncating source. Items over 200 lines carry a bounded-retrieval hint. FILE:START-END is
   parser-free and clamps END at EOF. Syntax-dirty structural targets need an auto-discovered or
   explicit LSP. Selectors reject stale source. Returned source is framed as untrusted data.
 
@@ -2928,8 +3158,8 @@ EXAMPLES
 
 const MAP_HELP: &str = r#"pira_codenav map — produce a bounded repository or subsystem shape
 
-WHEN TO USE
-  Start here when the relevant files are unknown.
+DESCRIPTION
+  Prints a bounded repository or subsystem shape.
 
 USAGE
   pira_codenav [LANGUAGE] map DIRECTORY [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
@@ -2953,44 +3183,43 @@ EXAMPLE
 
 const FIND_HELP: &str = r#"pira_codenav find — search declarations across a repository or subsystem
 
-WHEN TO USE
-  Use when a declaration name is known but its file is not. This searches parsed declarations, not text.
+DESCRIPTION
+  Searches parsed declaration metadata across a directory; body text is not searched.
 
 USAGE
-  pira_codenav [LANGUAGE] find DIRECTORY QUERY... [--exact | --regex] [--kind KIND]
-    [--max-items N] [--selectors] [--signatures] [--show-unique]
+  pira_codenav [LANGUAGE] find DIRECTORY QUERY... [--exact | --contains | --regex] [--kind KIND]
+    [--max-items N] [--selectors] [--signatures] [--locations-only | --show-unique]
     [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
 
 MATCHING
-  Default            Case-insensitive substring over qualified name, signature, and kind.
+  Default            Case-insensitive full/suffix name first; substring fallback only if none exist.
   --exact            Case-insensitive full name or qualified-name suffix.
-  --regex            Rust regex syntax; case-sensitive unless the pattern requests otherwise.
+  --contains         Case-insensitive substring matching, including related names.
+  --regex            Rust regex; case-sensitive unless the pattern requests otherwise.
   --kind KIND        Restrict declaration kind.
-  --signatures       Include signature/type detail.
+  --signatures       Add signature/type detail.
   --selectors        Include freshness-checked `show` targets.
-  --show-unique      Include source when a query has exactly one match and that item is at most
-                     200 lines, 24 KiB, and within a shared 64 KiB expansion budget.
+  --locations-only   Omit automatic source. --show-unique explicitly requests the default behavior.
   QUERY...           One to 32 independent queries; files are parsed once for the whole batch.
-  --max-items N      Per-query result limit; default 200; all query limits total at most 100,000.
+  --max-items N      Per-query result limit; default 20; all query limits total at most 100,000.
 
 OUTPUT AND BACKEND
-  Results follow stable query/file/declaration order. A multi-query run prints compact query groups.
-  LANGUAGE restricts discovery. Clean files use bundled Tree-sitter; syntax-dirty files need an
-  auto-discovered or explicit LSP. Clean matches survive peer failures. Use --show-unique to avoid
-  a second call for small unambiguous results; otherwise batch needed targets into one `show`.
+  Bounded top-K results rank public/close names before hidden/distant matches, then use stable source
+  order. Private results remain searchable. One match includes source up to 200 lines/24 KiB under a
+  shared 64 KiB budget. Larger or ambiguous results provide bounded locations/selectors. Clean files
+  use bundled Tree-sitter; syntax-dirty files need a PATH or explicit LSP. Peer successes remain visible.
 
 EXAMPLES
-  pira_codenav find . Parser --exact
-  pira_codenav find . Module.compile compile_fx --exact --selectors
+  pira_codenav find . Module.compile compile_fx
+  pira_codenav find . widget --contains --locations-only
   pira_codenav find src '^Parser::parse$' --regex --selectors"#;
 
 const SEARCH_HELP: &str = r#"pira_codenav search — find implementation text with bounded context
 
-WHEN TO USE
-  Declaration lookup is insufficient and known body text, operators, literals, or conditions can
-  narrow the exact source. For one already known file, an ordinary bounded search may be cheaper.
+DESCRIPTION
+  Finds known body text, operators, literals, or conditions with bounded source context.
 
 USAGE
   pira_codenav [LANGUAGE] search DIRECTORY PATTERN... [--regex] [--context N]
@@ -3014,8 +3243,8 @@ EXAMPLES
 
 const IMPORTS_HELP: &str = r#"pira_codenav imports — inspect direct import/include statements
 
-WHEN TO USE
-  A file is known and you need its immediate import/include edges.
+DESCRIPTION
+  Lists direct import/include statements and conservatively resolved local targets for files.
 
 USAGE
   pira_codenav [LANGUAGE] imports FILE...
@@ -3035,8 +3264,8 @@ EXAMPLE
 
 const DEPENDENTS_HELP: &str = r#"pira_codenav dependents — inspect direct reverse file dependencies
 
-WHEN TO USE
-  A file is known and you need files whose imports/includes resolve directly to it.
+DESCRIPTION
+  Lists files whose imports/includes resolve directly to one local file.
 
 USAGE
   pira_codenav [LANGUAGE] dependents FILE [--root DIRECTORY]
@@ -3056,8 +3285,8 @@ EXAMPLE
 
 const DEPS_HELP: &str = r#"pira_codenav deps — traverse bounded local structural file dependencies
 
-WHEN TO USE
-  Direct imports/dependents are insufficient and you need a bounded transitive file graph.
+DESCRIPTION
+  Traverses a bounded local import/include graph in either or both directions.
 
 USAGE
   pira_codenav [LANGUAGE] deps FILE [--direction imports|dependents|both] [--depth N]
@@ -3080,8 +3309,8 @@ EXAMPLE
 
 const DEFINITION_HELP: &str = r#"pira_codenav definition — locate semantic definitions through LSP
 
-WHEN TO USE
-  You need the exact definition behind a source use.
+DESCRIPTION
+  Requests semantic definitions for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] definition FILE:LINE:COLUMN... [--max-items N]
@@ -3104,8 +3333,8 @@ EXAMPLE
 
 const IMPLEMENTATION_HELP: &str = r#"pira_codenav implementation — locate semantic implementations through LSP
 
-WHEN TO USE
-  Move from an interface, abstract declaration, or protocol use to concrete implementations.
+DESCRIPTION
+  Requests concrete implementations for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] implementation FILE:LINE:COLUMN... [--max-items N]
@@ -3124,8 +3353,8 @@ EXAMPLE
 
 const TYPE_DEFINITION_HELP: &str = r#"pira_codenav type-definition — locate semantic type definitions through LSP
 
-WHEN TO USE
-  Navigate from an expression or value to the declaration of its resolved type.
+DESCRIPTION
+  Requests resolved type declarations for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] type-definition FILE:LINE:COLUMN... [--max-items N]
@@ -3144,8 +3373,8 @@ EXAMPLE
 
 const REFERENCES_HELP: &str = r#"pira_codenav references — locate bounded semantic references through LSP
 
-WHEN TO USE
-  You need semantic uses of the item at an exact source position.
+DESCRIPTION
+  Requests bounded semantic references for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] references FILE:LINE:COLUMN... [--include-declaration]
@@ -3164,8 +3393,8 @@ EXAMPLE
 
 const CALLERS_HELP: &str = r#"pira_codenav callers — inspect incoming semantic calls through LSP
 
-WHEN TO USE
-  Find functions or methods that call the item at an exact source position.
+DESCRIPTION
+  Requests incoming call-hierarchy relations for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] callers FILE:LINE:COLUMN... [--max-items N]
@@ -3184,8 +3413,8 @@ EXAMPLE
 
 const CALLEES_HELP: &str = r#"pira_codenav callees — inspect outgoing semantic calls through LSP
 
-WHEN TO USE
-  Find functions or methods called by the item at an exact source position.
+DESCRIPTION
+  Requests outgoing call-hierarchy relations for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] callees FILE:LINE:COLUMN... [--max-items N]
@@ -3204,8 +3433,8 @@ EXAMPLE
 
 const HOVER_HELP: &str = r#"pira_codenav hover — retrieve bounded semantic type or documentation text through LSP
 
-WHEN TO USE
-  You need concise type, signature, or documentation context at an exact source position.
+DESCRIPTION
+  Requests bounded type, signature, or documentation text for source positions from an LSP server.
 
 USAGE
   pira_codenav [LANGUAGE] hover FILE:LINE:COLUMN... [--max-bytes N]
@@ -3224,8 +3453,8 @@ EXAMPLE
 
 const LANGUAGES_HELP: &str = r#"pira_codenav languages — list installed language capabilities
 
-WHEN TO USE
-  Language inference or compiled support is uncertain.
+DESCRIPTION
+  Lists language parsers compiled into this executable.
 
 USAGE
   pira_codenav languages

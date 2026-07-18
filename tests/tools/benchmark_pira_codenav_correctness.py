@@ -12,10 +12,11 @@ import subprocess
 
 
 OUTLINE_RE = re.compile(
-    r"^\s*(\S+)\s+(\S+)\s+L(\d+):(\d+)-\d+:\d+\s+selector=(pira://\S+)$"
+    r"^\s*(\S+)\s+(.+?)\s+L(\d+):(\d+)-\d+:\d+\s+selector=(pira://\S+)$"
 )
 SHOW_RE = re.compile(
-    r"item=(\S+) kind=(\S+) range=L(\d+):(\d+)-\d+:\d+ hash=([0-9a-f]+)"
+    r"item=(.+?) kind=(\S+) "
+    r"range=L(\d+):(\d+)-\d+:\d+ hash=([0-9a-f]+)"
 )
 LANGUAGE_BY_SUFFIX = {
     ".py": "python",
@@ -116,6 +117,12 @@ SUPPORTED_SUFFIXES = {
     ".exs",
     ".jl",
 }
+
+
+def metadata_value(value: str) -> str:
+    return json.loads(value) if value.startswith('"') else value
+
+
 EXPLICIT_LANGUAGE = {
     "synthetic/c_project/include/model.h": "c",
     "synthetic/extensionless_python": "python",
@@ -323,11 +330,12 @@ def main() -> int:
                 "--selectors",
                 "--max-items",
                 "10000",
+                "--no-auto-lsp",
             ],
             data,
         )
         if result.returncode:
-            if "Tree-sitter found" in result.stderr and "rerun with --lsp" in result.stderr:
+            if "Tree-sitter found" in result.stderr and "--lsp" in result.stderr:
                 lsp_required.add(relative)
                 continue
             failures.append(
@@ -381,12 +389,14 @@ def main() -> int:
         }
         for mode, target in targets.items():
             prefix = language_prefix(relative) if mode == "location" else []
-            result = run([str(binary), *prefix, "show", target], data)
+            result = run(
+                [str(binary), *prefix, "show", target, "--no-auto-lsp"], data
+            )
             header = SHOW_RE.search(result.stdout)
             valid = (
                 result.returncode == 0
                 and header is not None
-                and header.group(1) == name
+                and metadata_value(header.group(1)) == name
                 and header.group(2) == kind
                 and int(header.group(3)) == line
                 and int(header.group(4)) == column

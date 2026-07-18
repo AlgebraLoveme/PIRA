@@ -352,12 +352,12 @@ Reading an entire repository is slow and context-heavy. `pira_codenav` helps an 
 <details>
 <summary>Technical behavior, language support, security, and validation</summary>
 
-The usual workflow is broad to narrow:
+Choose the cheapest operation that can return enough evidence:
 
-1. `map` gives a bounded repository or subsystem shape.
-2. `find` searches parsed declarations when a name is known but its file is not.
-3. `search` batches bounded implementation-text patterns when declaration lookup is insufficient.
-4. `outline` gives declarations and ranges without bodies; `show` returns selected items, line spans, or line windows. `find --show-unique` can return a small unambiguous item directly.
+1. `search` batches known implementation terms such as calls, assignments, literals, and conditions.
+2. `find` batches declaration names, tries exact names before substring fallback, ranks public/close matches first, and includes small unique source automatically.
+3. `show` returns a known item, line span, or line window; `outline` gives a known file's declarations without bodies.
+4. `map` gives a bounded repository or subsystem shape when the relevant files are unknown.
 5. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
 6. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a caller-installed language server.
 
@@ -396,7 +396,7 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 | Native structural targets | 1,047 |
 | Location / freshness-selector round trips | 1,047/1,047 each |
 | Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 82 / 17 / 14 |
+| Functional / inert security / Rust tests | 83 / 17 / 14 |
 | Reproducible benchmark tasks | 39 |
 
 The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
@@ -407,16 +407,16 @@ Each latency is a complete subprocess call through collected output. Native macO
 
 | Clean operation | PIRA native | PIRA sandbox | ast-outline 1.8.2 sandbox | Grove 0.3.1 sandbox |
 |---|---:|---:|---:|---:|
-| Python outline | 5.512 ms | 2.236 ms | 51.213 ms | 41.027 ms |
-| Rust outline | 7.036 ms | 3.562 ms | 53.623 ms | 44.535 ms |
-| Python exact item | 5.557 ms | 2.322 ms | 54.374 ms | 42.160 ms |
-| Python repository map | 4.806 ms | 1.026 ms | 51.170 ms | 37.437 ms |
-| Rust repository map | 5.085 ms | 0.996 ms | 49.782 ms | 35.020 ms |
-| Java outline | 4.103 ms | 1.006 ms | 48.960 ms | 29.933 ms |
-| C outline | 3.269 ms | 0.410 ms | unsupported | 73.030 ms |
-| C++ outline | 3.303 ms | 0.411 ms | 48.384 ms | 120.754 ms |
+| Python outline | 6.009 ms | 2.238 ms | 51.226 ms | 40.466 ms |
+| Rust outline | 7.613 ms | 3.348 ms | 52.752 ms | 42.178 ms |
+| Python exact item | 5.898 ms | 2.065 ms | 50.656 ms | 40.508 ms |
+| Python repository map | 5.100 ms | 0.927 ms | 49.323 ms | 35.797 ms |
+| Rust repository map | 5.056 ms | 0.860 ms | 48.708 ms | 33.463 ms |
+| Java outline | 4.557 ms | 0.951 ms | 47.728 ms | 29.241 ms |
+| C outline | 3.415 ms | 0.351 ms | unsupported | 71.696 ms |
+| C++ outline | 3.633 ms | 0.399 ms | 46.996 ms | 118.023 ms |
 
-On these tasks, the fastest available baseline took 12.5–178× as long as PIRA in the same sandbox. PIRA used about 3.6–5.6 MiB peak RSS, versus about 15.6–48.4 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
+On these tasks, the fastest available baseline took 12.6–204× as long as PIRA in the same sandbox. PIRA used about 4.1–5.6 MiB peak RSS, versus about 15.6–49.7 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
 
 ##### LSP cost
 
@@ -445,55 +445,56 @@ Context reduction compares returned UTF-8 bytes with complete source bytes other
 
 | Subcommand | Returned bytes | Context reduction | Native median | Sandbox median | Sandbox peak RSS |
 |---|---:|---:|---:|---:|---:|
-| `outline` | 1,652 | 92.4% | 5.512 ms | 2.236 ms | 3.6 MiB |
-| `show` | 3,334 | 84.6% | 5.557 ms | 2.322 ms | 3.6 MiB |
-| `map` | 432 | 69.9% | 4.806 ms | 1.026 ms | 4.6 MiB |
-| `find` | 236 | 83.5% | 4.935 ms | 0.977 ms | 4.6 MiB |
-| `imports` | 389 | 56.6% | 3.502 ms | 0.520 ms | 3.6 MiB |
-| `dependents` | 228 | 84.1% | 4.684 ms | 0.954 ms | 4.6 MiB |
-| `deps` | 342 | 76.1% | 4.771 ms | 0.927 ms | 4.1 MiB |
-| `definition` | 147 | 99.3% | 32.831 ms | 18.338 ms | 12.7 MiB |
-| `implementation` | 151 | 99.3% | 33.471 ms | 17.686 ms | 12.7 MiB |
-| `type-definition` | 152 | 99.3% | 33.226 ms | 17.891 ms | 12.2 MiB |
-| `references` | 1,435 | 93.4% | 33.399 ms | 18.100 ms | 12.7 MiB |
-| `callers` | 237 | 98.9% | 33.152 ms | 17.170 ms | 12.7 MiB |
-| `callees` | 237 | 98.9% | 32.557 ms | 17.745 ms | 12.7 MiB |
-| `hover` | 200 | 99.1% | 33.123 ms | 17.642 ms | 12.7 MiB |
-| `languages` | 166 | not applicable | 3.146 ms | 0.313 ms | 2.1 MiB |
+| `outline` | 1,652 | 92.4% | 6.009 ms | 2.238 ms | 4.1 MiB |
+| `show` | 3,334 | 84.6% | 5.898 ms | 2.065 ms | 4.1 MiB |
+| `map` | 432 | 69.9% | 5.100 ms | 0.927 ms | 4.6 MiB |
+| `find` | 650 | 54.6% | 5.361 ms | 0.976 ms | 4.6 MiB |
+| `imports` | 389 | 56.6% | 3.769 ms | 0.437 ms | 4.1 MiB |
+| `dependents` | 228 | 84.1% | 5.020 ms | 0.838 ms | 4.6 MiB |
+| `deps` | 342 | 76.1% | 5.492 ms | 0.818 ms | 4.6 MiB |
+| `definition` | 147 | 99.3% | 35.589 ms | 16.303 ms | 12.7 MiB |
+| `implementation` | 151 | 99.3% | 35.520 ms | 17.214 ms | 12.7 MiB |
+| `type-definition` | 152 | 99.3% | 36.850 ms | 16.539 ms | 12.7 MiB |
+| `references` | 1,435 | 93.4% | 35.182 ms | 16.461 ms | 12.7 MiB |
+| `callers` | 237 | 98.9% | 35.584 ms | 15.728 ms | 12.7 MiB |
+| `callees` | 237 | 98.9% | 35.794 ms | 16.063 ms | 12.7 MiB |
+| `hover` | 200 | 99.1% | 34.448 ms | 15.920 ms | 12.7 MiB |
+| `languages` | 166 | not applicable | 4.051 ms | 0.269 ms | 2.6 MiB |
 
 `outline`, `show`, and semantic rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
+The `find` row includes its small unique declaration source by default, trading some single-call bytes for one fewer retrieval round trip; `--locations-only` keeps only ranked locations.
 
 ##### All-language outline regression
 
 | Language | Fixture | Source | Outline | Reduction | Native | Sandbox |
 |---|---|---:|---:|---:|---:|---:|
-| Python | Click | 21,680 B | 1,652 B | 92.4% | 5.512 ms | 2.236 ms |
-| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 7.036 ms | 3.562 ms |
-| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 4.103 ms | 1.006 ms |
-| C | synthetic | 210 B | 124 B | 41.0% | 3.269 ms | 0.410 ms |
-| C++ | synthetic | 202 B | 272 B | −34.7% | 3.303 ms | 0.411 ms |
-| CUDA | synthetic | 419 B | 198 B | 52.7% | 4.024 ms | 0.440 ms |
-| Bash | bats-core | 16,510 B | 291 B | 98.2% | 5.022 ms | 2.793 ms |
-| Go | synthetic | 119 B | 99 B | 16.8% | 3.559 ms | 0.274 ms |
-| JavaScript | synthetic | 181 B | 211 B | −16.6% | 3.318 ms | 0.281 ms |
-| TypeScript | synthetic | 386 B | 214 B | 44.6% | 3.371 ms | 0.404 ms |
-| C# | synthetic | 235 B | 239 B | −1.7% | 3.412 ms | 0.413 ms |
-| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 5.395 ms | 10.884 ms |
-| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 8.894 ms | 5.175 ms |
-| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 3.858 ms | 1.043 ms |
-| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 8.318 ms | 4.448 ms |
-| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 3.645 ms | 0.591 ms |
-| R | dplyr | 15,796 B | 712 B | 95.5% | 4.970 ms | 1.656 ms |
-| Ruby | Rails | 14,867 B | 142 B | 99.0% | 3.905 ms | 1.471 ms |
-| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 4.459 ms | 5.402 ms |
-| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 27.503 ms | 22.177 ms |
-| Dart | http | 3,856 B | 550 B | 85.7% | 4.126 ms | 1.080 ms |
-| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 8.855 ms | 9.027 ms |
-| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 3.939 ms | 1.065 ms |
+| Python | Click | 21,680 B | 1,652 B | 92.4% | 6.009 ms | 2.238 ms |
+| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 7.613 ms | 3.348 ms |
+| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 4.557 ms | 0.951 ms |
+| C | synthetic | 210 B | 124 B | 41.0% | 3.415 ms | 0.351 ms |
+| C++ | synthetic | 202 B | 272 B | −34.7% | 3.633 ms | 0.399 ms |
+| CUDA | synthetic | 419 B | 198 B | 52.7% | 3.595 ms | 0.430 ms |
+| Bash | bats-core | 16,510 B | 291 B | 98.2% | 5.232 ms | 2.613 ms |
+| Go | synthetic | 119 B | 99 B | 16.8% | 4.148 ms | 0.288 ms |
+| JavaScript | synthetic | 181 B | 211 B | −16.6% | 3.682 ms | 0.311 ms |
+| TypeScript | synthetic | 386 B | 214 B | 44.6% | 3.911 ms | 0.353 ms |
+| C# | synthetic | 235 B | 239 B | −1.7% | 3.444 ms | 0.382 ms |
+| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 5.862 ms | 10.194 ms |
+| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 9.406 ms | 4.612 ms |
+| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 4.762 ms | 0.986 ms |
+| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 8.838 ms | 4.361 ms |
+| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 3.832 ms | 0.667 ms |
+| R | dplyr | 15,796 B | 712 B | 95.5% | 5.341 ms | 1.791 ms |
+| Ruby | Rails | 14,867 B | 142 B | 99.0% | 3.980 ms | 1.154 ms |
+| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 4.729 ms | 4.963 ms |
+| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 28.604 ms | 22.573 ms |
+| Dart | http | 3,856 B | 550 B | 85.7% | 4.862 ms | 1.087 ms |
+| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 9.377 ms | 9.124 ms |
+| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 4.094 ms | 1.072 ms |
 
 Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
 
-A minimal `pira_codenav --version` call measured 2.429 ms median / 2.686 ms p95 on native macOS. The optimized macOS arm64 binary is 51,190,960 bytes, or 5,709,612 bytes with deterministic gzip level 9.
+A minimal `pira_codenav --version` call measured 2.537 ms median / 2.867 ms p95 on native macOS. The optimized macOS arm64 binary is 51,257,408 bytes, or 5,758,561 bytes with deterministic gzip level 9.
 
 <details>
 <summary>Benchmark method and limitations</summary>

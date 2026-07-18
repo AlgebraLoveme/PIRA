@@ -54,6 +54,6 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `forget` requires explicit user permission and is only for erroneous/sensitive records; never use it to rewrite history.
 
 ### `pira_codenav`
-- Consult `pira_codenav --help`. Use it when repository shape, declarations, dependencies, body-text search, or LSP semantics can narrow inspection.
-- Choose the cheapest bounded operation. Batch independent queries or targets; when the exact file/range is already known, a bounded generic search or read is also appropriate.
+- Consult `pira_codenav --help`. Use the cheapest sufficient retrieval: batched `search` for known body terms, batched `find` for declaration names, `outline` for known-file structure, `show` for known targets, and `map` when relevant files are unknown.
+- Prefer one call that returns enough evidence; `find` includes small unique source automatically. When the exact file/range is already known, a bounded generic search or read is also appropriate.
 - Use LSP subcommands for semantic relationships rather than text matching; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
