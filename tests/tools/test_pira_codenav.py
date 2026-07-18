@@ -1567,6 +1567,49 @@ class PiraCodeNavTests(unittest.TestCase):
             'name="Illuminate\\\\Support\\\\Collection"', namespace_suffix.stdout
         )
 
+    def test_find_batches_independent_queries_in_one_repository_scan(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-find-multi-") as temp:
+            root = Path(temp)
+            (root / "api.py").write_text(
+                "class Widget:\n"
+                "    def run(self): return 1\n\n"
+                "def build_widget(): return Widget()\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "find",
+                ".",
+                "Widget",
+                "build_widget",
+                "--exact",
+                "--selectors",
+                "--max-items",
+                "1",
+                cwd=root,
+            )
+            lines = result.stdout.splitlines()
+            self.assertIn("queries=2", lines[0])
+            self.assertIn("matches=2 shown=2", lines[0])
+            self.assertIn('query index=1 text="Widget" mode=exact matches=1 shown=1', lines)
+            self.assertIn(
+                'query index=2 text="build_widget" mode=exact matches=1 shown=1',
+                lines,
+            )
+            self.assertIn('symbol query=1 file=api.py', result.stdout)
+            self.assertIn('symbol query=2 file=api.py', result.stdout)
+            self.assertEqual(2, len(SELECTOR_RE.findall(result.stdout)))
+
+            oversized = self.run_cli(
+                "find",
+                ".",
+                *[f"query_{index}" for index in range(32)],
+                "--max-items",
+                "3126",
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("times query count may not exceed 100000", oversized.stderr)
+
     def test_find_preserves_clean_results_and_uses_lsp_only_for_dirty_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-find-partial-") as temp:
             root = Path(temp)

@@ -2,24 +2,42 @@
 
 PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
 
-PIRA is designed to be warm, honest about uncertainty, evidence-first when evidence matters, and easy to inspect and customize.
+It adds a small, inspectable set of instructions and tools to Codex. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
+
+## What PIRA helps with
+
+- planning research and checking evidence;
+- writing and polishing scientific text;
+- coding, debugging, and repository work;
+- learning difficult material through clear explanations;
+- practical day-to-day problem-solving.
+
+PIRA follows five principles:
+
+- **Useful:** give concrete next steps, not vague advice.
+- **Honest:** never invent claims, citations, or results.
+- **Evidence-first:** prefer primary sources when facts matter.
+- **Transparent:** separate facts from interpretation and state uncertainty.
+- **Kind:** stay supportive, collaborative, and respectful.
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each with high reasoning effort**.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort**. Other models or agent platforms may work, but have not received the same level of testing.
 
 ## Quick start
 
-PIRA installs to `~/agent` by default. Setup is idempotent, backs up user-level Codex files before editing them, supports dry-run and verification modes, and is safe to rerun. Git is required; the setup wrapper handles Python discovery and can offer platform-specific installation help.
+PIRA installs to `~/agent` by default. You can use the one-line command for the easiest setup, or the inspect-first path if you want to review every change before it happens.
+
+Setup is safe to rerun: it preserves an existing `USER.md`, backs up user-level Codex files before changing them, and can preview or verify its work. Git is required. The setup helper checks for Python and can offer platform-specific installation help.
 
 ### Recommended one-line install or update
 
-This command:
+The recommended command installs or updates PIRA, then connects it to Codex. It:
 - uses the existing `~/agent` git checkout when present, otherwise clones PIRA into `~/agent`;
 - enables **soft-safe** mode;
 - keeps audio notifications **off**;
 - links PIRA into Codex;
-- installs or refreshes bundled PIRA tools such as `pira_ctx` in the user's `PATH`;
+- installs or refreshes bundled PIRA tools in the user's `PATH`;
 - moves old PIRA-managed legacy files into backup;
 - creates a private `USER.md` placeholder only if `USER.md` is missing.
 
@@ -35,7 +53,7 @@ Windows PowerShell:
 if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode placeholder --global-agents link --legacy remove
 ```
 
-If you are rerunning setup and want a missing `USER.md` to stay missing, use `--user-mode keep` instead.
+If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-mode keep`:
 
 macOS/Linux:
 
@@ -49,13 +67,13 @@ Windows PowerShell:
 Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode keep --global-agents link --legacy remove
 ```
 
-`git pull --ff-only` updates an existing checkout only when Git can do so without a merge. If you have tracked local edits or a divergent branch, it stops for manual review.
+`git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
 
 > **Soft-safe is not a sandbox.** It sets Codex to no-approval/full-permission mode and relies on PIRA's explicit safety rules before state-changing commands.
 
 ### Inspect-first install
 
-Use this path if you want to preview setup before writing anything:
+Use this path if you prefer to inspect setup before it changes anything:
 
 ```bash
 git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent
@@ -71,14 +89,14 @@ On Windows, invoke the same setup through `assets/scripts/setup_pira.ps1` from t
 powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 ```
 
-Both platform wrappers forward the same options to `assets/scripts/setup_pira.py`. They share the Python bootstrap helpers in `assets/scripts/lib/`; setup can offer to install Python with Homebrew on macOS or winget on Windows.
+The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
 
 ## Setup options
 
 <details>
 <summary>Execution, user configuration, and tool-install options</summary>
 
-The script asks before sensitive choices in interactive mode. For unattended setup, pass explicit flags.
+Most users can keep the recommended defaults. Open this section when you want stricter permissions, a custom install path, audio, or a tools-only update. Interactive setup asks before sensitive choices; unattended setup requires explicit flags.
 
 ### Execution mode
 
@@ -112,7 +130,7 @@ The script asks before sensitive choices in interactive mode. For unattended set
 
 ### Install or refresh only the PIRA tools
 
-If PIRA is already configured and you only need to install, update, or reinstall its bundled native tools, run the tools-only setup from the existing PIRA checkout. Update that checkout first when you want a newer bundled release. The normal command installs a missing tool, replaces a stale copy, and leaves an identical verified copy unchanged.
+If PIRA itself is already configured, these commands update only its bundled tools. A normal run installs missing tools, replaces outdated copies, and leaves verified matching copies unchanged.
 
 On macOS or Linux:
 
@@ -132,7 +150,7 @@ py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the same bundled r
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
 ```
 
-By default, the tools-only setup discovers every valid bundle under `tools/dist`, verifies all selected artifacts before writing, and installs each executable independently. Use `--tool pira_ctx` or `--tool pira_codenav` to operate on one tool; repeat `--tool` to select several. Use `--force` to reinstall even when an installed hash already matches, `--install-dir PATH` to override the default (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows), and `--no-path` when PATH persistence is managed separately. Restart the shell or agent process if setup reports that PATH changes are not yet active.
+The updater verifies every selected bundle before installation. Use `--tool pira_ctx` or `--tool pira_codenav` to select one tool, and repeat `--tool` to select several. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 </details>
 
@@ -141,7 +159,7 @@ By default, the tools-only setup discovers every valid bundle under `tools/dist`
 <details>
 <summary>Files, settings, tools, and verification performed by setup</summary>
 
-The setup script:
+In plain language, setup connects PIRA to Codex, installs its tools, and checks the result. More precisely, it:
 
 1. Detects the repository directory and ensures it is available as `~/agent`, unless another `--agent-dir` is given.
 2. Initializes a private `USER.md` placeholder when needed.
@@ -156,61 +174,75 @@ If setup cannot safely handle an existing conflicting file or Codex setting, it 
 
 </details>
 
-## Memory hierarchy
+## Memory System
 
-**Within its retention boundary, routed command history is not summarized away: events remain searchable.** PIRA stores operational history outside the prompt and retrieves it when needed, while keeping durable project understanding in a compact human-readable form.
+PIRA separates memory by how long it should remain useful. This prevents raw command logs from crowding out important project knowledge.
 
-| Level | Memory | Closest human analogue | Role |
+| Layer | What it remembers | Where it lives | Who reads it |
 |---|---|---|---|
-| Project-global memory | `AGENT_WORKBOOK.md` | A project journal | Keeps durable actions, results, decisions, and lessons that should guide future work. |
-| Event memory | `pira_ctx` storage | A detailed action log | Keeps command history and available evidence searchable without loading the full history into context. |
-| Recovery view | `pira_ctx recap` | Memory of the last few steps | Restores the recent current-thread events needed after context compaction. |
+| Activity | Commands, actions, and detailed evidence | `pira_ctx` | Agents search it when needed |
+| Decisions | Important choices, alternatives, and reasons | `pira_decision` | Agents search it when needed |
+| Project knowledge | Durable state, validated results, lessons, and limitations | `AGENT_WORKBOOK.md` | Agents and humans read it directly |
+
+Detailed activity remains searchable for as long as retention allows. After a conversation is compacted, `pira_ctx recap` can restore the recent activity needed to continue the work; it is part of the activity layer, not another memory layer.
 
 <details>
 <summary><strong>Difference from a Codex session log</strong></summary>
 
-A Codex session log is **session-centered and chronological**: it preserves the conversation and activity of one thread so that the thread can be reviewed or continued. PIRA memory is **project-centered and retrieval-oriented**: it preserves useful operational evidence across threads and promotes durable understanding into the workspace workbook. It does not copy the conversation, hidden reasoning, or every transient interaction into a second transcript.
+A Codex session log is **session-centered and chronological**: it preserves the conversation and activity of one thread so that the thread can be reviewed or continued. The PIRA Memory System is **project-centered and retrieval-oriented**: it preserves useful operational evidence across threads and promotes durable understanding into the workspace workbook. It does not copy the conversation, hidden reasoning, or every transient interaction into a second transcript.
 
-| Difference | Codex session log | PIRA memory hierarchy |
+| Difference | Codex session log | PIRA Memory System |
 |---|---|---|
 | Organizing unit | One conversation or thread | One workspace, with automatically scoped thread events |
-| Primary content | Chronological conversation and session activity | Searchable command-purpose events and curated project knowledge |
-| Retrieval model | Reopen or continue the session | Search relevant events, recap recent work, or read durable conclusions |
-| Cross-session value | Preserves the history of each session | Carries project decisions and lessons into future sessions |
-| Noise policy | Retains the conversational sequence | Keeps event detail in storage and promotes only lasting conclusions |
+| Primary content | Chronological conversation and session activity | Command events, structured decisions, and curated high-level project knowledge |
+| Retrieval model | Reopen or continue the session | Agents search lower layers; agents and humans read the workbook directly |
+| Cross-session value | Preserves each session's history | Carries operational evidence, decisions, and durable project understanding across sessions |
+| Noise policy | Retains the conversational sequence | Separates event detail, concluded decisions, and promoted high-level knowledge |
 
 The two are complementary. A session log answers **“what happened in this conversation?”** PIRA answers **“what has been done in this project, what evidence remains available, and what should future work remember?”**
 
 </details>
 
-Memory moves upward by **promotion, not replacement**. Events remain in `pira_ctx` storage, and only conclusions with lasting value are promoted to the workbook. Agents therefore search detailed history instead of summarizing it away, and read global memory only when the task needs project continuity. Retention and explicit pruning still define how long event history remains available; anything that must outlive those bounds belongs in the workbook.
+Information moves upward only when its lasting value increases. Activity stays in `pira_ctx`; concluded choices go to `pira_decision`; durable consequences become self-contained workbook entries. The workbook never requires a reader to look up a lower-level record.
 
-## `pira_ctx`: lightweight command context
+## PIRA Internal Tools
+
+PIRA includes three small tools that help agents work with less noise and better continuity. Most users never need to run them manually; built-in command help provides exact syntax.
+
+| Tool | What problem it solves |
+|---|---|
+| `pira_ctx` | Keeps large command output available without flooding the active conversation. |
+| `pira_decision` | Records important choices in a consistent, searchable form. |
+| `pira_codenav` | Lets an agent inspect code structure and relationships without editing or executing the code. |
+
+### `pira_ctx`: lightweight command context
+
+Long build logs, test output, and file listings can consume a model's working context. `pira_ctx` returns short output normally, but stores large output locally and gives the agent a compact summary. The full evidence remains available for focused follow-up.
 
 <details>
-<summary>How it works, security design, Context Mode comparison, and benchmarks</summary>
+<summary>Technical behavior, security, comparison, and validation</summary>
 
-`pira_ctx` keeps large command output from overwhelming active context while retaining it locally within configurable space limits. Automatic mode is the default and its name can be omitted:
+Automatic mode works as follows:
 
 1. Ordinary short output is returned directly.
-2. Long or diagnostic output is stored locally, while the model receives a bounded extractive synopsis and a capture ID.
-3. If more detail is needed, the retained capture remains available for targeted search, line-range retrieval, transformation, or exact replay.
+2. Long or diagnostic output is stored locally, while the model receives a short evidence-based summary and a capture ID.
+3. The agent can later search, inspect a range, analyze, or replay the retained output.
 
-For compile, test, lint, or other validation jobs where only success or failure matters, `check` stores the retained log but prints one PASS/FAIL status line with the child exit code and capture ID.
+For jobs where only the outcome matters—such as builds, tests, or linting—`check` stores the log but returns a single PASS/FAIL line, exit code, and capture ID.
 
-Explicit `exact` mode streams unchanged when attached to a terminal. In non-interactive calls it buffers the result so that highly repetitive output—or output exceeding retention or indexing bounds—can switch to a retained report instead of flooding or silently truncating context. Genuinely varied output remains exact, and every switch is announced.
+`exact` mode normally returns output unchanged. In non-interactive use, it may replace extremely repetitive or oversized output with a retained report rather than flood or silently truncate the context. It always announces that switch.
 
-For a non-interactive program still running after about 30 seconds, `pira_ctx` silently publishes a read-only checkpoint. Concurrent inspection uses a consistent snapshot without blocking the program; `exec` receives a private copy. Running captures are protected from verification, deletion, and pruning until completion. See `pira_ctx --help` for the exact contract.
+For a non-interactive program still running after about 30 seconds, `pira_ctx` publishes a read-only checkpoint. The agent can inspect a consistent snapshot without blocking the program. Running captures cannot be verified, deleted, or pruned until the program finishes.
 
-Compact command-purpose events retain agent-supplied intents without duplicating command output. `pira_ctx` automatically hashes `PIRA_CTX_THREAD_ID`, then `CODEX_THREAD_ID`, together with the workspace identity; raw thread identifiers are never stored. `pira_ctx history` reviews the current thread by default, while explicit `--scope workspace` merges anonymously labeled threads. Search covers all retained events by default but always stops at a bounded result limit of 10 unless changed. `--since`/`--until` select relative or RFC 3339 time bounds, while `--offset` and `--lookback` select event-number windows before intent matching—for example, the events before the newest 2,000. Literal intent matching is case-insensitive; fuzzy or semantic retrieval is not implicit, and regular expressions require `--regex`. With neither supported thread ID, current scope uses a labeled workspace-local unscoped fallback rather than claiming thread isolation.
+Each recorded event keeps the purpose of a command without copying its output. Thread identifiers are combined with the workspace identity and hashed; raw identifiers are never stored. History defaults to the current thread, while workspace scope can combine anonymously labeled threads. Search is bounded and supports time windows, event windows, literal text, and explicit regular expressions. It does not silently perform fuzzy or semantic matching.
 
-Version 1.0 stores immutable checked `PIRAEVT1` records under a hidden `.events` namespace and builds disposable per-thread `PIRAEIX1` catalogs. The bounded checked retention journal also carries the history-facing summaries, letting a search scan one ordered index and validate only selected records instead of sorting and fingerprinting every event file. It rebuilds from authoritative records if missing or corrupt. Selected `history --details` rows additionally load duration and redacted command. Pre-1.0 JSON ledgers are ignored and preserved until explicit `prune --legacy-events` cleanup.
+Version 1.0 stores checked, write-once event records and builds disposable per-thread search catalogs. If a catalog is missing or corrupt, it is rebuilt from the authoritative records. Older JSON ledgers are preserved but ignored until the user explicitly removes them.
 
-Setup installs a verified native executable in the user's `PATH`. Normal use requires no Python, Rust toolchain, daemon, database, network service, or model call; the optional `exec` command uses an available Python 3 interpreter to analyze a stored capture with explicit code. Captures are private user-cache files with independently compressed blocks and integrity hashes. `pira_ctx` preserves the caller's permissions and does not sandbox commands. Run `pira_ctx --help` to choose a command and `pira_ctx SUBCOMMAND --help` for exact usage. Its Rust source is under `tools/src/pira_ctx`, and verified builds for macOS arm64/x64, Linux arm64/x64, and Windows x64 are under `tools/dist/pira_ctx`.
+Setup installs a verified native executable in the user's `PATH`. Normal use needs no Python, Rust toolchain, daemon, database, network, or model call. The optional `exec` analysis command uses Python 3. Captures are private user-cache files with compressed, integrity-checked blocks. `pira_ctx` keeps the caller's permissions and does **not** sandbox commands. Run `pira_ctx --help` for usage. Source is under `tools/src/pira_ctx`; verified builds are under `tools/dist/pira_ctx`.
 
-### Security design
+#### Security design
 
-`pira_ctx` treats PROGRAM output as untrusted data, but it is not a sandbox and does not make the wrapped program safe. Its security boundary covers harm introduced by capturing, storing, selecting, or displaying PROGRAM output:
+`pira_ctx` treats program output as untrusted data. It protects the capture and display path, but it is not a sandbox and cannot make the wrapped program safe:
 
 - **Injection-aware display.** Agent-facing extracts are labeled as PROGRAM data, which PIRA rules treat as untrusted, and use trusted line and stream prefixes. Terminal escapes, Unicode line separators, bidirectional overrides, and invisible direction controls are sanitized so output cannot forge report structure or manipulate normal automatic display. A bounded heuristic scans the final displayed text for reserved role/wrapper markers and common **English** injection keywords, including English instructions split across displayed lines. Keyword detection is not multilingual; non-English text is detected only when it also contains a recognized marker or unsafe display control. When triggered, one warning appears before the evidence. Detection never suppresses or re-ranks evidence, and benign output pays no warning-token cost.
 - **Explicit exactness.** Automatic mode retains short output matched by the advisory heuristic instead of replaying it directly; short `exec` output follows the same routing. `search` applies the same warning. Exact byte-replay paths in `exact`, `raw`, and `range` remain unsanitized because utility and faithful recovery take precedence; they remain untrusted data under PIRA's agent rules.
@@ -219,7 +251,7 @@ Setup installs a verified native executable in the user's `PATH`. Normal use req
 
 Security checks are separate from ordinary functional tests and run as fixed, non-destructive fixtures in a deny-by-default sandbox with deliberately tiny configurable limits. Against 0.7.1 on 45 held-out benign real logs, 0.8.0 produced no false warnings, returned byte-identical responses, and showed no measurable median runtime regression in an alternating comparison. The live concurrency contract was also exercised with an inert delayed program in an isolated Linux Docker Sandbox. This is best-effort hardening, not a guarantee that every adversarial instruction will be detected; the primary boundary is the rule that PROGRAM output is data and cannot grant authority.
 
-### Relationship to Context Mode
+#### Relationship to Context Mode
 
 `pira_ctx` was informed by [Context Mode](https://github.com/mksglu/context-mode), especially its ideas of keeping raw tool output out of context, attaching intent to execution, retrieving indexed evidence after compaction, and analyzing stored output with small programs. We thank its contributors for publishing and explaining these ideas.
 
@@ -233,7 +265,7 @@ Security checks are separate from ordinary functional tests and run as fixed, no
 
 PIRA uses `pira_ctx` when a small single-binary wrapper and exact local fallback are preferable. Context Mode is the more comprehensive option when broader interception, hooks, sandboxing, or database-backed retrieval are needed.
 
-### Comprehensive held-out benchmark
+#### Comprehensive held-out benchmark
 
 The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.0.0` on that corpus:
 
@@ -257,7 +289,7 @@ All 45 PIRA cases preserved child status, entered full automatic-summary mode, r
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
 
-#### Corpus and evaluation protocol
+##### Corpus and evaluation protocol
 
 The prospective public core covers VCS patches, largest tracked Rust files, recursive declaration listings, 40-commit terminal logs, and GitHub pull-list responses. Exact and structural duplicates against earlier private corpora were excluded. Public changed basenames were preserved as sanitized metadata so suggestion labels remained observable. Five cases per category were selected by content SHA-256, producing 25 core cases.
 
@@ -280,7 +312,7 @@ Each suite's output-quality labels were fixed during the original holdout evalua
 | Static analysis | 1 | 1 success | 1/1 abstention | 92.5% |
 | LaTeX compilation | 5 | 1 success, 4 failure | 1/1 abstention; 3/4 markers | 94.6% |
 
-#### Context Mode comparison on the final corpus
+##### Context Mode comparison on the final corpus
 
 Context Mode 1.0.169 was installed inside an isolated Linux Docker Sandbox and rerun without errors on the exact final 45 sanitized fixtures. Generic passthrough used one persistent server, `ctx_execute_file`, the same category-level intent as PIRA, and JavaScript that printed each fixture while preserving its recorded exit status. Its direct Node emitter produced the same bytes and exit status as its raw baseline, so Docker startup and server initialization are excluded from overhead. It returned 71,621 bytes, classified all 45 statuses correctly, and immediately exposed 9/13 labeled outcomes: 7/8 failure markers and 2/5 changed basenames.
 
@@ -288,7 +320,7 @@ Context Mode 1.0.169 was installed inside an isolated Linux Docker Sandbox and r
 
 Generic passthrough is the closest automatic wrapper-level comparison, not Context Mode's recommended workflow. Context Mode normally asks the model to run task-specific analysis code and return only the derived answer. Its [published benchmark](https://github.com/mksglu/context-mode/blob/main/BENCHMARK.md) reports 98% reduction for task-specific execution, 82% for exact index-plus-search retrieval, and 96% overall. Returned-context measurements here count UTF-8 bytes rather than tokenizer-specific tokens, and immediate visibility does not measure evidence recoverable by later search.
 
-#### Limitations
+##### Limitations
 
 This remains a private implementation benchmark on one arm64 macOS evaluation host, not a universal performance claim. The remote suite is genuinely unseen and post-freeze imported, but its logs predate the freeze and are therefore not prospective outputs. Setup/install and static-analysis coverage remains below the five-case cap because no more eligible unique remote responses were available. Failure markers measure visibility of broad outcome evidence rather than complete diagnostic usefulness. arXiv selection required baseline build availability and includes one intentionally mutated source. Privacy sanitation changes path separators in LaTeX logs. Binary, non-UTF-8, and interactive-terminal behavior are covered by functional tests rather than this corpus. Web-search returns remain excluded because Codex built-in web output is not directly captured by the local command wrapper.
 
@@ -296,45 +328,64 @@ This remains a private implementation benchmark on one arm64 macOS evaluation ho
 
 </details>
 
-## `pira_codenav`: lightweight code navigation
+### `pira_decision`: structured decision memory
+
+Projects often lose the reason behind a choice. `pira_decision` keeps the context, serious alternatives, selected option, decision-maker, and time in one searchable record.
 
 <details>
-<summary>Behavior, backends, baseline relationship, security, and benchmarks</summary>
+<summary>Technical behavior, storage, and concurrency</summary>
 
-`pira_codenav` is a read-only code-inspection tool for broad-to-narrow agent exploration:
+Each record contains an ID, UTC timestamp, short context, ordered alternatives, the selected option, and whether the decision came from a human, an agent, or both. Saved records are not edited in place.
+
+The tool can add a decision, show one record, search individual fields with regular expressions, or explicitly forget one exact record. Search can distinguish every considered choice from the option that was selected, and returns newer matches first.
+
+Records live in private per-user application data and are separated by workspace. Multiple agents can write safely at the same time. Readers see only complete records, although a decision saved during a search may not appear until the next search. Invalid unrelated records are reported and skipped. No SQL database, daemon, network service, or repository-local metadata is required.
+
+Public source is under `tools/src/pira_decision`. Build it with `cargo build --manifest-path tools/Cargo.toml -p pira_decision --release`, then run `pira_decision --help` or command-specific help for exact usage.
+
+</details>
+
+### `pira_codenav`: lightweight code navigation
+
+Reading an entire repository is slow and context-heavy. `pira_codenav` lets an agent start with a map, narrow down to declarations and relationships, and retrieve exact source only when needed. It is read-only: it never edits or executes repository code.
+
+<details>
+<summary>Technical behavior, language support, security, and validation</summary>
+
+The usual workflow is broad to narrow:
 
 1. `map` gives a bounded repository or subsystem shape.
 2. `find` searches parsed declarations when a name is known but its file is not.
 3. `outline` gives declarations and ranges without bodies; `show` returns only selected exact source.
 4. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
-5. `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, and `hover` provide precise semantics through a caller-supplied language server.
+5. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a language server supplied by the caller.
 
-It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. PIRA setup installs one native executable in `PATH`; all grammars are compiled in. Native navigation needs no language runtime, daemon, database, network, project initialization, package manager, or runtime grammar download. Run `pira_codenav --help` and `pira_codenav SUBCOMMAND --help` for usage.
+It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. All parsers are built into one executable. Native navigation needs no language runtime, daemon, database, network, project initialization, package manager, or runtime download. Run `pira_codenav --help` for usage.
 
-Output is compact and adaptive: predictable success defaults are omitted, while LSP use, failures, incomplete processing, omissions, truncation, and ambiguous or unsupported files remain explicit.
+Output stays compact by omitting routine success details. Failures, incomplete results, omitted items, truncation, ambiguity, unsupported files, and language-server use remain explicit.
 
-### Native and LSP backends
+#### Native and LSP backends
 
-`imports`, `dependents`, `deps`, and `languages` are explicitly LSP-independent. `map`, `find`, `outline`, and structural `show` use Tree-sitter when the complete tree contains no `ERROR` or `MISSING` node. A structurally dirty file requires a suitable LSP document-symbol provider; PIRA does not label heuristic native recovery as clean.
+File relationships and language detection do not need a language server. Structural commands use built-in Tree-sitter parsers when a file parses cleanly. A file with syntax gaps requires a suitable language server; PIRA does not present a best-effort guess as a clean result.
 
-Semantic commands require one-based `FILE:LINE:COLUMN` positions, where the column is a UTF-8 byte offset. They never fall back to textual guesses. Up to 32 targets in one invocation reuse the matching server. Optional bounded JSON files can supply initialization options and workspace settings through `--lsp-init` and `--lsp-settings`; language-qualified forms support mixed configurations.
+Semantic commands use one-based `FILE:LINE:COLUMN` positions and never fall back to textual guesses. Up to 32 targets in one invocation can share a matching language server. Optional JSON files can provide server initialization and workspace settings.
 
-Servers start lazily, are reused within one invocation, and are then shut down. Clean structural files do not launch a configured server. PIRA keeps no daemon or persistent index. Repository `map` and `find` parse in deterministic 16-file batches, bounding retained full-source memory while preserving order and LSP reuse.
+Language servers start only when needed, are reused within one invocation, and then shut down. Clean structural work does not start one. PIRA keeps no daemon or persistent code index, and processes repositories in bounded batches.
 
-Batch and repository commands retain useful successes. `complete=0` and bounded errors expose processing gaps; explicit item/byte omissions remain separate. If every attempted file or target fails, PIRA flushes bounded evidence and returns the underlying failure class.
+Batch commands keep useful successful results even when some files fail. They clearly report incomplete processing, errors, and omitted output. If everything fails, the command returns the underlying failure.
 
-### Relationship to ast-outline and Grove
+#### Relationship to ast-outline and Grove
 
 ast-outline and Grove are useful functional baselines for compact structure and broad-to-narrow retrieval. PIRA keeps those ideas while avoiding runtime/project initialization and persistent state, and adds conservative file relationships plus a standard optional-LSP path. The comparison includes only overlapping clean tasks with task-specific correctness assertions. Unsupported or empty operations are omitted rather than counted as fast results; output schemas and exact retrieval semantics differ.
 
-### Read-only and security boundary
+#### Read-only and security boundary
 
 - Repository code is parsed but never executed or edited. Ignore rules are honored, symlinked directories are not followed, and dependency targets outside the selected root are blocked.
 - Exact source and LSP hover are framed as untrusted data. Unsafe terminal controls are escaped in source, hover, paths, symbols, signatures, dependency/call metadata, and errors.
 - PIRA rejects `workspace/applyEdit`. A supplied server remains an external executable and may maintain its own caches; trust and configure it as an IDE server.
 - Source, syntax depth, regex compilation, LSP messages/headers, configuration files, symbols, locations, call relations/ranges, hover, stderr, and reported errors are bounded. PIRA imposes no command timeout; the caller controls cancellation.
 
-### Validation
+#### Validation
 
 | Property | Result |
 |---|---:|
@@ -349,7 +400,7 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 
 The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
 
-### Performance
+#### Performance
 
 Each latency is a complete subprocess call through collected output. Native macOS arm64 measurements use 10 warmups and 100 calls. Same-sandbox Linux arm64 measurements use 5 warmups and 40 calls inside an already-running 2-CPU/4-GiB Docker Sandbox. Host and sandbox timings describe different environments; cross-tool comparisons use only same-sandbox columns.
 
@@ -366,7 +417,7 @@ Each latency is a complete subprocess call through collected output. Native macO
 
 On these tasks, the fastest available baseline took 12.5–178× as long as PIRA in the same sandbox. PIRA used about 3.6–5.6 MiB peak RSS, versus about 15.6–48.4 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
 
-#### LSP cost
+##### LSP cost
 
 Each row is a cold complete call: PIRA starts and initializes the server, performs the request, then shuts it down. Measurements use 2 warmups and 15 calls in the same sandbox.
 
@@ -387,7 +438,7 @@ Real-server cost is dominated by server startup, project configuration, and cach
 
 With the deterministic protocol server, two definition targets took 33.056 ms median in one invocation versus 65.337 ms as two calls, a 1.98× speedup from shared startup and document state.
 
-#### Subcommand context and latency
+##### Subcommand context and latency
 
 Context reduction compares returned UTF-8 bytes with complete source bytes otherwise needed by the fixed task. It is not a tokenizer-specific token count. Semantic rows use a deterministic minimal protocol server to isolate wrapper behavior rather than production-server initialization.
 
@@ -411,7 +462,7 @@ Context reduction compares returned UTF-8 bytes with complete source bytes other
 
 `outline`, `show`, and semantic rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
 
-#### All-language outline regression
+##### All-language outline regression
 
 | Language | Fixture | Source | Outline | Reduction | Native | Sandbox |
 |---|---|---:|---:|---:|---:|---:|
@@ -506,34 +557,14 @@ Keep `notify` at the top level of `config.toml`, before any `[section]` table, s
 
 </details>
 
-## What PIRA is for
-
-PIRA is meant to help with work that benefits from both care and rigor:
-
-- research planning and evidence-based analysis;
-- scientific writing and paper polishing;
-- coding, debugging, and repository work;
-- learning and explanation;
-- practical day-to-day guidance.
-
-## Core principles
-
-PIRA is built around a few simple commitments:
-
-- **Be useful.** Prefer concrete next steps over vague advice.
-- **Be honest.** Do not fabricate claims, citations, or results.
-- **Be evidence-first.** Use primary sources when facts matter.
-- **Be transparent.** Separate observation from interpretation and state uncertainty clearly.
-- **Be kind.** Stay supportive, collaborative, and respectful.
-
 ## Why this design
 
-PIRA is intentionally minimal:
+PIRA is intentionally small and inspectable:
 
 - **Inspectable.** Behavior is organized in readable policy and module files that are easy to review and customize.
-- **Lightweight.** Token overhead stays low; there is no heavy framework or rarely used abstraction layer.
+- **Lightweight.** It avoids a heavy framework and keeps instruction overhead low.
 - **Research-oriented.** Default workflows emphasize reasoning, writing, coding, evidence gathering, and careful iteration.
-- **Lean by default.** Drawing on [Ponytail](https://github.com/DietrichGebert/ponytail) and general lessons from *Clean Code* and *Clean Architecture*, the coding style favors deletion, standard-library or platform features, the smallest safe implementation, readable names, and clear boundaries over speculative abstractions.
+- **Lean by default.** Inspired by [Ponytail](https://github.com/DietrichGebert/ponytail) and general lessons from *Clean Code* and *Clean Architecture*, its coding style prefers simple, safe implementations and clear boundaries over speculative abstractions.
 - **Tool-friendly.** The small, explicit design integrates naturally with official tools such as Codex.
 
 ## Safety model
@@ -541,14 +572,14 @@ PIRA is intentionally minimal:
 <details>
 <summary>Permission boundaries and operating rules</summary>
 
-PIRA can run in soft-safe full-permission mode, but it is not a sandbox. Its safety depends on explicit operating rules in `TOOLS.md`, including:
+PIRA can run with full system permissions, but full-permission mode is not a sandbox. Its rules require the agent to:
 
-- before any command that may write or change state, print a brief safety review covering action, scope, destructive risk, secrets/privacy impact, and rollback path when available;
+- review the action, scope, destructive risk, privacy impact, and rollback path before a state-changing command;
 - prefer narrow, reversible actions;
 - avoid destructive commands without explicit permission;
 - keep temporary artifacts in the platform temp directory unless the user wants them preserved.
 
-Subagents should load the same bootstrap policy as the main agent. This is handled by Codex but has not been tested on other agents.
+Codex subagents load the same policy as the main agent. This behavior has not been equally tested on other agent platforms.
 
 </details>
 
@@ -572,7 +603,7 @@ Subagents should load the same bootstrap policy as the main agent. This is handl
 - `tests/tools/` and `tests/resources/pira_codenav/` — public codenav checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
-Except for the maintenance protocol itself, PIRA instruction files use **Meaning-Preserving Telegraphic Compression (MPTC)**. MPTC removes filler, duplication, and help-covered details while preserving each rule's actor, normative strength, trigger, action, scope, order, exceptions, and prohibitions; safety and permission rules remain grammatical rather than symbol-compressed.
+Most PIRA instruction files use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
 
 </details>
 

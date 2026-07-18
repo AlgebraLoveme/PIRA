@@ -21,7 +21,7 @@ Choosing a command:
   Continue or maintain:
     history    Review current-thread command-purpose events; workspace scope is explicit.
     recap      Restore recent current-thread events after platform-reported compaction.
-    stats      Inspect workspace totals or capture metadata.
+    stats      Inspect metadata; `stats --brief RESULT...` batches concise capture status.
     verify     Check capture integrity.
     list       Find stored captures.
     prune      Enforce capture-retention limits.
@@ -389,17 +389,19 @@ const STATS: &str = r#"pira_ctx stats — show workspace totals or capture metad
 
 USAGE
   pira_ctx stats [--store-dir PATH] [RESULT]
+  pira_ctx stats [--store-dir PATH] --brief RESULT...
 
 OUTPUT
   Without RESULT, prints current-workspace capture totals, current-thread event count and scope,
-  ignored legacy-event count, and workspace hash. With RESULT, prints command, cwd, state, status, duration, stream sizes/lines, store path,
-  format, and index state. Binary/non-UTF-8 flags appear only when active; detected paths and suggested
-  keywords appear only when nonempty. It does not print captured content. A running result reports
-  unknown exit status, checkpoint generation, and age.
+  ignored legacy-event count, and workspace hash. With one RESULT, prints complete capture metadata;
+  use --brief with up to 32 results when only state, exit, duration, and retained size are needed.
+  Brief mode omits command, paths, format, index, and suggestions. Neither form prints captured
+  content. A running result reports unknown exit status.
 
 EXAMPLES
   pira_ctx stats
-  pira_ctx stats --last"#;
+  pira_ctx stats --last
+  pira_ctx stats --brief RESULT_A RESULT_B"#;
 
 const COMMAND: &str = r#"pira_ctx command — retrieve the original invocation for a capture
 

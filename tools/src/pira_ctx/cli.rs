@@ -67,6 +67,8 @@ pub struct Config {
     pub keywords: Vec<String>,
     pub cmd: Vec<String>,
     pub target: Option<String>,
+    pub stats_targets: Vec<String>,
+    pub stats_brief: bool,
     pub query: Option<String>,
     pub regex: bool,
     pub history_scope: HistoryScope,
@@ -101,6 +103,8 @@ impl Default for Config {
             keywords: vec![],
             cmd: vec![],
             target: None,
+            stats_targets: vec![],
+            stats_brief: false,
             query: None,
             regex: false,
             history_scope: HistoryScope::Current,
@@ -241,22 +245,53 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
                 }
             }
         }
-        "stats" | "verify" => {
-            c.mode = if args[0] == "stats" {
-                Mode::Stats
-            } else {
-                Mode::Verify
-            };
-            let p = parse_store(&mut c, args, 1)?;
-            if c.mode == Mode::Verify && p + 1 != args.len() {
-                return Err(USAGE.into());
-            }
-            if p < args.len() {
-                c.target = Some(args[p].clone());
-                if p + 1 != args.len() {
-                    return Err(USAGE.into());
+        "stats" => {
+            c.mode = Mode::Stats;
+            let mut p = 1;
+            while p < args.len() {
+                match args[p].as_str() {
+                    "--store-dir" => {
+                        if c.store_dir.is_some() {
+                            return Err("--store-dir may be specified only once".into());
+                        }
+                        p += 1;
+                        c.store_dir = Some(take(args, &mut p, "--store-dir")?.into());
+                    }
+                    "--brief" => {
+                        if c.stats_brief {
+                            return Err("--brief may be specified only once".into());
+                        }
+                        c.stats_brief = true;
+                        p += 1;
+                    }
+                    value if value.starts_with('-') && value != "--last" => {
+                        return Err(USAGE.into());
+                    }
+                    _ => {
+                        c.stats_targets.push(args[p].clone());
+                        p += 1;
+                    }
                 }
             }
+            if c.stats_targets.len() > 32 {
+                return Err("stats accepts at most 32 results".into());
+            }
+            if c.stats_brief {
+                if c.stats_targets.is_empty() {
+                    return Err("stats --brief requires at least one RESULT".into());
+                }
+            } else if c.stats_targets.len() > 1 {
+                return Err("detailed stats accepts one RESULT; use --brief for multiple".into());
+            }
+            c.target = c.stats_targets.first().cloned();
+        }
+        "verify" => {
+            c.mode = Mode::Verify;
+            let p = parse_store(&mut c, args, 1)?;
+            if p + 1 != args.len() {
+                return Err(USAGE.into());
+            }
+            c.target = Some(args[p].clone());
         }
         "command" => {
             c.mode = Mode::Command;
@@ -888,6 +923,37 @@ mod tests {
         let command = parse_args(&a(&["command", "--store-dir", "/tmp/store", "abc"])).unwrap();
         assert_eq!(command.mode, Mode::Command);
         assert_eq!(command.target.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn stats_brief_accepts_bounded_multiple_results() {
+        let detailed = parse_args(&a(&["stats", "--last"])).unwrap();
+        assert!(!detailed.stats_brief);
+        assert_eq!(detailed.target.as_deref(), Some("--last"));
+
+        let brief = parse_args(&a(&[
+            "stats",
+            "one",
+            "--brief",
+            "--store-dir",
+            "/tmp/store",
+            "two",
+        ]))
+        .unwrap();
+        assert!(brief.stats_brief);
+        assert_eq!(brief.stats_targets, ["one", "two"]);
+        assert_eq!(
+            brief.store_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/store"))
+        );
+
+        assert!(parse_args(&a(&["stats", "--brief"])).is_err());
+        assert!(parse_args(&a(&["stats", "one", "two"])).is_err());
+        assert!(parse_args(&a(&["stats", "--brief", "--brief", "one"])).is_err());
+
+        let mut oversized = vec!["stats".to_string(), "--brief".to_string()];
+        oversized.extend((0..33).map(|index| format!("result-{index}")));
+        assert!(parse_args(&oversized).is_err());
     }
 
     #[test]

@@ -928,6 +928,46 @@ fn run_raw(config: &Config) -> Result<i32, String> {
 }
 
 fn run_stats(config: &Config) -> Result<i32, String> {
+    if config.stats_brief {
+        let dir = effective_store_dir(config.store_dir.as_ref())?;
+        let lines = config
+            .stats_targets
+            .iter()
+            .map(|target| {
+                let path = storage::resolve_result(&dir, target)?;
+                let store = storage::read_result_path(&path)?;
+                let metadata = &store.metadata;
+                let state = if store.is_running() {
+                    "running"
+                } else {
+                    "complete"
+                };
+                let exit = if store.is_running() {
+                    "unknown".to_string()
+                } else {
+                    metadata.exit_code.to_string()
+                };
+                let truncated = if metadata.retention_truncated {
+                    " | truncated=1"
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "Result: {} | state={} | exit={} | duration={}ms | bytes={}{}",
+                    metadata.result_id,
+                    state,
+                    exit,
+                    metadata.duration_ms,
+                    metadata.total_bytes,
+                    truncated
+                ))
+            })
+            .collect::<Result<Vec<String>, String>>()?;
+        for line in lines {
+            util::stdout_line(&line)?;
+        }
+        return Ok(0);
+    }
     if config.target.is_none() {
         let dir = effective_store_dir(config.store_dir.as_ref())?;
         let workspace = storage::current_workspace_hash()?;

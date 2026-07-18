@@ -11,6 +11,7 @@ Use this module only for maintenance of PIRA's own configuration, modules, and r
 - When a new experimental rule conflicts with an older established rule, preserve the older default unless the user explicitly approves a scope or routing change.
 - Put rules in the proper place: default/session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
 - Keep module-loading and routing policy only in `~/agent/AGENTS.md`.
+- Keep README public-phase only: document public behavior, releases, artifacts, usage, and reproducible public validation; exclude local development candidates, pending work, private validation state, and rollout plans.
 - After commit and push, clean temporary backup files created for the change if they are no longer needed.
 
 ## Meaning-Preserving Telegraphic Compression
