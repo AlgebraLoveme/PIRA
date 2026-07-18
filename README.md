@@ -347,7 +347,7 @@ Public source is under `tools/src/pira_decision`. Build it with `cargo build --m
 
 ### `pira_codenav`: lightweight code navigation
 
-Reading an entire repository is slow and context-heavy. `pira_codenav` lets an agent start with a map, narrow down to declarations and relationships, and retrieve exact source only when needed. It is read-only: it never edits or executes repository code.
+Reading an entire repository is slow and context-heavy. `pira_codenav` helps an agent narrow repository shape, declarations, implementation text, relationships, and exact source. It is read-only: it never edits or executes repository code, and it is not a mandatory replacement for a bounded read when the exact file and range are already known.
 
 <details>
 <summary>Technical behavior, language support, security, and validation</summary>
@@ -356,9 +356,10 @@ The usual workflow is broad to narrow:
 
 1. `map` gives a bounded repository or subsystem shape.
 2. `find` searches parsed declarations when a name is known but its file is not.
-3. `outline` gives declarations and ranges without bodies; `show` returns only selected exact source.
-4. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
-5. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a language server supplied by the caller.
+3. `search` batches bounded implementation-text patterns when declaration lookup is insufficient.
+4. `outline` gives declarations and ranges without bodies; `show` returns selected items, line spans, or line windows. `find --show-unique` can return a small unambiguous item directly.
+5. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
+6. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a caller-installed language server.
 
 It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. All parsers are built into one executable. Native navigation needs no language runtime, daemon, database, network, project initialization, package manager, or runtime download. Run `pira_codenav --help` for usage.
 
@@ -370,7 +371,7 @@ File relationships and language detection do not need a language server. Structu
 
 Semantic commands use one-based `FILE:LINE:COLUMN` positions and never fall back to textual guesses. Up to 32 targets in one invocation can share a matching language server. Optional JSON files can provide server initialization and workspace settings.
 
-Language servers start only when needed, are reused within one invocation, and then shut down. Clean structural work does not start one. PIRA keeps no daemon or persistent code index, and processes repositories in bounded batches.
+When needed, PIRA lazily discovers conventional dedicated servers such as `pyright-langserver`, `rust-analyzer`, or `clangd` on `PATH`. Explicit `--lsp` configuration overrides discovery, and `--no-auto-lsp` disables it. Servers are reused within one invocation and then shut down. Clean structural work does not even probe PATH. PIRA keeps no daemon or persistent code index, and processes repositories in bounded batches.
 
 Batch commands keep useful successful results even when some files fail. They clearly report incomplete processing, errors, and omitted output. If everything fails, the command returns the underlying failure.
 
@@ -382,7 +383,7 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 
 - Repository code is parsed but never executed or edited. Ignore rules are honored, symlinked directories are not followed, and dependency targets outside the selected root are blocked.
 - Exact source and LSP hover are framed as untrusted data. Unsafe terminal controls are escaped in source, hover, paths, symbols, signatures, dependency/call metadata, and errors.
-- PIRA rejects `workspace/applyEdit`. A supplied server remains an external executable and may maintain its own caches; trust and configure it as an IDE server.
+- PIRA rejects `workspace/applyEdit`. An explicit or PATH-discovered server remains an external executable and may maintain its own caches; trust PATH as executable configuration or use `--no-auto-lsp`.
 - Source, syntax depth, regex compilation, LSP messages/headers, configuration files, symbols, locations, call relations/ranges, hover, stderr, and reported errors are bounded. PIRA imposes no command timeout; the caller controls cancellation.
 
 #### Validation
@@ -395,8 +396,8 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 | Native structural targets | 1,047 |
 | Location / freshness-selector round trips | 1,047/1,047 each |
 | Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 78 / 16 / 14 |
-| Reproducible benchmark tasks | 38 |
+| Functional / inert security / Rust tests | 82 / 17 / 14 |
+| Reproducible benchmark tasks | 39 |
 
 The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
 

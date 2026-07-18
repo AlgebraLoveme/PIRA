@@ -43,12 +43,37 @@ impl ParsedFile {
 }
 
 pub fn parse_file(path: &Path, language: Language) -> Result<ParsedFile, String> {
-    let (syntax, syntax_defects) = parse_native(path, language)?;
-    let mut symbols = if syntax_defects == 0 {
-        collect_symbols(&syntax.tree, language, &syntax.source)
-    } else {
-        Vec::new()
-    };
+    let source = read_source(path)?;
+    let (symbols, syntax_defects) = parse_source_symbols(path, language, &source)?;
+    Ok(ParsedFile {
+        path: path.to_path_buf(),
+        language,
+        source,
+        symbols,
+        backend: ParseBackend::TreeSitter,
+        syntax_defects,
+    })
+}
+
+pub fn parse_source_symbols(
+    path: &Path,
+    language: Language,
+    source: &str,
+) -> Result<(Vec<Symbol>, usize), String> {
+    let mut parser = language.parser(path)?;
+    let tree = parser
+        .parse(source.as_bytes(), None)
+        .ok_or_else(|| format!("{} parser returned no tree", language.name()))?;
+    let defects = inspect_tree(tree.root_node()).map_err(|depth| {
+        format!(
+            "syntax tree nesting exceeds supported depth of {MAX_SYNTAX_DEPTH} in {} (observed at least {depth})",
+            path.display()
+        )
+    })?;
+    if defects > 0 {
+        return Ok((Vec::new(), defects));
+    }
+    let mut symbols = collect_symbols(&tree, language, source);
     symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     symbols.dedup_by(|left, right| {
         left.start_byte == right.start_byte
@@ -56,14 +81,7 @@ pub fn parse_file(path: &Path, language: Language) -> Result<ParsedFile, String>
             && left.kind == right.kind
             && left.qualified_name == right.qualified_name
     });
-    Ok(ParsedFile {
-        path: syntax.path,
-        language: syntax.language,
-        source: syntax.source,
-        symbols,
-        backend: ParseBackend::TreeSitter,
-        syntax_defects,
-    })
+    Ok((symbols, defects))
 }
 
 pub fn parse_syntax(path: &Path, language: Language) -> Result<ParsedSyntax, String> {

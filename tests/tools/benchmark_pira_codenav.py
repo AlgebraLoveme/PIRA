@@ -182,6 +182,20 @@ def main() -> int:
                 "--exact",
             ],
         },
+        "python_search": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "python",
+                "search",
+                "real/python_click",
+                "def command",
+                "return decorator",
+                "--context",
+                "1",
+                "--max-items",
+                "10",
+            ],
+        },
         "python_imports": {
             "pira_codenav": [
                 tools["pira_codenav"],
@@ -454,6 +468,7 @@ def main() -> int:
         "python_map": b"api.py",
         "rust_map": b"parser.rs",
         "python_find": b'name="Client.fetch"',
+        "python_search": b"def command",
         "python_imports": b"package/models.py resolution=structural",
         "python_dependents": b"dependent=package/api.py",
         "python_deps": b"edge depth=1 direction=import",

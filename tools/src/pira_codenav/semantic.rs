@@ -86,7 +86,8 @@ fn semantic_service(
             return Err((
                 2,
                 format!(
-                    "{command} requires --lsp ABSOLUTE_SERVER_PATH (or --lsp {}=ABSOLUTE_SERVER_PATH)",
+                    "{command} requires an LSP for {}; install a conventional server on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH",
+                    target.language.name(),
                     target.language.name()
                 ),
             ));

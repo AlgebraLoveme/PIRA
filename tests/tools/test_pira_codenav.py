@@ -59,6 +59,7 @@ class PiraCodeNavTests(unittest.TestCase):
         *args: str,
         cwd: Path = SYNTHETIC_ROOT,
         expected: int = 0,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             [str(self.binary), *args],
@@ -67,6 +68,7 @@ class PiraCodeNavTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=env,
         )
         self.assertEqual(
             expected,
@@ -94,12 +96,14 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("read-only code navigation", help_result.stdout)
         self.assertIn("outline", help_result.stdout)
         self.assertIn("find", help_result.stdout)
+        self.assertIn("search", help_result.stdout)
         self.assertIn("dependents", help_result.stdout)
         self.assertIn("deps", help_result.stdout)
         self.assertIn("--lsp", help_result.stdout)
         self.assertIn("CHOOSE A COMMAND", help_result.stdout)
         self.assertIn("TYPICAL FLOW", help_result.stdout)
-        self.assertIn("--max-items 200", help_result.stdout)
+        self.assertIn("ordinary bounded read", help_result.stdout)
+        self.assertIn("--no-auto-lsp", help_result.stdout)
         self.assertIn("do not substitute text matching", help_result.stdout)
         self.assertIn("Predictable success fields are omitted", help_result.stdout)
         for added in (
@@ -151,6 +155,7 @@ class PiraCodeNavTests(unittest.TestCase):
             "show",
             "map",
             "find",
+            "search",
             "imports",
             "dependents",
             "deps",
@@ -178,6 +183,14 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("smallest enclosing named item", show_help.stdout)
         self.assertIn("FILE:START-END", show_help.stdout)
         self.assertIn("parser-free", show_help.stdout)
+        self.assertIn("--window", show_help.stdout)
+
+        find_help = self.run_cli("find", "--help")
+        self.assertIn("--show-unique", find_help.stdout)
+
+        search_help = self.run_cli("search", "--help")
+        self.assertIn("ordinary bounded search", search_help.stdout)
+        self.assertIn("Overlapping windows merge", search_help.stdout)
         outline_help = self.run_cli("outline", "--help")
         self.assertIn("--signatures", outline_help.stdout)
         self.assertIn("--match", outline_help.stdout)
@@ -273,7 +286,11 @@ class PiraCodeNavTests(unittest.TestCase):
     def test_unclean_cuda_requires_lsp(self) -> None:
         root = SYNTHETIC_ROOT / "cuda_project"
         outline = self.run_cli(
-            "outline", "src/macro_kernel.cu", cwd=root, expected=3
+            "outline",
+            "src/macro_kernel.cu",
+            "--no-auto-lsp",
+            cwd=root,
+            expected=3,
         )
         self.assertIn("Tree-sitter", outline.stderr)
         self.assertIn("--lsp", outline.stderr)
@@ -536,7 +553,9 @@ class PiraCodeNavTests(unittest.TestCase):
             root = Path(temp)
             source = root / "dirty.rb"
             source.write_text("def native\n  1\nend\nbroken = (\n", encoding="utf-8")
-            missing = self.run_cli("outline", source.name, cwd=root, expected=3)
+            missing = self.run_cli(
+                "outline", source.name, "--no-auto-lsp", cwd=root, expected=3
+            )
             self.assertIn("--lsp ruby=ABSOLUTE_SERVER_PATH", missing.stderr)
 
             restored = self.run_cli(
@@ -664,7 +683,11 @@ class PiraCodeNavTests(unittest.TestCase):
 
         for language, relative in (("c", "c_jq/main.c"), ("cpp", "cpp_fmt/format.cc")):
             result = self.run_cli(
-                language, "outline", str(REAL_ROOT / relative), expected=3
+                language,
+                "outline",
+                str(REAL_ROOT / relative),
+                "--no-auto-lsp",
+                expected=3,
             )
             self.assertIn("Tree-sitter found", result.stderr)
             self.assertIn("--lsp", result.stderr)
@@ -1376,10 +1399,12 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertFalse(starts.exists(), "closed output should prevent later LSP startup")
 
     def test_unclean_file_requires_lsp_and_lsp_restores_outline_and_show(self) -> None:
-        missing = self.run_cli("outline", "malformed.py", expected=3)
+        missing = self.run_cli(
+            "outline", "malformed.py", "--no-auto-lsp", expected=3
+        )
         self.assertEqual("", missing.stdout)
         self.assertIn("Tree-sitter found", missing.stderr)
-        self.assertIn("rerun with --lsp", missing.stderr)
+        self.assertIn("pass --lsp", missing.stderr)
 
         outline = self.run_cli(
             "outline", "malformed.py", *self.fake_lsp_args()
@@ -1456,8 +1481,14 @@ class PiraCodeNavTests(unittest.TestCase):
                 "def second():\n    return Target()\n",
                 encoding="utf-8",
             )
-            missing = self.run_cli("definition", "sample.py:4:12", cwd=root, expected=2)
-            self.assertIn("requires --lsp", missing.stderr)
+            missing = self.run_cli(
+                "definition",
+                "sample.py:4:12",
+                "--no-auto-lsp",
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("requires an LSP", missing.stderr)
             imprecise = self.run_cli(
                 "definition", "sample.py:4", *self.fake_lsp_args(), cwd=root, expected=2
             )
@@ -1957,6 +1988,155 @@ class PiraCodeNavTests(unittest.TestCase):
         mismatch = self.run_cli("rust", "outline", "python_project/app.py", expected=2)
         self.assertIn("language mismatch", mismatch.stderr.lower())
 
+    def test_search_batches_patterns_merges_context_and_bounds_output(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-search-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "def evaluate(value):\n"
+                "    if value is None:\n"
+                "        raise ValueError('missing')\n"
+                "    return value + 1\n"
+                "    # --literal-marker\n\n"
+                "def other():\n"
+                "    return 'missing'\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "search",
+                ".",
+                "value is None",
+                "raise ValueError",
+                "--context",
+                "1",
+                cwd=root,
+            )
+            self.assertIn("patterns=2", result.stdout.splitlines()[0])
+            self.assertIn("matches=2 shown=2", result.stdout.splitlines()[0])
+            self.assertEqual(1, result.stdout.count("match file=sample.py"))
+            self.assertIn('hits="L2:8[q1],L3:9[q2]"', result.stdout)
+            self.assertIn('items="evaluate"', result.stdout)
+            self.assertIn(">2 |     if value is None:", result.stdout)
+            self.assertIn("begin untrusted repository source", result.stdout)
+
+            regex = self.run_cli(
+                "search", ".", r"return\s+value", "--regex", "--context", "0", cwd=root
+            )
+            self.assertIn("mode=regex", regex.stdout.splitlines()[0])
+            self.assertIn("matches=1 shown=1", regex.stdout.splitlines()[0])
+            self.assertNotIn("if value is None", regex.stdout)
+
+            bounded = self.run_cli(
+                "search", ".", "return", "--max-items", "1", "--context", "0", cwd=root
+            )
+            self.assertIn("matches=2 shown=1", bounded.stdout.splitlines()[0])
+            self.assertIn("omitted=1", bounded.stdout.splitlines()[0])
+
+            leading_dash = self.run_cli(
+                "search", ".", "--context", "0", "--", "--literal-marker", cwd=root
+            )
+            self.assertIn("matches=1 shown=1", leading_dash.stdout.splitlines()[0])
+
+    def test_show_window_and_find_show_unique_avoid_large_body_expansion(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-retrieve-") as temp:
+            root = Path(temp)
+            body = "\n".join(f"    value_{index} = {index}" for index in range(220))
+            (root / "sample.py").write_text(
+                "def small(value):\n    return value + 1\n\n"
+                f"def large():\n{body}\n    return value_219\n",
+                encoding="utf-8",
+            )
+            line = self.line_of(root / "sample.py", "value_110")
+            window = self.run_cli(
+                "show", f"sample.py:{line}", "--window", "1", cwd=root
+            )
+            self.assertIn(f"lines={line - 1}-{line + 1}", window.stdout.splitlines()[0])
+            self.assertIn("value_110", window.stdout)
+            self.assertNotIn("value_100", window.stdout)
+            incompatible = self.run_cli(
+                "show",
+                f"sample.py:{line}",
+                "--window",
+                "1",
+                "--max-items",
+                "2",
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("does not apply", incompatible.stderr)
+
+            unique = self.run_cli(
+                "find", ".", "small", "--exact", "--show-unique", cwd=root
+            )
+            self.assertIn("matches=1 shown=1", unique.stdout.splitlines()[0])
+            self.assertIn("def small(value):", unique.stdout)
+
+            deduplicated = self.run_cli(
+                "find",
+                ".",
+                "small",
+                "small",
+                "--exact",
+                "--show-unique",
+                cwd=root,
+            )
+            self.assertEqual(1, deduplicated.stdout.count("def small(value):"))
+
+            large = self.run_cli(
+                "find", ".", "large", "--exact", "--show-unique", cwd=root
+            )
+            self.assertIn("source_omitted", large.stdout)
+            self.assertIn("reason=item-too-large", large.stdout)
+            self.assertNotIn("value_110", large.stdout)
+
+            full = self.run_cli("show", "sample.py::large", cwd=root)
+            self.assertIn("item_lines=", full.stdout.splitlines()[0])
+            self.assertIn("hint=use-search-or-show-window", full.stdout.splitlines()[0])
+
+    @unittest.skipIf(os.name == "nt", "the fake PATH server uses a POSIX shebang")
+    def test_lsp_is_discovered_lazily_from_path_and_explicit_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-auto-lsp-") as temp:
+            root = Path(temp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            marker = root / "started.log"
+            server = bin_dir / "pyright-langserver"
+            server.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('started', encoding='utf-8')\n"
+                "args = [arg for arg in sys.argv[1:] if arg != '--stdio']\n"
+                f"os.execv(sys.executable, [sys.executable, {str(FAKE_LSP)!r}, *args])\n",
+                encoding="utf-8",
+            )
+            server.chmod(0o755)
+            (root / "clean.py").write_text("def clean(): return 1\n", encoding="utf-8")
+            (root / "dirty.py").write_text(
+                "class AutoRecovered:\n    pass\n\n\nbroken = (\n", encoding="utf-8"
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"bin{os.pathsep}{env.get('PATH', '')}"
+
+            clean = self.run_cli("outline", "clean.py", cwd=root, env=env)
+            self.assertNotIn("backend=lsp", clean.stdout)
+            self.assertFalse(marker.exists(), "clean structural parsing must not launch PATH LSP")
+
+            recovered = self.run_cli("outline", "dirty.py", cwd=root, env=env)
+            self.assertIn("backend=lsp", recovered.stdout.splitlines()[0])
+            self.assertTrue(marker.exists())
+
+            marker.unlink()
+            explicit = self.run_cli(
+                "outline", "dirty.py", *self.fake_lsp_args(), cwd=root, env=env
+            )
+            self.assertIn("backend=lsp", explicit.stdout.splitlines()[0])
+            self.assertFalse(marker.exists(), "explicit --lsp must override PATH discovery")
+
+            disabled = self.run_cli(
+                "outline", "dirty.py", "--no-auto-lsp", cwd=root, env=env, expected=3
+            )
+            self.assertIn("pass --lsp python=ABSOLUTE_SERVER_PATH", disabled.stderr)
+
     def test_unimplemented_semantic_operations_are_not_commands(self) -> None:
         for command in ("symbols", "workspace-symbol", "calls", "rename"):
             result = self.run_cli(command, "anything", expected=2)
@@ -1970,6 +2150,20 @@ class PiraCodeNavTests(unittest.TestCase):
             commands = (
                 ("outline", "python_project/package/api.py"),
                 ("show", "python_project/package/api.py:11"),
+                (
+                    "show",
+                    "python_project/package/api.py:11",
+                    "--window",
+                    "2",
+                ),
+                ("search", "python_project", "return", "--max-items", "3"),
+                (
+                    "find",
+                    "python_project",
+                    "parse_payload",
+                    "--exact",
+                    "--show-unique",
+                ),
                 (
                     "show",
                     "python_project/package/api.py:11",

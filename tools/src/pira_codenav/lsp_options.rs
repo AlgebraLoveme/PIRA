@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::command::{CommandError, input_error};
 use crate::language::Language;
-use crate::lsp::{LspConfig, LspConfigs};
+use crate::lsp::{LspConfig, LspConfigs, auto_server_available};
 use crate::util::absolute_lexical;
 
 const MAX_LSP_CONFIG_BYTES: u64 = 64 * 1024;
@@ -19,11 +19,22 @@ struct ServerOptions {
     settings: Option<PathBuf>,
 }
 
-#[derive(Default)]
 pub struct LspOptions {
     default: ServerOptions,
     languages: BTreeMap<Language, ServerOptions>,
     root: Option<PathBuf>,
+    auto_discovery: bool,
+}
+
+impl Default for LspOptions {
+    fn default() -> Self {
+        Self {
+            default: ServerOptions::default(),
+            languages: BTreeMap::new(),
+            root: None,
+            auto_discovery: true,
+        }
+    }
 }
 
 impl LspOptions {
@@ -33,6 +44,10 @@ impl LspOptions {
             .and_then(|server| server.executable.as_ref())
             .is_some()
             || self.default.executable.is_some()
+            || (self.auto_discovery
+                && self.default.executable.is_none()
+                && !self.languages.contains_key(&language)
+                && auto_server_available(language))
     }
 
     pub fn config(&self, default_root: &Path) -> Result<LspConfigs, CommandError> {
@@ -47,10 +62,15 @@ impl LspOptions {
                 languages.insert(*language, config);
             }
         }
-        if self.root.is_some() && default.is_none() && languages.is_empty() {
+        let auto_root = (self.auto_discovery && default.is_none()).then(|| root.clone());
+        if self.root.is_some() && default.is_none() && languages.is_empty() && auto_root.is_none() {
             return Err((2, "--lsp-root requires at least one --lsp".into()));
         }
-        Ok(LspConfigs { default, languages })
+        Ok(LspConfigs {
+            default,
+            languages,
+            auto_root,
+        })
     }
 }
 
@@ -140,7 +160,10 @@ pub fn parse(
     let mut index = 0;
     while index < args.len() {
         let option = args[index].as_str();
-        if matches!(
+        if option == "--" {
+            remaining.extend(args[index..].iter().cloned());
+            break;
+        } else if matches!(
             option,
             "--lsp" | "--lsp-arg" | "--lsp-root" | "--lsp-init" | "--lsp-settings"
         ) {
@@ -238,6 +261,31 @@ pub fn parse(
                 _ => unreachable!(),
             }
             index += 2;
+        } else if option == "--no-auto-lsp" {
+            if !matches!(
+                command,
+                "outline"
+                    | "show"
+                    | "map"
+                    | "find"
+                    | "definition"
+                    | "implementation"
+                    | "type-definition"
+                    | "references"
+                    | "hover"
+                    | "callers"
+                    | "callees"
+            ) {
+                return Err((
+                    2,
+                    "--no-auto-lsp is supported only by structural/LSP navigation commands".into(),
+                ));
+            }
+            if !options.auto_discovery {
+                return Err((2, "--no-auto-lsp may be specified only once".into()));
+            }
+            options.auto_discovery = false;
+            index += 1;
         } else {
             remaining.push(args[index].clone());
             index += 1;

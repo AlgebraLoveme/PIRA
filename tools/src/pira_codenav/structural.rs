@@ -19,9 +19,10 @@ impl StructuralResolver {
         }
         if !self.service.is_configured(parsed.language) {
             return Err(format!(
-                "Tree-sitter found {} syntax defect(s) in {}; rerun with --lsp {}=ABSOLUTE_SERVER_PATH (or --lsp ABSOLUTE_SERVER_PATH for one language) to obtain an LSP-backed structural result",
+                "Tree-sitter found {} syntax defect(s) in {}; install a conventional {} LSP on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH to obtain a clean structural result",
                 parsed.syntax_defects,
                 parsed.path.display(),
+                parsed.language.name(),
                 parsed.language.name()
             ));
         }

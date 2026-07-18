@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
 use crate::command::{
     CommandResult, input_error, language_for, lsp_error, output_error, parse_location,
@@ -15,7 +15,7 @@ use crate::deps;
 use crate::language::Language;
 use crate::lsp_options::{self, LspOptions};
 use crate::model::{ImportEdge, ParseBackend, Symbol};
-use crate::parse::{ParsedFile, parse_file, parse_syntax};
+use crate::parse::{ParsedFile, parse_file, parse_source_symbols, parse_syntax};
 use crate::semantic;
 use crate::structural::StructuralResolver;
 use crate::util::{
@@ -34,6 +34,14 @@ const MAX_FIND_ITEMS: usize = 100_000;
 const MAX_FIND_QUERIES: usize = 32;
 const MAX_FIND_QUERY_BYTES: usize = 4 * 1024;
 const MAX_FIND_TOTAL_QUERY_BYTES: usize = 32 * 1024;
+const DEFAULT_SEARCH_MAX_ITEMS: usize = 200;
+const DEFAULT_SEARCH_MAX_BYTES: usize = 64 * 1024;
+const MAX_SEARCH_ITEMS: usize = 10_000;
+const MAX_SEARCH_CONTEXT: usize = 1_000;
+const LARGE_ITEM_LINES: usize = 200;
+const FIND_UNIQUE_MAX_LINES: usize = 200;
+const FIND_UNIQUE_MAX_BYTES: usize = 24 * 1024;
+const FIND_UNIQUE_TOTAL_BYTES: usize = 64 * 1024;
 
 type ParsedFileCache = BTreeMap<(PathBuf, Language), Result<ParsedFile, (i32, String)>>;
 
@@ -192,6 +200,7 @@ where
         "show" => command_show(&values, explicit_language, &cwd, &lsp, &mut output),
         "map" => command_map(&values, explicit_language, &cwd, &lsp, &mut output),
         "find" => command_find(&values, explicit_language, &cwd, &lsp, &mut output),
+        "search" => command_search(&values, explicit_language, &cwd, &mut output),
         "definition" => semantic::definition(&values, explicit_language, &cwd, &lsp, &mut output),
         "implementation" => {
             semantic::implementation(&values, explicit_language, &cwd, &lsp, &mut output)
@@ -351,6 +360,43 @@ fn command_show(
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_show_options(args)?;
+    if let Some(window) = options.window {
+        if options.targets.len() != 1 {
+            return usage("show --window requires exactly one FILE:LINE[:COLUMN] target");
+        }
+        if options.max_items.is_some() {
+            return usage("show --max-items does not apply to a single --window target");
+        }
+        let target = &options.targets[0];
+        let (path_text, line, _) = parse_location(target).ok_or_else(|| {
+            (
+                2,
+                "show --window requires a FILE:LINE[:COLUMN] target".into(),
+            )
+        })?;
+        if line == 0 {
+            return Err((2, "show line coordinates are one-based".into()));
+        }
+        let path = absolute_lexical(Path::new(path_text), cwd);
+        language_for(&path, explicit)?;
+        let start = line.saturating_sub(window).max(1);
+        let end = line.saturating_add(window);
+        let mut item = Vec::new();
+        render_line_range(&path, start, end, cwd, &mut item)?;
+        if let Some(max_bytes) = options.max_bytes
+            && item.len() > max_bytes
+        {
+            writeln!(
+                output,
+                "# pira_codenav show targets=1 shown=0 omitted=1 byte_limited=1 max_bytes={}",
+                max_bytes
+            )
+            .map_err(output_error)?;
+            return Ok(());
+        }
+        output.write_all(&item).map_err(output_error)?;
+        return Ok(());
+    }
     let mut parsed_files = ParsedFileCache::new();
     let mut resolver = StructuralResolver::new(lsp.config(cwd)?);
     if options.targets.len() == 1
@@ -487,24 +533,37 @@ struct ShowOptions {
     targets: Vec<String>,
     max_items: Option<usize>,
     max_bytes: Option<usize>,
+    window: Option<usize>,
 }
 
 fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
     let mut targets = Vec::new();
     let mut max_items = None;
     let mut max_bytes = None;
+    let mut window = None;
     let mut index = 0;
     while index < args.len() {
         let option = args[index].as_str();
-        if matches!(option, "--max-items" | "--max-bytes") {
+        if matches!(option, "--max-items" | "--max-bytes" | "--window") {
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| (2, format!("{option} requires a positive integer")))?;
-            let parsed = positive_usize(value, option)?;
-            if option == "--max-items" {
-                max_items = Some(parsed);
+            if option == "--window" {
+                if window.is_some() {
+                    return Err((2, "--window may be specified only once".into()));
+                }
+                window = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| (2, "--window requires a non-negative integer".into()))?,
+                );
             } else {
-                max_bytes = Some(parsed);
+                let parsed = positive_usize(value, option)?;
+                if option == "--max-items" {
+                    max_items = Some(parsed);
+                } else {
+                    max_bytes = Some(parsed);
+                }
             }
             index += 2;
         } else if option.starts_with('-') {
@@ -529,6 +588,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
         targets,
         max_items,
         max_bytes,
+        window,
     })
 }
 
@@ -823,6 +883,7 @@ struct FindOptions {
     max_items: usize,
     selectors: bool,
     signatures: bool,
+    show_unique: bool,
 }
 
 struct FindQuery {
@@ -977,6 +1038,8 @@ fn command_find(
         )
         .map_err(output_error)?;
     }
+    let mut unique_source_bytes = 0usize;
+    let mut expanded_sources = HashSet::new();
     for (query_index, query_rows) in rows.into_iter().enumerate() {
         if multi_query {
             let query_omitted = matched[query_index].saturating_sub(query_rows.len());
@@ -1024,10 +1087,52 @@ fn command_find(
                 )
                 .map_err(output_error)?;
             }
-            if let Some(selector) = row.selector {
+            if let Some(selector) = &row.selector {
                 write!(output, " selector={selector}").map_err(output_error)?;
             }
             writeln!(output).map_err(output_error)?;
+            if options.show_unique && matched[query_index] == 1 {
+                let identity = (row.path.clone(), row.symbol.start_byte, row.symbol.end_byte);
+                if !expanded_sources.insert(identity) {
+                    continue;
+                }
+                let item_lines = row.symbol.end_row.saturating_sub(row.symbol.start_row) + 1;
+                if item_lines > FIND_UNIQUE_MAX_LINES {
+                    writeln!(
+                        output,
+                        "source_omitted query={} reason=item-too-large item_lines={} max_lines={} hint=use-search-or-show-window",
+                        query_index + 1,
+                        item_lines,
+                        FIND_UNIQUE_MAX_LINES
+                    )
+                    .map_err(output_error)?;
+                    continue;
+                }
+                let mut source = Vec::new();
+                render_line_range(
+                    &row.path,
+                    row.symbol.start_row + 1,
+                    row.symbol.end_row + 1,
+                    cwd,
+                    &mut source,
+                )?;
+                if source.len() > FIND_UNIQUE_MAX_BYTES
+                    || source.len() > FIND_UNIQUE_TOTAL_BYTES.saturating_sub(unique_source_bytes)
+                {
+                    writeln!(
+                        output,
+                        "source_omitted query={} reason=byte-limit bytes={} per_item_max={} total_max={} hint=use-show-with-max-bytes",
+                        query_index + 1,
+                        source.len(),
+                        FIND_UNIQUE_MAX_BYTES,
+                        FIND_UNIQUE_TOTAL_BYTES
+                    )
+                    .map_err(output_error)?;
+                    continue;
+                }
+                unique_source_bytes += source.len();
+                output.write_all(&source).map_err(output_error)?;
+            }
         }
     }
     finish_partial_result(
@@ -1047,6 +1152,7 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
     let mut max_items = 200usize;
     let mut selectors = false;
     let mut signatures = false;
+    let mut show_unique = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -1094,6 +1200,13 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
             }
             "--signatures" => {
                 signatures = true;
+                index += 1;
+            }
+            "--show-unique" => {
+                if show_unique {
+                    return Err((2, "--show-unique may be specified only once".into()));
+                }
+                show_unique = true;
                 index += 1;
             }
             value if value.starts_with('-') => {
@@ -1157,6 +1270,7 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
         max_items,
         selectors,
         signatures,
+        show_unique,
     })
 }
 
@@ -1167,6 +1281,471 @@ fn build_find_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, (i32
         .dfa_size_limit(1024 * 1024)
         .build()
         .map_err(|error| (2, format!("invalid find regex: {error}")))
+}
+
+struct SearchOptions {
+    root: String,
+    patterns: Vec<String>,
+    regex: bool,
+    context: usize,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+struct SearchEngine {
+    set: RegexSet,
+    expressions: Vec<Regex>,
+}
+
+#[derive(Clone)]
+struct SearchHit {
+    row: usize,
+    column: usize,
+    queries: Vec<usize>,
+}
+
+struct SearchScan {
+    total: usize,
+    hits: Vec<SearchHit>,
+}
+
+struct SelectedSearchFile {
+    path: PathBuf,
+    language: Language,
+    source: String,
+    hits: Vec<SearchHit>,
+}
+
+#[derive(Default)]
+struct SearchRenderState {
+    blocks: Vec<Vec<u8>>,
+    payload_bytes: usize,
+    shown: usize,
+    byte_limited: usize,
+}
+
+fn command_search(
+    args: &[String],
+    explicit: Option<Language>,
+    cwd: &Path,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let options = parse_search_options(args)?;
+    let root = absolute_lexical(Path::new(&options.root), cwd);
+    if !root.is_dir() {
+        return Err(input_error(format!(
+            "search target is not a directory: {}",
+            root.display()
+        )));
+    }
+    let engine = build_search_engine(&options.patterns, options.regex)?;
+    let discovery = discover_files(
+        &root,
+        explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+    );
+    let mut failures = FailureCollector::default();
+    let mut scanned_files = 0usize;
+    let mut matched_files = 0usize;
+    let mut matched_total = 0usize;
+    let mut selected_total = 0usize;
+    let mut render = SearchRenderState::default();
+    for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
+        let mut selected_files = Vec::new();
+        let scanned = batch
+            .par_iter()
+            .map(|(path, language)| {
+                read_source(path).map(|source| {
+                    let scan = scan_source(&source, &engine, options.max_items);
+                    (*language, source, scan)
+                })
+            })
+            .collect::<Vec<_>>();
+        for ((path, _), result) in batch.iter().zip(scanned) {
+            let (language, source, mut scan) = match result {
+                Ok(value) => value,
+                Err(message) => {
+                    failures.record(display_path(path, &root), 2, message);
+                    continue;
+                }
+            };
+            scanned_files = scanned_files.saturating_add(1);
+            matched_total = matched_total.saturating_add(scan.total);
+            if scan.total > 0 {
+                matched_files = matched_files.saturating_add(1);
+            }
+            let remaining = options.max_items.saturating_sub(selected_total);
+            scan.hits.truncate(remaining);
+            if !scan.hits.is_empty() {
+                selected_total = selected_total.saturating_add(scan.hits.len());
+                selected_files.push(SelectedSearchFile {
+                    path: path.clone(),
+                    language,
+                    source,
+                    hits: scan.hits,
+                });
+            }
+        }
+        render_selected_search_files(
+            &selected_files,
+            options.context,
+            options.max_bytes,
+            cwd,
+            &mut render,
+        )?;
+    }
+
+    if options.patterns.len() == 1 {
+        write!(
+            output,
+            "# pira_codenav search root={} pattern={} mode={} files={} matched_files={} matches={} shown={}",
+            display_path(&root, cwd),
+            quote_metadata(&options.patterns[0]),
+            if options.regex { "regex" } else { "literal" },
+            discovery.files.len(),
+            matched_files,
+            matched_total,
+            render.shown
+        )
+        .map_err(output_error)?;
+    } else {
+        write!(
+            output,
+            "# pira_codenav search root={} patterns={} mode={} files={} matched_files={} matches={} shown={}",
+            display_path(&root, cwd),
+            options.patterns.len(),
+            if options.regex { "regex" } else { "literal" },
+            discovery.files.len(),
+            matched_files,
+            matched_total,
+            render.shown
+        )
+        .map_err(output_error)?;
+    }
+    if scanned_files != discovery.files.len() {
+        write!(
+            output,
+            " scanned={} failed={} complete=0",
+            scanned_files, failures.total
+        )
+        .map_err(output_error)?;
+    }
+    let skipped = discovery.discovered.saturating_sub(discovery.files.len());
+    if skipped > 0 {
+        write!(output, " skipped={skipped}").map_err(output_error)?;
+    }
+    let omitted = matched_total.saturating_sub(render.shown);
+    if omitted > 0 {
+        write!(output, " omitted={omitted}").map_err(output_error)?;
+    }
+    if render.byte_limited > 0 {
+        write!(
+            output,
+            " byte_limited={} max_bytes={}",
+            render.byte_limited, options.max_bytes
+        )
+        .map_err(output_error)?;
+    }
+    if failures.omitted() > 0 {
+        write!(output, " errors_omitted={}", failures.omitted()).map_err(output_error)?;
+    }
+    writeln!(output).map_err(output_error)?;
+    if options.patterns.len() > 1 {
+        for (index, pattern) in options.patterns.iter().enumerate() {
+            writeln!(
+                output,
+                "query index={} pattern={}",
+                index + 1,
+                quote_metadata(pattern)
+            )
+            .map_err(output_error)?;
+        }
+    }
+    for failure in &failures.shown {
+        writeln!(
+            output,
+            "error file={} code={} message={}",
+            quote_metadata(&failure.subject),
+            failure.code,
+            quote_metadata(&failure.message)
+        )
+        .map_err(output_error)?;
+    }
+    for block in render.blocks {
+        output.write_all(&block).map_err(output_error)?;
+    }
+    finish_partial_result(
+        discovery.files.len(),
+        scanned_files,
+        &failures,
+        "all eligible search files failed; inspect the reported file errors",
+        output,
+    )
+}
+
+fn render_selected_search_files(
+    files: &[SelectedSearchFile],
+    context: usize,
+    max_bytes: usize,
+    cwd: &Path,
+    render: &mut SearchRenderState,
+) -> CommandResult {
+    let parsed_symbols = files
+        .par_iter()
+        .map(|file| {
+            parse_source_symbols(&file.path, file.language, &file.source)
+                .ok()
+                .and_then(|(symbols, defects)| (defects == 0).then_some(symbols))
+        })
+        .collect::<Vec<_>>();
+    for (file, symbols) in files.iter().zip(&parsed_symbols) {
+        let mut index = 0usize;
+        while index < file.hits.len() {
+            let start = file.hits[index].row.saturating_sub(context);
+            let mut end = file.hits[index].row.saturating_add(context);
+            let mut next = index + 1;
+            while next < file.hits.len() {
+                let next_start = file.hits[next].row.saturating_sub(context);
+                if next_start > end.saturating_add(1) {
+                    break;
+                }
+                end = end.max(file.hits[next].row.saturating_add(context));
+                next += 1;
+            }
+            let cluster = &file.hits[index..next];
+            let block = render_search_block(file, cluster, start, end, symbols.as_deref(), cwd)?;
+            if block.len() > max_bytes.saturating_sub(render.payload_bytes) {
+                render.byte_limited = render.byte_limited.saturating_add(cluster.len());
+            } else {
+                render.payload_bytes = render.payload_bytes.saturating_add(block.len());
+                render.shown = render.shown.saturating_add(cluster.len());
+                render.blocks.push(block);
+            }
+            index = next;
+        }
+    }
+    Ok(())
+}
+
+fn parse_search_options(args: &[String]) -> Result<SearchOptions, (i32, String)> {
+    let mut positional = Vec::new();
+    let mut regex = false;
+    let mut context = 2usize;
+    let mut max_items = DEFAULT_SEARCH_MAX_ITEMS;
+    let mut max_bytes = DEFAULT_SEARCH_MAX_BYTES;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                positional.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            "--regex" => {
+                if regex {
+                    return Err((2, "--regex may be specified only once".into()));
+                }
+                regex = true;
+                index += 1;
+            }
+            option @ ("--context" | "--max-items" | "--max-bytes") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| (2, format!("{option} requires a value")))?;
+                if option == "--context" {
+                    context = value
+                        .parse::<usize>()
+                        .map_err(|_| (2, "--context requires a non-negative integer".into()))?;
+                    if context > MAX_SEARCH_CONTEXT {
+                        return Err((
+                            2,
+                            format!("search --context may not exceed {MAX_SEARCH_CONTEXT}"),
+                        ));
+                    }
+                } else if option == "--max-items" {
+                    max_items = positive_usize(value, option)?;
+                    if max_items > MAX_SEARCH_ITEMS {
+                        return Err((
+                            2,
+                            format!("search --max-items may not exceed {MAX_SEARCH_ITEMS}"),
+                        ));
+                    }
+                } else {
+                    max_bytes = positive_usize(value, option)?;
+                }
+                index += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err((2, format!("unknown search option `{value}`")));
+            }
+            value => {
+                positional.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    if !(2..=MAX_FIND_QUERIES + 1).contains(&positional.len()) {
+        return Err((
+            2,
+            format!("search requires DIRECTORY and 1..{MAX_FIND_QUERIES} PATTERN arguments"),
+        ));
+    }
+    let root = positional.remove(0);
+    if positional
+        .iter()
+        .any(|pattern| pattern.is_empty() || pattern.len() > MAX_FIND_QUERY_BYTES)
+    {
+        return Err((
+            2,
+            "each search PATTERN must contain 1..4096 UTF-8 bytes".into(),
+        ));
+    }
+    if positional.iter().map(String::len).sum::<usize>() > MAX_FIND_TOTAL_QUERY_BYTES {
+        return Err((
+            2,
+            "combined search PATTERN text may not exceed 32768 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(SearchOptions {
+        root,
+        patterns: positional,
+        regex,
+        context,
+        max_items,
+        max_bytes,
+    })
+}
+
+fn build_search_engine(
+    patterns: &[String],
+    regex_mode: bool,
+) -> Result<SearchEngine, (i32, String)> {
+    let patterns = patterns
+        .iter()
+        .map(|pattern| {
+            if regex_mode {
+                pattern.clone()
+            } else {
+                regex::escape(pattern)
+            }
+        })
+        .collect::<Vec<_>>();
+    let set = RegexSetBuilder::new(&patterns)
+        .size_limit(1024 * 1024)
+        .dfa_size_limit(1024 * 1024)
+        .build()
+        .map_err(|error| (2, format!("invalid search regex: {error}")))?;
+    let expressions = patterns
+        .iter()
+        .map(|pattern| {
+            RegexBuilder::new(pattern)
+                .size_limit(1024 * 1024)
+                .dfa_size_limit(1024 * 1024)
+                .build()
+                .map_err(|error| (2, format!("invalid search regex: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SearchEngine { set, expressions })
+}
+
+fn scan_source(source: &str, engine: &SearchEngine, collect_limit: usize) -> SearchScan {
+    let mut total = 0usize;
+    let mut hits = Vec::with_capacity(collect_limit.min(1_000));
+    for (row, line) in source.split_terminator('\n').enumerate() {
+        let matches = engine.set.matches(line);
+        if !matches.matched_any() {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if hits.len() >= collect_limit {
+            continue;
+        }
+        let queries = matches.iter().collect::<Vec<_>>();
+        let column = queries
+            .iter()
+            .filter_map(|query| engine.expressions[*query].find(line))
+            .map(|matched| line[..matched.start()].chars().count() + 1)
+            .min()
+            .unwrap_or(1);
+        hits.push(SearchHit {
+            row,
+            column,
+            queries,
+        });
+    }
+    SearchScan { total, hits }
+}
+
+fn render_search_block(
+    file: &SelectedSearchFile,
+    hits: &[SearchHit],
+    requested_start: usize,
+    requested_end: usize,
+    symbols: Option<&[Symbol]>,
+    cwd: &Path,
+) -> Result<Vec<u8>, (i32, String)> {
+    let lines = file.source.split_terminator('\n').collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let start = requested_start.min(lines.len() - 1);
+    let end = requested_end.min(lines.len() - 1);
+    let hit_rows = hits.iter().map(|hit| hit.row).collect::<HashSet<_>>();
+    let mut hit_text = String::new();
+    for (index, hit) in hits.iter().enumerate() {
+        if index > 0 {
+            hit_text.push(',');
+        }
+        let queries = hit
+            .queries
+            .iter()
+            .map(|query| (query + 1).to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        hit_text.push_str(&format!("L{}:{}[q{}]", hit.row + 1, hit.column, queries));
+    }
+    let mut items = BTreeSet::new();
+    if let Some(symbols) = symbols {
+        for hit in hits {
+            if let Some(symbol) = symbols
+                .iter()
+                .filter(|symbol| symbol.start_row <= hit.row && hit.row <= symbol.end_row)
+                .min_by_key(|symbol| symbol.end_row.saturating_sub(symbol.start_row))
+            {
+                items.insert(bounded_metadata(&symbol.qualified_name, 256));
+            }
+        }
+    }
+    let mut block = Vec::new();
+    write!(
+        block,
+        "match file={} lines={}-{} hits={}",
+        display_path(&file.path, cwd),
+        start + 1,
+        end + 1,
+        quote_metadata(&hit_text)
+    )
+    .map_err(output_error)?;
+    if !items.is_empty() {
+        write!(
+            block,
+            " items={}",
+            quote_metadata(&items.into_iter().collect::<Vec<_>>().join(","))
+        )
+        .map_err(output_error)?;
+    }
+    writeln!(block).map_err(output_error)?;
+    let width = (end + 1).to_string().len();
+    let mut rendered = String::new();
+    let mut escaped_controls = 0usize;
+    for (row, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+        let (line, escaped) = escape_untrusted_text(line);
+        escaped_controls += escaped;
+        let marker = if hit_rows.contains(&row) { '>' } else { ' ' };
+        rendered.push_str(&format!("{marker}{:>width$} | {line}\n", row + 1));
+    }
+    render_source_boundary(&mut block, escaped_controls)?;
+    write!(block, "{rendered}").map_err(output_error)?;
+    writeln!(block, "--- end source ---").map_err(output_error)?;
+    Ok(block)
 }
 
 struct FileSummary {
@@ -1957,6 +2536,14 @@ fn render_source(
     if parsed.backend == ParseBackend::Lsp {
         write!(output, " backend=lsp").map_err(output_error)?;
     }
+    let item_lines = symbol.end_row.saturating_sub(symbol.start_row) + 1;
+    if item_lines > LARGE_ITEM_LINES {
+        write!(
+            output,
+            " item_lines={item_lines} hint=use-search-or-show-window"
+        )
+        .map_err(output_error)?;
+    }
     writeln!(output).map_err(output_error)?;
     let (rendered, escaped_controls) = escape_untrusted_text(source);
     render_source_boundary(output, escaped_controls)?;
@@ -2259,7 +2846,7 @@ fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, St
 fn print_global_help(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nCHOOSE A COMMAND\n  map DIRECTORY          relevant files unknown; bounded repository shape\n  find DIRECTORY QUERY... declaration names known; one parsed repository scan\n  outline FILE...        file known; declarations and ranges without bodies\n  show TARGET...         exact source for the smallest selected items or line span\n  imports FILE...        direct import/include statements from known files\n  dependents FILE        files that directly import/include one known file\n  deps FILE              bounded transitive local file dependencies\n  languages              supported language names\n\nLSP SEMANTICS\n  definition LOCATION...       definition behind a use\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declaration\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nTYPICAL FLOW\n  map DIRECTORY --max-items 200 -> batch related find queries or outline known files -> one\n  multi-target show for only the needed source. Use an LSP semantic command when an exact\n  relationship matters; do not substitute text matching.\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Supply it before SUBCOMMAND for an\n  extensionless/ambiguous file or to filter a directory scan. Structural commands use bundled\n  Tree-sitter and request an optional LSP only for syntax-dirty files. Semantic commands require\n  FILE:LINE:COLUMN and --lsp [LANGUAGE=]ABSOLUTE_PATH. Servers are lazy and invocation-local.\n\nOUTPUT CONTRACT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. A caller-supplied LSP is an external executable and may maintain its own caches.\n\nRun `pira_codenav SUBCOMMAND --help` for exact targets, options, defaults, and examples."
+        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nCHOOSE A COMMAND\n  map DIRECTORY             relevant files unknown; bounded repository shape\n  find DIRECTORY QUERY...   declaration names known; one parsed repository scan\n  search DIRECTORY PATTERN... implementation/body text known; bounded contextual matches\n  outline FILE...           file known; declarations and ranges without bodies\n  show TARGET...            exact source for selected items, line spans, or windows\n  imports FILE...           direct import/include statements from known files\n  dependents FILE           files that directly import/include one known file\n  deps FILE                 bounded transitive local file dependencies\n  languages                 supported language names\n\nLSP SEMANTICS\n  definition LOCATION...       definition behind a use\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declaration\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nTYPICAL FLOW\n  Use map only while relevant files are unknown. Batch related find/search queries, then request the\n  smallest needed source with show. For an already known file/range, an ordinary bounded read or\n  search can be cheaper. Use LSP semantics for exact relationships; do not substitute text matching.\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; semantic commands use LSP directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT CONTRACT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for exact targets, options, defaults, and examples."
     )
     .map_err(output_error)
 }
@@ -2285,7 +2872,7 @@ USAGE
   pira_codenav [LANGUAGE] outline FILE... [--match TEXT]... [--max-items N]
     [--signatures] [--selectors] [--lsp [LANGUAGE=]ABSOLUTE_PATH]
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
+    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
 
 OPTIONS
   --match TEXT      Case-insensitive OR filter over kind, qualified name, and signature.
@@ -2296,8 +2883,8 @@ OPTIONS
 
 OUTPUT AND BACKEND
   Prints declaration kind, qualified name, and exact range; bodies are omitted. Clean files use
-  bundled Tree-sitter. A syntax-dirty file requires --lsp; backend=lsp then marks the recovered
-  result. Successful files remain visible if another FILE fails.
+  bundled Tree-sitter. A syntax-dirty file uses a conventional server on PATH or an explicit --lsp;
+  backend=lsp marks that result. --no-auto-lsp disables discovery. Peer successes remain visible.
 
 NEXT
   Use `pira_codenav show FILE:LINE` for the smallest enclosing named item. Use --selectors only when
@@ -2312,9 +2899,9 @@ WHEN TO USE
   You know the relevant item or range and need the smallest sufficient exact source.
 
 USAGE
-  pira_codenav [LANGUAGE] show TARGET... [--max-items N] [--max-bytes N]
+  pira_codenav [LANGUAGE] show TARGET... [--window N] [--max-items N] [--max-bytes N]
     [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
+    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
 
 TARGETS
   FILE:LINE[:COLUMN]       Selects the smallest enclosing named item; coordinates are one-based.
@@ -2322,15 +2909,20 @@ TARGETS
   pira://...               Freshness-checked selector from --selectors.
   FILE:START-END           Exact inclusive line span; only as the single target.
 
+OPTIONS
+  --window N               For one FILE:LINE[:COLUMN], return N lines before and after that line.
+                           N may be zero; this bypasses structural item selection.
+
 BOUNDS AND OUTPUT
   A single structural target returns the whole item by default. Multiple targets default to 20
   deduplicated whole items and 64 KiB; --max-items and --max-bytes omit whole items rather than
-  truncating source. FILE:START-END is parser-free and clamps END at EOF. Structural targets require
-  --lsp only when the file is syntax-dirty. Selectors reject stale source. Returned source is framed
-  as untrusted repository data.
+  truncating source. Items over 200 lines carry a hint to use search or --window. FILE:START-END is
+  parser-free and clamps END at EOF. Syntax-dirty structural targets need an auto-discovered or
+  explicit LSP. Selectors reject stale source. Returned source is framed as untrusted data.
 
 EXAMPLES
   pira_codenav show src/parser.rs:120
+  pira_codenav show src/parser.rs:120 --window 8
   pira_codenav show src/parser.rs::Parser::parse
   pira_codenav show src/parser.rs:120-145"#;
 
@@ -2342,7 +2934,7 @@ WHEN TO USE
 USAGE
   pira_codenav [LANGUAGE] map DIRECTORY [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
+    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
 
 OUTPUT AND LIMITS
   Prints compact file rows with language and representative top-level declarations. Selection is
@@ -2352,7 +2944,8 @@ OUTPUT AND LIMITS
 DISCOVERY AND BACKEND
   Git ignore rules are honored and symlinked directories are not followed. Without LANGUAGE, each
   supported file is inferred independently; LANGUAGE restricts the scan. Clean files use bundled
-  Tree-sitter. Syntax-dirty files require a matching --lsp; backend=lsp marks only those rows.
+  Tree-sitter. Syntax-dirty files use a server on PATH or an explicit --lsp; backend=lsp marks only
+  those rows. --no-auto-lsp disables discovery.
   complete=0 and bounded errors identify gaps without discarding clean rows.
 
 EXAMPLE
@@ -2365,9 +2958,10 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] find DIRECTORY QUERY... [--exact | --regex] [--kind KIND]
-    [--max-items N] [--selectors] [--signatures] [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
+    [--max-items N] [--selectors] [--signatures] [--show-unique]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
+    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
 
 MATCHING
   Default            Case-insensitive substring over qualified name, signature, and kind.
@@ -2376,19 +2970,47 @@ MATCHING
   --kind KIND        Restrict declaration kind.
   --signatures       Include signature/type detail.
   --selectors        Include freshness-checked `show` targets.
+  --show-unique      Include source when a query has exactly one match and that item is at most
+                     200 lines, 24 KiB, and within a shared 64 KiB expansion budget.
   QUERY...           One to 32 independent queries; files are parsed once for the whole batch.
   --max-items N      Per-query result limit; default 200; all query limits total at most 100,000.
 
 OUTPUT AND BACKEND
   Results follow stable query/file/declaration order. A multi-query run prints compact query groups.
-  LANGUAGE restricts discovery. Clean files use bundled Tree-sitter; syntax-dirty files require --lsp.
-  Clean matches remain visible when other files fail. For exact source, request selectors and pass
-  the needed selector targets together to one `show` invocation; an extra outline is unnecessary.
+  LANGUAGE restricts discovery. Clean files use bundled Tree-sitter; syntax-dirty files need an
+  auto-discovered or explicit LSP. Clean matches survive peer failures. Use --show-unique to avoid
+  a second call for small unambiguous results; otherwise batch needed targets into one `show`.
 
 EXAMPLES
   pira_codenav find . Parser --exact
   pira_codenav find . Module.compile compile_fx --exact --selectors
   pira_codenav find src '^Parser::parse$' --regex --selectors"#;
+
+const SEARCH_HELP: &str = r#"pira_codenav search — find implementation text with bounded context
+
+WHEN TO USE
+  Declaration lookup is insufficient and known body text, operators, literals, or conditions can
+  narrow the exact source. For one already known file, an ordinary bounded search may be cheaper.
+
+USAGE
+  pira_codenav [LANGUAGE] search DIRECTORY PATTERN... [--regex] [--context N]
+    [--max-items N] [--max-bytes N]
+
+MATCHING AND BOUNDS
+  Literal matching is case-sensitive. --regex uses Rust regex syntax. One to 32 patterns are scanned
+  together and reported as q1..q32. --context defaults to 2 lines on each side and may be zero.
+  --max-items limits matching lines (default 200, maximum 10,000); --max-bytes limits complete
+  rendered context blocks (default 64 KiB). Overlapping windows merge without duplicating source.
+  Put `--` before a literal or regex pattern beginning with `-`.
+
+OUTPUT AND SCOPE
+  Git ignore rules and LANGUAGE filtering match `find`. Exact contextual lines are framed as
+  untrusted repository data. Only matched files are structurally parsed, solely to add the smallest
+  clean enclosing item when available; text matches remain usable for syntax-dirty files.
+
+EXAMPLES
+  pira_codenav search . 'raise ' 'except ' --context 3
+  pira_codenav search src 'if .*is_none' --regex --context 1"#;
 
 const IMPORTS_HELP: &str = r#"pira_codenav imports — inspect direct import/include statements
 
@@ -2463,7 +3085,8 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] definition FILE:LINE:COLUMN... [--max-items N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 INPUT AND OUTPUT
@@ -2472,9 +3095,9 @@ INPUT AND OUTPUT
   coordinates and encoding. No source body is printed.
 
 LSP
-  --lsp must name an absolute executable. --lsp-root selects its workspace; repeat --lsp-arg for
-  server arguments. Up to 32 targets reuse one server and open document per file. This command never
-  guesses.
+  A conventional dedicated server on PATH is used automatically. --lsp with an absolute executable
+  overrides discovery; --no-auto-lsp disables it. --lsp-root selects the workspace.
+  Up to 32 targets reuse one server and open document per file. Semantic results are never guessed.
 
 EXAMPLE
   pira_codenav definition src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
@@ -2486,13 +3109,15 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] implementation FILE:LINE:COLUMN... [--max-items N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 INPUT AND OUTPUT
   LOCATION uses one-based lines and UTF-8 byte columns. Default: 20 normalized locations per target,
   no source bodies. Up to 32 targets reuse one server and document state. The server must advertise
-  implementation support; this command never guesses.
+  implementation support; this command never guesses. PATH discovery is automatic; --lsp overrides
+  it and --no-auto-lsp disables it.
 
 EXAMPLE
   pira_codenav implementation src/api.py:18:12 --lsp /absolute/path/to/server --lsp-root ."#;
@@ -2504,13 +3129,15 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] type-definition FILE:LINE:COLUMN... [--max-items N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 INPUT AND OUTPUT
   LOCATION uses one-based lines and UTF-8 byte columns. Default: 20 normalized locations per target,
   no source bodies. Up to 32 targets reuse one server and document state. The server must advertise
-  type-definition support; this command never guesses.
+  type-definition support; this command never guesses. PATH discovery is automatic; --lsp overrides
+  it and --no-auto-lsp disables it.
 
 EXAMPLE
   pira_codenav type-definition src/app.ts:30:9 --lsp /absolute/path/to/server --lsp-root ."#;
@@ -2522,7 +3149,7 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] references FILE:LINE:COLUMN... [--include-declaration]
-    [--max-items N] --lsp [LANGUAGE=]ABSOLUTE_PATH
+    [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR] [--lsp-init [LANGUAGE=]JSON_FILE]
     [--lsp-settings [LANGUAGE=]JSON_FILE]
 
@@ -2530,7 +3157,7 @@ OPTIONS AND OUTPUT
   LOCATION uses one-based lines and UTF-8 byte columns. Declarations are excluded unless
   --include-declaration is passed. Default: 200 locations per target. Headers add shown/omitted only
   when bounded. Up to 32 targets reuse one server and document state. No source bodies are printed;
-  this command never performs text search.
+  this command never performs text search. PATH discovery is automatic; --lsp overrides it.
 
 EXAMPLE
   pira_codenav references src/lib.rs:80:14 --max-items 50 --lsp /absolute/server --lsp-root ."#;
@@ -2542,13 +3169,15 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] callers FILE:LINE:COLUMN... [--max-items N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 OUTPUT
   Default: 100 caller relations per target and 8 compact call sites per relation. Readable locations
   are normalized. Up to 32 targets reuse one server and document state. The server must support LSP
-  call hierarchy; no textual or heuristic call graph is produced.
+  call hierarchy; no textual or heuristic call graph is produced. PATH discovery is automatic;
+  --lsp overrides it.
 
 EXAMPLE
   pira_codenav callers src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
@@ -2560,13 +3189,15 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] callees FILE:LINE:COLUMN... [--max-items N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 OUTPUT
   Default: 100 callee relations per target and 8 compact call sites per relation. Readable locations
   are normalized. Up to 32 targets reuse one server and document state. The server must support LSP
-  call hierarchy; no textual or heuristic call graph is produced.
+  call hierarchy; no textual or heuristic call graph is produced. PATH discovery is automatic;
+  --lsp overrides it.
 
 EXAMPLE
   pira_codenav callees src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
@@ -2578,13 +3209,15 @@ WHEN TO USE
 
 USAGE
   pira_codenav [LANGUAGE] hover FILE:LINE:COLUMN... [--max-bytes N]
-    --lsp [LANGUAGE=]ABSOLUTE_PATH [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
+    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
+    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
     [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
 
 INPUT AND OUTPUT
   LOCATION uses one-based lines and UTF-8 byte columns. --max-bytes defaults to 16 KiB per target.
   Truncation occurs only at a UTF-8 boundary and is reported in the header. Content is framed as
-  untrusted LSP data. Up to 32 targets reuse one server and document state.
+  untrusted LSP data. Up to 32 targets reuse one server and document state. PATH discovery is
+  automatic; --lsp overrides it and --no-auto-lsp disables it.
 
 EXAMPLE
   pira_codenav hover src/app.py:24:9 --max-bytes 4096 --lsp /absolute/server --lsp-root ."#;
@@ -2610,6 +3243,7 @@ fn print_command_help(command: &str, output: &mut dyn Write) -> CommandResult {
         "show" => SHOW_HELP,
         "map" => MAP_HELP,
         "find" => FIND_HELP,
+        "search" => SEARCH_HELP,
         "imports" => IMPORTS_HELP,
         "dependents" => DEPENDENTS_HELP,
         "deps" => DEPS_HELP,

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,7 @@ pub struct LspConfig {
 pub struct LspConfigs {
     pub default: Option<LspConfig>,
     pub languages: BTreeMap<Language, LspConfig>,
+    pub auto_root: Option<PathBuf>,
 }
 
 impl LspConfig {
@@ -92,6 +94,13 @@ impl LspService {
     }
 
     fn client(&mut self, language: Language) -> Result<&mut LspClient, String> {
+        if !self.configs.languages.contains_key(&language)
+            && self.configs.default.is_none()
+            && let Some(root) = self.configs.auto_root.as_deref()
+            && let Some(config) = discover_config(language, root)?
+        {
+            self.configs.languages.insert(language, config);
+        }
         let key = self
             .configs
             .languages
@@ -128,7 +137,13 @@ impl LspService {
     }
 
     pub fn is_configured(&self, language: Language) -> bool {
-        self.configs.languages.contains_key(&language) || self.configs.default.is_some()
+        self.configs.languages.contains_key(&language)
+            || self.configs.default.is_some()
+            || self
+                .configs
+                .auto_root
+                .as_deref()
+                .is_some_and(|_| auto_server_available(language))
     }
 
     pub fn document_symbols(
@@ -220,4 +235,99 @@ impl LspService {
         self.client(language)?
             .calls(path, language, source, row, byte_column, incoming)
     }
+}
+
+pub fn auto_server_available(language: Language) -> bool {
+    discover_executable(language).is_some()
+}
+
+fn discover_config(language: Language, root: &Path) -> Result<Option<LspConfig>, String> {
+    let Some((executable, arguments)) = discover_executable(language) else {
+        return Ok(None);
+    };
+    LspConfig::new(executable, arguments, root.to_path_buf(), None, None).map(Some)
+}
+
+fn discover_executable(language: Language) -> Option<(PathBuf, Vec<String>)> {
+    let candidates: &[(&str, &[&str])] = match language {
+        Language::Python => &[
+            ("basedpyright-langserver", &["--stdio"]),
+            ("pyright-langserver", &["--stdio"]),
+            ("pylsp", &[]),
+        ],
+        Language::Rust => &[("rust-analyzer", &[])],
+        Language::Java => &[("jdtls", &[])],
+        Language::C | Language::Cpp | Language::Cuda => &[("clangd", &[])],
+        Language::Bash => &[("bash-language-server", &["start"])],
+        Language::Go => &[("gopls", &[])],
+        Language::JavaScript | Language::TypeScript => {
+            &[("typescript-language-server", &["--stdio"])]
+        }
+        Language::CSharp => &[("csharp-ls", &[])],
+        Language::Php => &[("intelephense", &["--stdio"])],
+        Language::Kotlin => &[("kotlin-language-server", &[])],
+        Language::Lua => &[("lua-language-server", &[])],
+        Language::Hcl => &[("terraform-ls", &["serve"])],
+        Language::Ruby => &[("solargraph", &["stdio"])],
+        Language::Swift => &[("sourcekit-lsp", &[])],
+        Language::Scala => &[("metals", &[])],
+        Language::PowerShell
+        | Language::R
+        | Language::Dart
+        | Language::Elixir
+        | Language::Julia => &[],
+    };
+    candidates.iter().find_map(|(name, arguments)| {
+        executable_in_path(name).map(|executable| {
+            (
+                executable,
+                arguments.iter().map(|value| (*value).to_string()).collect(),
+            )
+        })
+    })
+}
+
+fn executable_in_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    let names = executable_names(name);
+    env::split_paths(&path)
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .find_map(|candidate| {
+            is_executable_file(&candidate)
+                .then(|| fs::canonicalize(candidate).ok())
+                .flatten()
+        })
+}
+
+#[cfg(windows)]
+fn executable_names(name: &str) -> Vec<String> {
+    if Path::new(name).extension().is_some() {
+        return vec![name.to_string()];
+    }
+    let extensions = env::var_os("PATHEXT")
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    extensions
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| format!("{name}{extension}"))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn executable_names(name: &str) -> Vec<String> {
+    vec![name.to_string()]
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }

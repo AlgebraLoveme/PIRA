@@ -54,6 +54,6 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `forget` requires explicit user permission and is only for erroneous/sensitive records; never use it to rewrite history.
 
 ### `pira_codenav`
-- Read-only navigation supports Python, Rust, Java, C/C++/CUDA, Bash, Go, JavaScript/TypeScript, C#, PowerShell, PHP, Kotlin, Lua, HCL, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. For these, use `pira_codenav` instead of generic search/file reading. Other formats—including HTML, CSS, SQL, JSON, and YAML—use generic tools.
-- Unknown files → `map`; known declaration → `find`; known file → `outline`; smallest needed exact source → `show`.
-- Semantic question → caller-supplied LSP, not text matching.
+- Consult `pira_codenav --help`. Use it when repository shape, declarations, dependencies, body-text search, or LSP semantics can narrow inspection.
+- Choose the cheapest bounded operation. Batch independent queries or targets; when the exact file/range is already known, a bounded generic search or read is also appropriate.
+- Use LSP subcommands for semantic relationships rather than text matching; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
