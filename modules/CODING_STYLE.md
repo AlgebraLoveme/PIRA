@@ -1,77 +1,71 @@
 # CODING_STYLE
 
 ## Workflow
-1. Define the change scope and smallest useful acceptance check.
+1. Define scope and the smallest useful acceptance check.
 2. Apply the lean ladder before adding code.
 3. Make the minimal safe change.
-4. Run the smallest relevant checks and report gaps.
+4. Run the smallest relevant checks; report gaps.
 
 ## Lean Ladder
-Stop at the first rung that holds:
-1. Does this need to exist? Skip speculative code and say so briefly.
-2. Does the standard library already solve it? Use it.
-3. Does a native platform feature cover it? Use it.
-4. Does an already-installed dependency solve it cleanly? Use it.
-5. If it can be one clear line, it should be.
-6. Only then write the minimum code that works.
+Stop at the first sufficient rung:
+1. Need not exist → skip speculative code; say so briefly.
+2. Standard library solves it → use it.
+3. Native platform feature covers it → use it.
+4. Installed dependency solves it cleanly → use it.
+5. One clear line is sufficient → keep one line.
+6. Otherwise write the minimum working code.
 
 ## Scope and Structure
-- Use this global coding style by default; switch to repository-local style only on explicit instruction.
-- Solutions should be correct, boring, and readable rather than clever or speculative.
-- Avoid unrequested abstractions, boilerplate, scaffolding "for later", and configuration for values that never change.
-- Deletion should be chosen over addition when possible; the fewest-file, shortest working diff should win.
+- Use this global style by default; switch to repository-local style only on explicit instruction.
+- Use correct, boring, readable solutions rather than clever/speculative ones.
+- Avoid unrequested abstractions, boilerplate, future scaffolding, and configuration for constants.
+- Choose deletion over addition when possible; the fewest-file, shortest working diff wins.
 - Keep data flow explicit and side effects narrow.
-- Keep each function at one clear abstraction level; extract only when the extraction names a real idea, removes duplication, or makes a boundary explicit.
-- Avoid flag arguments when they create two different behaviors; split the behavior or use an explicit mode only when that is simpler.
+- Keep each function at one abstraction level. Extract only to name a real idea, remove duplication, or expose a boundary.
+- Avoid flag arguments that create distinct behaviors; split behavior or use an explicit mode only when simpler.
 - Centralize true configuration; avoid scattered hardcoded constants.
-- If a complex request has a simpler sufficient version, implement it and briefly name what was skipped; ask only when defaulting would be risky.
+- For a complex request with a simpler sufficient solution, implement it and briefly name omissions; ask only when defaulting is risky.
 
 ## Boundaries and Refactoring
-- Refactor only when it reduces current change risk, removes duplication, clarifies a boundary, or makes testing materially easier.
-- Preserve behavior first; before non-trivial refactors, identify the smallest check that protects the behavior being moved.
-- Keep stable core logic independent from volatile details such as CLI parsing, file I/O, network calls, databases, UI, frameworks, and subprocess wiring when the separation is cheap.
-- Let dependencies point from volatile outer code toward stable inner logic; do not make core logic import infrastructure just for convenience.
-- Pass simple data across boundaries; avoid leaking framework, ORM, request, or process objects into core logic unless the project is intentionally just glue code.
-- Boundary improvements should be incremental and limited to touched code rather than architecture-wide rewrites.
-- Leave touched code slightly cleaner when it is already in scope, but do not expand into drive-by refactors.
+- Refactor only to reduce current-change risk, remove duplication, clarify a boundary, or materially ease testing.
+- Preserve behavior first; before non-trivial refactoring, identify the smallest check protecting moved behavior.
+- When cheap, isolate stable core logic from volatile CLI, file I/O, network, database, UI, framework, and subprocess details.
+- Dependencies point from volatile outer code to stable inner logic; core logic must not import infrastructure merely for convenience.
+- Pass simple data across boundaries; do not leak framework, ORM, request, or process objects into core logic unless the project is intentionally glue code.
+- Improve boundaries incrementally within touched code; no architecture-wide or drive-by refactors. Leave in-scope touched code slightly cleaner.
 
 ## Names and Types
-- Use type hints whenever proper, especially on function or method signatures.
-- Names should reveal intent, domain meaning, units, and important distinctions.
-- Avoid misleading near-synonyms; use the same word for the same concept.
-- Keep names concise unless expansion removes ambiguity.
-- When proposing names, give one best choice by default.
+- Use type hints when appropriate, especially on function/method signatures.
+- Names reveal intent, domain meaning, units, and important distinctions. Use one word for one concept; avoid misleading near-synonyms.
+- Keep names concise unless expansion removes ambiguity. When proposing names, give one best choice by default.
 
 ## Dependencies and Performance
-- Add a dependency only when the material benefit is clear and a few lines would be worse to own.
-- Between equally small standard-library or platform options, choose the one with better edge-case correctness.
-- Optimize only with profiling, measurement, or clear workload evidence; stop if the evidence is not convincing.
-- For non-obvious optimization, add a short comment explaining the tradeoff.
-- For large features likely to be open-sourced, survey online for high-quality implementations, then raise and confirm any promising one with the user.
+- Add a dependency only for clear material benefit when owning a few lines would be worse.
+- Between equally small standard-library/platform options, choose better edge-case correctness.
+- Optimize only with profiling, measurement, or clear workload evidence; stop when evidence is unconvincing.
+- Explain non-obvious optimization tradeoffs in a short comment.
+- For large likely-open-source features, survey high-quality online implementations; raise promising options and confirm with the user.
 
 ## Contracts, Errors, Security, and Shortcuts
-- Never simplify away input validation at trust boundaries, data-loss-preventing error handling, security behavior, accessibility basics, or real-hardware calibration knobs.
-- Treat security as behavior, not ceremony: preserve authentication, authorization, permission/scope checks, secret handling, safe parsing/escaping, injection/XSS/CSRF/SSRF protections, resource limits, crypto/TLS defaults, and audit-relevant logs when they are in scope.
-- Add runtime checks only where strict assumptions truly matter, such as shape, range, dtype, device, trust boundary, or security boundary.
-- Keep checks narrow, fail-fast, and actionable; avoid silent fallbacks unless explicitly requested.
-- Keep error paths visible without obscuring the main flow; avoid swallowing or translating errors unless it adds actionable context.
-- For bug fixes involving failures or exceptions, include the smallest practical check for the failure path.
-- Mark intentional simplifications with a `PIRA:` comment. If the shortcut has a known ceiling, such as a global lock, $O(n^2)$ scan, or naive heuristic, name the ceiling and upgrade path.
+- Never remove trust-boundary input validation, data-loss-preventing error handling, security behavior, accessibility basics, or real-hardware calibration knobs for simplicity.
+- Security is behavior: preserve in-scope authentication, authorization, permission/scope checks, secret handling, safe parsing/escaping, injection/XSS/CSRF/SSRF protections, resource limits, crypto/TLS defaults, and audit-relevant logs.
+- Add runtime checks only where strict assumptions matter, e.g. shape, range, dtype, device, trust, or security boundaries.
+- Checks must be narrow, fail-fast, and actionable; avoid silent fallback unless explicitly requested.
+- Keep error paths visible without obscuring main flow. Swallow/translate errors only when it adds actionable context.
+- Failure/exception bug fix → include the smallest practical failure-path check.
+- Mark intentional simplifications with `PIRA:`. If a shortcut has a known ceiling (e.g. global lock, $O(n^2)$ scan, naive heuristic), name the ceiling and upgrade path.
 
 ## Observability and Comments
-- Default to concise structured logs for config, major stage start/end, and critical metrics.
-- Avoid verbose per-iteration logs unless debugging is explicitly needed.
-- Public APIs should have concise docstrings; internal/helper docstrings are needed only when logic is non-obvious.
-- Clearer names or structure should be used before adding explanatory comments; keep comments for intent, invariants, ceilings, and tradeoffs.
-- Comments should explain intent, assumptions, and tradeoffs, not obvious syntax.
-- For non-obvious tensor-shape handling, infer and note shapes inline; run small tests if needed to confirm important shapes.
+- Default to concise structured logs for configuration, major-stage start/end, and critical metrics; avoid per-iteration logs unless explicitly debugging.
+- Public APIs need concise docstrings; internal/helper docstrings only for non-obvious logic.
+- Prefer clearer names/structure to explanatory comments. Comments cover intent, invariants, assumptions, ceilings, and tradeoffs—not obvious syntax.
+- For non-obvious tensor-shape handling, infer and note shapes inline; run small tests when needed to confirm important shapes.
 
 ## Reproducibility
-- Add random seeding by default via a centralized `seed_everything(seed)` utility.
-- Do not enforce additional reproducibility metadata unless explicitly requested.
+- Add random seeding by default through centralized `seed_everything(seed)`.
+- Add no further reproducibility metadata unless explicitly requested.
 
 ## Checks and Tests
-- Non-trivial new logic should leave the smallest runnable check that would fail if it breaks; trivial one-liners do not need tests.
-- Tests should be readable, independent, fast, and focused on observable behavior rather than implementation shape.
-- If the user specifies tests, run those first.
-- Otherwise run minimal fast checks by default, mainly syntax, grammar, static sanity, or a focused smoke test.
+- Non-trivial new logic needs the smallest runnable check that fails if it breaks; trivial one-liners need no tests.
+- Tests must be readable, independent, fast, and focused on observable behavior, not implementation shape.
+- Run user-specified tests first. Otherwise default to minimal fast checks: syntax, grammar, static sanity, or focused smoke test.

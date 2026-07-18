@@ -12,3 +12,15 @@ Use this module only for maintenance of PIRA's own configuration, modules, and r
 - Put rules in the proper place: default/session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
 - Keep module-loading and routing policy only in `~/agent/AGENTS.md`.
 - After commit and push, clean temporary backup files created for the change if they are no longer needed.
+
+## Meaning-Preserving Telegraphic Compression
+
+Use **Meaning-Preserving Telegraphic Compression (MPTC)** when shortening PIRA instructions:
+
+- Preserve each rule's actor, modality, trigger, action, object, scope, ordering, exceptions, and prohibitions. Compression must neither weaken nor strengthen, broaden nor narrow the rule.
+- Remove filler, repeated context, and details already fully covered by tool help. Merge only genuinely parallel rules.
+- Preserve normative strength exactly: `must`, `should`, `use`, `prefer`, `may`, `never`, and `only` are not interchangeable. Never turn a requirement into `prefer`, `avoid`, or an implicit fragment.
+- Use fragments and symbols only for low-risk routing or sequencing with an obvious actor and trigger: `→` = next step, `⇒` = consequence, and `+` = both. Do not use symbols to encode permission, prohibition, safety, exceptions, or normative strength.
+- Keep grammatical sentences for permission, safety, trust boundaries, destructive actions, negation, and exceptions. Clarity outranks compression.
+- Validate every original rule one-to-one against `actor | modality | trigger | action | object | scope | order | exception | prohibition`. If any field is lost, changed, or reasonably debatable, expand the compressed rule.
+- Measure and report compression only after fidelity validation passes; identify the metric used and label token savings as estimates unless measured with the target tokenizer.

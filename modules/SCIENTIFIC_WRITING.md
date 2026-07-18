@@ -1,84 +1,78 @@
 # SCIENTIFIC_WRITING
 
 ## Role and Scope
-- Default role: polish user-provided drafts.
-- Draft from scratch only on explicit request.
-- Use the text-writing rules for manuscript drafting, polishing, rebuttal writing, and response-letter writing.
-- Use the figure rules only for explicit paper-facing figure tasks such as styling, layout refinement, or manuscript integration.
-- Use the TikZ-specific rules only for explicit TikZ figure tasks.
+- Default: polish user drafts; draft from scratch only on explicit request.
+- Text rules cover manuscripts, polishing, rebuttals, and response letters.
+- Figure rules apply only to explicit paper-facing styling/layout/integration; TikZ rules only to explicit TikZ tasks.
 
-## General Writing Rules
-- Preserve technical meaning, author intent, core claims, and uncertainty calibration unless correctness or an explicit request requires change.
-- Improve clarity, flow, and academic concision; remove redundancy without dropping important information.
-- Establish the target readers early and calibrate exposition accordingly; provide enough motivation and background when the audience is less familiar with the application domain.
-- Keep terminology, notation, symbols, equations, definitions, headings, and citation style internally consistent; fix them only for consistency, clarity, or correctness.
-- In LaTeX prose, use `\cref` consistently for cross-references; use `\citet` for textual citations and `\citep` for parenthetical citations; avoid generic `\cite` unless the document style explicitly requires it.
-- Expand acronyms on first use in each section when needed, then use them consistently.
-- Prose should be concise and reader-friendly: shorter sentences when helpful, natural logical connectors, and examples only when they materially improve clarity.
-- In academic prose, semicolons should be avoided unless they are clearly necessary; sentence splits or light wording changes should be used instead. Keep semicolons when they are part of math, code, or notation syntax.
-- Flag logic, evidence, or exposition gaps and propose minimal fixes.
-- Do not leave ambiguous notation, undefined symbols, unexplained task-specific terminology, or obvious audience-mismatch problems in the final text.
+## General Writing
+- Preserve technical meaning, author intent, core claims, and uncertainty calibration unless correctness or explicit request requires change.
+- Improve clarity, flow, and academic concision; remove redundancy without losing important information.
+- Establish target readers early; add sufficient motivation/background for audiences less familiar with the domain.
+- Keep terminology, notation, symbols, equations, definitions, headings, and citation style consistent; change them only for consistency, clarity, or correctness.
+- LaTeX prose: `\cref` for cross-references, `\citet` for textual citations, `\citep` for parenthetical citations; avoid generic `\cite` unless document style requires it.
+- Expand acronyms on first use in each section when needed; then use consistently.
+- Keep prose concise and reader-friendly: shorter sentences when helpful, natural logical connectors, examples only when materially clarifying.
+- Avoid academic-prose semicolons unless clearly necessary; prefer sentence splits/light rewording. Preserve semicolons in math, code, or notation syntax.
+- Flag logic, evidence, or exposition gaps; propose minimal fixes.
+- Final text must not contain ambiguous notation, undefined symbols, unexplained task-specific terms, or obvious audience mismatch.
 
-## Drafting Rules
-- Build a clear section flow that matches the paper function, for example `motivation -> method -> evidence -> takeaway` when appropriate.
-- Drafting should use present tense, active voice, and `we` when clear, unless the target venue or user draft clearly requires another style.
-- Do not introduce unsupported claims, evidence, or citations.
-- Do not add future-work statements unless the user asks for them or the draft already contains them.
-- Ensure the drafted section has a clear reader-oriented purpose, coherent flow, and enough context for the intended audience.
+## Drafting
+- Match section flow to function, e.g. motivation → method → evidence → takeaway.
+- Default to present tense, active voice, and clear `we`, unless venue or user draft requires otherwise.
+- Never introduce unsupported claims, evidence, or citations.
+- Add future-work statements only when requested or already present.
+- Ensure a clear reader-oriented purpose, coherent flow, and sufficient audience context.
 
-## Polishing Rules
-- Preserve author voice unless the user asks for a stronger rewrite.
-- When compacting text, preserve key claims, concessions, limitations, reviewer praise, and other decision-relevant content unless the user explicitly asks to remove them.
-- Allow moderate sentence-level restructuring, but keep paragraph order, relative emphasis, and overall section flow unless coherence clearly improves.
-- If an edit may shift meaning, provide two alternatives, safer and improved, and recommend one.
-- Do not let a cleaner rewrite introduce meaning drift, remove decision-relevant nuance, or weaken the author's intended emphasis.
-- For rebuttals and response letters, optimize for directness, factual grounding, and reviewer usability: answer the concern first, keep a clear mapping from concern to response, distinguish clarifications and paper changes from remaining limitations, concrete commitments should be used over vague reassurance, and keep the tone respectful and non-defensive without overstating novelty, evidence strength, or implementation status.
+## Polishing
+- Preserve author voice unless a stronger rewrite is requested.
+- During compaction, preserve key claims, concessions, limitations, reviewer praise, and other decision-relevant content unless explicitly removed by the user.
+- Moderate sentence restructuring is allowed; preserve paragraph order, relative emphasis, and section flow unless coherence clearly improves.
+- If an edit may shift meaning, provide safer and improved alternatives; recommend one.
+- A cleaner rewrite must not drift in meaning, remove decision-relevant nuance, or weaken intended emphasis.
+- Rebuttals/response letters: optimize for directness, factual grounding, and reviewer usability; answer concern first; map concern → response; distinguish clarification/paper changes from remaining limitations; use concrete commitments instead of vague reassurance; remain respectful/non-defensive; do not overstate novelty, evidence, or implementation status.
 
 ## Default Output
-1. Requested writing deliverable.
-2. Brief changelog with the key edits and why.
-- Add open questions or risky assumptions only when needed.
-- If meaning-shift risk is non-trivial, include paired alternatives and recommend one.
-- Do not add confidence tags unless explicitly requested.
-- Keep the changelog brief unless more detail is requested.
+1. Requested deliverable.
+2. Brief changelog: key edits and reasons.
+
+Add open questions/risky assumptions only when needed. For non-trivial meaning-shift risk, include paired alternatives and recommend one. Add no confidence tags unless requested. Keep the changelog brief unless more detail is requested.
 
 ## Hard Constraints
 - Never fabricate evidence, citations, or results.
 - Never silently change core technical claims.
-- Never alter equation or definition semantics.
-- Never present pending validation as completed.
+- Never alter equation/definition semantics.
+- Never present pending validation as complete.
 
-## General Paper Figure Rules
+## General Paper Figures
 
-### Working Rules
-- Use these rules only for explicit paper-facing figure tasks or manuscript-integrated visual refinement; do not use them for general plotting code changes, analysis plots, or exploratory plots.
-- Match the paper's established visual template unless the user requests a new style.
-- Favor a paper-integrated appearance over a standalone analysis-plot appearance: compact footprint, reduced whitespace, subdued text hierarchy, and restrained visual weight.
-- For visual or layout-sensitive figure tasks, rendered appearance is the primary acceptance criterion; always visually inspect the rendered preview rather than relying only on compilation pass or code inspection.
-- Inspect for overlap, clipping, crowding, weak contrast, ambiguous labeling, inconsistent styling, spacing imbalance, and alignment issues.
-- Use color semantically: one color should encode one condition or model consistently across the figure.
-- Palette choices should be clear and reusable; avoid weak low-contrast colors for important curves.
-- When important contents overlap due to numerical similarity, use alpha and other lightweight styling adjustments to improve separability without making the figure noisy.
-- Keep legends, annotations, ticks, and tick labels concise, visually attributable, and clean.
-- Compile policy: fast draft compile each pass, single-pass by default, full compile on the final pass, and multi-pass only when refs or layout require it.
+### Working
+- Apply only to explicit paper-facing or manuscript-integrated refinement—not general plotting code, analysis plots, or exploratory plots.
+- Match the paper's established template unless a new style is requested.
+- Favor paper-integrated appearance: compact footprint, less whitespace, subdued text hierarchy, restrained visual weight.
+- For visual/layout-sensitive work, rendered appearance is the primary acceptance criterion; always inspect the preview, not only compilation/code.
+- Check overlap, clipping, crowding, weak contrast, ambiguous labels, inconsistent style, spacing imbalance, and alignment.
+- Use color semantically: one color consistently represents one condition/model. Choose clear reusable palettes; avoid weak low-contrast colors for important curves.
+- Numerically overlapping important content: use alpha or other lightweight styling for separability without noise.
+- Keep legends, annotations, ticks, and tick labels concise, attributable, and clean.
+- Compile: fast draft each pass; single-pass by default; full compile on final pass; multi-pass only when references/layout require it.
 
-### Completion Rules
-- Completion gate: no overlap or clipping; readable labels; consistent fonts and line styles; balanced spacing and alignment; correct caption and label; and style consistency with nearby figures.
-- If any gate item fails, revise and re-render; never present the figure as final while any gate item still fails.
-- Iterate until the deliverable passes or 10 passes are reached.
-- If the 10-pass cap is reached, provide exactly one primary fix plan with estimated effort and wait for approval.
+### Completion
+- Gate: no overlap/clipping; readable labels; consistent fonts/line styles; balanced spacing/alignment; correct caption/label; consistency with nearby figures.
+- Any failure requires revision and re-rendering; never present as final while a gate item fails.
+- Iterate until pass or 10 passes. At the cap, give exactly one primary fix plan with estimated effort and wait for approval.
 
-## TikZ Paper Figure Rules
+## TikZ Paper Figures
 
-### Working Rules
-- Use TikZ mainly for conceptual scientific figures; default output is the full figure block (`figure` + `caption` + `label`).
+### Working
+- Use TikZ mainly for conceptual scientific figures; default output is the full `figure` + `caption` + `label` block.
 - Keep layouts clean; avoid negative `\vspace` and aggressive squeezing unless explicitly requested.
-- Reuse existing template or header commands and styles first; search only the current repository for reusable commands or styles, and semantic style aliases should be used rather than raw inline styling unless necessary.
-- For TikZ figures, use named macros, coordinates, or semantic nodes for major repeated or structural geometry; avoid scattering hardcoded layout numbers across the figure unless abstraction would not help.
-- If styles or macros are missing, propose at most two options, minimal and richer, confirm with the user, and edit headers only after approval.
-- Use clear semantic names for new commands or styles; do not force personal prefixes.
-- If two iterations in a row miss the intended style or structure, explicitly acknowledge the mismatch and switch strategy instead of continuing the same generation loop.
-- Once the user provides a manually drawn or manually adjusted figure, treat it as the primary visual source of truth and bias toward cleanup, cropping, placement, notation alignment, and manuscript integration unless the user explicitly asks for a replacement.
+- Reuse existing template/header commands/styles first. Search only the current repository; use semantic style aliases rather than raw inline styling unless necessary.
+- Use named macros, coordinates, or semantic nodes for major repeated/structural geometry; avoid scattered hardcoded layout numbers unless abstraction would not help.
+- Missing styles/macros: propose at most two options (minimal, richer), confirm with the user, and edit headers only after approval.
+- Give new commands/styles clear semantic names; do not force personal prefixes.
+- Two consecutive misses of intended style/structure require explicit acknowledgment and a strategy change.
+- A user-provided manual drawing/adjustment is the primary visual source of truth. Bias toward cleanup, cropping, placement, notation alignment, and manuscript integration unless replacement is explicitly requested.
 
-### Completion Rules
-- Treat a TikZ figure task as incomplete if the structure is technically correct but the visual style, spacing, or figure-language match is still off relative to the target paper or reference figure.
+### Completion
+- The task remains incomplete when structure is correct but visual style, spacing, or figure-language fit still misses the target paper/reference.

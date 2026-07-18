@@ -572,6 +572,8 @@ Subagents should load the same bootstrap policy as the main agent. This is handl
 - `tests/tools/` and `tests/resources/pira_codenav/` — public codenav checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
+Except for the maintenance protocol itself, PIRA instruction files use **Meaning-Preserving Telegraphic Compression (MPTC)**. MPTC removes filler, duplication, and help-covered details while preserving each rule's actor, normative strength, trigger, action, scope, order, exceptions, and prohibitions; safety and permission rules remain grammatical rather than symbol-compressed.
+
 </details>
 
 ## Public/private split
