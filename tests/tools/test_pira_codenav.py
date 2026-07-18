@@ -208,7 +208,7 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("transitive", deps_help.stdout)
         self.assertIn("--direction VALUE", deps_help.stdout)
         find_help = self.run_cli("find", "--help")
-        self.assertIn("parsed declarations, not body text", find_help.stdout)
+        self.assertIn("body text is not searched", find_help.stdout)
         self.assertIn("freshness-checked `show` targets", find_help.stdout)
         definition_help = self.run_cli("definition", "--help")
         self.assertIn("--lsp-init", definition_help.stdout)
@@ -1703,6 +1703,30 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("mode=contains-fallback", bounded.stdout.splitlines()[0])
             self.assertIn("matches=28 shown=20", bounded.stdout.splitlines()[0])
             self.assertIn("omitted=8", bounded.stdout.splitlines()[0])
+
+    def test_find_and_search_accept_one_file_as_the_scan_scope(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-file-scope-") as temp:
+            root = Path(temp)
+            source = root / "module.py"
+            source.write_text(
+                "def selected_item():\n    return 'file-scope-marker'\n",
+                encoding="utf-8",
+            )
+
+            found = self.run_cli(
+                "find", "module.py", "selected_item", "--locations-only", cwd=root
+            )
+            self.assertIn("files=1 matches=1 shown=1", found.stdout.splitlines()[0])
+            self.assertIn('name="selected_item"', found.stdout)
+
+            searched = self.run_cli(
+                "search", "module.py", "file-scope-marker", "--context", "0", cwd=root
+            )
+            self.assertIn(
+                "files=1 matched_files=1 matches=1 shown=1",
+                searched.stdout.splitlines()[0],
+            )
+            self.assertIn("file-scope-marker", searched.stdout)
 
     def test_find_batches_independent_queries_in_one_repository_scan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-find-multi-") as temp:

@@ -1093,9 +1093,9 @@ fn command_find(
 ) -> CommandResult {
     let options = parse_find_options(args)?;
     let root = absolute_lexical(Path::new(&options.root), cwd);
-    if !root.is_dir() {
+    if !root.is_dir() && !root.is_file() {
         return Err(input_error(format!(
-            "find target is not a directory: {}",
+            "find target is not a file or directory: {}",
             root.display()
         )));
     }
@@ -1103,7 +1103,12 @@ fn command_find(
         &root,
         explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
     );
-    let mut resolver = StructuralResolver::new(lsp.config(&root)?);
+    let lsp_root = if root.is_dir() {
+        root.as_path()
+    } else {
+        root.parent().unwrap_or(cwd)
+    };
+    let mut resolver = StructuralResolver::new(lsp.config(lsp_root)?);
     let mut failures = FailureCollector::default();
     let mut parsed_count = 0usize;
     let mut lsp_count = 0usize;
@@ -1445,7 +1450,7 @@ fn parse_find_options(args: &[String]) -> Result<FindOptions, (i32, String)> {
     if !(2..=MAX_FIND_QUERIES + 1).contains(&positional.len()) {
         return Err((
             2,
-            format!("find requires DIRECTORY and 1..{MAX_FIND_QUERIES} QUERY arguments"),
+            format!("find requires PATH and 1..{MAX_FIND_QUERIES} QUERY arguments"),
         ));
     }
     if usize::from(exact) + usize::from(contains) + usize::from(regex) > 1 {
@@ -1566,9 +1571,9 @@ fn command_search(
 ) -> CommandResult {
     let options = parse_search_options(args)?;
     let root = absolute_lexical(Path::new(&options.root), cwd);
-    if !root.is_dir() {
+    if !root.is_dir() && !root.is_file() {
         return Err(input_error(format!(
-            "search target is not a directory: {}",
+            "search target is not a file or directory: {}",
             root.display()
         )));
     }
@@ -1819,7 +1824,7 @@ fn parse_search_options(args: &[String]) -> Result<SearchOptions, (i32, String)>
     if !(2..=MAX_FIND_QUERIES + 1).contains(&positional.len()) {
         return Err((
             2,
-            format!("search requires DIRECTORY and 1..{MAX_FIND_QUERIES} PATTERN arguments"),
+            format!("search requires PATH and 1..{MAX_FIND_QUERIES} PATTERN arguments"),
         ));
     }
     let root = positional.remove(0);
@@ -3080,7 +3085,7 @@ fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, St
 fn print_global_help(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
-        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nSTRUCTURAL COMMANDS\n  map DIRECTORY             bounded repository shape\n  find DIRECTORY QUERY...   ranked declaration lookup with bounded unique source\n  search DIRECTORY PATTERN... bounded implementation-text matches and context\n  outline FILE...           declarations and ranges without bodies\n  show TARGET...            exact selected source, line spans, or windows\n  imports FILE...           direct import/include statements\n  dependents FILE           direct reverse file dependencies\n  deps FILE                 bounded transitive local file dependencies\n  languages                 compiled language capabilities\n\nLSP COMMANDS\n  definition LOCATION...       semantic definitions\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declarations\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; LSP commands use a server directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for command syntax, options, defaults, and examples."
+        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nSTRUCTURAL COMMANDS\n  map DIRECTORY             bounded repository shape\n  find PATH QUERY...        ranked declaration lookup with bounded unique source\n  search PATH PATTERN...    bounded implementation-text matches and context\n  outline FILE...           declarations and ranges without bodies\n  show TARGET...            exact selected source, line spans, or windows\n  imports FILE...           direct import/include statements\n  dependents FILE           direct reverse file dependencies\n  deps FILE                 bounded transitive local file dependencies\n  languages                 compiled language capabilities\n\nLSP COMMANDS\n  definition LOCATION...       semantic definitions\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declarations\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; LSP commands use a server directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for command syntax, options, defaults, and examples."
     )
     .map_err(output_error)
 }
@@ -3181,13 +3186,13 @@ DISCOVERY AND BACKEND
 EXAMPLE
   pira_codenav map src --max-items 200"#;
 
-const FIND_HELP: &str = r#"pira_codenav find — search declarations across a repository or subsystem
+const FIND_HELP: &str = r#"pira_codenav find — search declarations across source paths
 
 DESCRIPTION
-  Searches parsed declaration metadata across a directory; body text is not searched.
+  Searches parsed declaration metadata in one file or across a directory; body text is not searched.
 
 USAGE
-  pira_codenav [LANGUAGE] find DIRECTORY QUERY... [--exact | --contains | --regex] [--kind KIND]
+  pira_codenav [LANGUAGE] find PATH QUERY... [--exact | --contains | --regex] [--kind KIND]
     [--max-items N] [--selectors] [--signatures] [--locations-only | --show-unique]
     [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
     [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
@@ -3219,10 +3224,10 @@ EXAMPLES
 const SEARCH_HELP: &str = r#"pira_codenav search — find implementation text with bounded context
 
 DESCRIPTION
-  Finds known body text, operators, literals, or conditions with bounded source context.
+  Finds body text, operators, literals, or conditions in one file or directory with bounded source context.
 
 USAGE
-  pira_codenav [LANGUAGE] search DIRECTORY PATTERN... [--regex] [--context N]
+  pira_codenav [LANGUAGE] search PATH PATTERN... [--regex] [--context N]
     [--max-items N] [--max-bytes N]
 
 MATCHING AND BOUNDS
@@ -3286,7 +3291,7 @@ EXAMPLE
 const DEPS_HELP: &str = r#"pira_codenav deps — traverse bounded local structural file dependencies
 
 DESCRIPTION
-  Traverses a bounded local import/include graph in either or both directions.
+  Traverses a bounded transitive local import/include graph in either or both directions.
 
 USAGE
   pira_codenav [LANGUAGE] deps FILE [--direction imports|dependents|both] [--depth N]
