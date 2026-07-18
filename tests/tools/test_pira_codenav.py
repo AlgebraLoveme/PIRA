@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -92,21 +93,31 @@ class PiraCodeNavTests(unittest.TestCase):
         help_result = self.run_cli("--help")
         self.assertIn("read-only code navigation", help_result.stdout)
         self.assertIn("outline", help_result.stdout)
+        self.assertIn("find", help_result.stdout)
         self.assertIn("dependents", help_result.stdout)
         self.assertIn("deps", help_result.stdout)
         self.assertIn("--lsp", help_result.stdout)
+        self.assertIn("CHOOSE A COMMAND", help_result.stdout)
         self.assertIn("TYPICAL FLOW", help_result.stdout)
         self.assertIn("--max-items 200", help_result.stdout)
-        for added in ("definition", "references", "hover"):
+        self.assertIn("do not substitute text matching", help_result.stdout)
+        self.assertIn("Predictable success fields are omitted", help_result.stdout)
+        for added in (
+            "definition",
+            "implementation",
+            "type-definition",
+            "references",
+            "callers",
+            "callees",
+            "hover",
+        ):
             self.assertIn(f"  {added} ", help_result.stdout)
-        for removed in ("callers", "calls", "workspace-symbol"):
+        for removed in ("calls", "workspace-symbol", "rename"):
             self.assertNotIn(f"  {removed} ", help_result.stdout)
 
         languages = self.run_cli("languages")
-        self.assertIn(
-            "# pira_codenav languages count=23 parser=tree-sitter lsp=optional "
-            "capabilities=outline,show,map,imports,dependents,deps,definition,references,hover",
-            languages.stdout,
+        self.assertEqual(
+            "# pira_codenav languages count=23", languages.stdout.splitlines()[0]
         )
         listed = set(languages.stdout.splitlines()[1:])
         self.assertEqual(listed, {
@@ -139,11 +150,16 @@ class PiraCodeNavTests(unittest.TestCase):
             "outline",
             "show",
             "map",
+            "find",
             "imports",
             "dependents",
             "deps",
             "definition",
+            "implementation",
+            "type-definition",
             "references",
+            "callers",
+            "callees",
             "hover",
             "languages",
         ):
@@ -161,18 +177,36 @@ class PiraCodeNavTests(unittest.TestCase):
         show_help = self.run_cli("show", "--help")
         self.assertIn("smallest enclosing named item", show_help.stdout)
         self.assertIn("FILE:START-END", show_help.stdout)
+        self.assertIn("parser-free", show_help.stdout)
         outline_help = self.run_cli("outline", "--help")
         self.assertIn("--signatures", outline_help.stdout)
         self.assertIn("--match", outline_help.stdout)
         self.assertIn("--lsp [LANGUAGE=]ABSOLUTE_PATH", outline_help.stdout)
+        self.assertIn("without implementation bodies", outline_help.stdout)
         imports_help = self.run_cli("help", "imports")
         self.assertIn("Never invokes a package manager", imports_help.stdout)
+        self.assertIn("workspace root", imports_help.stdout)
+        dependents_help = self.run_cli("dependents", "--help")
+        self.assertIn("FILE is relative to --root", dependents_help.stdout)
         deps_help = self.run_cli("help", "deps")
         self.assertIn("transitive", deps_help.stdout)
+        self.assertIn("--direction VALUE", deps_help.stdout)
+        find_help = self.run_cli("find", "--help")
+        self.assertIn("parsed declarations, not text", find_help.stdout)
+        self.assertIn("freshness-checked `show` targets", find_help.stdout)
+        definition_help = self.run_cli("definition", "--help")
+        self.assertIn("--lsp-init", definition_help.stdout)
+        self.assertIn("Up to 32 targets reuse", definition_help.stdout)
+        self.assertIn("one server and open document per file", definition_help.stdout)
+        references_help = self.run_cli("references", "--help")
+        self.assertIn("--include-declaration", references_help.stdout)
+        self.assertIn("never performs text search", references_help.stdout)
+        language_help = self.run_cli("python", "--help")
+        self.assertIn("extensionless or ambiguous file", language_help.stdout)
+        self.assertIn("restrict map/find to python", language_help.stdout)
 
     def test_python_outline_auto_detects_and_omits_bodies(self) -> None:
         result = self.run_cli("outline", "python_project/package/api.py")
-        self.assertIn("language=python", result.stdout)
         self.assertRegex(result.stdout, r"class\s+Client\b")
         self.assertRegex(result.stdout, r"method\s+Client\.fetch\b")
         self.assertRegex(result.stdout, r"function\s+parse_payload\b")
@@ -195,7 +229,6 @@ class PiraCodeNavTests(unittest.TestCase):
 
     def test_rust_outline_explicit_language_and_nested_impl(self) -> None:
         result = self.run_cli("rust", "outline", "rust_project/src/parser.rs")
-        self.assertIn("language=rust", result.stdout)
         self.assertRegex(result.stdout, r"enum\s+ParseError\b")
         self.assertRegex(result.stdout, r"variant\s+ParseError::Empty\b")
         self.assertRegex(result.stdout, r"struct\s+Parser\b")
@@ -204,10 +237,26 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertRegex(result.stdout, r"function\s+résumé\b")
         self.assertNotIn("Parse one input record and preserve", result.stdout)
 
+    def test_rust_generic_impl_uses_natural_owner_name(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-rust-generics-") as temp:
+            root = Path(temp)
+            (root / "cache.rs").write_text(
+                "struct Cache<T>(T);\n\n"
+                "impl<T> Cache<T> {\n"
+                "    fn get(&self) -> &T {\n"
+                "        &self.0\n"
+                "    }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            outline = self.run_cli("outline", "cache.rs", cwd=root)
+            self.assertRegex(outline.stdout, r"method\s+Cache::get\b")
+            shown = self.run_cli("show", "cache.rs::Cache::get", cwd=root)
+            self.assertIn("fn get(&self) -> &T", shown.stdout)
+
     def test_cuda_outline_includes_and_dependents(self) -> None:
         root = SYNTHETIC_ROOT / "cuda_project"
         outline = self.run_cli("outline", "src/kernel.cu", cwd=root)
-        self.assertIn("language=cuda", outline.stdout)
         self.assertRegex(outline.stdout, r"function\s+kernels::scale_kernel\b")
         self.assertRegex(outline.stdout, r"function\s+kernels::launch_scale\b")
 
@@ -258,7 +307,6 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("--lsp", outline.stderr)
 
         tsx = self.run_cli("outline", "view.tsx", cwd=root)
-        self.assertIn("language=typescript", tsx.stdout)
         self.assertRegex(tsx.stdout, r"function\s+UserName\b")
 
         nested = self.run_cli("outline", "app.ts", cwd=root)
@@ -634,7 +682,7 @@ class PiraCodeNavTests(unittest.TestCase):
 
     def test_show_exact_line_range_is_bounded_and_validated(self) -> None:
         result = self.run_cli("show", "python_project/package/api.py:18-20")
-        self.assertIn("item=lines:18-20 kind=range", result.stdout.splitlines()[0])
+        self.assertIn("lines=18-20", result.stdout.splitlines()[0])
         self.assertIn("def fetch", result.stdout)
         self.assertIn("payload =", result.stdout)
         self.assertNotIn("class Client", result.stdout)
@@ -645,7 +693,7 @@ class PiraCodeNavTests(unittest.TestCase):
         )
         self.assertIn("1 <= START <= END", reversed_range.stderr)
         clamped = self.run_cli("show", "python_project/package/api.py:29-999")
-        self.assertIn("item=lines:29-31", clamped.stdout.splitlines()[0])
+        self.assertIn("lines=29-31", clamped.stdout.splitlines()[0])
         self.assertIn("def résumé", clamped.stdout)
         beyond_start = self.run_cli(
             "show", "python_project/package/api.py:999-1000", expected=2
@@ -657,11 +705,9 @@ class PiraCodeNavTests(unittest.TestCase):
             root = Path(temp)
             (root / "dense.py").write_text("\n" * 10_000, encoding="utf-8")
             first = self.run_cli("show", "dense.py:1-1", cwd=root)
-            self.assertIn("item=lines:1-1", first.stdout.splitlines()[0])
-            self.assertIn("bytes=1", first.stdout.splitlines()[0])
+            self.assertIn("lines=1-1", first.stdout.splitlines()[0])
             result = self.run_cli("show", "dense.py:9999-10000", cwd=root)
-            self.assertIn("item=lines:9999-10000", result.stdout.splitlines()[0])
-            self.assertIn("bytes=2", result.stdout.splitlines()[0])
+            self.assertIn("lines=9999-10000", result.stdout.splitlines()[0])
 
     def test_show_uses_column_to_disambiguate_same_line_items(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-column-") as temp:
@@ -1019,11 +1065,8 @@ class PiraCodeNavTests(unittest.TestCase):
             result = self.run_cli("map", ".", "--max-items", "3", cwd=root)
             header = result.stdout.splitlines()[0]
             for expected in (
-                "discovered=10",
-                "eligible=8",
+                "files=8",
                 "parsed=7",
-                "tree_sitter=7",
-                "lsp=0",
                 "failed=1",
                 "unsupported=1",
                 "ambiguous=1",
@@ -1166,7 +1209,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 "javascript", "dependents", "target.js", "--root", ".", cwd=root
             )
             self.assertIn("dependent=consumer.ts", result.stdout)
-            self.assertIn("complete=1", result.stdout.splitlines()[0])
+            self.assertNotIn("failed=", result.stdout.splitlines()[0])
 
     def test_c_family_dependency_group_includes_all_three_dialects(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-c-family-deps-") as temp:
@@ -1180,7 +1223,7 @@ class PiraCodeNavTests(unittest.TestCase):
             )
             for name in ("consumer.c", "consumer.cpp", "consumer.cu"):
                 self.assertIn(f"dependent={name}", result.stdout)
-            self.assertIn("complete=1", result.stdout.splitlines()[0])
+            self.assertNotIn("failed=", result.stdout.splitlines()[0])
 
     def test_both_direction_dependency_output_is_balanced(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-balanced-deps-") as temp:
@@ -1207,7 +1250,7 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertEqual(2, len(edges))
             self.assertTrue(any("direction=import" in line for line in edges))
             self.assertTrue(any("direction=dependent" in line for line in edges))
-            self.assertIn("complete=1", result.stdout.splitlines()[0])
+            self.assertNotIn("failed=", result.stdout.splitlines()[0])
 
     def test_transitive_file_dependencies_are_bounded_and_directional(self) -> None:
         root = SYNTHETIC_ROOT / "python_project"
@@ -1267,13 +1310,11 @@ class PiraCodeNavTests(unittest.TestCase):
 
     def test_real_world_python_and_rust_files_have_useful_outlines(self) -> None:
         python = self.run_cli("outline", str(REAL_ROOT / "python_click" / "decorators.py"))
-        self.assertIn("language=python", python.stdout)
         self.assertRegex(python.stdout, r"function\s+command\b")
         self.assertRegex(python.stdout, r"function\s+pass_context\.new_func\b")
         self.assertNotRegex(python.stdout, r"method\s+pass_context\.new_func\b")
 
         rust = self.run_cli("outline", str(REAL_ROOT / "rust_ripgrep" / "gitignore.rs"))
-        self.assertIn("language=rust", rust.stdout)
         self.assertRegex(rust.stdout, r"struct\s+Gitignore\b")
         self.assertRegex(rust.stdout, r"method\s+Gitignore::matched\b")
 
@@ -1366,7 +1407,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 *self.fake_lsp_args("--log", str(log)),
                 cwd=root,
             )
-            self.assertIn("backend=tree-sitter", native.stdout.splitlines()[0])
+            self.assertNotIn("backend=", native.stdout.splitlines()[0])
             self.assertFalse(log.exists(), "clean native parsing must not start the LSP")
 
             dirty = root / "dirty.py"
@@ -1425,7 +1466,7 @@ class PiraCodeNavTests(unittest.TestCase):
             definition = self.run_cli(
                 "definition", "sample.py:4:12", *self.fake_lsp_args(), cwd=root
             )
-            self.assertIn("count=1 shown=1 omitted=0", definition.stdout.splitlines()[0])
+            self.assertIn("count=1", definition.stdout.splitlines()[0])
             self.assertIn("file=sample.py range=L1:7-1:13", definition.stdout)
 
             references = self.run_cli(
@@ -1445,7 +1486,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 *self.fake_lsp_args(),
                 cwd=root,
             )
-            self.assertIn("count=3 shown=3 omitted=0", including.stdout.splitlines()[0])
+            self.assertIn("count=3", including.stdout.splitlines()[0])
             self.assertIn("range=L1:7-1:13", including.stdout)
 
             hover = self.run_cli(
@@ -1455,6 +1496,234 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("begin untrusted LSP hover", hover.stdout)
             self.assertIn("**Target**", hover.stdout)
             self.assertIn("end LSP hover", hover.stdout)
+
+    def test_find_searches_repository_declarations_with_bounded_handoffs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-find-") as temp:
+            root = Path(temp)
+            (root / "api.py").write_text(
+                "class Widget:\n"
+                "    def run(self, value: int) -> int:\n"
+                "        return value\n\n"
+                "def build_widget():\n"
+                "    return Widget()\n",
+                encoding="utf-8",
+            )
+            (root / "other.py").write_text(
+                "class Other:\n    def run(self):\n        return None\n",
+                encoding="utf-8",
+            )
+
+            literal = self.run_cli("find", ".", "widget", cwd=root)
+            self.assertIn("mode=literal", literal.stdout.splitlines()[0])
+            self.assertIn('name="Widget"', literal.stdout)
+            self.assertIn('name="build_widget"', literal.stdout)
+
+            exact = self.run_cli(
+                "find", ".", "Widget", "--exact", "--kind", "class", cwd=root
+            )
+            self.assertIn("matches=1 shown=1", exact.stdout.splitlines()[0])
+            self.assertIn('kind=class name="Widget"', exact.stdout)
+            self.assertNotIn("build_widget", exact.stdout)
+
+            regex = self.run_cli(
+                "find",
+                ".",
+                r"^Widget\.run$",
+                "--regex",
+                "--selectors",
+                "--signatures",
+                cwd=root,
+            )
+            self.assertIn("mode=regex", regex.stdout.splitlines()[0])
+            self.assertIn('name="Widget.run"', regex.stdout)
+            self.assertIn("signature=", regex.stdout)
+            selector = SELECTOR_RE.search(regex.stdout)
+            self.assertIsNotNone(selector)
+            shown = self.run_cli("show", selector.group(1), cwd=root)
+            self.assertIn("def run(self, value: int) -> int:", shown.stdout)
+            self.assertNotIn("def build_widget", shown.stdout)
+
+            bounded = self.run_cli("find", ".", "run", "--max-items", "1", cwd=root)
+            self.assertRegex(bounded.stdout.splitlines()[0], r"matches=2 shown=1 omitted=1")
+
+        unicode_name = self.run_cli(
+            "python",
+            "find",
+            "python_project",
+            "RÉSUMÉ",
+            "--exact",
+        )
+        self.assertIn('name="résumé"', unicode_name.stdout)
+
+        namespace_suffix = self.run_cli(
+            "php",
+            "find",
+            "php_laravel",
+            "COLLECTION",
+            "--exact",
+            cwd=REAL_ROOT,
+        )
+        self.assertIn(
+            'name="Illuminate\\\\Support\\\\Collection"', namespace_suffix.stdout
+        )
+
+    def test_find_preserves_clean_results_and_uses_lsp_only_for_dirty_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-find-partial-") as temp:
+            root = Path(temp)
+            (root / "clean.py").write_text("def native_item(): return 1\n", encoding="utf-8")
+            (root / "dirty.py").write_text("def dirty():\n    return (\n", encoding="utf-8")
+
+            partial = self.run_cli("find", ".", "item", cwd=root)
+            header = partial.stdout.splitlines()[0]
+            self.assertIn("parsed=1", header)
+            self.assertIn("failed=1", header)
+            self.assertIn("complete=0", header)
+            self.assertIn('name="native_item"', partial.stdout)
+
+            restored = self.run_cli(
+                "find", ".", "LspFile", "--exact", *self.fake_lsp_args(), cwd=root
+            )
+            self.assertIn("files=2", restored.stdout.splitlines()[0])
+            self.assertIn("lsp=1", restored.stdout.splitlines()[0])
+            self.assertIn("file=dirty.py", restored.stdout)
+            self.assertIn("backend=lsp", restored.stdout)
+
+    def test_find_batches_parsing_without_restarting_lsp(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-find-batches-") as temp:
+            root = Path(temp)
+            for index in range(20):
+                (root / f"dirty_{index:02}.py").write_text(
+                    f"def item_{index}():\n    return (\n", encoding="utf-8"
+                )
+            log = root / "requests.log"
+            result = self.run_cli(
+                "find",
+                ".",
+                "LspFile",
+                "--exact",
+                "--max-items",
+                "20",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn("files=20", result.stdout.splitlines()[0])
+            self.assertIn("lsp=20", result.stdout.splitlines()[0])
+            self.assertIn("matches=20 shown=20", result.stdout.splitlines()[0])
+            methods = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, methods.count("initialize"))
+            self.assertEqual(20, methods.count("textDocument/documentSymbol"))
+
+            oversized = self.run_cli(
+                "find", ".", "item", "--max-items", "100001", cwd=root, expected=2
+            )
+            self.assertIn("may not exceed 100000", oversized.stderr)
+
+    def test_extended_semantics_and_multi_target_reuse(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-extended-semantics-") as temp:
+            root = Path(temp)
+            source = root / "sample.py"
+            source.write_text(
+                "class Target: pass\n\n"
+                "def first():\n    return Target()\n\n"
+                "def second():\n    return Target()\n",
+                encoding="utf-8",
+            )
+            for command in ("implementation", "type-definition"):
+                result = self.run_cli(
+                    command, "sample.py:4:12", *self.fake_lsp_args(), cwd=root
+                )
+                self.assertIn(f"pira_codenav {command}", result.stdout.splitlines()[0])
+                self.assertIn("file=sample.py range=L1:7-1:13", result.stdout)
+
+            callers = self.run_cli(
+                "callers", "sample.py:4:12", *self.fake_lsp_args(), cwd=root
+            )
+            self.assertIn('name="caller_of_Target"', callers.stdout)
+            self.assertIn('callsites="sample.py:L1:7-1:13"', callers.stdout)
+
+            callees = self.run_cli(
+                "callees", "sample.py:4:12", *self.fake_lsp_args(), cwd=root
+            )
+            self.assertIn('name="callee_of_Target"', callees.stdout)
+            self.assertIn('callsites="sample.py:L1:7-1:13"', callees.stdout)
+
+            log = root / "requests.log"
+            batch = self.run_cli(
+                "definition",
+                "sample.py:4:12",
+                "sample.py:7:12",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn("batch targets=2 succeeded=2", batch.stdout)
+            methods = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, methods.count("initialize"))
+            self.assertEqual(1, methods.count("textDocument/didOpen"))
+            self.assertEqual(2, methods.count("textDocument/definition"))
+            self.assertEqual(1, methods.count("textDocument/didClose"))
+
+    def test_lsp_initialization_and_settings_are_bounded_and_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-config-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "class Target: pass\nTarget()\n", encoding="utf-8"
+            )
+            initialization = root / "init.json"
+            settings = root / "settings.json"
+            config_log = root / "config.json"
+            initialization.write_text(json.dumps({"mode": "test"}), encoding="utf-8")
+            settings.write_text(
+                json.dumps({"python": {"analysis": {"level": "strict"}}}),
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "definition",
+                "sample.py:2:1",
+                "--lsp-init",
+                "init.json",
+                "--lsp-settings",
+                "settings.json",
+                *self.fake_lsp_args(
+                    "--config-log",
+                    str(config_log),
+                    "--request-configuration",
+                    "python.analysis",
+                ),
+                cwd=root,
+            )
+            self.assertIn("count=1", result.stdout)
+            observed = json.loads(config_log.read_text(encoding="utf-8"))
+            self.assertEqual({"mode": "test"}, observed["initializationOptions"])
+            self.assertEqual(
+                {"python": {"analysis": {"level": "strict"}}}, observed["settings"]
+            )
+            self.assertEqual([{"level": "strict"}], observed["configuration"])
+
+            malformed = root / "malformed.json"
+            malformed.write_text("{", encoding="utf-8")
+            invalid = self.run_cli(
+                "definition",
+                "sample.py:2:1",
+                "--lsp-init",
+                "malformed.json",
+                *self.fake_lsp_args(),
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("invalid JSON", invalid.stderr)
+
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b'"' + b"x" * (64 * 1024) + b'"')
+            too_large = self.run_cli(
+                "definition",
+                "sample.py:2:1",
+                "--lsp-settings",
+                "oversized.json",
+                *self.fake_lsp_args(),
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("exceeds 64 KiB", too_large.stderr)
 
     def test_semantic_lsp_position_conversion_and_capabilities(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-semantic-unicode-") as temp:
@@ -1532,7 +1801,6 @@ class PiraCodeNavTests(unittest.TestCase):
                 *self.fake_lsp_args("--log", str(log)),
                 cwd=root,
             )
-            self.assertIn("tree_sitter=0", result.stdout.splitlines()[0])
             self.assertIn("lsp=3", result.stdout.splitlines()[0])
             methods = log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(1, methods.count("initialize"))
@@ -1647,7 +1915,7 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("language mismatch", mismatch.stderr.lower())
 
     def test_unimplemented_semantic_operations_are_not_commands(self) -> None:
-        for command in ("symbols", "type-definition", "implementation", "calls", "callers"):
+        for command in ("symbols", "workspace-symbol", "calls", "rename"):
             result = self.run_cli(command, "anything", expected=2)
             self.assertIn("unknown subcommand", result.stderr.lower())
 

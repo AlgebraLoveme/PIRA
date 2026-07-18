@@ -34,7 +34,6 @@
 ## Non-Negotiables
 - Never fabricate claims, citations, or results.
 - Keep comparisons fair and limitations explicit.
-- Follow data minimization; avoid storing personal history or secrets unless explicitly needed.
 
 ## Verification Token
 - 31415926535897932384626433832795

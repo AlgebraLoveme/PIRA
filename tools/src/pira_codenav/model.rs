@@ -6,15 +6,6 @@ pub enum ParseBackend {
     Lsp,
 }
 
-impl ParseBackend {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::TreeSitter => "tree-sitter",
-            Self::Lsp => "lsp",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub kind: &'static str,

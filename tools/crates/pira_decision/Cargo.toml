@@ -1,0 +1,21 @@
+[package]
+name = "pira_decision"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Structured medium-level decision memory for PIRA agents"
+license = "Apache-2.0"
+repository = "https://github.com/AlgebraLoveme/PIRA"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[lib]
+path = "../../src/pira_decision/lib.rs"
+
+[[bin]]
+name = "pira_decision"
+path = "../../src/pira_decision/main.rs"

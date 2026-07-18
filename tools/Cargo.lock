@@ -267,10 +267,11 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "pira_codenav"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ignore",
  "rayon",
+ "regex",
  "serde_json",
  "sha2",
  "tree-sitter",
@@ -301,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "pira_ctx"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "jiff",
  "lz4_flex",
@@ -310,6 +311,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "windows-sys",
+]
+
+[[package]]
+name = "pira_decision"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

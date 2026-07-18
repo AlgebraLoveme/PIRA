@@ -1923,7 +1923,7 @@ fn walk_rust(
     if node.kind() == "impl_item" {
         let type_name = node
             .child_by_field_name("type")
-            .map(|part| one_line(&source_slice(source, part.start_byte(), part.end_byte())))
+            .map(|part| rust_impl_owner(&source_slice(source, part.start_byte(), part.end_byte())))
             .unwrap_or_else(|| "impl".into());
         let qualified = qualify(parent, &type_name, "::");
         if let Some(body) = node.child_by_field_name("body") {
@@ -1993,6 +1993,25 @@ fn signature(node: Node<'_>, source: &str, start_byte: usize) -> String {
     one_line(&source_slice(source, start_byte, end))
 }
 
+fn rust_impl_owner(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut generic_depth = 0usize;
+    for character in value.chars() {
+        match character {
+            '<' => generic_depth = generic_depth.saturating_add(1),
+            '>' if generic_depth > 0 => generic_depth -= 1,
+            _ if generic_depth == 0 => output.push(character),
+            _ => {}
+        }
+    }
+    let output = one_line(&output);
+    if output.is_empty() {
+        one_line(value)
+    } else {
+        output
+    }
+}
+
 fn rust_attached_start(node: Node<'_>, source: &str) -> (usize, Point) {
     let mut start_node = node;
     let mut previous = node.prev_named_sibling();
@@ -2048,5 +2067,17 @@ mod parse_completeness_tests {
             .expect("python grammar");
         let tree = parser.parse(source.as_bytes(), None).expect("tree");
         assert!(inspect_tree(tree.root_node()).expect("bounded tree") > 0);
+    }
+}
+
+#[cfg(test)]
+mod rust_navigation_tests {
+    use super::rust_impl_owner;
+
+    #[test]
+    fn impl_owner_omits_generic_arguments_from_navigation_names() {
+        assert_eq!(rust_impl_owner("SourcePositions<'a>"), "SourcePositions");
+        assert_eq!(rust_impl_owner("crate::Cache<K, Vec<V>>"), "crate::Cache");
+        assert_eq!(rust_impl_owner("Plain"), "Plain");
     }
 }

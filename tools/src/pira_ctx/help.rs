@@ -14,6 +14,7 @@ Choosing a command:
     range      Retrieve the smallest sufficient exact line range.
     transform  Use for supported deterministic filtering, counting, aggregation, or slicing.
     exec       Use for custom Python analysis that prints only decision-relevant output.
+    command    Retrieve the exact original argv and cwd for traceability.
     raw        Use when complete exact retained bytes are genuinely required.
                Prefer the targeted commands above for agent analysis.
 
@@ -400,6 +401,23 @@ EXAMPLES
   pira_ctx stats
   pira_ctx stats --last"#;
 
+const COMMAND: &str = r#"pira_ctx command — retrieve the original invocation for a capture
+
+USAGE
+  pira_ctx command [--store-dir PATH] RESULT
+
+OUTPUT
+  Prints one JSON object with argv, cwd, and exact. New captures retain the original argument vector
+  and report exact=true. Older captures fall back to their redacted argument vector and report
+  exact=false. Running checkpoints are supported.
+
+SECURITY
+  argv and cwd are returned exactly and may contain secrets or private paths. Use this targeted
+  command only when invocation traceability is needed; list and stats remain redacted.
+
+EXAMPLE
+  pira_ctx command 20260712-052432"#;
+
 const VERIFY: &str = r#"pira_ctx verify — verify a stored capture's structure and stream integrity
 
 USAGE
@@ -488,6 +506,7 @@ pub fn canonical_topic(topic: &str) -> Option<&'static str> {
         "recap" => "recap",
         "history" => "history",
         "stats" => "stats",
+        "command" => "command",
         "verify" => "verify",
         "list" => "list",
         "prune" => "prune",
@@ -512,6 +531,7 @@ pub fn command(topic: &str) -> Option<&'static str> {
         "recap" => RECAP,
         "history" => HISTORY,
         "stats" => STATS,
+        "command" => COMMAND,
         "verify" => VERIFY,
         "list" => LIST,
         "prune" => PRUNE,
@@ -541,6 +561,7 @@ mod tests {
             "recap",
             "history",
             "stats",
+            "command",
             "verify",
             "list",
             "prune",

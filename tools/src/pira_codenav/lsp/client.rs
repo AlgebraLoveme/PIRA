@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -10,10 +11,11 @@ use crate::language::Language;
 use crate::model::Symbol;
 
 use super::protocol::{
-    PositionEncoding, SourcePositions, bounded_text, file_uri, language_id, parse_document_symbols,
-    parse_hover, parse_locations,
+    MAX_CALL_ITEMS, MAX_CALL_RANGES, PositionEncoding, SourcePositions, bounded_text, file_uri,
+    language_id, parse_call_items, parse_calls, parse_document_symbols, parse_hover,
+    parse_locations,
 };
-use super::{LspConfig, LspHover, LspLocation};
+use super::{LspCall, LspConfig, LspHover, LspLocation};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -25,8 +27,11 @@ const MAX_SERVER_STDERR_BYTES: usize = 16 * 1024;
 struct ServerCapabilities {
     document_symbols: bool,
     definition: bool,
+    implementation: bool,
+    type_definition: bool,
     references: bool,
     hover: bool,
+    call_hierarchy: bool,
 }
 
 struct DocumentPosition<'a> {
@@ -46,10 +51,13 @@ pub(super) struct LspClient {
     next_id: u64,
     encoding: PositionEncoding,
     capabilities: ServerCapabilities,
+    settings: Option<Value>,
+    retain_documents: bool,
+    open_documents: BTreeMap<String, Vec<usize>>,
 }
 
 impl LspClient {
-    pub(super) fn start(config: &LspConfig) -> Result<Self, String> {
+    pub(super) fn start(config: &LspConfig, retain_documents: bool) -> Result<Self, String> {
         let mut child = Command::new(&config.executable)
             .args(&config.arguments)
             .current_dir(&config.root)
@@ -99,6 +107,9 @@ impl LspClient {
             next_id: 1,
             encoding: PositionEncoding::Utf16,
             capabilities: ServerCapabilities::default(),
+            settings: config.settings.clone(),
+            retain_documents,
+            open_documents: BTreeMap::new(),
         };
         let root_uri = file_uri(&config.root)?;
         let root_name = config
@@ -106,25 +117,29 @@ impl LspClient {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("workspace");
-        let initialized = client.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "clientInfo": {"name": "pira_codenav", "version": env!("CARGO_PKG_VERSION")},
-                "rootUri": root_uri,
-                "workspaceFolders": [{"uri": root_uri, "name": root_name}],
-                "capabilities": {
-                    "general": {"positionEncodings": ["utf-8", "utf-16", "utf-32"]},
-                    "textDocument": {
-                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
-                        "definition": {"linkSupport": true},
-                        "references": {},
-                        "hover": {"contentFormat": ["markdown", "plaintext"]}
-                    },
-                    "workspace": {"workspaceFolders": true, "applyEdit": false}
-                }
-            }),
-        )?;
+        let mut initialize_params = json!({
+            "processId": std::process::id(),
+            "clientInfo": {"name": "pira_codenav", "version": env!("CARGO_PKG_VERSION")},
+            "rootUri": root_uri,
+            "workspaceFolders": [{"uri": root_uri, "name": root_name}],
+            "capabilities": {
+                "general": {"positionEncodings": ["utf-8", "utf-16", "utf-32"]},
+                "textDocument": {
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                    "definition": {"linkSupport": true},
+                    "implementation": {"linkSupport": true},
+                    "typeDefinition": {"linkSupport": true},
+                    "references": {},
+                    "hover": {"contentFormat": ["markdown", "plaintext"]},
+                    "callHierarchy": {"dynamicRegistration": false}
+                },
+                "workspace": {"workspaceFolders": true, "applyEdit": false}
+            }
+        });
+        if let Some(options) = &config.initialization_options {
+            initialize_params["initializationOptions"] = options.clone();
+        }
+        let initialized = client.request("initialize", initialize_params)?;
         let capabilities = initialized
             .get("capabilities")
             .and_then(Value::as_object)
@@ -132,8 +147,11 @@ impl LspClient {
         client.capabilities = ServerCapabilities {
             document_symbols: provider_enabled(capabilities.get("documentSymbolProvider")),
             definition: provider_enabled(capabilities.get("definitionProvider")),
+            implementation: provider_enabled(capabilities.get("implementationProvider")),
+            type_definition: provider_enabled(capabilities.get("typeDefinitionProvider")),
             references: provider_enabled(capabilities.get("referencesProvider")),
             hover: provider_enabled(capabilities.get("hoverProvider")),
+            call_hierarchy: provider_enabled(capabilities.get("callHierarchyProvider")),
         };
         client.encoding = match capabilities
             .get("positionEncoding")
@@ -151,6 +169,12 @@ impl LspClient {
             }
         };
         client.notify("initialized", json!({}))?;
+        if let Some(settings) = client.settings.clone() {
+            client.notify(
+                "workspace/didChangeConfiguration",
+                json!({"settings": settings}),
+            )?;
+        }
         Ok(client)
     }
 
@@ -181,6 +205,52 @@ impl LspClient {
         self.require_capability(self.capabilities.definition, "definition")?;
         let result = self.position_request(
             "textDocument/definition",
+            DocumentPosition {
+                path,
+                language,
+                source,
+                row,
+                byte_column,
+            },
+            None,
+        )?;
+        parse_locations(&result, true, self.encoding)
+    }
+
+    pub(super) fn implementation(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        self.require_capability(self.capabilities.implementation, "implementation")?;
+        let result = self.position_request(
+            "textDocument/implementation",
+            DocumentPosition {
+                path,
+                language,
+                source,
+                row,
+                byte_column,
+            },
+            None,
+        )?;
+        parse_locations(&result, true, self.encoding)
+    }
+
+    pub(super) fn type_definition(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        self.require_capability(self.capabilities.type_definition, "type definition")?;
+        let result = self.position_request(
+            "textDocument/typeDefinition",
             DocumentPosition {
                 path,
                 language,
@@ -240,6 +310,62 @@ impl LspClient {
         parse_hover(&result, self.encoding)
     }
 
+    pub(super) fn calls(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+        incoming: bool,
+    ) -> Result<Vec<LspCall>, String> {
+        self.require_capability(self.capabilities.call_hierarchy, "call hierarchy")?;
+        let uri = self.open_document(path, language, source)?;
+        let position = match self.document_position(&uri, source, row, byte_column) {
+            Ok(position) => position,
+            Err(error) => {
+                self.close_document(&uri);
+                return Err(error);
+            }
+        };
+        let prepared = self.request(
+            "textDocument/prepareCallHierarchy",
+            json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": position.line, "character": position.character}
+            }),
+        );
+        let result = (|| {
+            let items = parse_call_items(&prepared?)?;
+            let method = if incoming {
+                "callHierarchy/incomingCalls"
+            } else {
+                "callHierarchy/outgoingCalls"
+            };
+            let mut calls = Vec::new();
+            let mut total_ranges = 0usize;
+            for item in items {
+                let value = self.request(method, json!({"item": item}))?;
+                let next = parse_calls(&value, incoming, &uri, self.encoding)?;
+                if calls.len().saturating_add(next.len()) > MAX_CALL_ITEMS {
+                    return Err("LSP call hierarchy result exceeds the safety limit".into());
+                }
+                total_ranges = total_ranges.saturating_add(
+                    next.iter()
+                        .map(|call| call.call_ranges.len())
+                        .sum::<usize>(),
+                );
+                if total_ranges > MAX_CALL_RANGES {
+                    return Err("LSP call hierarchy ranges exceed the safety limit".into());
+                }
+                calls.extend(next);
+            }
+            Ok(calls)
+        })();
+        self.close_document(&uri);
+        result
+    }
+
     fn require_capability(&self, available: bool, name: &str) -> Result<(), String> {
         available
             .then_some(())
@@ -253,6 +379,9 @@ impl LspClient {
         source: &str,
     ) -> Result<String, String> {
         let uri = file_uri(path)?;
+        if self.retain_documents && self.open_documents.contains_key(&uri) {
+            return Ok(uri);
+        }
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -264,10 +393,16 @@ impl LspClient {
                 }
             }),
         )?;
+        self.open_documents
+            .insert(uri.clone(), SourcePositions::index(source));
         Ok(uri)
     }
 
     fn close_document(&mut self, uri: &str) {
+        if self.retain_documents {
+            return;
+        }
+        self.open_documents.remove(uri);
         let _ = self.notify(
             "textDocument/didClose",
             json!({"textDocument": {"uri": uri}}),
@@ -280,9 +415,15 @@ impl LspClient {
         target: DocumentPosition<'_>,
         context: Option<Value>,
     ) -> Result<Value, String> {
-        let position = SourcePositions::new(target.source, self.encoding)
-            .lsp_position(target.row, target.byte_column)?;
         let uri = self.open_document(target.path, target.language, target.source)?;
+        let position =
+            match self.document_position(&uri, target.source, target.row, target.byte_column) {
+                Ok(position) => position,
+                Err(error) => {
+                    self.close_document(&uri);
+                    return Err(error);
+                }
+            };
         let mut params = json!({
             "textDocument": {"uri": uri},
             "position": {"line": position.line, "character": position.character}
@@ -293,6 +434,21 @@ impl LspClient {
         let result = self.request(method, params);
         self.close_document(&uri);
         result
+    }
+
+    fn document_position(
+        &self,
+        uri: &str,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<super::protocol::LspPosition, String> {
+        let line_starts = self
+            .open_documents
+            .get(uri)
+            .ok_or_else(|| "LSP document position requested before didOpen".to_string())?;
+        SourcePositions::with_index(source, self.encoding, line_starts)
+            .lsp_position(row, byte_column)
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -354,11 +510,23 @@ impl LspClient {
                 "result": {"applied": false, "failureReason": "pira_codenav is read-only"}
             }),
             "workspace/configuration" => {
-                let count = message
+                let items = message
                     .pointer("/params/items")
                     .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                json!({"jsonrpc": "2.0", "id": id, "result": vec![Value::Null; count]})
+                    .cloned()
+                    .unwrap_or_default();
+                let values = items
+                    .iter()
+                    .map(|item| match item.get("section") {
+                        None | Some(Value::Null) => self.settings.clone().unwrap_or(Value::Null),
+                        Some(Value::String(section)) => {
+                            configuration_section(self.settings.as_ref(), section)
+                                .unwrap_or(Value::Null)
+                        }
+                        Some(_) => Value::Null,
+                    })
+                    .collect::<Vec<_>>();
+                json!({"jsonrpc": "2.0", "id": id, "result": values})
             }
             "client/registerCapability"
             | "client/unregisterCapability"
@@ -470,6 +638,12 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
+        for (uri, _) in std::mem::take(&mut self.open_documents) {
+            let _ = self.notify(
+                "textDocument/didClose",
+                json!({"textDocument": {"uri": uri}}),
+            );
+        }
         let id = self.next_id;
         let _ = self.send(&json!({
             "jsonrpc": "2.0",
@@ -494,6 +668,41 @@ impl Drop for LspClient {
     }
 }
 
+fn configuration_section(settings: Option<&Value>, section: &str) -> Option<Value> {
+    let mut value = settings?;
+    if section.is_empty() {
+        return Some(value.clone());
+    }
+    for component in section.split('.') {
+        value = value.get(component)?;
+    }
+    Some(value.clone())
+}
+
 fn provider_enabled(value: Option<&Value>) -> bool {
     value.is_some_and(|provider| provider == true || provider.is_object())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::configuration_section;
+
+    #[test]
+    fn configuration_sections_support_whole_and_dotted_settings() {
+        let settings = json!({"python": {"analysis": {"level": "strict"}}});
+        assert_eq!(
+            configuration_section(Some(&settings), ""),
+            Some(settings.clone())
+        );
+        assert_eq!(
+            configuration_section(Some(&settings), "python.analysis"),
+            Some(json!({"level": "strict"}))
+        );
+        assert_eq!(
+            configuration_section(Some(&settings), "python.missing"),
+            None
+        );
+    }
 }

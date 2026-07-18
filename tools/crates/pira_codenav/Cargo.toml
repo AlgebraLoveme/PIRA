@@ -1,6 +1,6 @@
 [package]
 name = "pira_codenav"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Read-only structural code navigation for PIRA agents"
 license = "Apache-2.0"
@@ -9,6 +9,7 @@ repository = "https://github.com/AlgebraLoveme/PIRA"
 [dependencies]
 ignore = "0.4"
 rayon = "1"
+regex = "1"
 serde_json = "1"
 sha2 = "0.10"
 tree-sitter = "0.26.11"

@@ -67,6 +67,7 @@ fn real_main() -> Result<i32, String> {
         Mode::Batch => run_batch(&config),
         Mode::List => run_list(&config),
         Mode::Stats => run_stats(&config),
+        Mode::Command => run_command(&config),
         Mode::Verify => run_verify(&config),
         Mode::Prune => run_prune(&config),
         Mode::Forget => run_forget(&config),
@@ -1018,6 +1019,23 @@ fn run_stats(config: &Config) -> Result<i32, String> {
             metadata.suggested_keywords.join(", ")
         ))?;
     }
+    Ok(0)
+}
+
+fn run_command(config: &Config) -> Result<i32, String> {
+    let store = open_target(config)?;
+    let metadata = &store.metadata;
+    let (argv, exact) = if metadata.original_command_argv.is_empty() {
+        (&metadata.command_argv, false)
+    } else {
+        (&metadata.original_command_argv, true)
+    };
+    let record = serde_json::json!({
+        "argv": argv,
+        "cwd": metadata.cwd,
+        "exact": exact,
+    });
+    util::stdout_line(&serde_json::to_string(&record).map_err(|error| error.to_string())?)?;
     Ok(0)
 }
 

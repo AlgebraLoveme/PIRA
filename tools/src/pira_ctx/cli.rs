@@ -28,6 +28,7 @@ pub enum Mode {
     Batch,
     List,
     Stats,
+    Command,
     Verify,
     Prune,
     Forget,
@@ -256,6 +257,14 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
                     return Err(USAGE.into());
                 }
             }
+        }
+        "command" => {
+            c.mode = Mode::Command;
+            let p = parse_store(&mut c, args, 1)?;
+            if p + 1 != args.len() {
+                return Err(USAGE.into());
+            }
+            c.target = Some(args[p].clone());
         }
         "prune" => parse_prune(&mut c, args)?,
         "forget" => {
@@ -875,7 +884,10 @@ mod tests {
     }
     #[test]
     fn internal_needs_no_intent() {
-        assert!(parse_args(&a(&["search", "--last", "x"])).is_ok())
+        assert!(parse_args(&a(&["search", "--last", "x"])).is_ok());
+        let command = parse_args(&a(&["command", "--store-dir", "/tmp/store", "abc"])).unwrap();
+        assert_eq!(command.mode, Mode::Command);
+        assert_eq!(command.target.as_deref(), Some("abc"));
     }
 
     #[test]

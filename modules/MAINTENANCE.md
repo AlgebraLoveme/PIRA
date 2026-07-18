@@ -3,7 +3,7 @@
 Use this module only for maintenance of PIRA's own configuration, modules, and rules, not for ordinary project work.
 
 ## Maintenance Rules
-- Keep workbook-behavior defaults in `~/agent/AGENTS.md`; use this module only to maintain those defaults, not to define ordinary workbook handling locally.
+- Keep memory-system defaults in `~/agent/MEMORY_SYSTEM.md`; use this module only to maintain them, not to define ordinary memory handling locally.
 - When files are removed from the active scheme in the future, add them to `~/agent/assets/LEGACY_LIST.md`.
 - Overwrite with current policy text only: no timestamps, question IDs, changelogs, or override chains.
 - After every write, check for cross-file conflicts and raise any immediately.

@@ -126,6 +126,22 @@ class PiraCodeNavSecurityTests(unittest.TestCase):
             self.assertIn(r"\u{1b}", result.stdout)
             self.assertIn("truncated=1", result.stdout.splitlines()[0])
 
+    def test_lsp_call_names_are_control_safe(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-call-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "def target(): pass\ntarget()\n", encoding="utf-8"
+            )
+            result = self.run_cli(
+                root,
+                "callers",
+                "sample.py:2:1",
+                *self.fake_lsp_args("--hostile-call"),
+            )
+            self.assertNotIn("\x1b", result.stdout)
+            self.assertIn(r"\u{1b}", result.stdout)
+            self.assertIn('callsites="sample.py:L1:5-1:11"', result.stdout)
+
     def test_prompt_like_source_is_delimited_not_interpreted(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-sec-") as temp:
             root = Path(temp)

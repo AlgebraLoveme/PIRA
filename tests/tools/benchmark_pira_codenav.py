@@ -172,6 +172,16 @@ def main() -> int:
             "ast_outline": [tools["ast_outline"], "digest", "synthetic/rust_project"],
             "grove": [tools["grove"], "map", "synthetic/rust_project"],
         },
+        "python_find": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "python",
+                "find",
+                "synthetic/python_project",
+                "Client.fetch",
+                "--exact",
+            ],
+        },
         "python_imports": {
             "pira_codenav": [
                 tools["pira_codenav"],
@@ -217,6 +227,28 @@ def main() -> int:
                 str(fake_lsp),
             ],
         },
+        "python_implementation": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "implementation",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
+        "python_type_definition": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "type-definition",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
         "python_references": {
             "pira_codenav": [
                 tools["pira_codenav"],
@@ -234,6 +266,28 @@ def main() -> int:
             "pira_codenav": [
                 tools["pira_codenav"],
                 "hover",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
+        "python_callers": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "callers",
+                "real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
+        "python_callees": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "callees",
                 "real/python_click/decorators.py:168:5",
                 "--lsp",
                 str(python),
@@ -399,13 +453,18 @@ def main() -> int:
         "python_show": b"def command",
         "python_map": b"api.py",
         "rust_map": b"parser.rs",
+        "python_find": b'name="Client.fetch"',
         "python_imports": b"package/models.py resolution=structural",
         "python_dependents": b"dependent=package/api.py",
         "python_deps": b"edge depth=1 direction=import",
         "languages": b"\nr\n",
         "python_definition": b"location file=real/python_click/decorators.py range=L138:5-138:12",
-        "python_references": b"backend=lsp count=",
+        "python_implementation": b"location file=real/python_click/decorators.py range=L138:5-138:12",
+        "python_type_definition": b"location file=real/python_click/decorators.py range=L138:5-138:12",
+        "python_references": b"references target=",
         "python_hover": b"**command**",
+        "python_callers": b'name="caller_of_command"',
+        "python_callees": b'name="callee_of_command"',
         "java_outline": b"StringUtils",
         "c_outline": b"main",
         "cpp_outline": b"Widget",

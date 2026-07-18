@@ -299,58 +299,40 @@ This remains a private implementation benchmark on one arm64 macOS evaluation ho
 ## `pira_codenav`: lightweight code navigation
 
 <details>
-<summary>Behavior, native and LSP backends, baseline relationship, security, and benchmarks</summary>
+<summary>Behavior, backends, baseline relationship, security, and benchmarks</summary>
 
-`pira_codenav` is a read-only native code-inspection tool for agents. It supports a broad-to-narrow workflow without requiring an IDE:
+`pira_codenav` is a read-only code-inspection tool for broad-to-narrow agent exploration:
 
-1. `map` returns a bounded mixed-language repository shape.
-2. `outline` returns declarations and ranges without implementation bodies; `--match` narrows a file locally.
-3. `show` returns exact source for selected items or bounded line ranges.
-4. `imports`, `dependents`, and `deps` expose conservative file-level relationships without invoking a build system.
-5. `definition`, `references`, and `hover` expose precise semantic navigation through a caller-supplied language server.
-6. `languages` reports installed language and command capabilities.
+1. `map` gives a bounded repository or subsystem shape.
+2. `find` searches parsed declarations when a name is known but its file is not.
+3. `outline` gives declarations and ranges without bodies; `show` returns only selected exact source.
+4. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
+5. `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, and `hover` provide precise semantics through a caller-supplied language server.
 
-It supports Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. PIRA setup installs one native executable in `PATH`. All 23 Tree-sitter grammars are compiled in, so native navigation needs no language runtime, daemon, database, network, package manager, or runtime grammar download. Run `pira_codenav --help` to choose an operation and `pira_codenav SUBCOMMAND --help` for exact syntax.
+It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. PIRA setup installs one native executable in `PATH`; all grammars are compiled in. Native navigation needs no language runtime, daemon, database, network, project initialization, package manager, or runtime grammar download. Run `pira_codenav --help` and `pira_codenav SUBCOMMAND --help` for usage.
+
+Output is compact and adaptive: predictable success defaults are omitted, while LSP use, failures, incomplete processing, omissions, truncation, and ambiguous or unsupported files remain explicit.
 
 ### Native and LSP backends
 
-LSP-independent operations remain explicit. `imports`, `dependents`, `deps`, and `languages` never start a language server. `outline`, structural `show`, and `map` use Tree-sitter when the complete native tree has no `ERROR` or `MISSING` node. If a grammar cannot cleanly parse a file, that structural target fails unless a suitable LSP is configured; PIRA does not present heuristic recovery as a clean result.
+`imports`, `dependents`, `deps`, and `languages` are explicitly LSP-independent. `map`, `find`, `outline`, and structural `show` use Tree-sitter when the complete tree contains no `ERROR` or `MISSING` node. A structurally dirty file requires a suitable LSP document-symbol provider; PIRA does not label heuristic native recovery as clean.
 
-A caller-installed server can provide clean document symbols for structurally difficult files:
+Semantic commands require one-based `FILE:LINE:COLUMN` positions, where the column is a UTF-8 byte offset. They never fall back to textual guesses. Up to 32 targets in one invocation reuse the matching server. Optional bounded JSON files can supply initialization options and workspace settings through `--lsp-init` and `--lsp-settings`; language-qualified forms support mixed configurations.
 
-```bash
-pira_codenav outline src/file.cpp \
-  --lsp cpp=/absolute/path/to/clangd \
-  --lsp-arg cpp=--background-index=0 \
-  --lsp-root .
-```
+Servers start lazily, are reused within one invocation, and are then shut down. Clean structural files do not launch a configured server. PIRA keeps no daemon or persistent index. Repository `map` and `find` parse in deterministic 16-file batches, bounding retained full-source memory while preserving order and LSP reuse.
 
-`definition`, `references`, and `hover` are deliberately LSP-only. They require `FILE:LINE:COLUMN`, where line and UTF-8 byte column are one-based, and never fall back to text-search guesses:
-
-```bash
-pira_codenav definition src/file.cpp:42:17 \
-  --lsp cpp=/absolute/path/to/clangd \
-  --lsp-root .
-```
-
-Use `--lsp /absolute/path` for one default server, or repeat `--lsp LANGUAGE=/absolute/path` and `--lsp-arg LANGUAGE=ARG` for mixed-language structural operations. Servers start lazily, are reused by language within one invocation, and are then shut down. PIRA maintains no daemon or persistent index. Clean structural files do not launch a configured server. `imports`, `dependents`, and `deps` require clean native syntax because standard LSP has no portable file-import graph.
-
-Batch and repository commands preserve useful partial results. `complete=0` and bounded per-file errors identify processing gaps, while item/byte-limit omissions remain separate. If every attempted file or target fails, PIRA prints the bounded evidence and returns the underlying failure class. `dependents` and `deps` scan only the target language plus explicit C/C++/CUDA or JavaScript/TypeScript compatibility groups; `deps --direction both` alternates the two directions under its shared output bound.
-
-The configured server owns semantic correctness. Results depend on the workspace root, project configuration, compiler flags, server implementation, and server-side caches. PIRA normalizes readable local LSP locations to its UTF-8 byte coordinates; locations it cannot safely normalize retain explicit LSP coordinates and encoding.
+Batch and repository commands retain useful successes. `complete=0` and bounded errors expose processing gaps; explicit item/byte omissions remain separate. If every attempted file or target fails, PIRA flushes bounded evidence and returns the underlying failure class.
 
 ### Relationship to ast-outline and Grove
 
-ast-outline and Grove are useful functional baselines for broad-to-narrow code reading. `pira_codenav` keeps compact outlines, bounded exact retrieval, stable freshness-checked item identities, and repository maps while using one native executable, compile-time grammars, no project initialization, and no persistent index. It adds conservative file relationships and a standard optional-LSP path for clean structural and semantic results.
-
-The comparison below covers only overlapping clean tasks with task-specific output assertions. Outputs and feature sets are not identical: PIRA location lookup returns one exact item, ast-outline name lookup may return overloads, and Grove may expose alternate IDs. Unsupported or empty baseline operations are omitted rather than counted as fast results. Semantic timings are reported separately because the caller's language server dominates them and the baselines do not expose an equivalent interface in this benchmark.
+ast-outline and Grove are useful functional baselines for compact structure and broad-to-narrow retrieval. PIRA keeps those ideas while avoiding runtime/project initialization and persistent state, and adds conservative file relationships plus a standard optional-LSP path. The comparison includes only overlapping clean tasks with task-specific correctness assertions. Unsupported or empty operations are omitted rather than counted as fast results; output schemas and exact retrieval semantics differ.
 
 ### Read-only and security boundary
 
-- Repository code and scripts are parsed but never executed. Traversal honors ignore rules, does not follow symlinks, and blocks structural dependency targets outside the workspace.
-- Exact source and hover content are framed as untrusted data. Unsafe terminal controls are escaped in source, hover, paths, native/LSP symbols, dependency labels, and errors; per-target error count and size are bounded. Tool output is evidence, not instructions.
-- PIRA rejects `workspace/applyEdit` and does not request edits. A supplied LSP is nevertheless an external executable and may create its own caches; trust and configure it as you would an IDE server.
-- Source files, syntax-tree depth, LSP messages and headers, symbols, locations, hover output, and stderr capture are bounded. Pathologically deep trees are rejected before recursive extraction. PIRA does not impose an execution timeout.
+- Repository code is parsed but never executed or edited. Ignore rules are honored, symlinked directories are not followed, and dependency targets outside the selected root are blocked.
+- Exact source and LSP hover are framed as untrusted data. Unsafe terminal controls are escaped in source, hover, paths, symbols, signatures, dependency/call metadata, and errors.
+- PIRA rejects `workspace/applyEdit`. A supplied server remains an external executable and may maintain its own caches; trust and configure it as an IDE server.
+- Source, syntax depth, regex compilation, LSP messages/headers, configuration files, symbols, locations, call relations/ranges, hover, stderr, and reported errors are bounded. PIRA imposes no command timeout; the caller controls cancellation.
 
 ### Validation
 
@@ -358,107 +340,117 @@ The comparison below covers only overlapping clean tasks with task-specific outp
 |---|---:|
 | Supported languages | 23 |
 | Public correctness files | 74 |
-| Clean native Tree-sitter files | 67 |
-| Files correctly rejected as LSP-required | 7 |
+| Clean native / correctly LSP-required files | 67 / 7 |
 | Native structural targets | 1,047 |
-| Location-to-item round trips | 1,047/1,047 |
-| Freshness-selector round trips | 1,047/1,047 |
+| Location / freshness-selector round trips | 1,047/1,047 each |
 | Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 72 / 15 / 11 |
+| Functional / inert security / Rust tests | 78 / 16 / 14 |
+| Reproducible benchmark tasks | 38 |
 
-The Linux arm64 sandbox also validated real clangd 21.1.8 and basedpyright 1.39.9 for document symbols, definitions, references, and hover. Fake-server tests cover hierarchical and flat symbols, independent capability negotiation, UTF-16 positions, server-request refusal, malformed and oversized responses, bounded hostile diagnostics, hostile metadata and hover text, range escapes, lazy startup, failed-start and failed-parse reuse, and per-language process reuse.
+The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
 
 ### Performance
 
-Each latency is a complete subprocess call from launch through collected output. The native column is direct macOS arm64 execution with 10 warmups and 100 measured calls. Same-sandbox columns were measured together inside an already-running Linux arm64 Docker Sandbox with 2 CPUs and 4 GiB RAM, using 5 warmups and 40 calls. Host and sandbox timings describe different environments and should not be compared as parser throughput; cross-tool comparisons use only same-sandbox columns.
+Each latency is a complete subprocess call through collected output. Native macOS arm64 measurements use 10 warmups and 100 calls. Same-sandbox Linux arm64 measurements use 5 warmups and 40 calls inside an already-running 2-CPU/4-GiB Docker Sandbox. Host and sandbox timings describe different environments; cross-tool comparisons use only same-sandbox columns.
 
 | Clean operation | PIRA native | PIRA sandbox | ast-outline 1.8.2 sandbox | Grove 0.3.1 sandbox |
 |---|---:|---:|---:|---:|
-| Python outline | 5.601 ms | 2.048 ms | 48.337 ms | 39.423 ms |
-| Rust outline | 7.176 ms | 3.269 ms | 50.499 ms | 40.287 ms |
-| Python exact item | 5.556 ms | 2.038 ms | 49.816 ms | 40.095 ms |
-| Python repository map | 4.667 ms | 0.774 ms | 47.958 ms | 35.686 ms |
-| Rust repository map | 4.645 ms | 0.827 ms | 47.526 ms | 32.514 ms |
-| Java outline | 4.293 ms | 0.929 ms | 45.753 ms | 27.930 ms |
-| C outline | 3.312 ms | 0.324 ms | unsupported | 69.441 ms |
-| C++ outline | 3.479 ms | 0.334 ms | 43.856 ms | 114.327 ms |
+| Python outline | 5.512 ms | 2.236 ms | 51.213 ms | 41.027 ms |
+| Rust outline | 7.036 ms | 3.562 ms | 53.623 ms | 44.535 ms |
+| Python exact item | 5.557 ms | 2.322 ms | 54.374 ms | 42.160 ms |
+| Python repository map | 4.806 ms | 1.026 ms | 51.170 ms | 37.437 ms |
+| Rust repository map | 5.085 ms | 0.996 ms | 49.782 ms | 35.020 ms |
+| Java outline | 4.103 ms | 1.006 ms | 48.960 ms | 29.933 ms |
+| C outline | 3.269 ms | 0.410 ms | unsupported | 73.030 ms |
+| C++ outline | 3.303 ms | 0.411 ms | 48.384 ms | 120.754 ms |
 
-On these clean tasks, the fastest available baseline took 12.3–214× as long as PIRA in the same sandbox. PIRA used about 3.1–5.1 MiB peak RSS, versus about 15.6–46.5 MiB for ast-outline/Grove on overlapping rows. The largest ratios use tiny synthetic C/C++ fixtures, so they principally measure complete-call overhead.
+On these tasks, the fastest available baseline took 12.5–178× as long as PIRA in the same sandbox. PIRA used about 3.6–5.6 MiB peak RSS, versus about 15.6–48.4 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
 
 #### LSP cost
 
-Every row below is a cold complete call: PIRA starts and initializes the configured server, performs one request, and shuts it down. Real-server measurements use 2 warmups and 15 calls in the same sandbox.
+Each row is a cold complete call: PIRA starts and initializes the server, performs the request, then shuts it down. Measurements use 2 warmups and 15 calls in the same sandbox.
 
 | Server and operation | Median | p95 |
 |---|---:|---:|
-| clangd definition | 173.082 ms | 178.642 ms |
-| clangd references | 173.880 ms | 177.944 ms |
-| clangd hover | 176.831 ms | 180.309 ms |
-| basedpyright definition | 370.001 ms | 383.492 ms |
-| basedpyright references | 488.983 ms | 526.721 ms |
-| basedpyright hover | 516.557 ms | 540.636 ms |
+| clangd definition | 158.495 ms | 162.704 ms |
+| clangd references | 158.617 ms | 162.876 ms |
+| clangd hover | 158.407 ms | 163.975 ms |
+| clangd callers | 157.946 ms | 168.538 ms |
+| clangd callees | 155.893 ms | 166.187 ms |
+| basedpyright definition | 404.028 ms | 449.634 ms |
+| basedpyright implementation | 560.360 ms | 604.304 ms |
+| basedpyright type-definition | 566.938 ms | 613.717 ms |
+| basedpyright references | 534.363 ms | 589.496 ms |
+| basedpyright hover | 570.874 ms | 606.642 ms |
 
-A server is reused for all matching files within one structural invocation but not across separate CLI calls; the server may retain its own external cache. A configured server adds no process-start cost to a clean native structural result.
+Real-server cost is dominated by server startup, project configuration, and caches. Batch semantic targets amortize that startup within one PIRA invocation.
+
+With the deterministic protocol server, two definition targets took 33.056 ms median in one invocation versus 65.337 ms as two calls, a 1.98× speedup from shared startup and document state.
 
 #### Subcommand context and latency
 
-Context reduction compares returned UTF-8 bytes with the complete source bytes otherwise needed by the fixed task, not tokenizer-specific token counts. Semantic rows use a deterministic protocol fixture so the measurements isolate PIRA plus a minimal server process rather than a production server's initialization cost.
+Context reduction compares returned UTF-8 bytes with complete source bytes otherwise needed by the fixed task. It is not a tokenizer-specific token count. Semantic rows use a deterministic minimal protocol server to isolate wrapper behavior rather than production-server initialization.
 
 | Subcommand | Returned bytes | Context reduction | Native median | Sandbox median | Sandbox peak RSS |
 |---|---:|---:|---:|---:|---:|
-| `outline` | 1,698 | 92.2% | 5.601 ms | 2.025 ms | 3.6 MiB |
-| `show` | 3,381 | 84.4% | 5.556 ms | 2.027 ms | 3.6 MiB |
-| `map` | 631 | 56.0% | 4.667 ms | 0.768 ms | 4.6 MiB |
-| `imports` | 405 | 54.8% | 3.483 ms | 0.413 ms | 3.6 MiB |
-| `dependents` | 296 | 79.3% | 4.728 ms | 0.791 ms | 4.6 MiB |
-| `deps` | 428 | 70.1% | 4.706 ms | 0.784 ms | 4.6 MiB |
-| `definition` | 193 | 99.1% | 32.617 ms | 14.924 ms | 12.2 MiB |
-| `references` | 1,463 | 93.3% | 34.088 ms | 15.275 ms | 12.2 MiB |
-| `hover` | 276 | 98.7% | 33.726 ms | 14.901 ms | 12.2 MiB |
-| `languages` | 280 | not applicable | 3.152 ms | 0.247 ms | 2.1 MiB |
+| `outline` | 1,652 | 92.4% | 5.512 ms | 2.236 ms | 3.6 MiB |
+| `show` | 3,334 | 84.6% | 5.557 ms | 2.322 ms | 3.6 MiB |
+| `map` | 432 | 69.9% | 4.806 ms | 1.026 ms | 4.6 MiB |
+| `find` | 236 | 83.5% | 4.935 ms | 0.977 ms | 4.6 MiB |
+| `imports` | 389 | 56.6% | 3.502 ms | 0.520 ms | 3.6 MiB |
+| `dependents` | 228 | 84.1% | 4.684 ms | 0.954 ms | 4.6 MiB |
+| `deps` | 342 | 76.1% | 4.771 ms | 0.927 ms | 4.1 MiB |
+| `definition` | 147 | 99.3% | 32.831 ms | 18.338 ms | 12.7 MiB |
+| `implementation` | 151 | 99.3% | 33.471 ms | 17.686 ms | 12.7 MiB |
+| `type-definition` | 152 | 99.3% | 33.226 ms | 17.891 ms | 12.2 MiB |
+| `references` | 1,435 | 93.4% | 33.399 ms | 18.100 ms | 12.7 MiB |
+| `callers` | 237 | 98.9% | 33.152 ms | 17.170 ms | 12.7 MiB |
+| `callees` | 237 | 98.9% | 32.557 ms | 17.745 ms | 12.7 MiB |
+| `hover` | 200 | 99.1% | 33.123 ms | 17.642 ms | 12.7 MiB |
+| `languages` | 166 | not applicable | 3.146 ms | 0.313 ms | 2.1 MiB |
 
-`outline`, `show`, and the semantic rows use the complete 21,680-byte pinned Click file. `imports` uses its 896-byte input; `map`, `dependents`, and `deps` use all 1,433 supported source bytes scanned by the deterministic Python fixture.
+`outline`, `show`, and semantic rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
 
-#### All-language outline check
+#### All-language outline regression
 
 | Language | Fixture | Source | Outline | Reduction | Native | Sandbox |
 |---|---|---:|---:|---:|---:|---:|
-| Python | Click | 21,680 B | 1,698 B | 92.2% | 5.601 ms | 2.025 ms |
-| Rust | ripgrep | 32,269 B | 2,928 B | 90.9% | 7.176 ms | 3.257 ms |
-| Java | JUnit | 12,572 B | 1,415 B | 88.7% | 4.293 ms | 0.929 ms |
-| C | synthetic | 210 B | 165 B | 21.4% | 3.312 ms | 0.320 ms |
-| C++ | synthetic | 202 B | 315 B | −55.9% | 3.479 ms | 0.343 ms |
-| CUDA | synthetic | 419 B | 242 B | 42.2% | 3.479 ms | 0.407 ms |
-| Bash | bats-core | 16,510 B | 335 B | 98.0% | 5.821 ms | 2.606 ms |
-| Go | synthetic | 119 B | 141 B | −18.5% | 3.351 ms | 0.276 ms |
-| JavaScript | synthetic | 181 B | 261 B | −44.2% | 3.365 ms | 0.301 ms |
-| TypeScript | synthetic | 386 B | 264 B | 31.6% | 3.528 ms | 0.333 ms |
-| C# | synthetic | 235 B | 285 B | −21.3% | 3.360 ms | 0.361 ms |
-| PowerShell | PowerShell | 17,197 B | 1,569 B | 90.9% | 5.687 ms | 9.890 ms |
-| PHP | Laravel | 55,672 B | 7,487 B | 86.6% | 8.826 ms | 4.537 ms |
-| Kotlin | kotlinx.coroutines | 17,043 B | 841 B | 95.1% | 3.903 ms | 0.973 ms |
-| Lua | Neovim | 53,653 B | 2,114 B | 96.1% | 8.326 ms | 4.301 ms |
-| HCL | Terraform | 2,248 B | 2,049 B | 8.9% | 3.692 ms | 0.570 ms |
-| R | dplyr | 15,796 B | 753 B | 95.2% | 4.948 ms | 1.615 ms |
-| Ruby | Rails | 14,867 B | 186 B | 98.7% | 3.679 ms | 1.079 ms |
-| Swift | ArgumentParser | 10,088 B | 1,278 B | 87.3% | 4.256 ms | 4.807 ms |
-| Scala | cats-effect | 82,458 B | 13,958 B | 83.1% | 27.169 ms | 21.322 ms |
-| Dart | http | 3,856 B | 594 B | 84.6% | 3.946 ms | 1.031 ms |
-| Elixir | Elixir | 42,726 B | 3,283 B | 92.3% | 8.301 ms | 8.589 ms |
-| Julia | HTTP.jl | 4,675 B | 176 B | 96.2% | 3.691 ms | 1.063 ms |
+| Python | Click | 21,680 B | 1,652 B | 92.4% | 5.512 ms | 2.236 ms |
+| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 7.036 ms | 3.562 ms |
+| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 4.103 ms | 1.006 ms |
+| C | synthetic | 210 B | 124 B | 41.0% | 3.269 ms | 0.410 ms |
+| C++ | synthetic | 202 B | 272 B | −34.7% | 3.303 ms | 0.411 ms |
+| CUDA | synthetic | 419 B | 198 B | 52.7% | 4.024 ms | 0.440 ms |
+| Bash | bats-core | 16,510 B | 291 B | 98.2% | 5.022 ms | 2.793 ms |
+| Go | synthetic | 119 B | 99 B | 16.8% | 3.559 ms | 0.274 ms |
+| JavaScript | synthetic | 181 B | 211 B | −16.6% | 3.318 ms | 0.281 ms |
+| TypeScript | synthetic | 386 B | 214 B | 44.6% | 3.371 ms | 0.404 ms |
+| C# | synthetic | 235 B | 239 B | −1.7% | 3.412 ms | 0.413 ms |
+| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 5.395 ms | 10.884 ms |
+| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 8.894 ms | 5.175 ms |
+| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 3.858 ms | 1.043 ms |
+| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 8.318 ms | 4.448 ms |
+| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 3.645 ms | 0.591 ms |
+| R | dplyr | 15,796 B | 712 B | 95.5% | 4.970 ms | 1.656 ms |
+| Ruby | Rails | 14,867 B | 142 B | 99.0% | 3.905 ms | 1.471 ms |
+| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 4.459 ms | 5.402 ms |
+| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 27.503 ms | 22.177 ms |
+| Dart | http | 3,856 B | 550 B | 85.7% | 4.126 ms | 1.080 ms |
+| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 8.855 ms | 9.027 ms |
+| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 3.939 ms | 1.065 ms |
 
-Negative reduction means fixed structural metadata is larger than a tiny source fixture; it does not indicate lost or duplicated source. HCL is similarly declaration-dense. The table is a language-path regression check, not a claim that synthetic files represent repository-scale compression.
+Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
 
-A minimal `pira_codenav --version` complete call measured 3.274 ms median / 3.860 ms p95 on native macOS and 0.249 ms / 0.319 ms inside the already-running sandbox. The sandbox result excludes `sbx exec`, Docker startup, and provisioning. The optimized macOS arm64 binary is 51,124,208 bytes, or 5,687,626 bytes with deterministic gzip level 9.
+A minimal `pira_codenav --version` call measured 2.429 ms median / 2.686 ms p95 on native macOS. The optimized macOS arm64 binary is 51,190,960 bytes, or 5,709,612 bytes with deterministic gzip level 9.
 
 <details>
 <summary>Benchmark method and limitations</summary>
 
-Pinned real fixtures are stored unmodified with adjacent licenses, immutable upstream commits, and SHA-256 records in `tests/resources/pira_codenav/SOURCES.md`; synthetic fixtures exercise compact language-specific constructs. Repository source is parsed and read but never executed. Every timed task must return a task-specific marker, so an empty or incorrect response fails.
+Pinned real fixtures are stored unmodified with adjacent licenses, immutable upstream commits, and SHA-256 records in `tests/resources/pira_codenav/SOURCES.md`; synthetic fixtures exercise compact language-specific constructs. Fixture source is parsed and read but never executed. Every timed task has a task-specific output assertion, so empty or incorrect output fails.
 
-The baseline operations are functionally similar, not identical. Grove runtime grammar provisioning is excluded from repeated-call latency. LSP timings depend strongly on server, project size, initialization, build configuration, filesystem, and server-side caches. Real-server validation demonstrates the protocol path, not universal symbol completeness. The deterministic semantic fixture validates PIRA's protocol and bounds but is not representative of production-server latency or memory.
+Baseline operations are functionally similar, not identical. Grove runtime grammar provisioning is excluded from repeated-call latency. LSP measurements depend on server, project size, initialization, flags, filesystem, and server caches. Real-server validation demonstrates protocol interoperability, not universal result completeness; the deterministic server validates PIRA protocol, bounds, and context behavior rather than production latency.
 
-Measurements come from one Apple M1 Pro/macOS host and one Linux arm64 Docker Sandbox on that host. Complete-call latency is the CLI product metric but does not isolate grammar throughput. Binary/non-UTF-8 input, malformed syntax, path and symlink escapes, control characters, stale selectors, output-consumer behavior, and hostile LSP messages are covered by functional/security tests rather than the latency tables. Reproducible runners are under `tests/tools`.
+Measurements come from one Apple M1 Pro/macOS host and one Linux arm64 Docker Sandbox on that host. Complete-call latency is the product metric but does not isolate grammar throughput. Non-UTF-8 input, malformed syntax, path/symlink escapes, stale selectors, controls, closed output consumers, and hostile LSP messages are covered by functional/security tests rather than these tables. Reproducible runners are under `tests/tools`.
 
 </details>
 
@@ -568,13 +560,14 @@ Subagents should load the same bootstrap policy as the main agent. This is handl
 - `AGENTS.md` — bootstrap instructions and module routing policy
 - `SOUL.md` — PI's identity, tone, and non-negotiable behaviors
 - `TOOLS.md` — tool-use and safety rules
+- `MEMORY_SYSTEM.md` — three-layer workspace-memory policy
 - `USER.md` — user-specific knowledge and working preferences; keep this private
 - `modules/` — optional task-specific modules for research, coding, writing, learning, guidance, and maintenance
 - `assets/scripts/` — setup and helper scripts
 - `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
 - `tools/build/build_pira_codenav_platform_bins.py` — package-isolated release entry point for `pira_codenav`
-- `tools/src/pira_ctx/` and `tools/src/pira_codenav/` — public Rust implementations
+- `tools/src/pira_ctx/`, `tools/src/pira_decision/`, and `tools/src/pira_codenav/` — public Rust implementations
 - `tools/dist/pira_ctx/` and `tools/dist/pira_codenav/` — verified platform executables and per-tool bundle manifests
 - `tests/tools/` and `tests/resources/pira_codenav/` — public codenav checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications

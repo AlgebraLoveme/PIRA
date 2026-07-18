@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -11,6 +12,8 @@ const MAX_LOCATIONS: usize = 100_000;
 const MAX_SYMBOL_DEPTH: usize = 128;
 const MAX_URI_BYTES: usize = 16 * 1024;
 const MAX_HOVER_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_CALL_ITEMS: usize = 1_024;
+pub(super) const MAX_CALL_RANGES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug)]
 pub enum PositionEncoding {
@@ -68,6 +71,17 @@ pub struct LspHover {
     pub contents: String,
     pub format: HoverFormat,
     pub range: Option<LspRange>,
+    pub encoding: PositionEncoding,
+}
+
+#[derive(Clone, Debug)]
+pub struct LspCall {
+    pub name: String,
+    pub kind: &'static str,
+    pub uri: String,
+    pub range: LspRange,
+    pub site_uri: String,
+    pub call_ranges: Vec<LspRange>,
     pub encoding: PositionEncoding,
 }
 
@@ -136,6 +150,92 @@ pub(super) fn parse_locations(
         .then(|| parse_location(value, allow_links, encoding))
         .ok_or_else(|| "LSP location result is not an object, array, or null".to_string())?
         .map(|location| vec![location])
+}
+
+pub(super) fn parse_call_items(value: &Value) -> Result<Vec<Value>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| "LSP prepare-call-hierarchy result is not an array or null".to_string())?;
+    if values.len() > MAX_CALL_ITEMS {
+        return Err("LSP call hierarchy preparation exceeds the safety limit".into());
+    }
+    for item in values {
+        validate_call_item(item)?;
+    }
+    Ok(values.clone())
+}
+
+pub(super) fn parse_calls(
+    value: &Value,
+    incoming: bool,
+    source_uri: &str,
+    encoding: PositionEncoding,
+) -> Result<Vec<LspCall>, String> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| "LSP call hierarchy result is not an array or null".to_string())?;
+    if values.len() > MAX_CALL_ITEMS {
+        return Err("LSP call hierarchy result exceeds the safety limit".into());
+    }
+    let item_key = if incoming { "from" } else { "to" };
+    let mut calls = Vec::with_capacity(values.len());
+    let mut total_ranges = 0usize;
+    for relation in values {
+        let item = required(relation, item_key)?;
+        let (name, kind, uri, range) = validate_call_item(item)?;
+        let ranges = required(relation, "fromRanges")?
+            .as_array()
+            .ok_or_else(|| "LSP call hierarchy fromRanges is not an array".to_string())?;
+        total_ranges = total_ranges.saturating_add(ranges.len());
+        if total_ranges > MAX_CALL_RANGES {
+            return Err("LSP call hierarchy ranges exceed the safety limit".into());
+        }
+        let call_ranges = ranges
+            .iter()
+            .map(parse_protocol_range)
+            .collect::<Result<Vec<_>, _>>()?;
+        calls.push(LspCall {
+            name,
+            kind,
+            site_uri: if incoming {
+                uri.clone()
+            } else {
+                source_uri.to_string()
+            },
+            uri,
+            range,
+            call_ranges,
+            encoding,
+        });
+    }
+    Ok(calls)
+}
+
+fn validate_call_item(value: &Value) -> Result<(String, &'static str, String, LspRange), String> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(|name| bounded_text(name, 1024))
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "LSP call hierarchy item has no usable name".to_string())?;
+    let kind = symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0));
+    let uri = required(value, "uri")?
+        .as_str()
+        .ok_or_else(|| "LSP call hierarchy item URI is not a string".to_string())?;
+    if uri.len() > MAX_URI_BYTES {
+        return Err("LSP call hierarchy item URI exceeds the safety limit".into());
+    }
+    let range = value
+        .get("selectionRange")
+        .or_else(|| value.get("range"))
+        .ok_or_else(|| "LSP call hierarchy item omitted its range".to_string())?;
+    Ok((name, kind, uri.to_string(), parse_protocol_range(range)?))
 }
 
 fn parse_location(
@@ -371,23 +471,39 @@ fn push_flat_symbol(
 
 pub(super) struct SourcePositions<'a> {
     source: &'a str,
-    line_starts: Vec<usize>,
+    line_starts: Cow<'a, [usize]>,
     encoding: PositionEncoding,
 }
 
 impl<'a> SourcePositions<'a> {
     pub(super) fn new(source: &'a str, encoding: PositionEncoding) -> Self {
+        Self {
+            source,
+            line_starts: Cow::Owned(Self::index(source)),
+            encoding,
+        }
+    }
+
+    pub(super) fn with_index(
+        source: &'a str,
+        encoding: PositionEncoding,
+        line_starts: &'a [usize],
+    ) -> Self {
+        Self {
+            source,
+            line_starts: Cow::Borrowed(line_starts),
+            encoding,
+        }
+    }
+
+    pub(super) fn index(source: &str) -> Vec<usize> {
         let mut line_starts = vec![0];
         for (index, byte) in source.bytes().enumerate() {
             if byte == b'\n' {
                 line_starts.push(index + 1);
             }
         }
-        Self {
-            source,
-            line_starts,
-            encoding,
-        }
+        line_starts
     }
 
     fn range(&self, value: &Value) -> Result<(usize, usize, usize, usize, usize, usize), String> {
@@ -566,7 +682,7 @@ fn qualification_separator(language: Language) -> &'static str {
     }
 }
 
-fn symbol_kind(kind: u64) -> &'static str {
+pub(super) fn symbol_kind(kind: u64) -> &'static str {
     match kind {
         2 => "module",
         3 => "namespace",

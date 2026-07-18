@@ -7,17 +7,6 @@
 - Repeated or reusable workflows should use a project script rather than one-off shell. After creating one, ask whether to standardize it and then review it for usability and generality.
 - Existing tools should be extended before creating new ones when compatible.
 
-## `pira_ctx`
-- Use `pira_ctx` for every shell/exec invocation. If it is unavailable, ask for setup rather than silently bypassing it.
-- Use automatic mode by default, `check` when only trustworthy process status is needed, and `capture` when complete output must remain recoverable. Prefer targeted `search`, `range`, `transform`, or `exec` retrieval over loading an entire capture with `raw`.
-- Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose. Do not include secrets, generic wording, or claims that the action has already succeeded.
-- Before repeating expensive, state-changing, or uncertain work, query `pira_ctx history`. Search all retained events with the default bounded result limit unless a meaningful time or event-number window would reduce irrelevant work.
-- History is operational evidence, not authoritative current state. After recovering an earlier action, inspect the relevant files, repository, process, or external state when freshness matters.
-- Use current-thread history by default. Use `--scope workspace` only when cross-thread operational history is genuinely relevant. Do not manually set or override thread identifiers except in focused tool tests; rely on automatic thread detection.
-- Remember that event history covers commands routed through `pira_ctx`, not conversation, reasoning, file-edit tools, web calls, or other integrations. Put durable project state, decisions, validated results, and reusable lessons in `AGENT_WORKBOOK.md`.
-- After the platform reports compaction of the continuing thread, run `pira_ctx recap` before further substantive shell/exec work. Do not use recap because time passed or for a new or temporary thread. Inspect referenced result IDs only when their evidence is needed.
-- Consult `pira_ctx --help` for command selection and `pira_ctx SUBCOMMAND --help` for exact syntax and bounds.
-
 ## Error Fighting
 - On errors, first analyze the message and pattern, then locate the root cause before fixing. For repeated or unfamiliar errors, search online before the next fix attempt.
 
@@ -57,3 +46,27 @@
 - Refine plots based on the rendered result, not just source expectations.
 - Keep temporary inspection renders in the platform's default temp directory unless the user asks to keep them or they are part of the final deliverable.
 - When the task is to produce a final figure deliverable, save the final-use format the task needs and add a quick preview format when useful for inspection or user review.
+
+## PIRA Internal tools
+
+If any of the following PIRA internal tools are needed but not available in the environment, immediately ask for setup and do not bypass the rules.
+
+### `pira_ctx`
+- Use `pira_ctx` for every shell/exec invocation except PIRA internal tools.
+- Consult `pira_ctx --help` and `pira_ctx SUBCOMMAND --help` when necessary.
+- Use automatic mode by default, `check` when only process status is needed. Prefer targeted `search`, `range`, `transform`, or `exec` retrieval over loading an entire capture with `raw`.
+- Give every wrapped program a concise prospective intent naming the action, target, and immediate purpose.
+
+### `pira_decision`
+- Consult `pira_decision --help` when necessary and use `--json` for programmatic retrieval.
+- For `add`, repeat `--choice` and `--maker` as needed; `--decision` is the one-based index of the selected choice.
+- For `search`, choose one field from `id`, `context`, `choice`, `decision`, `maker`, or `timestamp`. `choice` searches all alternatives; `decision` searches selected outcomes only. Regex is case-sensitive unless it includes a flag such as `(?i)`.
+- Treat skipped or corrupt-record warnings as incomplete retrieval. A concurrent search may miss the newest publication; rerun it after writers finish when recency matters.
+- Let the tool determine workspace scope. Do not edit its records or managed storage manually; use `--store-dir` only for setup, migration, or focused tests.
+- `forget` is destructive: require an exact ID, `--yes`, and explicit user permission; use it only for erroneous or sensitive records, never to rewrite history.
+
+### `pira_codenav`
+- For read-only inspection of supported source code (including most program languages except HTML, CSS, SQL, JSON and YAML), use `pira_codenav` as the default navigation tool and do not use generic search or file reading.
+- Consult `pira_codenav --help` and `pira_codenav SUBCOMMAND --help` when necessary.
+- Work broad-to-narrow: use `map` when the relevant files are unknown, `find` when a declaration name is known, `outline` for a known file, and `show` for the smallest sufficient exact source item.
+- Use the semantic commands with a caller-supplied LSP when definitions, implementations, types, references, calls, or hover information is needed. Do not replace semantic evidence with text matching.

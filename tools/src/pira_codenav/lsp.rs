@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use crate::language::Language;
 use crate::model::Symbol;
 
@@ -9,13 +11,17 @@ mod client;
 mod protocol;
 
 use client::LspClient;
-pub use protocol::{LspHover, LspLocation, LspRange, file_path_from_uri, normalize_range};
+pub use protocol::{
+    LspCall, LspHover, LspLocation, LspRange, PositionEncoding, file_path_from_uri, normalize_range,
+};
 
 #[derive(Clone, Debug)]
 pub struct LspConfig {
     executable: PathBuf,
     arguments: Vec<String>,
     root: PathBuf,
+    initialization_options: Option<Value>,
+    settings: Option<Value>,
 }
 
 #[derive(Default)]
@@ -25,7 +31,13 @@ pub struct LspConfigs {
 }
 
 impl LspConfig {
-    pub fn new(executable: PathBuf, arguments: Vec<String>, root: PathBuf) -> Result<Self, String> {
+    pub fn new(
+        executable: PathBuf,
+        arguments: Vec<String>,
+        root: PathBuf,
+        initialization_options: Option<Value>,
+        settings: Option<Value>,
+    ) -> Result<Self, String> {
         if !executable.is_absolute() {
             return Err("--lsp requires an absolute path to an executable".into());
         }
@@ -48,6 +60,8 @@ impl LspConfig {
             executable,
             arguments,
             root,
+            initialization_options,
+            settings,
         })
     }
 }
@@ -56,14 +70,24 @@ pub struct LspService {
     configs: LspConfigs,
     clients: BTreeMap<Option<Language>, LspClient>,
     failed_starts: BTreeMap<Option<Language>, String>,
+    retain_documents: bool,
 }
 
 impl LspService {
     pub fn new(configs: LspConfigs) -> Self {
+        Self::with_document_reuse(configs, false)
+    }
+
+    pub fn new_semantic(configs: LspConfigs) -> Self {
+        Self::with_document_reuse(configs, true)
+    }
+
+    fn with_document_reuse(configs: LspConfigs, retain_documents: bool) -> Self {
         Self {
             configs,
             clients: BTreeMap::new(),
             failed_starts: BTreeMap::new(),
+            retain_documents,
         }
     }
 
@@ -87,7 +111,7 @@ impl LspService {
                 .and_then(|language| self.configs.languages.get(&language))
                 .or(self.configs.default.as_ref())
                 .expect("an LSP configuration was checked above");
-            match LspClient::start(config) {
+            match LspClient::start(config, self.retain_documents) {
                 Ok(client) => {
                     self.clients.insert(key, client);
                 }
@@ -129,6 +153,30 @@ impl LspService {
             .definition(path, language, source, row, byte_column)
     }
 
+    pub fn implementation(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        self.client(language)?
+            .implementation(path, language, source, row, byte_column)
+    }
+
+    pub fn type_definition(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+    ) -> Result<Vec<LspLocation>, String> {
+        self.client(language)?
+            .type_definition(path, language, source, row, byte_column)
+    }
+
     pub fn references(
         &mut self,
         path: &Path,
@@ -158,5 +206,18 @@ impl LspService {
     ) -> Result<Option<LspHover>, String> {
         self.client(language)?
             .hover(path, language, source, row, byte_column)
+    }
+
+    pub fn calls(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: &str,
+        row: usize,
+        byte_column: usize,
+        incoming: bool,
+    ) -> Result<Vec<LspCall>, String> {
+        self.client(language)?
+            .calls(path, language, source, row, byte_column, incoming)
     }
 }

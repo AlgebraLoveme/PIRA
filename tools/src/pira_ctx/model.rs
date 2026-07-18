@@ -159,6 +159,8 @@ pub struct Metadata {
     #[serde(default)]
     pub command_argv: Vec<String>,
     #[serde(default)]
+    pub original_command_argv: Vec<String>,
+    #[serde(default)]
     pub cwd: String,
     #[serde(default)]
     pub created_at: String,

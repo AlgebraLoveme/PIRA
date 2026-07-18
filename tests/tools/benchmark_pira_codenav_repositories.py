@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -90,7 +91,7 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 def peak_rss_kib(command: list[str], cwd: Path) -> int | None:
-    if not Path("/usr/bin/time").is_file():
+    if sys.platform != "linux" or not Path("/usr/bin/time").is_file():
         return None
     with tempfile.NamedTemporaryFile() as measurement:
         completed = subprocess.run(
@@ -148,6 +149,10 @@ def repository_result(
     ]
     source_bytes = sum(path.stat().st_size for path in supported_files)
     output_bytes = len(completed.stdout) + len(completed.stderr)
+    file_count = fields.get("files", 0)
+    failed_files = fields.get("failed", 0)
+    parsed_files = fields.get("parsed", file_count - failed_files)
+    lsp_files = fields.get("lsp", 0)
     symbol_files = sum(
         bool(line.rsplit(" symbols=", 1)[-1]) for line in lines[1:] if " symbols=" in line
     )
@@ -162,11 +167,11 @@ def repository_result(
         "supported_source_bytes": source_bytes,
         "map_output_bytes": output_bytes,
         "context_reduction_pct": round((1 - output_bytes / source_bytes) * 100, 1),
-        "parsed_files": fields.get("parsed", 0),
-        "tree_sitter_files": fields.get("tree_sitter", 0),
-        "lsp_files": fields.get("lsp", 0),
+        "parsed_files": parsed_files,
+        "tree_sitter_files": parsed_files - lsp_files,
+        "lsp_files": lsp_files,
         "files_with_symbols": symbol_files,
-        "failed_files": fields.get("failed", 0),
+        "failed_files": failed_files,
         "ambiguous_files": fields.get("ambiguous", 0),
         "median_ms": round(statistics.median(samples), 3),
         "p95_ms": round(percentile(samples, 0.95), 3),

@@ -15,8 +15,61 @@ OUTLINE_RE = re.compile(
     r"^\s*(\S+)\s+(\S+)\s+L(\d+):(\d+)-\d+:\d+\s+selector=(pira://\S+)$"
 )
 SHOW_RE = re.compile(
-    r"item=(\S+) kind=(\S+) range=L(\d+):(\d+)-\d+:\d+ bytes=\d+ hash=([0-9a-f]+)"
+    r"item=(\S+) kind=(\S+) range=L(\d+):(\d+)-\d+:\d+ hash=([0-9a-f]+)"
 )
+LANGUAGE_BY_SUFFIX = {
+    ".py": "python",
+    ".pyi": "python",
+    ".pyw": "python",
+    ".rs": "rust",
+    ".java": "java",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".cu": "cuda",
+    ".cuh": "cuda",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".go": "go",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".cs": "csharp",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    ".php": "php",
+    ".php3": "php",
+    ".php4": "php",
+    ".php5": "php",
+    ".phtml": "php",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".lua": "lua",
+    ".hcl": "hcl",
+    ".tf": "hcl",
+    ".tfvars": "hcl",
+    ".r": "r",
+    ".rb": "ruby",
+    ".rake": "ruby",
+    ".gemspec": "ruby",
+    ".swift": "swift",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".dart": "dart",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".jl": "julia",
+}
 SUPPORTED_SUFFIXES = {
     ".py",
     ".rs",
@@ -230,6 +283,16 @@ def language_prefix(relative: str) -> list[str]:
     return [language] if language else []
 
 
+def inferred_language(relative: str) -> str:
+    explicit = EXPLICIT_LANGUAGE.get(relative)
+    if explicit:
+        return explicit
+    language = LANGUAGE_BY_SUFFIX.get(Path(relative).suffix.lower())
+    if language:
+        return language
+    raise ValueError(f"benchmark lacks a language mapping for {relative}")
+
+
 def main() -> int:
     args = arguments()
     binary = args.pira.resolve()
@@ -273,11 +336,8 @@ def main() -> int:
             continue
         header = result.stdout.splitlines()[0]
         backend = re.search(r"\bbackend=(\S+)", header)
-        if backend:
-            backend_counts[backend.group(1)] += 1
-        language = re.search(r"\blanguage=(\S+)", header)
-        if language:
-            language_counts[language.group(1)] += 1
+        backend_counts[backend.group(1) if backend else "tree-sitter"] += 1
+        language_counts[inferred_language(relative)] += 1
         for line in result.stdout.splitlines()[1:]:
             match = OUTLINE_RE.match(line)
             if match:
