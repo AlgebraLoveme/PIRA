@@ -231,7 +231,7 @@ Each condition was one independent `gpt-5.6-sol` high-reasoning run against a pi
 | JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +94.2% | +18.1% | +49.3% | +525.5% |
 | JAX | `pira_codenav` / no PIRA | 100% / 100% | (96.0% / 92.3%) vs (96.0% / 92.3%) | −17.0% | −30.8% | −27.4% | +18.6% |
 
-The result is deliberately not presented as a universal win. `pira_codenav` helped on the JAX questions because its LSP interface replaced several difficult hand-written protocol scripts, but it added turns and output for the PyTorch questions, which were already tractable with precise `rg` and bounded reads. `pira_ctx` reduced visible output on PyTorch, yet both context tasks favored a baseline that aggregated all five files in one Python call; the agent instead inspected captures one at a time, paid help and retry costs, and accumulated more conversational turns. This identifies multi-capture analysis and more robust multiline analysis input as important follow-up work.
+The result is deliberately not presented as a universal win. `pira_codenav` helped on the JAX questions because its LSP interface replaced several difficult hand-written protocol scripts, but it added turns and output for the PyTorch questions, which were already tractable with precise `rg` and bounded reads. `pira_ctx` reduced visible output on PyTorch, yet both context tasks favored a baseline that aggregated all five files in one Python call; the agent instead inspected captures one at a time, paid help and retry costs, and accumulated more conversational turns. Those findings motivated labeled multi-capture analysis and stdin-safe multiline Python; the table remains the pre-change diagnostic until a fresh agent-level run replaces it.
 
 Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Command-output bytes measure tool-visible terminal output, not model context directly. This is a single development trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
@@ -262,7 +262,7 @@ Each recorded event keeps the purpose of a command without copying its output. T
 
 Version 1.0 stores checked, write-once event records and builds disposable per-thread search catalogs. If a catalog is missing or corrupt, it is rebuilt from the authoritative records. Older JSON ledgers are preserved but ignored until the user explicitly removes them.
 
-Setup installs a verified native executable in the user's `PATH`. Normal use needs no Python, Rust toolchain, daemon, database, network, or model call. The optional `exec` analysis command uses Python 3. Captures are private user-cache files with compressed, integrity-checked blocks. `pira_ctx` keeps the caller's permissions and does **not** sandbox commands. Run `pira_ctx --help` for usage. Source is under `tools/src/pira_ctx`; verified builds are under `tools/dist/pira_ctx`.
+Setup installs a verified native executable in the user's `PATH`. Normal use needs no Python, Rust toolchain, daemon, database, network, or model call. The optional `exec` analysis command uses Python 3; it can analyze up to 32 labeled captures together and accepts multiline analysis through stdin without temporary user files. Captures are private user-cache files with compressed, integrity-checked blocks. `pira_ctx` keeps the caller's permissions and does **not** sandbox commands. Run `pira_ctx --help` for usage. Source is under `tools/src/pira_ctx`; verified builds are under `tools/dist/pira_ctx`.
 
 #### Security design
 

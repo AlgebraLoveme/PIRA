@@ -75,14 +75,15 @@ fn real_main() -> Result<i32, String> {
 }
 
 fn run_python_exec(config: &Config) -> Result<i32, String> {
-    let source = open_target(config)?;
-    let prepared = python_exec::prepare(config, &source)?;
+    let sources = open_exec_sources(config)?;
+    let prepared = python_exec::prepare(config, &sources)?;
     let mut analysis_config = config.clone();
-    analysis_config.cmd = vec![
-        "pira_ctx".to_string(),
-        "exec".to_string(),
-        source.metadata.result_id.clone(),
-    ];
+    analysis_config.cmd = vec!["pira_ctx".to_string(), "exec".to_string()];
+    analysis_config.cmd.extend(
+        sources
+            .iter()
+            .map(|(name, source)| format!("{name}={}", source.metadata.result_id)),
+    );
     let ranking = ranking_terms(&analysis_config);
     let mut capture = match capture_program(&analysis_config, &prepared.command)? {
         Ok(capture) => capture,
@@ -111,6 +112,25 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
         && !capture.stdout.non_utf8
         && !capture.stderr.non_utf8;
     store_and_summarize(&analysis_config, &capture, compact)
+}
+
+fn open_exec_sources(config: &Config) -> Result<Vec<(String, StoredResult)>, String> {
+    let store_dir = effective_store_dir(config.store_dir.as_ref())?;
+    if let Some(target) = config.target.as_ref() {
+        let path = storage::resolve_result(&store_dir, target)?;
+        return Ok(vec![(
+            "capture".to_string(),
+            storage::read_result_path(&path)?,
+        )]);
+    }
+    config
+        .exec_inputs
+        .iter()
+        .map(|input| {
+            let path = storage::resolve_result(&store_dir, &input.target)?;
+            Ok((input.name.clone(), storage::read_result_path(&path)?))
+        })
+        .collect()
 }
 
 fn run_exact(config: &Config) -> Result<i32, String> {

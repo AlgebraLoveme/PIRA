@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,33 +11,53 @@ use crate::storage::StoredResult;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-const BOOTSTRAP: &str = r#"import sys
-msg_path, stdout_path, stderr_path, msg_id, msg_exit, msg_state, msg_generation, code_path, source_name = sys.argv[1:10]
-with open(msg_path, "rb") as _f:
-    MSG_BYTES = _f.read()
-MSG = MSG_BYTES.decode("utf-8", "replace")
-MSG_PATH = msg_path
-MSG_STDOUT_PATH = stdout_path
-MSG_STDERR_PATH = stderr_path
-MSG_ID = msg_id
-MSG_EXIT = None if msg_exit == "" else int(msg_exit)
-MSG_STATE = msg_state
-MSG_GENERATION = int(msg_generation)
+const BOOTSTRAP: &str = r#"import json, sys
+manifest_path, code_path, source_name = sys.argv[1:4]
+with open(manifest_path, "rb") as _f:
+    entries = json.load(_f)
+CAPTURES = {}
+for entry in entries:
+    with open(entry["path"], "rb") as _f:
+        exact = _f.read()
+    CAPTURES[entry["name"]] = {
+        "text": exact.decode("utf-8", "replace"),
+        "bytes": exact,
+        "path": entry["path"],
+        "stdout_path": entry["stdout_path"],
+        "stderr_path": entry["stderr_path"],
+        "id": entry["id"],
+        "exit": entry["exit"],
+        "state": entry["state"],
+        "generation": entry["generation"],
+    }
+CAPTURE_NAMES = list(CAPTURES)
+MSGS = [CAPTURES[name]["text"] for name in CAPTURE_NAMES]
+MSG_BYTES_LIST = [CAPTURES[name]["bytes"] for name in CAPTURE_NAMES]
+MSG_IDS = [CAPTURES[name]["id"] for name in CAPTURE_NAMES]
 with open(code_path, "rb") as _f:
     source = _f.read()
 scope = {
     "__name__": "__main__",
     "__file__": source_name,
-    "MSG": MSG,
-    "MSG_BYTES": MSG_BYTES,
-    "MSG_PATH": MSG_PATH,
-    "MSG_STDOUT_PATH": MSG_STDOUT_PATH,
-    "MSG_STDERR_PATH": MSG_STDERR_PATH,
-    "MSG_ID": MSG_ID,
-    "MSG_EXIT": MSG_EXIT,
-    "MSG_STATE": MSG_STATE,
-    "MSG_GENERATION": MSG_GENERATION,
+    "CAPTURES": CAPTURES,
+    "CAPTURE_NAMES": CAPTURE_NAMES,
+    "MSGS": MSGS,
+    "MSG_BYTES_LIST": MSG_BYTES_LIST,
+    "MSG_IDS": MSG_IDS,
 }
+if len(CAPTURE_NAMES) == 1:
+    _single = CAPTURES[CAPTURE_NAMES[0]]
+    scope.update({
+        "MSG": _single["text"],
+        "MSG_BYTES": _single["bytes"],
+        "MSG_PATH": _single["path"],
+        "MSG_STDOUT_PATH": _single["stdout_path"],
+        "MSG_STDERR_PATH": _single["stderr_path"],
+        "MSG_ID": _single["id"],
+        "MSG_EXIT": _single["exit"],
+        "MSG_STATE": _single["state"],
+        "MSG_GENERATION": _single["generation"],
+    })
 sys.argv = [source_name]
 exec(compile(source, source_name, "exec"), scope, scope)
 "#;
@@ -49,30 +69,63 @@ pub struct PreparedExec {
     pub command: Vec<String>,
 }
 
-pub fn prepare(config: &Config, source: &StoredResult) -> Result<PreparedExec, String> {
-    if source.metadata.timeline_truncated {
-        return Err("cannot construct merged MSG from a result with a truncated line index".into());
+pub fn prepare(
+    config: &Config,
+    sources: &[(String, StoredResult)],
+) -> Result<PreparedExec, String> {
+    if sources.is_empty() {
+        return Err("exec requires at least one resolved capture".into());
     }
     let maximum = std::env::var("PIRA_CTX_MAX_EXEC_BYTES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(DEFAULT_MAX_EXEC_BYTES, |value| value.max(4 * 1024));
-    if source.metadata.total_bytes > maximum {
+    let mut total_bytes = 0_u64;
+    for (name, source) in sources {
+        if source.metadata.timeline_truncated {
+            return Err(format!(
+                "cannot construct merged text for input {name:?} with a truncated line index"
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(source.metadata.total_bytes)
+            .ok_or("combined capture size overflow")?;
+    }
+    if total_bytes > maximum {
         return Err(format!(
-            "capture is {} bytes; exec materialization is limited to {maximum} bytes by PIRA_CTX_MAX_EXEC_BYTES; use search/transform or raise the limit deliberately",
-            source.metadata.total_bytes
+            "combined captures are {total_bytes} bytes; exec materialization is limited to {maximum} bytes by PIRA_CTX_MAX_EXEC_BYTES; use search/transform or raise the limit deliberately"
         ));
     }
     let mut command = resolve_python(config)?;
     let workspace = PrivateWorkspace::create()?;
-    let merged_path = workspace.path.join("merged.log");
-    let stdout_path = workspace.path.join("stdout.log");
-    let stderr_path = workspace.path.join("stderr.log");
+    let manifest_path = workspace.path.join("captures.json");
     let code_path = workspace.path.join("analysis.py");
-    materialize(source, &merged_path, &stdout_path, &stderr_path)?;
+    let mut manifest = Vec::with_capacity(sources.len());
+    for (index, (name, source)) in sources.iter().enumerate() {
+        let merged_path = workspace.path.join(format!("input-{index:02}-merged.log"));
+        let stdout_path = workspace.path.join(format!("input-{index:02}-stdout.log"));
+        let stderr_path = workspace.path.join(format!("input-{index:02}-stderr.log"));
+        materialize(source, &merged_path, &stdout_path, &stderr_path)?;
+        manifest.push(serde_json::json!({
+            "name": name,
+            "path": merged_path.to_string_lossy(),
+            "stdout_path": stdout_path.to_string_lossy(),
+            "stderr_path": stderr_path.to_string_lossy(),
+            "id": source.metadata.result_id,
+            "exit": if source.is_running() { serde_json::Value::Null } else { serde_json::json!(source.metadata.exit_code) },
+            "state": if source.is_running() { "running" } else { "complete" },
+            "generation": source.live_generation().unwrap_or_default(),
+        }));
+    }
+    let manifest_bytes = serde_json::to_vec(&manifest)
+        .map_err(|error| format!("cannot encode exec input manifest: {error}"))?;
+    write_private(&manifest_path, &manifest_bytes)?;
 
     let (code, source_name) = match (&config.exec_code, &config.exec_file) {
         (Some(code), None) => (code.as_bytes().to_vec(), "<pira_ctx-exec>".to_string()),
+        (None, Some(path)) if path == Path::new("-") => {
+            (read_stdin_limited()?, "<stdin>".to_string())
+        }
         (None, Some(path)) => (
             crate::util::read_file_limited(path, MAX_ANALYSIS_CODE_BYTES, "analysis file")?,
             path.display().to_string(),
@@ -89,22 +142,7 @@ pub fn prepare(config: &Config, source: &StoredResult) -> Result<PreparedExec, S
     command.extend([
         "-c".to_string(),
         BOOTSTRAP.to_string(),
-        merged_path.display().to_string(),
-        stdout_path.display().to_string(),
-        stderr_path.display().to_string(),
-        source.metadata.result_id.clone(),
-        if source.is_running() {
-            String::new()
-        } else {
-            source.metadata.exit_code.to_string()
-        },
-        if source.is_running() {
-            "running"
-        } else {
-            "complete"
-        }
-        .to_string(),
-        source.live_generation().unwrap_or_default().to_string(),
+        manifest_path.display().to_string(),
         code_path.display().to_string(),
         source_name,
     ]);
@@ -112,6 +150,21 @@ pub fn prepare(config: &Config, source: &StoredResult) -> Result<PreparedExec, S
         _workspace: workspace,
         command,
     })
+}
+
+fn read_stdin_limited() -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .lock()
+        .take(MAX_ANALYSIS_CODE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read analysis code from stdin: {error}"))?;
+    if bytes.len() as u64 > MAX_ANALYSIS_CODE_BYTES {
+        return Err(format!(
+            "analysis code from stdin exceeds the {MAX_ANALYSIS_CODE_BYTES}-byte limit"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn materialize(

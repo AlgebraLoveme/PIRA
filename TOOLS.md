@@ -45,7 +45,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_ctx`
 - Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations.
 - Default: automatic mode. Status-only → `check`. Prefer targeted `search`, `range`, `transform`, or `exec` over `raw`.
-- Group independent, already-narrow PIRA inspections into one shell turn when this avoids repeated model round trips.
+- Analyze related captures together with labeled `exec --input NAME=RESULT` values; pass multiline Python through `--file -`. Group other independent, already-narrow PIRA inspections into one shell turn.
 - Intent: concise, prospective action + target + immediate purpose.
 
 ### `pira_decision`

@@ -13,7 +13,7 @@ Choosing a command:
     search     Start here to locate relevant evidence.
     range      Retrieve the smallest sufficient exact line range.
     transform  Use for supported deterministic filtering, counting, aggregation, or slicing.
-    exec       Use for custom Python analysis that prints only decision-relevant output.
+    exec       Use for custom Python analysis, including several labeled captures in one call.
     command    Retrieve the exact original argv and cwd for traceability.
     raw        Use when complete exact retained bytes are genuinely required.
                Prefer the targeted commands above for agent analysis.
@@ -291,8 +291,15 @@ WHEN TO USE
 USAGE
   pira_ctx exec [--store-dir PATH] RESULT --intent TEXT
                 (--code CODE | --file PATH) [--python PATH]
+  pira_ctx exec [--store-dir PATH] --input NAME=RESULT [--input NAME=RESULT ...]
+                --intent TEXT (--code CODE | --file PATH) [--python PATH]
 
 BINDINGS
+  CAPTURES            Ordered mapping from each input name to a record containing text, bytes,
+                      private paths, id, exit, state, and generation.
+  CAPTURE_NAMES       Input names in command order.
+  MSGS                Merged texts in command order; MSG_BYTES_LIST and MSG_IDS are parallel lists.
+  MSG...              The scalar bindings below exist only for a single RESULT/input.
   MSG                 Merged text with invalid UTF-8 replaced by U+FFFD.
   MSG_BYTES           Exact merged bytes.
   MSG_PATH            Private temporary merged-capture path.
@@ -304,18 +311,21 @@ BINDINGS
   MSG_GENERATION      Live checkpoint generation, or 0 for a completed capture.
 
 BEHAVIOR
-  --last resolves once before execution. Choose exactly one code source. Interpreter order is
+  Choose one RESULT or up to 32 unique labeled --input values. Every target resolves once before
+  execution. Combined materialization defaults to a 64 MiB ceiling controlled by
+  PIRA_CTX_MAX_EXEC_BYTES. Choose exactly one code source; --file - reads bounded code from stdin
+  and avoids shell quoting for multiline Python. Interpreter order is
   --python PATH, PIRA_CTX_PYTHON, python3, Windows `py -3`, then python. Python is optional for all
-  other commands. MSG_BYTES and MSG eagerly load the complete merged capture into Python memory;
-  materialization defaults to a 64 MiB ceiling controlled by PIRA_CTX_MAX_EXEC_BYTES. Prefer
-  search/transform for larger inputs or raise the ceiling deliberately. Temporary paths exist only
-  during execution. Running input is copied once before Python starts, so later PROGRAM writes
-  cannot change the analysis view or be changed by the analysis. Analysis code is limited to 1 MiB. Analysis status is preserved; retained
-  analysis metadata links to the source ID through its command. Code runs with caller permissions
-  and is not sandboxed.
+  other commands. Exact bytes and decoded text are eagerly loaded. Prefer search/transform for
+  larger inputs or raise the ceiling deliberately. Temporary paths exist only during execution.
+  Every running input is copied once before Python starts, so later PROGRAM writes cannot change the
+  analysis view or be changed by it. Analysis code is limited to 1 MiB. Analysis status is preserved;
+  retained analysis metadata links to all source IDs. Code runs with caller permissions and is not
+  sandboxed.
 
 EXAMPLES
   pira_ctx exec --last --intent "Count failures" --code 'print(MSG.count("FAILED"))'
+  pira_ctx exec --input build=ID1 --input tests=ID2 --intent "Compare failures" --file -
   pira_ctx exec RESULT --intent "Extract errors" --file analysis.py"#;
 
 const RECAP: &str = r#"pira_ctx recap — restore recent same-thread command events after compaction

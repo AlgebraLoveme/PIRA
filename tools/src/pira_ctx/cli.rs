@@ -59,6 +59,12 @@ pub struct TransformOptions {
     pub tail: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecInput {
+    pub name: String,
+    pub target: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: Mode,
@@ -80,6 +86,7 @@ pub struct Config {
     pub raw_stream: Option<RawStream>,
     pub exec_code: Option<String>,
     pub exec_file: Option<PathBuf>,
+    pub exec_inputs: Vec<ExecInput>,
     pub python: Option<String>,
     pub max_age_days: Option<u64>,
     pub max_store_bytes: Option<u64>,
@@ -116,6 +123,7 @@ impl Default for Config {
             raw_stream: None,
             exec_code: None,
             exec_file: None,
+            exec_inputs: vec![],
             python: None,
             max_age_days: None,
             max_store_bytes: None,
@@ -403,6 +411,11 @@ fn parse_python_exec(c: &mut Config, args: &[String]) -> Result<(), String> {
                     return Err("choose exactly one --code CODE or --file PATH".into());
                 }
             }
+            "--input" => {
+                p += 1;
+                c.exec_inputs
+                    .push(parse_exec_input(take(args, &mut p, "--input")?)?);
+            }
             "--python" => {
                 p += 1;
                 if c.python
@@ -425,10 +438,55 @@ fn parse_python_exec(c: &mut Config, args: &[String]) -> Result<(), String> {
         _ => return Err("choose exactly one --code CODE or --file PATH".into()),
     }
     if c.target.is_none() {
-        return Err("exec requires RESULT".into());
+        if c.exec_inputs.is_empty() {
+            return Err("exec requires RESULT or at least one --input NAME=RESULT".into());
+        }
+    } else if !c.exec_inputs.is_empty() {
+        return Err("choose one RESULT or labeled --input NAME=RESULT values".into());
     }
+    validate_exec_inputs(&c.exec_inputs)?;
     if c.python.as_deref().is_some_and(|value| value.is_empty()) {
         return Err("--python PATH must not be empty".into());
+    }
+    Ok(())
+}
+
+fn parse_exec_input(value: &str) -> Result<ExecInput, String> {
+    let (name, target) = value
+        .split_once('=')
+        .ok_or("--input requires NAME=RESULT")?;
+    if name.is_empty() || target.is_empty() {
+        return Err("--input requires non-empty NAME=RESULT".into());
+    }
+    Ok(ExecInput {
+        name: name.to_string(),
+        target: target.to_string(),
+    })
+}
+
+fn validate_exec_inputs(inputs: &[ExecInput]) -> Result<(), String> {
+    const MAX_EXEC_INPUTS: usize = 32;
+    if inputs.len() > MAX_EXEC_INPUTS {
+        return Err(format!(
+            "at most {MAX_EXEC_INPUTS} --input values are allowed"
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for input in inputs {
+        let mut chars = input.name.chars();
+        let valid_start = chars
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
+        let valid_rest = chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+        if !valid_start || !valid_rest || input.name.len() > 64 {
+            return Err(
+                "each --input NAME must be a unique ASCII Python identifier of at most 64 bytes"
+                    .into(),
+            );
+        }
+        if !names.insert(input.name.as_str()) {
+            return Err(format!("duplicate --input name: {}", input.name));
+        }
     }
     Ok(())
 }
@@ -913,6 +971,69 @@ mod tests {
                 "x",
                 "--code",
                 "pass"
+            ]))
+            .is_err()
+        );
+
+        let labeled = parse_args(&a(&[
+            "exec",
+            "--input",
+            "tree=abc",
+            "--input",
+            "tests=def",
+            "--intent",
+            "aggregate captures",
+            "--file",
+            "-",
+        ]))
+        .unwrap();
+        assert!(labeled.target.is_none());
+        assert_eq!(
+            labeled.exec_inputs,
+            vec![
+                ExecInput {
+                    name: "tree".into(),
+                    target: "abc".into(),
+                },
+                ExecInput {
+                    name: "tests".into(),
+                    target: "def".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            labeled.exec_file.as_deref(),
+            Some(std::path::Path::new("-"))
+        );
+        assert!(
+            parse_args(&a(&[
+                "exec",
+                "abc",
+                "--input",
+                "other=def",
+                "--intent",
+                "x",
+                "--code",
+                "pass",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(&a(&[
+                "exec",
+                "--input",
+                "bad-name=abc",
+                "--intent",
+                "x",
+                "--code",
+                "pass",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(&a(&[
+                "exec", "--input", "same=abc", "--input", "same=def", "--intent", "x", "--code",
+                "pass",
             ]))
             .is_err()
         );
