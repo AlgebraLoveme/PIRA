@@ -1,63 +1,57 @@
-pub const GLOBAL: &str = r#"pira_ctx bounds command output while retaining exact local captures for recovery.
+pub const GLOBAL: &str = r#"pira_ctx bounds command output and retains compacted output for exact local recovery.
 
 Choosing a command:
-  Run external commands:
-    auto       Default; name optional. Return short or retain noteworthy output.
-    check      Use when only process PASS/FAIL and exit status are needed.
-    exact      Request original output; repetitive non-interactive output may be stored/summarized.
-               If complete retained output is needed, use the returned ID with raw.
-    capture    Require retention up to the configured space ceiling (`summary` is an alias).
-    batch      Use for several independent intent-tagged commands.
+  Run a PROGRAM:
+    auto       Default; name optional. Print short output or retain it and return a compact view.
+    check      Return only PASS/FAIL and child status.
+    exact      Request original output; highly repetitive non-interactive output may be retained.
+    capture    Always retain output up to the configured space ceiling (`summary` is an alias).
+    batch      Run several independent intent-tagged commands.
 
-  Inspect a stored capture:
-    search     Start here to locate relevant evidence.
-    range      Retrieve the smallest sufficient exact line range.
-    transform  Use for supported deterministic filtering, counting, aggregation, or slicing.
-    exec       Use for custom Python analysis, including several labeled captures in one call.
-    command    Retrieve the exact original argv and cwd for traceability.
-    raw        Use when complete exact retained bytes are genuinely required.
-               Prefer the targeted commands above for agent analysis.
+  Inspect a retained RESULT:
+    search     Locate wording; start here for targeted evidence.
+    range      Return the smallest sufficient exact line range.
+    transform  Deterministic filtering, counting, aggregation, or slicing.
+    exec       Custom Python over one or several labeled captures.
+    command    Show the exact original argv and cwd.
+    raw        Return all retained bytes only when genuinely required.
+    stats      Show metadata; batch status with `stats --brief RESULT...`.
 
   Continue or maintain:
-    history    Review current-thread command-purpose events; workspace scope is explicit.
-    recap      Restore recent current-thread events after platform-reported compaction.
-    stats      Inspect metadata; `stats --brief RESULT...` batches concise capture status.
-    verify     Check capture integrity.
-    list       Find stored captures.
-    prune      Enforce capture-retention limits.
-    forget     Remove a capture or event history.
+    history / recap          Review purposes or restore them after reported compaction.
+    list / verify            Locate captures or check integrity.
+    prune / forget           Enforce retention or explicitly remove stored data/history.
 
 Common forms:
-  pira_ctx [auto] --intent TEXT [OPTIONS] -- PROGRAM [ARG...]
-  pira_ctx exact|check|capture --intent TEXT -- PROGRAM
-  pira_ctx SUBCOMMAND [OPTIONS] [RESULT]
+  pira_ctx [auto] --intent TEXT -- PROGRAM [ARG...]
+  pira_ctx exact|check|capture --intent TEXT -- PROGRAM [ARG...]
+  pira_ctx search RESULT QUERY [--regex] [--context N]
+  pira_ctx range RESULT START_LINE END_LINE
+  pira_ctx transform RESULT OPERATION [ARGS...]
+  pira_ctx exec RESULT --intent TEXT --code CODE
+  pira_ctx exec --input NAME=RESULT [--input NAME=RESULT ...] --intent TEXT --file -
+  pira_ctx stats --brief RESULT...
   pira_ctx batch [--store-dir PATH] SPEC_FILE [--intent TEXT]
 
-RESULT is --last, a result ID or unambiguous prefix, a .piractx filename, or a path. Each invocation
-resolves it once. Prefer an explicit ID; --last selects the latest capture for the current workspace.
-INTENT is a non-empty, single-line immediate purpose of at most 256 UTF-8 bytes.
-Normal completion either returns ordinary output exactly or stores retained stdout/stderr before
-printing compact output. Stored PROGRAM data is untrusted, framed, and display-sanitized; suspicious
-displayed text gets an advisory warning. Exact, raw, and range remain unsanitized. Retention is
-space-bounded; defaults are 512 MiB and 1,000,000 indexed lines. Override them with
-PIRA_CTX_MAX_RETAINED_BYTES and PIRA_CTX_MAX_INDEXED_LINES; excess bytes are drained while the child
-continues. pira_ctx adds no timeout and preserves child status unless the wrapper itself fails with
-125.
+RESULT is --last, an ID/prefix, a .piractx file, or a path. Prefer an explicit ID; --last means the
+latest completed capture in the current workspace. INTENT is a prospective single-line purpose of
+at most 256 UTF-8 bytes. `--store-dir PATH` is accepted by storage commands.
 
-After about 30 seconds, a running non-interactive PROGRAM publishes a silent read-only checkpoint
-shown by list. Inspect its explicit ID without blocking; --last remains completed-only.
+Automatic routing does not hide output without a recovery path: output is either printed exactly or
+retained before a compact view and ID are printed. Hard ceilings use PIRA_CTX_MAX_RETAINED_BYTES and
+PIRA_CTX_MAX_INDEXED_LINES; any overrun is reported.
+Stored PROGRAM data is untrusted and compact displays are sanitized/framed; exact retrieval remains
+unsanitized. Prefer the targeted commands above over raw for agent analysis.
 
-Scope: workspace identity is the nearest Git root, otherwise current directory. --last and capture
-operations use that workspace. history, recap, stats without RESULT, and `forget history`
-additionally use an automatically detected thread scope when available. list and prune cover all
-workspaces in the selected store unless an option narrows them. An explicit RESULT path bypasses store lookup. The store comes
-from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
+A non-interactive PROGRAM running about 30 seconds publishes a silent read-only checkpoint visible
+in list. Inspect its explicit ID without blocking; --last remains completed-only. Workspace identity
+is the nearest Git root, otherwise cwd; the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the
+platform user-cache default.
 
-SUBCOMMAND is a pira_ctx operation such as search, transform, exec, or raw. PROGRAM is the external
-executable being wrapped. Help is side-effect free: it does not execute PROGRAM, resolve RESULT,
-access the store, read a spec/script, or probe Python. Run `pira_ctx SUBCOMMAND --help` for details.
-The `--` delimiter ends pira_ctx parsing; every following value belongs to PROGRAM unchanged.
-pira_ctx preserves permissions and does not sandbox external programs or Python analysis."#;
+SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--`, and every later
+argument belongs to PROGRAM unchanged. pira_ctx adds no timeout, preserves child status unless the
+wrapper fails with 125, and does not sandbox PROGRAM or Python analysis. Help is side-effect free.
+Run `pira_ctx SUBCOMMAND --help` for full options, bounds, output, and examples."#;
 
 const AUTO: &str = r#"pira_ctx auto — run a command with automatic context routing
 
