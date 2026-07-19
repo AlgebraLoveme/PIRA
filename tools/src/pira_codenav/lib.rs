@@ -1,6 +1,7 @@
 mod cli;
 mod command;
 mod deps;
+mod help;
 mod language;
 mod lsp;
 mod lsp_options;

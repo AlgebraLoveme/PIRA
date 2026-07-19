@@ -309,6 +309,19 @@ def main() -> int:
                 str(fake_lsp),
             ],
         },
+        "python_query": {
+            "pira_codenav": [
+                tools["pira_codenav"],
+                "query",
+                "definition=real/python_click/decorators.py:168:5",
+                "hover=real/python_click/decorators.py:168:5",
+                "references=real/python_click/decorators.py:168:5",
+                "--lsp",
+                str(python),
+                "--lsp-arg",
+                str(fake_lsp),
+            ],
+        },
         "java_outline": {
             "pira_codenav": [tools["pira_codenav"], "outline", "real/java_junit/StringUtils.java"],
             "ast_outline": [tools["ast_outline"], "real/java_junit/StringUtils.java"],
@@ -461,6 +474,11 @@ def main() -> int:
             ],
         },
     }
+    for commands in tasks.values():
+        command = commands.get("pira_codenav")
+        if command and any(value in {"outline", "show", "map", "find"} for value in command):
+            if "--lsp" not in command and "--no-lsp" not in command:
+                command.append("--no-lsp")
     expected = {
         "python_outline": b"command",
         "rust_outline": b"Gitignore",
@@ -480,6 +498,7 @@ def main() -> int:
         "python_hover": b"**command**",
         "python_callers": b'name="caller_of_command"',
         "python_callees": b'name="callee_of_command"',
+        "python_query": b"pira_codenav query requests=3 succeeded=3",
         "java_outline": b"StringUtils",
         "c_outline": b"main",
         "cpp_outline": b"Widget",

@@ -9,13 +9,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
-use crate::model::{CaptureResult, LineMeta, StreamKind, TempSpool};
+use crate::model::{CaptureResult, CapturedStream, LineMeta, StreamKind};
 use crate::{spawn_command, util};
 
 const DEFAULT_MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_INDEXED_LINES: usize = 1_000_000;
 const HARD_MAX_INDEXED_LINES: usize = 2_000_000;
 const DEFAULT_LIVE_CHECKPOINT_MS: u64 = 30_000;
+const MEMORY_SPOOL_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -107,8 +108,8 @@ pub fn capture_command(
         maximum: retained_limit,
         used: AtomicU64::new(0),
     });
-    let (mut stdout_spool, stdout_file) = create_spool("stdout", start_ms)?;
-    let (mut stderr_spool, stderr_file) = create_spool("stderr", start_ms)?;
+    let stdout_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stdout", start_ms)));
+    let stderr_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stderr", start_ms)));
     let mut child = match spawn_command(cmd) {
         Ok(child) => child,
         Err(error) if error.starts_with("__EXIT127__ ") => {
@@ -142,10 +143,11 @@ pub fn capture_command(
     }));
     let stdout_collected = Arc::clone(&collected);
     let stdout_budget = Arc::clone(&budget);
+    let stdout_writer = Arc::clone(&stdout_spool);
     let stdout_handle = thread::spawn(move || {
         read_stream(
             child_stdout,
-            stdout_file,
+            &stdout_writer,
             StreamKind::Stdout,
             &stdout_collected,
             indexed_line_limit,
@@ -154,10 +156,11 @@ pub fn capture_command(
     });
     let stderr_collected = Arc::clone(&collected);
     let stderr_budget = Arc::clone(&budget);
+    let stderr_writer = Arc::clone(&stderr_spool);
     let stderr_handle = thread::spawn(move || {
         read_stream(
             child_stderr,
-            stderr_file,
+            &stderr_writer,
             StreamKind::Stderr,
             &stderr_collected,
             indexed_line_limit,
@@ -174,18 +177,36 @@ pub fn capture_command(
         let store_dir = store_dir.to_path_buf();
         let command = cmd.to_vec();
         let cwd = cwd.clone();
-        let stdout_path = stdout_spool.path().to_path_buf();
-        let stderr_path = stderr_spool.path().to_path_buf();
+        let stdout_spool = Arc::clone(&stdout_spool);
+        let stderr_spool = Arc::clone(&stderr_spool);
         let collected = Arc::clone(&collected);
         thread::spawn(move || {
             let mut live_id = None;
             let mut generation = 0_u64;
+            let mut last_progress = None;
             loop {
                 match checkpoint_receiver.recv_timeout(checkpoint_interval) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                let Ok(snapshot) = collected.lock().map(|state| state.clone()) else {
+                let snapshot = {
+                    let Ok(state) = collected.lock() else {
+                        break;
+                    };
+                    let progress = (
+                        state.stdout_bytes,
+                        state.stderr_bytes,
+                        state.total,
+                        state.truncated,
+                    );
+                    if last_progress == Some(progress) {
+                        continue;
+                    }
+                    last_progress = Some(progress);
+                    state.clone()
+                };
+                let paths = live_spool_paths(&stdout_spool, &stderr_spool);
+                let Ok((stdout_path, stderr_path)) = paths else {
                     break;
                 };
                 generation = generation.saturating_add(1);
@@ -265,22 +286,8 @@ pub fn capture_command(
         .clone();
     let retention_truncated = stdout_analysis.observed_length > stdout_analysis.length
         || stderr_analysis.observed_length > stderr_analysis.length;
-    let stdout = TempSpool {
-        path: stdout_spool.disarm(),
-        length: stdout_analysis.length,
-        observed_length: stdout_analysis.observed_length,
-        sha256: stdout_analysis.sha256,
-        binary: stdout_analysis.binary,
-        non_utf8: stdout_analysis.non_utf8,
-    };
-    let stderr = TempSpool {
-        path: stderr_spool.disarm(),
-        length: stderr_analysis.length,
-        observed_length: stderr_analysis.observed_length,
-        sha256: stderr_analysis.sha256,
-        binary: stderr_analysis.binary,
-        non_utf8: stderr_analysis.non_utf8,
-    };
+    let stdout = finish_spool(stdout_spool, stdout_analysis, "stdout")?;
+    let stderr = finish_spool(stderr_spool, stderr_analysis, "stderr")?;
     let exit_code = util::status_code(status);
     let capture = CaptureResult {
         stdout,
@@ -312,6 +319,112 @@ fn join_reader(
         .map_err(|error| format!("{name} reader failed: {error}"))
 }
 
+fn live_spool_paths(
+    stdout: &Mutex<AdaptiveSpool>,
+    stderr: &Mutex<AdaptiveSpool>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let stdout = stdout
+        .lock()
+        .map_err(|_| "stdout spool lock poisoned".to_string())?
+        .ensure_file()?
+        .to_path_buf();
+    let stderr = stderr
+        .lock()
+        .map_err(|_| "stderr spool lock poisoned".to_string())?
+        .ensure_file()?
+        .to_path_buf();
+    Ok((stdout, stderr))
+}
+
+fn finish_spool(
+    spool: Arc<Mutex<AdaptiveSpool>>,
+    analysis: StreamAnalysis,
+    name: &str,
+) -> Result<CapturedStream, String> {
+    let spool = Arc::try_unwrap(spool)
+        .map_err(|_| format!("{name} spool still shared after capture"))?
+        .into_inner()
+        .map_err(|_| format!("{name} spool lock poisoned"))?;
+    spool.finish(analysis)
+}
+
+struct AdaptiveSpool {
+    stream: &'static str,
+    start_ms: u128,
+    memory: Vec<u8>,
+    file: Option<File>,
+    guard: Option<SpoolGuard>,
+}
+
+impl AdaptiveSpool {
+    fn new(stream: &'static str, start_ms: u128) -> Self {
+        Self {
+            stream,
+            start_ms,
+            memory: Vec::new(),
+            file: None,
+            guard: None,
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.file.is_none()
+            && self.memory.len().saturating_add(bytes.len()) <= MEMORY_SPOOL_BYTES
+        {
+            self.memory.extend_from_slice(bytes);
+            return Ok(());
+        }
+        self.ensure_file()?;
+        self.file
+            .as_mut()
+            .ok_or_else(|| "temporary capture writer was not initialized".to_string())?
+            .write_all(bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn ensure_file(&mut self) -> Result<&Path, String> {
+        if self.file.is_none() {
+            let (guard, mut file) = create_spool(self.stream, self.start_ms)?;
+            file.write_all(&self.memory)
+                .map_err(|error| format!("initialize temporary capture: {error}"))?;
+            self.memory.clear();
+            self.memory.shrink_to_fit();
+            self.guard = Some(guard);
+            self.file = Some(file);
+        }
+        self.guard
+            .as_ref()
+            .and_then(SpoolGuard::path)
+            .ok_or_else(|| "temporary capture path was not initialized".to_string())
+    }
+
+    fn finish(mut self, analysis: StreamAnalysis) -> Result<CapturedStream, String> {
+        if self.file.take().is_some() {
+            let path = self
+                .guard
+                .as_mut()
+                .and_then(SpoolGuard::disarm)
+                .ok_or_else(|| "file-backed capture is missing its path".to_string())?;
+            Ok(CapturedStream::file(
+                path,
+                analysis.length,
+                analysis.observed_length,
+                analysis.sha256,
+                analysis.binary,
+                analysis.non_utf8,
+            ))
+        } else {
+            Ok(CapturedStream::memory(
+                self.memory,
+                analysis.observed_length,
+                analysis.sha256,
+                analysis.binary,
+                analysis.non_utf8,
+            ))
+        }
+    }
+}
+
 fn create_spool(stream: &str, start_ms: u128) -> Result<(SpoolGuard, File), String> {
     let directory = std::env::temp_dir();
     for nonce in 0..100_u32 {
@@ -338,12 +451,12 @@ struct SpoolGuard {
 }
 
 impl SpoolGuard {
-    fn path(&self) -> &Path {
-        self.path.as_deref().expect("spool guard already disarmed")
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
-    fn disarm(&mut self) -> PathBuf {
-        self.path.take().expect("spool guard already disarmed")
+    fn disarm(&mut self) -> Option<PathBuf> {
+        self.path.take()
     }
 }
 
@@ -357,7 +470,7 @@ impl Drop for SpoolGuard {
 
 fn read_stream<R: Read>(
     mut input: R,
-    mut output: File,
+    output: &Mutex<AdaptiveSpool>,
     stream: StreamKind,
     collected: &Mutex<CollectedLines>,
     indexed_line_limit: usize,
@@ -382,7 +495,11 @@ fn read_stream<R: Read>(
             continue;
         }
         let chunk = &buffer[..retained];
-        output.write_all(chunk)?;
+        output
+            .lock()
+            .map_err(|_| io::Error::other("capture spool lock poisoned"))?
+            .write_all(chunk)
+            .map_err(io::Error::other)?;
         hasher.update(chunk);
         validator.feed(chunk);
         null_seen |= chunk.contains(&0);
@@ -518,5 +635,54 @@ impl Utf8Validator {
 
     fn finish(self) -> bool {
         self.invalid || !self.tail.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analysis(bytes: &[u8]) -> StreamAnalysis {
+        StreamAnalysis {
+            length: bytes.len() as u64,
+            observed_length: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+            binary: false,
+            non_utf8: false,
+        }
+    }
+
+    #[test]
+    fn short_spool_stays_in_memory_and_replays_exactly() {
+        let bytes = b"small output\n";
+        let mut adaptive = AdaptiveSpool::new("test-memory", util::millis(SystemTime::now()));
+        adaptive.write_all(bytes).unwrap();
+        assert!(adaptive.file.is_none());
+        let spool = adaptive.finish(analysis(bytes)).unwrap();
+        let mut reader = spool.open().unwrap();
+        let mut replayed = Vec::new();
+        reader.read_to_end(&mut replayed).unwrap();
+        assert_eq!(replayed, bytes);
+    }
+
+    #[test]
+    fn large_spool_spills_once_and_removes_its_file_on_drop() {
+        let bytes = vec![b'x'; MEMORY_SPOOL_BYTES + 1];
+        let mut adaptive = AdaptiveSpool::new("test-file", util::millis(SystemTime::now()));
+        adaptive.write_all(&bytes).unwrap();
+        let path = adaptive
+            .guard
+            .as_ref()
+            .and_then(SpoolGuard::path)
+            .unwrap()
+            .to_path_buf();
+        assert!(path.is_file());
+        let spool = adaptive.finish(analysis(&bytes)).unwrap();
+        let mut reader = spool.open().unwrap();
+        let mut replayed = Vec::new();
+        reader.read_to_end(&mut replayed).unwrap();
+        assert_eq!(replayed, bytes);
+        drop(spool);
+        assert!(!path.exists());
     }
 }

@@ -1104,7 +1104,7 @@ fn write_catalog(
         put_string(&mut body, &event.category)?;
         put_string(&mut body, event.capture_id.as_deref().unwrap_or(""))?;
     }
-    atomic_write(
+    atomic_write_relaxed(
         path,
         &finish_checked(CATALOG_MAGIC, body, MAX_CATALOG_BYTES)?,
     )
@@ -1173,7 +1173,7 @@ fn write_retention_snapshot(
     if bytes.len() as u64 > MAX_RETENTION_BYTES {
         return Err("event retention state exceeds size limit".into());
     }
-    atomic_write(path, &bytes)
+    atomic_write_relaxed(path, &bytes)
 }
 
 fn append_retention_delta(
@@ -1198,7 +1198,7 @@ fn append_retention_delta(
     options.mode(0o600);
     let mut file = options.open(path).map_err(|error| error.to_string())?;
     file.write_all(&frame).map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+    file.flush().map_err(|error| error.to_string())
 }
 
 fn retention_header(workspace_hash: &str) -> Result<Vec<u8>, String> {
@@ -1611,6 +1611,14 @@ fn take_array<const N: usize>(bytes: &[u8], position: &mut usize) -> Result<[u8;
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_with_durability(path, bytes, true)
+}
+
+fn atomic_write_relaxed(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_with_durability(path, bytes, false)
+}
+
+fn atomic_write_with_durability(path: &Path, bytes: &[u8], durable: bool) -> Result<(), String> {
     let temporary =
         path.with_extension(format!("tmp-{}-{:016x}", std::process::id(), short_nonce()));
     let mut options = OpenOptions::new();
@@ -1624,17 +1632,17 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
     }
-    if let Err(error) = file.sync_all() {
+    if durable && let Err(error) = file.sync_all() {
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
     }
     drop(file);
-    if let Err(error) = replace_file(&temporary, path) {
+    if let Err(error) = replace_file(&temporary, path, durable) {
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
     }
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
+    if durable && let Some(parent) = path.parent() {
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| error.to_string())?;
@@ -1643,12 +1651,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn replace_file(source: &Path, destination: &Path, _durable: bool) -> std::io::Result<()> {
     fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+fn replace_file(source: &Path, destination: &Path, durable: bool) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -1664,7 +1672,7 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    let flags = MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 };
     // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that remain
     // alive for the duration of the call.
     if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } != 0 {

@@ -26,6 +26,14 @@ class PiraCodeNavSecurityTests(unittest.TestCase):
     def run_cli(
         self, root: Path, *args: str, expected: int = 0
     ) -> subprocess.CompletedProcess[str]:
+        command = next(
+            (value for value in args if value in {"outline", "show", "map", "find"}),
+            None,
+        )
+        if command is not None and "--help" not in args and not any(
+            value == "--no-lsp" or value.startswith("--lsp") for value in args
+        ):
+            args = (*args, "--no-lsp")
         result = subprocess.run(
             [str(self.binary), *args],
             cwd=root,

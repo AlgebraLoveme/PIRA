@@ -117,6 +117,8 @@ def repository_result(
     lsp_root: str | None,
 ) -> dict[str, object]:
     command = [str(binary), "map", ".", "--max-items", "1000000"]
+    if not lsp:
+        command.append("--no-lsp")
     for server in lsp:
         command.extend(("--lsp", server))
     for argument in lsp_args:

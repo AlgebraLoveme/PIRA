@@ -330,7 +330,7 @@ def main() -> int:
                 "--selectors",
                 "--max-items",
                 "10000",
-                "--no-auto-lsp",
+                "--no-lsp",
             ],
             data,
         )
@@ -390,7 +390,7 @@ def main() -> int:
         for mode, target in targets.items():
             prefix = language_prefix(relative) if mode == "location" else []
             result = run(
-                [str(binary), *prefix, "show", target, "--no-auto-lsp"], data
+                [str(binary), *prefix, "show", target, "--no-lsp"], data
             )
             header = SHOW_RE.search(result.stdout)
             valid = (

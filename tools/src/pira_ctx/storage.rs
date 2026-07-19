@@ -482,8 +482,8 @@ fn write_container(
         write_zeros(&mut output, stdout_table_length)?;
         let stderr_table_offset = output.stream_position().map_err(|e| e.to_string())?;
         write_zeros(&mut output, stderr_table_length)?;
-        let (stdout_blocks, stdout_stored) = write_block_stream(&capture.stdout.path, &mut output)?;
-        let (stderr_blocks, stderr_stored) = write_block_stream(&capture.stderr.path, &mut output)?;
+        let (stdout_blocks, stdout_stored) = write_block_stream(&capture.stdout, &mut output)?;
+        let (stderr_blocks, stderr_stored) = write_block_stream(&capture.stderr, &mut output)?;
         let stdout_table = encode_block_table_v4(&stdout_blocks);
         let stderr_table = encode_block_table_v4(&stderr_blocks);
         if stdout_table.len() as u64 != stdout_table_length
@@ -812,11 +812,11 @@ fn block_table_length(logical_length: u64) -> Result<u64, String> {
 }
 
 fn write_block_stream(
-    path: &Path,
+    spool: &crate::model::CapturedStream,
     output: &mut File,
 ) -> Result<(Vec<BlockDescriptor>, u64), String> {
     const BLOCK: usize = BLOCK_BYTES as usize;
-    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    let mut input = spool.open()?;
     let mut descriptors = Vec::new();
     let mut logical = 0_u64;
     let mut payload = 0_u64;

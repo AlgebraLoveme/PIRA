@@ -60,7 +60,21 @@ class PiraCodeNavTests(unittest.TestCase):
         cwd: Path = SYNTHETIC_ROOT,
         expected: int = 0,
         env: dict[str, str] | None = None,
+        native: bool | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        command = next(
+            (value for value in args if value in {"outline", "show", "map", "find"}),
+            None,
+        )
+        has_backend_option = any(value == "--no-lsp" or value.startswith("--lsp") for value in args)
+        if (
+            command is not None
+            and "--help" not in args
+            and "-h" not in args
+            and not has_backend_option
+            and native is not False
+        ):
+            args = (*args, "--no-lsp")
         result = subprocess.run(
             [str(self.binary), *args],
             cwd=cwd,
@@ -104,7 +118,8 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("LSP COMMANDS", help_result.stdout)
         self.assertNotIn("CHOOSE A COMMAND", help_result.stdout)
         self.assertNotIn("TYPICAL FLOW", help_result.stdout)
-        self.assertIn("--no-auto-lsp", help_result.stdout)
+        self.assertIn("--no-lsp", help_result.stdout)
+        self.assertNotIn("--no-auto-lsp", help_result.stdout)
         self.assertIn("Predictable success fields are omitted", help_result.stdout)
         for added in (
             "definition",
@@ -114,6 +129,7 @@ class PiraCodeNavTests(unittest.TestCase):
             "callers",
             "callees",
             "hover",
+            "query",
         ):
             self.assertIn(f"  {added} ", help_result.stdout)
         for removed in ("calls", "workspace-symbol", "rename"):
@@ -166,6 +182,7 @@ class PiraCodeNavTests(unittest.TestCase):
             "callers",
             "callees",
             "hover",
+            "query",
             "languages",
         ):
             detailed = self.run_cli(command, "--help")
@@ -217,6 +234,9 @@ class PiraCodeNavTests(unittest.TestCase):
         references_help = self.run_cli("references", "--help")
         self.assertIn("--include-declaration", references_help.stdout)
         self.assertIn("never performs text search", references_help.stdout)
+        query_help = self.run_cli("query", "--help")
+        self.assertIn("OPERATION=FILE:LINE:COLUMN", query_help.stdout)
+        self.assertIn("Up to 32 requests", query_help.stdout)
         language_help = self.run_cli("python", "--help")
         self.assertIn("extensionless or ambiguous file", language_help.stdout)
         self.assertIn("restrict map/find to python", language_help.stdout)
@@ -291,7 +311,7 @@ class PiraCodeNavTests(unittest.TestCase):
         outline = self.run_cli(
             "outline",
             "src/macro_kernel.cu",
-            "--no-auto-lsp",
+            "--no-lsp",
             cwd=root,
             expected=3,
         )
@@ -557,7 +577,7 @@ class PiraCodeNavTests(unittest.TestCase):
             source = root / "dirty.rb"
             source.write_text("def native\n  1\nend\nbroken = (\n", encoding="utf-8")
             missing = self.run_cli(
-                "outline", source.name, "--no-auto-lsp", cwd=root, expected=3
+                "outline", source.name, "--no-lsp", cwd=root, expected=3
             )
             self.assertIn("--lsp ruby=ABSOLUTE_SERVER_PATH", missing.stderr)
 
@@ -689,7 +709,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 language,
                 "outline",
                 str(REAL_ROOT / relative),
-                "--no-auto-lsp",
+                "--no-lsp",
                 expected=3,
             )
             self.assertIn("Tree-sitter found", result.stderr)
@@ -1364,6 +1384,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 str(self.binary),
                 "outline",
                 str(REAL_ROOT / "python_click" / "decorators.py"),
+                "--no-lsp",
             ],
             cwd=SYNTHETIC_ROOT,
             text=True,
@@ -1380,44 +1401,9 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertEqual(0, return_code, stderr)
         self.assertNotIn("panicked", stderr)
 
-    def test_closed_output_consumer_stops_before_later_lsp_work(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="pira-codenav-closed-output-") as temp:
-            root = Path(temp)
-            (root / "many.py").write_text(
-                "".join(f"def item_{index}(): return {index}\n" for index in range(5_000)),
-                encoding="utf-8",
-            )
-            (root / "dirty.py").write_text(
-                "def dirty():\n    return (\n", encoding="utf-8"
-            )
-            starts = root / "starts.log"
-            process = subprocess.Popen(
-                [
-                    str(self.binary),
-                    "outline",
-                    "many.py",
-                    "dirty.py",
-                    "--max-items",
-                    "5000",
-                    *self.fake_lsp_args("--startup-log", str(starts)),
-                ],
-                cwd=root,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            assert process.stdout is not None
-            self.assertTrue(process.stdout.readline().startswith("# pira_codenav outline"))
-            process.stdout.close()
-            assert process.stderr is not None
-            stderr = process.stderr.read()
-            process.stderr.close()
-            self.assertEqual(0, process.wait(timeout=10), stderr)
-            self.assertFalse(starts.exists(), "closed output should prevent later LSP startup")
-
     def test_unclean_file_requires_lsp_and_lsp_restores_outline_and_show(self) -> None:
         missing = self.run_cli(
-            "outline", "malformed.py", "--no-auto-lsp", expected=3
+            "outline", "malformed.py", "--no-lsp", expected=3
         )
         self.assertEqual("", missing.stdout)
         self.assertIn("Tree-sitter found", missing.stderr)
@@ -1437,20 +1423,21 @@ class PiraCodeNavTests(unittest.TestCase):
         self.assertIn("return 0", shown.stdout)
         self.assertNotIn("broken =", shown.stdout)
 
-    def test_lsp_is_lazy_and_utf16_ranges_return_exact_source(self) -> None:
+    def test_lsp_handles_clean_and_dirty_utf16_ranges(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-") as temp:
             root = Path(temp)
             clean = root / "clean.py"
             clean.write_text("def native(): return 1\n", encoding="utf-8")
             log = root / "requests.log"
-            native = self.run_cli(
+            clean_result = self.run_cli(
                 "outline",
                 "clean.py",
                 *self.fake_lsp_args("--log", str(log)),
                 cwd=root,
             )
-            self.assertNotIn("backend=", native.stdout.splitlines()[0])
-            self.assertFalse(log.exists(), "clean native parsing must not start the LSP")
+            self.assertIn("backend=lsp", clean_result.stdout.splitlines()[0])
+            self.assertIn("function native", clean_result.stdout)
+            self.assertTrue(log.exists(), "default structural parsing must start the LSP")
 
             dirty = root / "dirty.py"
             dirty.write_text(
@@ -1501,9 +1488,9 @@ class PiraCodeNavTests(unittest.TestCase):
             missing = self.run_cli(
                 "definition",
                 "sample.py:4:12",
-                "--no-auto-lsp",
                 cwd=root,
                 expected=2,
+                env={"PATH": ""},
             )
             self.assertIn("requires an LSP", missing.stderr)
             imprecise = self.run_cli(
@@ -1785,7 +1772,7 @@ class PiraCodeNavTests(unittest.TestCase):
             )
             self.assertIn("times query count may not exceed 100000", oversized.stderr)
 
-    def test_find_preserves_clean_results_and_uses_lsp_only_for_dirty_files(self) -> None:
+    def test_find_native_reports_dirty_gaps_and_lsp_covers_all_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-find-partial-") as temp:
             root = Path(temp)
             (root / "clean.py").write_text("def native_item(): return 1\n", encoding="utf-8")
@@ -1802,7 +1789,7 @@ class PiraCodeNavTests(unittest.TestCase):
                 "find", ".", "LspFile", "--exact", *self.fake_lsp_args(), cwd=root
             )
             self.assertIn("files=2", restored.stdout.splitlines()[0])
-            self.assertIn("lsp=1", restored.stdout.splitlines()[0])
+            self.assertIn("lsp=2", restored.stdout.splitlines()[0])
             self.assertIn("file=dirty.py", restored.stdout)
             self.assertIn("backend=lsp", restored.stdout)
 
@@ -1879,6 +1866,72 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertEqual(1, methods.count("textDocument/didOpen"))
             self.assertEqual(2, methods.count("textDocument/definition"))
             self.assertEqual(1, methods.count("textDocument/didClose"))
+
+    def test_semantic_query_mixes_operations_with_one_lsp_session(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-semantic-query-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "class Target: pass\n\ndef first():\n    return Target()\n",
+                encoding="utf-8",
+            )
+            log = root / "requests.log"
+            result = self.run_cli(
+                "query",
+                "definition=sample.py:4:12",
+                "hover=sample.py:4:12",
+                "references=sample.py:4:12",
+                "--include-declaration",
+                *self.fake_lsp_args("--log", str(log)),
+                cwd=root,
+            )
+            self.assertIn("# pira_codenav definition", result.stdout)
+            self.assertIn("# pira_codenav hover", result.stdout)
+            self.assertIn("# pira_codenav references", result.stdout)
+            self.assertIn(
+                "# pira_codenav query requests=3 succeeded=3", result.stdout
+            )
+            methods = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(1, methods.count("initialize"))
+            self.assertEqual(1, methods.count("textDocument/didOpen"))
+            self.assertEqual(1, methods.count("textDocument/definition"))
+            self.assertEqual(1, methods.count("textDocument/hover"))
+            self.assertEqual(1, methods.count("textDocument/references"))
+            self.assertEqual(1, methods.count("textDocument/didClose"))
+
+            missing = self.run_cli(
+                "query",
+                "definition=sample.py:4:12",
+                cwd=root,
+                expected=2,
+                env={"PATH": ""},
+            )
+            self.assertIn("query requires an LSP", missing.stderr)
+            invalid = self.run_cli(
+                "query", "rename=sample.py:4:12", cwd=root, expected=2
+            )
+            self.assertIn("unsupported query operation", invalid.stderr)
+            oversized = self.run_cli(
+                "query",
+                "definition=sample.py:4:12",
+                "--max-items",
+                "1001",
+                cwd=root,
+                expected=2,
+            )
+            self.assertIn("may not exceed 1000", oversized.stderr)
+            all_failed = self.run_cli(
+                "query",
+                "definition=sample.py:4:12",
+                "hover=sample.py:4:12",
+                *self.fake_lsp_args("--disable-semantics"),
+                cwd=root,
+                expected=3,
+            )
+            self.assertIn("pira_codenav query error", all_failed.stdout)
+            self.assertIn(
+                "query requests=2 succeeded=0 failed=2 complete=0",
+                all_failed.stdout,
+            )
 
     def test_lsp_initialization_and_settings_are_bounded_and_forwarded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-lsp-config-") as temp:
@@ -2237,7 +2290,7 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("hint=use-search-or-show-window", full.stdout.splitlines()[0])
 
     @unittest.skipIf(os.name == "nt", "the fake PATH server uses a POSIX shebang")
-    def test_lsp_is_discovered_lazily_from_path_and_explicit_override_wins(self) -> None:
+    def test_lsp_is_discovered_from_path_and_explicit_override_wins(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-auto-lsp-") as temp:
             root = Path(temp)
             bin_dir = root / "bin"
@@ -2261,11 +2314,13 @@ class PiraCodeNavTests(unittest.TestCase):
             env = os.environ.copy()
             env["PATH"] = f"bin{os.pathsep}{env.get('PATH', '')}"
 
-            clean = self.run_cli("outline", "clean.py", cwd=root, env=env)
-            self.assertNotIn("backend=lsp", clean.stdout)
-            self.assertFalse(marker.exists(), "clean structural parsing must not launch PATH LSP")
+            clean = self.run_cli("outline", "clean.py", cwd=root, env=env, native=False)
+            self.assertIn("backend=lsp", clean.stdout)
+            self.assertIn("function clean", clean.stdout)
+            self.assertTrue(marker.exists(), "default structural parsing must launch the PATH LSP")
 
-            recovered = self.run_cli("outline", "dirty.py", cwd=root, env=env)
+            marker.unlink()
+            recovered = self.run_cli("outline", "dirty.py", cwd=root, env=env, native=False)
             self.assertIn("backend=lsp", recovered.stdout.splitlines()[0])
             self.assertTrue(marker.exists())
 
@@ -2276,10 +2331,31 @@ class PiraCodeNavTests(unittest.TestCase):
             self.assertIn("backend=lsp", explicit.stdout.splitlines()[0])
             self.assertFalse(marker.exists(), "explicit --lsp must override PATH discovery")
 
-            disabled = self.run_cli(
-                "outline", "dirty.py", "--no-auto-lsp", cwd=root, env=env, expected=3
+            native = self.run_cli(
+                "outline", "clean.py", "--no-lsp", cwd=root, env=env
             )
-            self.assertIn("pass --lsp python=ABSOLUTE_SERVER_PATH", disabled.stderr)
+            self.assertNotIn("backend=lsp", native.stdout)
+            self.assertFalse(marker.exists(), "--no-lsp must not launch a PATH server")
+
+    def test_structural_navigation_requires_lsp_unless_native_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-required-lsp-") as temp:
+            root = Path(temp)
+            (root / "clean.py").write_text("def clean(): return 1\n", encoding="utf-8")
+            missing = self.run_cli(
+                "outline",
+                "clean.py",
+                cwd=root,
+                env={"PATH": ""},
+                native=False,
+                expected=3,
+            )
+            self.assertEqual("", missing.stdout)
+            self.assertTrue(missing.stderr.startswith("warning: no LSP server was found"))
+            self.assertIn("--no-lsp", missing.stderr)
+
+            native = self.run_cli("outline", "clean.py", "--no-lsp", cwd=root)
+            self.assertIn("function clean", native.stdout)
+            self.assertNotIn("backend=lsp", native.stdout)
 
     def test_unimplemented_semantic_operations_are_not_commands(self) -> None:
         for command in ("symbols", "workspace-symbol", "calls", "rename"):

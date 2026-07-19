@@ -25,6 +25,8 @@ const DEFAULT_CALL_SITE_MAX_ITEMS: usize = 8;
 const DEFAULT_HOVER_MAX_BYTES: usize = 16 * 1024;
 const MAX_SEMANTIC_TARGETS: usize = 32;
 const MAX_BATCH_ERRORS: usize = 16;
+const MAX_QUERY_ITEMS_PER_REQUEST: usize = 1_000;
+const MAX_QUERY_HOVER_BYTES: usize = 64 * 1024;
 
 struct SemanticTarget {
     path: PathBuf,
@@ -77,11 +79,11 @@ fn parse_semantic_target(
 
 fn semantic_service(
     options: &LspOptions,
-    targets: &[SemanticTarget],
+    requests: &[SemanticRequest],
     cwd: &Path,
     command: &str,
 ) -> Result<LspService, (i32, String)> {
-    for target in targets {
+    for target in requests.iter().map(|request| &request.target) {
         if !options.has_server(target.language) {
             return Err((
                 2,
@@ -96,7 +98,7 @@ fn semantic_service(
     Ok(LspService::new_semantic(options.config(cwd)?))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SemanticCommand {
     Definition,
     Implementation,
@@ -117,6 +119,30 @@ impl SemanticCommand {
             Self::Hover => "hover",
             Self::Callers => "callers",
             Self::Callees => "callees",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "definition" => Some(Self::Definition),
+            "implementation" => Some(Self::Implementation),
+            "type-definition" => Some(Self::TypeDefinition),
+            "references" => Some(Self::References),
+            "hover" => Some(Self::Hover),
+            "callers" => Some(Self::Callers),
+            "callees" => Some(Self::Callees),
+            _ => None,
+        }
+    }
+
+    const fn default_max_items(self) -> usize {
+        match self {
+            Self::Definition | Self::Implementation | Self::TypeDefinition => {
+                DEFAULT_DEFINITION_MAX_ITEMS
+            }
+            Self::References => DEFAULT_REFERENCE_MAX_ITEMS,
+            Self::Callers | Self::Callees => DEFAULT_CALL_MAX_ITEMS,
+            Self::Hover => 0,
         }
     }
 }
@@ -195,14 +221,7 @@ fn parse_options(
     }
     Ok(SemanticOptions {
         targets,
-        max_items: max_items.unwrap_or(match command {
-            SemanticCommand::Definition
-            | SemanticCommand::Implementation
-            | SemanticCommand::TypeDefinition => DEFAULT_DEFINITION_MAX_ITEMS,
-            SemanticCommand::References => DEFAULT_REFERENCE_MAX_ITEMS,
-            SemanticCommand::Callers | SemanticCommand::Callees => DEFAULT_CALL_MAX_ITEMS,
-            SemanticCommand::Hover => 0,
-        }),
+        max_items: max_items.unwrap_or(command.default_max_items()),
         max_bytes: max_bytes.unwrap_or(DEFAULT_HOVER_MAX_BYTES),
         include_declaration,
     })
@@ -306,6 +325,168 @@ pub fn callees(
     run_command(args, SemanticCommand::Callees, explicit, cwd, lsp, output)
 }
 
+pub fn query(
+    args: &[String],
+    explicit: Option<Language>,
+    cwd: &Path,
+    lsp: &LspOptions,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let options = parse_query_options(args)?;
+    let mut sources = BTreeMap::new();
+    let requests = prepare_requests(
+        options.requests,
+        explicit,
+        cwd,
+        &mut sources,
+        options.max_items,
+        options.max_bytes,
+        options.include_declaration,
+    )?;
+    run_requests(requests, lsp, cwd, BatchKind::Query, output)
+}
+
+struct QueryOptions {
+    requests: Vec<(SemanticCommand, String)>,
+    max_items: Option<usize>,
+    max_bytes: usize,
+    include_declaration: bool,
+}
+
+fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
+    let mut requests = Vec::new();
+    let mut max_items = None;
+    let mut max_bytes = None;
+    let mut include_declaration = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--max-items" => {
+                if max_items.is_some() {
+                    return usage("--max-items may be specified only once");
+                }
+                let value = positive_usize(
+                    args.get(index + 1)
+                        .ok_or_else(|| (2, "--max-items requires a value".into()))?,
+                    "--max-items",
+                )?;
+                if value > MAX_QUERY_ITEMS_PER_REQUEST {
+                    return usage(format!(
+                        "query --max-items may not exceed {MAX_QUERY_ITEMS_PER_REQUEST}"
+                    ));
+                }
+                max_items = Some(value);
+                index += 2;
+            }
+            "--max-bytes" => {
+                if max_bytes.is_some() {
+                    return usage("--max-bytes may be specified only once");
+                }
+                let value = positive_usize(
+                    args.get(index + 1)
+                        .ok_or_else(|| (2, "--max-bytes requires a value".into()))?,
+                    "--max-bytes",
+                )?;
+                if value > MAX_QUERY_HOVER_BYTES {
+                    return usage(format!(
+                        "query --max-bytes may not exceed {MAX_QUERY_HOVER_BYTES}"
+                    ));
+                }
+                max_bytes = Some(value);
+                index += 2;
+            }
+            "--include-declaration" => {
+                if include_declaration {
+                    return usage("--include-declaration may be specified only once");
+                }
+                include_declaration = true;
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                return usage(format!("unknown query option `{value}`"));
+            }
+            value => {
+                if requests.len() >= MAX_SEMANTIC_TARGETS {
+                    return usage(format!(
+                        "query accepts at most {MAX_SEMANTIC_TARGETS} OPERATION=FILE:LINE:COLUMN requests"
+                    ));
+                }
+                let (operation, target) = value.split_once('=').ok_or_else(|| {
+                    (
+                        2,
+                        format!("invalid query request `{value}`; use OPERATION=FILE:LINE:COLUMN"),
+                    )
+                })?;
+                let command = SemanticCommand::parse(operation).ok_or_else(|| {
+                    (
+                        2,
+                        format!(
+                            "unsupported query operation `{operation}`; use definition, implementation, type-definition, references, hover, callers, or callees"
+                        ),
+                    )
+                })?;
+                if target.is_empty() {
+                    return usage(format!("query request `{value}` has an empty target"));
+                }
+                requests.push((command, target.to_string()));
+                index += 1;
+            }
+        }
+    }
+    if requests.is_empty() {
+        return Err((
+            2,
+            "query requires at least one OPERATION=FILE:LINE:COLUMN request".into(),
+        ));
+    }
+    Ok(QueryOptions {
+        requests,
+        max_items,
+        max_bytes: max_bytes.unwrap_or(DEFAULT_HOVER_MAX_BYTES),
+        include_declaration,
+    })
+}
+
+struct SemanticRequest {
+    command: SemanticCommand,
+    value: String,
+    target: SemanticTarget,
+    max_items: usize,
+    max_bytes: usize,
+    include_declaration: bool,
+}
+
+fn prepare_requests(
+    specs: Vec<(SemanticCommand, String)>,
+    explicit: Option<Language>,
+    cwd: &Path,
+    sources: &mut BTreeMap<PathBuf, Arc<str>>,
+    max_items: Option<usize>,
+    max_bytes: usize,
+    include_declaration: bool,
+) -> Result<Vec<SemanticRequest>, (i32, String)> {
+    specs
+        .into_iter()
+        .map(|(command, value)| {
+            let target = parse_semantic_target(&value, explicit, cwd, sources)?;
+            Ok(SemanticRequest {
+                command,
+                value,
+                target,
+                max_items: max_items.unwrap_or(command.default_max_items()),
+                max_bytes,
+                include_declaration,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum BatchKind {
+    Homogeneous(SemanticCommand),
+    Query,
+}
+
 fn run_command(
     args: &[String],
     command: SemanticCommand,
@@ -316,25 +497,58 @@ fn run_command(
 ) -> CommandResult {
     let options = parse_options(args, command)?;
     let mut sources = BTreeMap::new();
-    let targets = options
+    let specs = options
         .targets
         .iter()
-        .map(|value| parse_semantic_target(value, explicit, cwd, &mut sources))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut service = semantic_service(lsp, &targets, cwd, command.name())?;
+        .map(|value| (command, value.clone()))
+        .collect();
+    let requests = prepare_requests(
+        specs,
+        explicit,
+        cwd,
+        &mut sources,
+        Some(options.max_items),
+        options.max_bytes,
+        options.include_declaration,
+    )?;
+    run_requests(requests, lsp, cwd, BatchKind::Homogeneous(command), output)
+}
+
+fn run_requests(
+    requests: Vec<SemanticRequest>,
+    lsp: &LspOptions,
+    cwd: &Path,
+    batch: BatchKind,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let label = match batch {
+        BatchKind::Homogeneous(command) => command.name(),
+        BatchKind::Query => "query",
+    };
+    let mut service = semantic_service(lsp, &requests, cwd, label)?;
     let mut succeeded = 0usize;
     let mut failures = Vec::new();
     let mut omitted_errors = 0usize;
     let mut first_failure = None;
-    for (value, target) in options.targets.iter().zip(&targets) {
-        match execute_one(command, &options, value, target, &mut service, cwd, output) {
+    for request in &requests {
+        match execute_one(request, &mut service, cwd, output) {
             Ok(()) => succeeded += 1,
             Err((code, message)) if code <= 1 => return Err((code, message)),
-            Err((code, message)) if targets.len() == 1 => return Err((code, message)),
+            Err((code, message))
+                if requests.len() == 1 && matches!(batch, BatchKind::Homogeneous(_)) =>
+            {
+                return Err((code, message));
+            }
             Err((code, message)) => {
                 first_failure.get_or_insert((code, message.clone()));
                 if failures.len() < MAX_BATCH_ERRORS {
-                    failures.push((value, code, message));
+                    let subject = match batch {
+                        BatchKind::Homogeneous(_) => request.value.clone(),
+                        BatchKind::Query => {
+                            format!("{}={}", request.command.name(), request.value)
+                        }
+                    };
+                    failures.push((subject, code, message));
                 } else {
                     omitted_errors += 1;
                 }
@@ -345,23 +559,31 @@ fn run_command(
         writeln!(
             output,
             "# pira_codenav {} error target={} code={} message={}",
-            command.name(),
+            label,
             quote_metadata(target),
             code,
             quote_metadata(message)
         )
         .map_err(output_error)?;
     }
-    if targets.len() > 1 {
-        write!(
-            output,
-            "# pira_codenav {} batch targets={} succeeded={}",
-            command.name(),
-            targets.len(),
-            succeeded
-        )
+    if requests.len() > 1 || matches!(batch, BatchKind::Query) {
+        match batch {
+            BatchKind::Homogeneous(command) => write!(
+                output,
+                "# pira_codenav {} batch targets={} succeeded={}",
+                command.name(),
+                requests.len(),
+                succeeded
+            ),
+            BatchKind::Query => write!(
+                output,
+                "# pira_codenav query requests={} succeeded={}",
+                requests.len(),
+                succeeded
+            ),
+        }
         .map_err(output_error)?;
-        let failed = targets.len().saturating_sub(succeeded);
+        let failed = requests.len().saturating_sub(succeeded);
         if failed > 0 {
             write!(output, " failed={failed} complete=0").map_err(output_error)?;
         }
@@ -371,22 +593,20 @@ fn run_command(
         writeln!(output).map_err(output_error)?;
     }
     if succeeded == 0 {
-        return Err(
-            first_failure.unwrap_or_else(|| (3, format!("all {} targets failed", command.name())))
-        );
+        return Err(first_failure.unwrap_or_else(|| (3, format!("all {label} requests failed"))));
     }
     Ok(())
 }
 
 fn execute_one(
-    command: SemanticCommand,
-    options: &SemanticOptions,
-    value: &str,
-    target: &SemanticTarget,
+    request: &SemanticRequest,
     service: &mut LspService,
     cwd: &Path,
     output: &mut dyn Write,
 ) -> CommandResult {
+    let command = request.command;
+    let value = &request.value;
+    let target = &request.target;
     match command {
         SemanticCommand::Definition
         | SemanticCommand::Implementation
@@ -420,7 +640,7 @@ fn execute_one(
                     &target.source,
                     target.row,
                     target.byte_column,
-                    options.include_declaration,
+                    request.include_declaration,
                 ),
                 _ => unreachable!(),
             }
@@ -430,7 +650,7 @@ fn execute_one(
                 value,
                 target,
                 locations,
-                options.max_items,
+                request.max_items,
                 cwd,
                 output,
             )
@@ -445,7 +665,7 @@ fn execute_one(
                     target.byte_column,
                 )
                 .map_err(lsp_error)?;
-            render_hover(value, target, hover, options.max_bytes, output)
+            render_hover(value, target, hover, request.max_bytes, output)
         }
         SemanticCommand::Callers | SemanticCommand::Callees => {
             let calls = service
@@ -463,7 +683,7 @@ fn execute_one(
                 value,
                 target,
                 calls,
-                options.max_items,
+                request.max_items,
                 cwd,
                 output,
             )

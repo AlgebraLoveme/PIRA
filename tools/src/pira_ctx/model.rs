@@ -1,7 +1,8 @@
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -85,8 +86,8 @@ impl LineMeta {
 }
 
 #[derive(Debug)]
-pub struct TempSpool {
-    pub path: PathBuf,
+pub struct CapturedStream {
+    data: CapturedStreamData,
     pub length: u64,
     pub observed_length: u64,
     pub sha256: [u8; 32],
@@ -94,16 +95,77 @@ pub struct TempSpool {
     pub non_utf8: bool,
 }
 
-impl Drop for TempSpool {
+#[derive(Debug)]
+pub enum CapturedStreamData {
+    Memory(Arc<[u8]>),
+    File(PathBuf),
+}
+
+impl CapturedStream {
+    pub fn memory(
+        bytes: Vec<u8>,
+        observed_length: u64,
+        sha256: [u8; 32],
+        binary: bool,
+        non_utf8: bool,
+    ) -> Self {
+        let length = bytes.len() as u64;
+        Self {
+            data: CapturedStreamData::Memory(bytes.into()),
+            length,
+            observed_length,
+            sha256,
+            binary,
+            non_utf8,
+        }
+    }
+
+    pub fn file(
+        path: PathBuf,
+        length: u64,
+        observed_length: u64,
+        sha256: [u8; 32],
+        binary: bool,
+        non_utf8: bool,
+    ) -> Self {
+        Self {
+            data: CapturedStreamData::File(path),
+            length,
+            observed_length,
+            sha256,
+            binary,
+            non_utf8,
+        }
+    }
+
+    fn reader(&self) -> Result<RawReader, String> {
+        match &self.data {
+            CapturedStreamData::Memory(bytes) => {
+                Ok(RawReader::Memory(Cursor::new(Arc::clone(bytes))))
+            }
+            CapturedStreamData::File(path) => Ok(RawReader::File(BufReader::new(
+                File::open(path).map_err(|error| error.to_string())?,
+            ))),
+        }
+    }
+
+    pub fn open(&self) -> Result<CapturedStreamReader, String> {
+        Ok(CapturedStreamReader(self.reader()?))
+    }
+}
+
+impl Drop for CapturedStream {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let CapturedStreamData::File(path) = &self.data {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct CaptureResult {
-    pub stdout: TempSpool,
-    pub stderr: TempSpool,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
     pub timeline: Vec<LineMeta>,
     pub total_lines: usize,
     pub stdout_lines: usize,
@@ -139,14 +201,7 @@ impl CaptureResult {
     }
 
     pub fn readers(&self) -> Result<StreamReaders, String> {
-        StreamReaders::from_paths(
-            &self.stdout.path,
-            0,
-            self.stdout.length,
-            &self.stderr.path,
-            0,
-            self.stderr.length,
-        )
+        StreamReaders::from_spools(&self.stdout, &self.stderr)
     }
 }
 
@@ -287,7 +342,7 @@ pub struct BlockDescriptor {
 #[derive(Debug)]
 enum SectionReader {
     Raw {
-        reader: BufReader<File>,
+        reader: RawReader,
         base: u64,
         length: u64,
     },
@@ -300,7 +355,54 @@ enum SectionReader {
     },
 }
 
+#[derive(Debug)]
+enum RawReader {
+    File(BufReader<File>),
+    Memory(Cursor<Arc<[u8]>>),
+}
+
+impl Read for RawReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(reader) => reader.read(buffer),
+            Self::Memory(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl Seek for RawReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::File(reader) => reader.seek(position),
+            Self::Memory(reader) => reader.seek(position),
+        }
+    }
+}
+
+pub struct CapturedStreamReader(RawReader);
+
+impl Read for CapturedStreamReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
 impl StreamReaders {
+    fn from_spools(stdout: &CapturedStream, stderr: &CapturedStream) -> Result<Self, String> {
+        Ok(Self {
+            stdout: SectionReader::Raw {
+                reader: stdout.reader()?,
+                base: 0,
+                length: stdout.length,
+            },
+            stderr: SectionReader::Raw {
+                reader: stderr.reader()?,
+                base: 0,
+                length: stderr.length,
+            },
+        })
+    }
+
     pub fn from_paths(
         stdout_path: &std::path::Path,
         stdout_base: u64,
@@ -311,12 +413,16 @@ impl StreamReaders {
     ) -> Result<Self, String> {
         Ok(Self {
             stdout: SectionReader::Raw {
-                reader: BufReader::new(File::open(stdout_path).map_err(|error| error.to_string())?),
+                reader: RawReader::File(BufReader::new(
+                    File::open(stdout_path).map_err(|error| error.to_string())?,
+                )),
                 base: stdout_base,
                 length: stdout_length,
             },
             stderr: SectionReader::Raw {
-                reader: BufReader::new(File::open(stderr_path).map_err(|error| error.to_string())?),
+                reader: RawReader::File(BufReader::new(
+                    File::open(stderr_path).map_err(|error| error.to_string())?,
+                )),
                 base: stderr_base,
                 length: stderr_length,
             },

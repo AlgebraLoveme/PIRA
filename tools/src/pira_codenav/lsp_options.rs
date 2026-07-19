@@ -19,33 +19,26 @@ struct ServerOptions {
     settings: Option<PathBuf>,
 }
 
+#[derive(Default)]
 pub struct LspOptions {
     default: ServerOptions,
     languages: BTreeMap<Language, ServerOptions>,
     root: Option<PathBuf>,
-    auto_discovery: bool,
-}
-
-impl Default for LspOptions {
-    fn default() -> Self {
-        Self {
-            default: ServerOptions::default(),
-            languages: BTreeMap::new(),
-            root: None,
-            auto_discovery: true,
-        }
-    }
+    native_only: bool,
 }
 
 impl LspOptions {
+    pub fn native_only(&self) -> bool {
+        self.native_only
+    }
+
     pub fn has_server(&self, language: Language) -> bool {
         self.languages
             .get(&language)
             .and_then(|server| server.executable.as_ref())
             .is_some()
             || self.default.executable.is_some()
-            || (self.auto_discovery
-                && self.default.executable.is_none()
+            || (self.default.executable.is_none()
                 && !self.languages.contains_key(&language)
                 && auto_server_available(language))
     }
@@ -62,10 +55,7 @@ impl LspOptions {
                 languages.insert(*language, config);
             }
         }
-        let auto_root = (self.auto_discovery && default.is_none()).then(|| root.clone());
-        if self.root.is_some() && default.is_none() && languages.is_empty() && auto_root.is_none() {
-            return Err((2, "--lsp-root requires at least one --lsp".into()));
-        }
+        let auto_root = default.is_none().then(|| root.clone());
         Ok(LspConfigs {
             default,
             languages,
@@ -167,20 +157,7 @@ pub fn parse(
             option,
             "--lsp" | "--lsp-arg" | "--lsp-root" | "--lsp-init" | "--lsp-settings"
         ) {
-            if !matches!(
-                command,
-                "outline"
-                    | "show"
-                    | "map"
-                    | "find"
-                    | "definition"
-                    | "implementation"
-                    | "type-definition"
-                    | "references"
-                    | "hover"
-                    | "callers"
-                    | "callees"
-            ) {
+            if !supports_lsp(command) {
                 return Err((
                     2,
                     format!("{option} is supported only by structural/LSP navigation commands"),
@@ -261,35 +238,58 @@ pub fn parse(
                 _ => unreachable!(),
             }
             index += 2;
-        } else if option == "--no-auto-lsp" {
-            if !matches!(
-                command,
-                "outline"
-                    | "show"
-                    | "map"
-                    | "find"
-                    | "definition"
-                    | "implementation"
-                    | "type-definition"
-                    | "references"
-                    | "hover"
-                    | "callers"
-                    | "callees"
-            ) {
+        } else if option == "--no-lsp" {
+            if !supports_native_structural(command) {
                 return Err((
                     2,
-                    "--no-auto-lsp is supported only by structural/LSP navigation commands".into(),
+                    "--no-lsp is supported only by outline, show, map, and find".into(),
                 ));
             }
-            if !options.auto_discovery {
-                return Err((2, "--no-auto-lsp may be specified only once".into()));
+            if options.native_only {
+                return Err((2, "--no-lsp may be specified only once".into()));
             }
-            options.auto_discovery = false;
+            options.native_only = true;
             index += 1;
         } else {
             remaining.push(args[index].clone());
             index += 1;
         }
     }
+    if options.native_only {
+        let has_lsp_configuration = options.default.executable.is_some()
+            || !options.default.arguments.is_empty()
+            || options.default.initialization.is_some()
+            || options.default.settings.is_some()
+            || !options.languages.is_empty()
+            || options.root.is_some();
+        if has_lsp_configuration {
+            return Err((
+                2,
+                "--no-lsp cannot be combined with LSP configuration".into(),
+            ));
+        }
+    }
     Ok((remaining, options))
+}
+
+fn supports_native_structural(command: &str) -> bool {
+    matches!(command, "outline" | "show" | "map" | "find")
+}
+
+fn supports_lsp(command: &str) -> bool {
+    matches!(
+        command,
+        "outline"
+            | "show"
+            | "map"
+            | "find"
+            | "definition"
+            | "implementation"
+            | "type-definition"
+            | "references"
+            | "hover"
+            | "callers"
+            | "callees"
+            | "query"
+    )
 }

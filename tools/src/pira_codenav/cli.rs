@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
 use crate::command::{
-    CommandResult, input_error, language_for, lsp_error, output_error, parse_location,
+    CommandError, CommandResult, input_error, language_for, output_error, parse_location,
     positive_usize,
 };
 use crate::deps;
@@ -152,10 +152,10 @@ where
         values.remove(0);
     }
     if values.first().is_some_and(|value| value == "help") && values.len() > 1 {
-        return finish_output(print_command_help(&values[1], &mut output), &mut output);
+        return finish_output(crate::help::command(&values[1], &mut output), &mut output);
     }
     if values.is_empty() || matches!(values[0].as_str(), "--help" | "-h" | "help") {
-        return finish_output(print_global_help(&mut output), &mut output);
+        return finish_output(crate::help::global(VERSION, &mut output), &mut output);
     }
     if matches!(values[0].as_str(), "--version" | "-V") {
         let result = writeln!(output, "pira_codenav {VERSION}").map_err(output_error);
@@ -163,7 +163,7 @@ where
     }
     if values[0] == "languages" {
         if values.len() == 2 && matches!(values[1].as_str(), "--help" | "-h") {
-            return finish_output(print_command_help("languages", &mut output), &mut output);
+            return finish_output(crate::help::command("languages", &mut output), &mut output);
         }
         if values.len() != 1 {
             return fail(
@@ -178,7 +178,7 @@ where
     if let Some(language) = explicit_language {
         values.remove(0);
         if values.is_empty() || matches!(values[0].as_str(), "--help" | "-h") {
-            return finish_output(print_language_help(language, &mut output), &mut output);
+            return finish_output(crate::help::language(language, &mut output), &mut output);
         }
     }
     if values.is_empty() {
@@ -186,7 +186,7 @@ where
     }
     let command = values.remove(0);
     if values.len() == 1 && matches!(values[0].as_str(), "--help" | "-h") {
-        return finish_output(print_command_help(&command, &mut output), &mut output);
+        return finish_output(crate::help::command(&command, &mut output), &mut output);
     }
     let cwd = match std::env::current_dir() {
         Ok(path) => path,
@@ -211,6 +211,7 @@ where
         }
         "references" => semantic::references(&values, explicit_language, &cwd, &lsp, &mut output),
         "hover" => semantic::hover(&values, explicit_language, &cwd, &lsp, &mut output),
+        "query" => semantic::query(&values, explicit_language, &cwd, &lsp, &mut output),
         "callers" => semantic::callers(&values, explicit_language, &cwd, &lsp, &mut output),
         "callees" => semantic::callees(&values, explicit_language, &cwd, &lsp, &mut output),
         "imports" => command_imports(&values, explicit_language, &cwd, &mut output),
@@ -221,11 +222,7 @@ where
             format!("unknown subcommand `{other}`; run pira_codenav --help"),
         )),
     };
-    match result {
-        Ok(()) => finish_output(Ok(()), &mut output),
-        Err((0, _)) => 0,
-        Err((code, message)) => fail(code, message),
-    }
+    finish_output(result, &mut output)
 }
 
 fn command_outline(
@@ -241,14 +238,20 @@ fn command_outline(
     }
     let total = options.paths.len();
     let mut failures = FailureCollector::default();
-    let mut resolver = StructuralResolver::new(lsp.config(cwd)?);
-    for path in options.paths {
-        let absolute = absolute_lexical(Path::new(&path), cwd);
-        let result = (|| {
+    let resolved_paths = options
+        .paths
+        .into_iter()
+        .map(|path| {
+            let absolute = absolute_lexical(Path::new(&path), cwd);
             let language = language_for(&absolute, explicit)?;
-            let parsed = resolver
-                .resolve(parse_file(&absolute, language).map_err(input_error)?)
-                .map_err(lsp_error)?;
+            Ok((path, absolute, language))
+        })
+        .collect::<Result<Vec<_>, CommandError>>()?;
+    let mut resolver = StructuralResolver::new(lsp.config(cwd)?, lsp.native_only());
+    resolver.require_languages(resolved_paths.iter().map(|(_, _, language)| *language))?;
+    for (path, absolute, language) in resolved_paths {
+        let result = (|| {
+            let parsed = resolver.resolve_path(&absolute, language)?;
             render_outline(
                 &parsed,
                 cwd,
@@ -399,7 +402,7 @@ fn command_show(
         return Ok(());
     }
     let mut parsed_files = ParsedFileCache::new();
-    let mut resolver = StructuralResolver::new(lsp.config(cwd)?);
+    let mut resolver = StructuralResolver::new(lsp.config(cwd)?, lsp.native_only());
     if options.targets.len() == 1
         && let Some((path_text, start, end)) = parse_line_range(&options.targets[0])
     {
@@ -658,10 +661,9 @@ fn resolve_show_target(
         (path, language, None)
     };
     let key = (path, language);
+    resolver.require_languages([language])?;
     if !parsed_files.contains_key(&key) {
-        let parsed = parse_file(&key.0, key.1)
-            .map_err(input_error)
-            .and_then(|parsed| resolver.resolve(parsed).map_err(lsp_error));
+        let parsed = resolver.resolve_path(&key.0, key.1);
         parsed_files.insert(key.clone(), parsed);
     }
     let parsed = match parsed_files
@@ -788,24 +790,43 @@ fn command_map(
     );
     let mut failures = FailureCollector::default();
     let mut summaries = Vec::with_capacity(discovery.files.len());
-    let mut resolver = StructuralResolver::new(lsp.config(&root)?);
+    let mut resolver = StructuralResolver::new(lsp.config(&root)?, lsp.native_only());
+    resolver.require_languages(discovery.files.iter().map(|(_, language)| *language))?;
     for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
-        let parsed = batch
-            .par_iter()
-            .map(|(path, language)| parse_file(path, *language))
-            .collect::<Vec<_>>();
-        for ((path, _), result) in batch.iter().zip(parsed) {
-            match result {
-                Ok(parsed) => match resolver.resolve(parsed) {
+        if resolver.native_only() {
+            let parsed = batch
+                .par_iter()
+                .map(|(path, language)| parse_file(path, *language))
+                .collect::<Vec<_>>();
+            for ((path, _), result) in batch.iter().zip(parsed) {
+                match result {
+                    Ok(parsed) => match resolver.resolve_native(parsed) {
+                        Ok(parsed) => summaries.push(FileSummary {
+                            path: parsed.path,
+                            language: parsed.language,
+                            backend: parsed.backend,
+                            names: top_level_map_names(&parsed.symbols),
+                        }),
+                        Err((code, message)) => {
+                            failures.record(display_path(path, &root), code, message)
+                        }
+                    },
+                    Err(message) => failures.record(display_path(path, &root), 2, message),
+                }
+            }
+        } else {
+            for (path, language) in batch {
+                match resolver.resolve_path(path, *language) {
                     Ok(parsed) => summaries.push(FileSummary {
                         path: parsed.path,
                         language: parsed.language,
                         backend: parsed.backend,
                         names: top_level_map_names(&parsed.symbols),
                     }),
-                    Err(message) => failures.record(display_path(path, &root), 3, message),
-                },
-                Err(message) => failures.record(display_path(path, &root), 2, message),
+                    Err((code, message)) => {
+                        failures.record(display_path(path, &root), code, message)
+                    }
+                }
             }
         }
     }
@@ -1140,7 +1161,8 @@ fn command_find(
     } else {
         root.parent().unwrap_or(cwd)
     };
-    let mut resolver = StructuralResolver::new(lsp.config(lsp_root)?);
+    let mut resolver = StructuralResolver::new(lsp.config(lsp_root)?, lsp.native_only());
+    resolver.require_languages(discovery.files.iter().map(|(_, language)| *language))?;
     let mut failures = FailureCollector::default();
     let mut parsed_count = 0usize;
     let mut lsp_count = 0usize;
@@ -1150,14 +1172,31 @@ fn command_find(
     for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
         let parsed = batch
             .par_iter()
-            .map(|(path, language)| parse_file(path, *language))
+            .map(|(path, language)| {
+                if resolver.native_only() {
+                    parse_file(path, *language)
+                } else {
+                    Ok(ParsedFile {
+                        path: path.clone(),
+                        language: *language,
+                        source: String::new(),
+                        symbols: Vec::new(),
+                        backend: ParseBackend::Lsp,
+                        syntax_defects: 0,
+                    })
+                }
+            })
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(parsed) {
             let parsed = match result {
-                Ok(parsed) => match resolver.resolve(parsed) {
+                Ok(parsed) => match if resolver.native_only() {
+                    resolver.resolve_native(parsed)
+                } else {
+                    resolver.resolve_path(path, parsed.language)
+                } {
                     Ok(parsed) => parsed,
-                    Err(message) => {
-                        failures.record(display_path(path, &root), 3, message);
+                    Err((code, message)) => {
+                        failures.record(display_path(path, &root), code, message);
                         continue;
                     }
                 },
@@ -3114,424 +3153,6 @@ fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, St
     None
 }
 
-fn print_global_help(output: &mut dyn Write) -> CommandResult {
-    writeln!(
-        output,
-        "pira_codenav {VERSION} — read-only code navigation\n\nUSAGE\n  pira_codenav [LANGUAGE] SUBCOMMAND [ARGS...]\n  pira_codenav help SUBCOMMAND\n\nSTRUCTURAL COMMANDS\n  map DIRECTORY             bounded repository shape\n  find PATH QUERY...        ranked declaration lookup with bounded unique source\n  search PATH PATTERN...    bounded implementation-text matches and context\n  outline FILE...           declarations and ranges without bodies\n  show TARGET...            exact selected source, line spans, or windows\n  imports FILE...           direct import/include statements\n  dependents FILE           direct reverse file dependencies\n  deps FILE                 bounded transitive local file dependencies\n  languages                 compiled language capabilities\n\nLSP COMMANDS\n  definition LOCATION...       semantic definitions\n  implementation LOCATION...   concrete implementations\n  type-definition LOCATION...  resolved type declarations\n  references LOCATION...       semantic references\n  callers LOCATION...          incoming call hierarchy\n  callees LOCATION...          outgoing call hierarchy\n  hover LOCATION...            bounded type or documentation text\n\nLANGUAGE AND LSP\n  LANGUAGE is normally inferred from a suffix or shebang. Structural commands use bundled\n  Tree-sitter and consult an LSP only for syntax-dirty files; LSP commands use a server directly.\n  Conventional dedicated servers on PATH are discovered lazily. --lsp [LANGUAGE=]ABSOLUTE_PATH\n  overrides discovery; --no-auto-lsp disables it. Every server is invocation-local.\n\nOUTPUT\n  Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,\n  complete=0, failed/error, omitted, and truncated fields appear only when relevant. Successful\n  rows remain available when peer files or targets fail; an all-failed command returns an error.\n\nSAFETY\n  Repository source is read but never executed or edited. Exact source and hover text are framed as\n  untrusted data. An explicit or PATH-discovered LSP is an external executable and may keep caches.\n\nRun `pira_codenav SUBCOMMAND --help` for command syntax, options, defaults, and examples."
-    )
-    .map_err(output_error)
-}
-
-fn print_language_help(language: Language, output: &mut dyn Write) -> CommandResult {
-    writeln!(
-        output,
-        "pira_codenav {} — explicit language selection\n\nUSAGE\n  pira_codenav {} SUBCOMMAND [ARGS...]\n\nBEHAVIOR\n  Use this prefix for an extensionless or ambiguous file, to restrict map/find to {}, or to select\n  {}-qualified LSP options. A conflicting recognized suffix is an error. All commands and options\n  are otherwise unchanged.\n\nRun `pira_codenav SUBCOMMAND --help` for command syntax.",
-        language.name(),
-        language.name(),
-        language.name(),
-        language.name()
-    )
-    .map_err(output_error)
-}
-
-const OUTLINE_HELP: &str = r#"pira_codenav outline — inspect declarations without implementation bodies
-
-DESCRIPTION
-  Lists parsed declarations, signatures, ranges, and optional selectors for one or more files.
-
-USAGE
-  pira_codenav [LANGUAGE] outline FILE... [--match TEXT]... [--max-items N]
-    [--signatures] [--selectors] [--lsp [LANGUAGE=]ABSOLUTE_PATH]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
-
-OPTIONS
-  --match TEXT      Case-insensitive OR filter over kind, qualified name, and signature.
-                    Repeat it for alternatives. It is not a regex.
-  --signatures      Add signature/type detail otherwise omitted.
-  --selectors       Add freshness-checked identities for later `show`.
-  --max-items N     Per-file declaration limit; default 1,000.
-
-OUTPUT AND BACKEND
-  Prints declaration kind, qualified name, and exact range; bodies are omitted. Clean files use
-  bundled Tree-sitter. A syntax-dirty file uses a conventional server on PATH or an explicit --lsp;
-  backend=lsp marks that result. --no-auto-lsp disables discovery. Peer successes remain visible.
-
-EXAMPLE
-  pira_codenav outline src/parser.rs --match parse --signatures"#;
-
-const SHOW_HELP: &str = r#"pira_codenav show — retrieve one exact structural item or line span
-
-DESCRIPTION
-  Prints source selected by position, qualified name, selector, line span, or line window.
-
-USAGE
-  pira_codenav [LANGUAGE] show TARGET... [--window N] [--max-items N] [--max-bytes N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
-
-TARGETS
-  FILE:LINE[:COLUMN]       Selects the smallest enclosing named item; coordinates are one-based.
-  FILE::QUALIFIED-NAME     Exact declaration name from outline/find.
-  pira://...               Freshness-checked selector from --selectors.
-  FILE:START-END           Exact inclusive parser-free line span; spans may be batched or mixed.
-
-OPTIONS
-  --window N               For one FILE:LINE[:COLUMN], return N lines before and after that line.
-                           N may be zero; this bypasses structural item selection.
-
-BOUNDS AND OUTPUT
-  A single structural target returns the whole item by default. Multiple targets default to 20
-  deduplicated items or spans and 64 KiB; --max-items and --max-bytes omit whole results rather than
-  truncating source. Items over 200 lines carry a bounded-retrieval hint. FILE:START-END clamps END
-  at EOF. Syntax-dirty structural targets need an auto-discovered or
-  explicit LSP. Selectors reject stale source. Returned source is framed as untrusted data.
-
-EXAMPLES
-  pira_codenav show src/parser.rs:120
-  pira_codenav show src/parser.rs:120 --window 8
-  pira_codenav show src/parser.rs::Parser::parse
-  pira_codenav show src/parser.rs:120-145
-  pira_codenav show src/a.rs:10-20 src/b.rs:30-40"#;
-
-const MAP_HELP: &str = r#"pira_codenav map — produce a bounded repository or subsystem shape
-
-DESCRIPTION
-  Prints a bounded repository or subsystem shape.
-
-USAGE
-  pira_codenav [LANGUAGE] map DIRECTORY [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
-
-OUTPUT AND LIMITS
-  Prints compact file rows with language and representative top-level declarations. Selection is
-  deterministic and balanced across directories. Default: 1,000 files; use --max-items 200 or a
-  narrower DIRECTORY for an initial repository pass.
-
-DISCOVERY AND BACKEND
-  Git ignore rules are honored and symlinked directories are not followed. Without LANGUAGE, each
-  supported file is inferred independently; LANGUAGE restricts the scan. Clean files use bundled
-  Tree-sitter. Syntax-dirty files use a server on PATH or an explicit --lsp; backend=lsp marks only
-  those rows. --no-auto-lsp disables discovery.
-  complete=0 and bounded errors identify gaps without discarding clean rows.
-
-EXAMPLE
-  pira_codenav map src --max-items 200"#;
-
-const FIND_HELP: &str = r#"pira_codenav find — search declarations across source paths
-
-DESCRIPTION
-  Searches parsed declaration metadata in one file or across a directory; body text is not searched.
-
-USAGE
-  pira_codenav [LANGUAGE] find PATH QUERY... [--exact | --contains | --regex] [--kind KIND]
-    [--max-items N] [--selectors] [--signatures] [--locations-only | --show-unique]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH]...
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE] [--no-auto-lsp]
-
-MATCHING
-  Default            Case-insensitive full/suffix name first; substring fallback only if none exist.
-  --exact            Case-insensitive full name or qualified-name suffix.
-  --contains         Case-insensitive substring matching, including related names.
-  --regex            Rust regex; case-sensitive unless the pattern requests otherwise.
-  --kind KIND        Restrict declaration kind.
-  --signatures       Add signature/type detail.
-  --selectors        Include freshness-checked `show` targets.
-  --locations-only   Omit automatic source. --show-unique explicitly requests the default behavior.
-  QUERY...           One to 32 independent queries; files are parsed once for the whole batch.
-  --max-items N      Per-query result limit; default 20; all query limits total at most 100,000.
-
-OUTPUT AND BACKEND
-  Bounded top-K results rank public/close names before hidden/distant matches, then use stable source
-  order. Private results remain searchable. One match includes source up to 200 lines/24 KiB under a
-  shared 64 KiB budget. Larger or ambiguous results provide bounded locations/selectors. Clean files
-  use bundled Tree-sitter; syntax-dirty files need a PATH or explicit LSP. Peer successes remain visible.
-
-EXAMPLES
-  pira_codenav find . Module.compile compile_fx
-  pira_codenav find . widget --contains --locations-only
-  pira_codenav find src '^Parser::parse$' --regex --selectors"#;
-
-const SEARCH_HELP: &str = r#"pira_codenav search — find implementation text with bounded context
-
-DESCRIPTION
-  Finds body text, operators, literals, or conditions in one file or directory with bounded source context.
-
-USAGE
-  pira_codenav [LANGUAGE] search PATH PATTERN... [--regex] [--context N]
-    [--max-items N] [--max-bytes N]
-
-MATCHING AND BOUNDS
-  Literal matching is case-sensitive. --regex uses Rust regex syntax. One to 32 patterns are scanned
-  together and reported as q1..q32. --context defaults to 2 lines on each side and may be zero.
-  --max-items limits matching lines (default 200, maximum 10,000); --max-bytes limits complete
-  rendered context blocks (default 64 KiB). Overlapping windows merge without duplicating source.
-  Put `--` before a literal or regex pattern beginning with `-`.
-
-OUTPUT AND SCOPE
-  Git ignore rules and LANGUAGE filtering match `find`. Exact contextual lines are framed as
-  untrusted repository data. Only matched files are structurally parsed, solely to add the smallest
-  clean enclosing item when available; text matches remain usable for syntax-dirty files.
-
-EXAMPLES
-  pira_codenav search . 'raise ' 'except ' --context 3
-  pira_codenav search src 'if .*is_none' --regex --context 1"#;
-
-const IMPORTS_HELP: &str = r#"pira_codenav imports — inspect direct import/include statements
-
-DESCRIPTION
-  Lists direct import/include statements and conservatively resolved local targets for files.
-
-USAGE
-  pira_codenav [LANGUAGE] imports FILE...
-
-OUTPUT AND SCOPE
-  Prints source line, exact import text, resolution status, and a conservative local target when one
-  can be resolved from the current workspace. Run from the intended workspace root. External,
-  dynamic, ambiguous, package-dependent, and build-dependent targets remain visibly unresolved.
-  Multiple FILE successes survive peer failures.
-
-BOUNDARY
-  Requires clean native Tree-sitter syntax because LSP has no portable import graph.
-  Never invokes a package manager or build system, and never executes a source file.
-
-EXAMPLE
-  pira_codenav imports src/app.py src/model.py"#;
-
-const DEPENDENTS_HELP: &str = r#"pira_codenav dependents — inspect direct reverse file dependencies
-
-DESCRIPTION
-  Lists files whose imports/includes resolve directly to one local file.
-
-USAGE
-  pira_codenav [LANGUAGE] dependents FILE [--root DIRECTORY]
-
-INPUT AND SCOPE
-  FILE is relative to --root; --root defaults to the current directory. Narrow --root for large
-  repositories. The scan uses the target language plus only the C/C++/CUDA or JavaScript/TypeScript
-  compatibility group when applicable.
-
-OUTPUT
-  Prints each direct dependent with import line and resolution. complete=0 and bounded errors identify
-  parse gaps. This is file dependency navigation, not symbol reference search. Clean native syntax is
-  required because standard LSP has no portable import graph.
-
-EXAMPLE
-  pira_codenav dependents package/model.py --root src"#;
-
-const DEPS_HELP: &str = r#"pira_codenav deps — traverse bounded local structural file dependencies
-
-DESCRIPTION
-  Traverses a bounded transitive local import/include graph in either or both directions.
-
-USAGE
-  pira_codenav [LANGUAGE] deps FILE [--direction imports|dependents|both] [--depth N]
-    [--root DIRECTORY] [--max-items N]
-
-INPUT AND OPTIONS
-  FILE is relative to --root; it is not FILE:LINE or a symbol target.
-  --direction VALUE   imports, dependents, or both; default both.
-  --depth N           Traversal depth; default 2.
-  --root DIRECTORY    Dependency workspace; default current directory.
-  --max-items N       Shared edge limit; default 1,000. `both` alternates directions.
-
-OUTPUT AND BOUNDARY
-  Prints conservative local file edges with depth and direction. complete=0 marks parse gaps. It does
-  not infer symbol references, calls, build-system edges, package resolution, or dynamic imports.
-  Clean native syntax is required because standard LSP has no portable import graph.
-
-EXAMPLE
-  pira_codenav deps package/api.py --root src --direction both --depth 2"#;
-
-const DEFINITION_HELP: &str = r#"pira_codenav definition — locate semantic definitions through LSP
-
-DESCRIPTION
-  Requests semantic definitions for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] definition FILE:LINE:COLUMN... [--max-items N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-INPUT AND OUTPUT
-  LOCATION is FILE:LINE:COLUMN with one-based lines and UTF-8 byte columns. The default is 20
-  locations per target. Local readable locations use PIRA coordinates; other locations retain LSP
-  coordinates and encoding. No source body is printed.
-
-LSP
-  A conventional dedicated server on PATH is used automatically. --lsp with an absolute executable
-  overrides discovery; --no-auto-lsp disables it. --lsp-root selects the workspace.
-  Up to 32 targets reuse one server and open document per file. Semantic results are never guessed.
-
-EXAMPLE
-  pira_codenav definition src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
-
-const IMPLEMENTATION_HELP: &str = r#"pira_codenav implementation — locate semantic implementations through LSP
-
-DESCRIPTION
-  Requests concrete implementations for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] implementation FILE:LINE:COLUMN... [--max-items N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-INPUT AND OUTPUT
-  LOCATION uses one-based lines and UTF-8 byte columns. Default: 20 normalized locations per target,
-  no source bodies. Up to 32 targets reuse one server and document state. The server must advertise
-  implementation support; this command never guesses. PATH discovery is automatic; --lsp overrides
-  it and --no-auto-lsp disables it.
-
-EXAMPLE
-  pira_codenav implementation src/api.py:18:12 --lsp /absolute/path/to/server --lsp-root ."#;
-
-const TYPE_DEFINITION_HELP: &str = r#"pira_codenav type-definition — locate semantic type definitions through LSP
-
-DESCRIPTION
-  Requests resolved type declarations for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] type-definition FILE:LINE:COLUMN... [--max-items N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-INPUT AND OUTPUT
-  LOCATION uses one-based lines and UTF-8 byte columns. Default: 20 normalized locations per target,
-  no source bodies. Up to 32 targets reuse one server and document state. The server must advertise
-  type-definition support; this command never guesses. PATH discovery is automatic; --lsp overrides
-  it and --no-auto-lsp disables it.
-
-EXAMPLE
-  pira_codenav type-definition src/app.ts:30:9 --lsp /absolute/path/to/server --lsp-root ."#;
-
-const REFERENCES_HELP: &str = r#"pira_codenav references — locate bounded semantic references through LSP
-
-DESCRIPTION
-  Requests bounded semantic references for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] references FILE:LINE:COLUMN... [--include-declaration]
-    [--max-items N] [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR] [--lsp-init [LANGUAGE=]JSON_FILE]
-    [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-OPTIONS AND OUTPUT
-  LOCATION uses one-based lines and UTF-8 byte columns. Declarations are excluded unless
-  --include-declaration is passed. Default: 200 locations per target. Headers add shown/omitted only
-  when bounded. Up to 32 targets reuse one server and document state. No source bodies are printed;
-  this command never performs text search. PATH discovery is automatic; --lsp overrides it.
-
-EXAMPLE
-  pira_codenav references src/lib.rs:80:14 --max-items 50 --lsp /absolute/server --lsp-root ."#;
-
-const CALLERS_HELP: &str = r#"pira_codenav callers — inspect incoming semantic calls through LSP
-
-DESCRIPTION
-  Requests incoming call-hierarchy relations for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] callers FILE:LINE:COLUMN... [--max-items N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-OUTPUT
-  Default: 100 caller relations per target and 8 compact call sites per relation. Readable locations
-  are normalized. Up to 32 targets reuse one server and document state. The server must support LSP
-  call hierarchy; no textual or heuristic call graph is produced. PATH discovery is automatic;
-  --lsp overrides it.
-
-EXAMPLE
-  pira_codenav callers src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
-
-const CALLEES_HELP: &str = r#"pira_codenav callees — inspect outgoing semantic calls through LSP
-
-DESCRIPTION
-  Requests outgoing call-hierarchy relations for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] callees FILE:LINE:COLUMN... [--max-items N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-OUTPUT
-  Default: 100 callee relations per target and 8 compact call sites per relation. Readable locations
-  are normalized. Up to 32 targets reuse one server and document state. The server must support LSP
-  call hierarchy; no textual or heuristic call graph is produced. PATH discovery is automatic;
-  --lsp overrides it.
-
-EXAMPLE
-  pira_codenav callees src/app.cpp:42:17 --lsp /usr/bin/clangd --lsp-root ."#;
-
-const HOVER_HELP: &str = r#"pira_codenav hover — retrieve bounded semantic type or documentation text through LSP
-
-DESCRIPTION
-  Requests bounded type, signature, or documentation text for source positions from an LSP server.
-
-USAGE
-  pira_codenav [LANGUAGE] hover FILE:LINE:COLUMN... [--max-bytes N]
-    [--lsp [LANGUAGE=]ABSOLUTE_PATH] [--no-auto-lsp]
-    [--lsp-arg [LANGUAGE=]ARG]... [--lsp-root DIR]
-    [--lsp-init [LANGUAGE=]JSON_FILE] [--lsp-settings [LANGUAGE=]JSON_FILE]
-
-INPUT AND OUTPUT
-  LOCATION uses one-based lines and UTF-8 byte columns. --max-bytes defaults to 16 KiB per target.
-  Truncation occurs only at a UTF-8 boundary and is reported in the header. Content is framed as
-  untrusted LSP data. Up to 32 targets reuse one server and document state. PATH discovery is
-  automatic; --lsp overrides it and --no-auto-lsp disables it.
-
-EXAMPLE
-  pira_codenav hover src/app.py:24:9 --max-bytes 4096 --lsp /absolute/server --lsp-root ."#;
-
-const LANGUAGES_HELP: &str = r#"pira_codenav languages — list installed language capabilities
-
-DESCRIPTION
-  Lists language parsers compiled into this executable.
-
-USAGE
-  pira_codenav languages
-
-OUTPUT
-  Prints the supported-language count followed by one canonical LANGUAGE name per line. These names
-  may prefix commands and qualify LSP options.
-
-EXAMPLE
-  pira_codenav languages"#;
-
-fn print_command_help(command: &str, output: &mut dyn Write) -> CommandResult {
-    let text = match command {
-        "outline" => OUTLINE_HELP,
-        "show" => SHOW_HELP,
-        "map" => MAP_HELP,
-        "find" => FIND_HELP,
-        "search" => SEARCH_HELP,
-        "imports" => IMPORTS_HELP,
-        "dependents" => DEPENDENTS_HELP,
-        "deps" => DEPS_HELP,
-        "definition" => DEFINITION_HELP,
-        "implementation" => IMPLEMENTATION_HELP,
-        "type-definition" => TYPE_DEFINITION_HELP,
-        "references" => REFERENCES_HELP,
-        "callers" => CALLERS_HELP,
-        "callees" => CALLEES_HELP,
-        "hover" => HOVER_HELP,
-        "languages" => LANGUAGES_HELP,
-        other => {
-            return Err((
-                2,
-                format!("unknown subcommand `{other}`; run pira_codenav --help"),
-            ));
-        }
-    };
-    writeln!(output, "{text}").map_err(output_error)
-}
-
 fn print_languages(output: &mut dyn Write) -> CommandResult {
     writeln!(
         output,
@@ -3550,7 +3171,9 @@ fn usage<T: Into<String>>(message: T) -> CommandResult {
 }
 
 fn finish_output(result: CommandResult, output: &mut dyn Write) -> i32 {
-    let result = result.and_then(|()| output.flush().map_err(output_error));
+    if let Err((code, message)) = output.flush().map_err(output_error) {
+        return if code == 0 { 0 } else { fail(code, message) };
+    }
     match result {
         Ok(()) | Err((0, _)) => 0,
         Err((code, message)) => fail(code, message),
@@ -3558,7 +3181,11 @@ fn finish_output(result: CommandResult, output: &mut dyn Write) -> i32 {
 }
 
 fn fail<T: AsRef<str>>(code: i32, message: T) -> i32 {
-    eprintln!("error: {}", message.as_ref());
+    if let Some(message) = message.as_ref().strip_prefix("warning: ") {
+        eprintln!("warning: {message}");
+    } else {
+        eprintln!("error: {}", message.as_ref());
+    }
     code
 }
 
