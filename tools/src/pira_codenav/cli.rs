@@ -25,7 +25,8 @@ use crate::util::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SHOW_MAX_ITEMS: usize = 20;
-const DEFAULT_SHOW_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_SHOW_MAX_BYTES: usize = 32 * 1024;
+const DEFAULT_MAP_MAX_ITEMS: usize = 200;
 const MAX_REPORTED_FAILURES: usize = 20;
 const MAX_FAILURE_SUBJECT_BYTES: usize = 512;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
@@ -35,14 +36,14 @@ const MAX_FIND_QUERIES: usize = 32;
 const MAX_FIND_QUERY_BYTES: usize = 4 * 1024;
 const MAX_FIND_TOTAL_QUERY_BYTES: usize = 32 * 1024;
 const DEFAULT_FIND_MAX_ITEMS: usize = 20;
-const DEFAULT_SEARCH_MAX_ITEMS: usize = 200;
-const DEFAULT_SEARCH_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_SEARCH_MAX_ITEMS: usize = 48;
+const DEFAULT_SEARCH_MAX_BYTES: usize = 24 * 1024;
 const MAX_SEARCH_ITEMS: usize = 10_000;
 const MAX_SEARCH_CONTEXT: usize = 1_000;
 const LARGE_ITEM_LINES: usize = 200;
 const FIND_UNIQUE_MAX_LINES: usize = 200;
 const FIND_UNIQUE_MAX_BYTES: usize = 24 * 1024;
-const FIND_UNIQUE_TOTAL_BYTES: usize = 64 * 1024;
+const FIND_UNIQUE_TOTAL_BYTES: usize = 32 * 1024;
 
 type ParsedFileCache = BTreeMap<(PathBuf, Language), Result<ParsedFile, (i32, String)>>;
 
@@ -1607,16 +1608,73 @@ struct SearchEngine {
     expressions: Vec<Regex>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct SearchHit {
     row: usize,
     column: usize,
     queries: Vec<usize>,
+    quality: u8,
+}
+
+impl PartialOrd for SearchHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SearchHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.quality, self.row, self.column, &self.queries).cmp(&(
+            other.quality,
+            other.row,
+            other.column,
+            &other.queries,
+        ))
+    }
 }
 
 struct SearchScan {
     total: usize,
     hits: Vec<SearchHit>,
+    query_coverage: usize,
+    best_quality: u8,
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct SearchFileRank {
+    uncovered_queries: usize,
+    best_quality: u8,
+    visibility_penalty: u8,
+    path_depth: usize,
+    path: PathBuf,
+}
+
+struct RankedSearchFile {
+    rank: SearchFileRank,
+    path: PathBuf,
+    language: Language,
+    source_hash: String,
+    hits: Vec<SearchHit>,
+}
+
+impl PartialEq for RankedSearchFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank == other.rank
+    }
+}
+
+impl Eq for RankedSearchFile {}
+
+impl PartialOrd for RankedSearchFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedSearchFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank.cmp(&other.rank)
+    }
 }
 
 struct SelectedSearchFile {
@@ -1657,21 +1715,21 @@ fn command_search(
     let mut scanned_files = 0usize;
     let mut matched_files = 0usize;
     let mut matched_total = 0usize;
-    let mut selected_total = 0usize;
-    let mut render = SearchRenderState::default();
+    let candidate_limit = options.max_items.min(64);
+    let mut candidates = BinaryHeap::with_capacity(candidate_limit);
     for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
-        let mut selected_files = Vec::new();
         let scanned = batch
             .par_iter()
             .map(|(path, language)| {
                 read_source(path).map(|source| {
                     let scan = scan_source(&source, &engine, options.max_items);
-                    (*language, source, scan)
+                    let source_hash = (scan.total > 0).then(|| hash16(source.as_bytes()));
+                    (*language, scan, source_hash)
                 })
             })
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(scanned) {
-            let (language, source, mut scan) = match result {
+            let (language, scan, source_hash) = match result {
                 Ok(value) => value,
                 Err(message) => {
                     failures.record(display_path(path, &root), 2, message);
@@ -1682,27 +1740,93 @@ fn command_search(
             matched_total = matched_total.saturating_add(scan.total);
             if scan.total > 0 {
                 matched_files = matched_files.saturating_add(1);
-            }
-            let remaining = options.max_items.saturating_sub(selected_total);
-            scan.hits.truncate(remaining);
-            if !scan.hits.is_empty() {
-                selected_total = selected_total.saturating_add(scan.hits.len());
-                selected_files.push(SelectedSearchFile {
+                let relative = path.strip_prefix(&root).unwrap_or(path);
+                let ranked = RankedSearchFile {
+                    rank: SearchFileRank {
+                        uncovered_queries: options
+                            .patterns
+                            .len()
+                            .saturating_sub(scan.query_coverage),
+                        best_quality: scan.best_quality,
+                        visibility_penalty: path_visibility_penalty(relative),
+                        path_depth: relative.components().count(),
+                        path: relative.to_path_buf(),
+                    },
                     path: path.clone(),
                     language,
-                    source,
+                    source_hash: source_hash.expect("matching source must have a content hash"),
                     hits: scan.hits,
-                });
+                };
+                if candidates.len() < candidate_limit {
+                    candidates.push(ranked);
+                } else if candidates
+                    .peek()
+                    .is_some_and(|worst| ranked.rank < worst.rank)
+                {
+                    candidates.pop();
+                    candidates.push(ranked);
+                }
             }
         }
-        render_selected_search_files(
-            &selected_files,
-            options.context,
-            options.max_bytes,
-            cwd,
-            &mut render,
-        )?;
     }
+
+    let mut ranked = candidates.into_sorted_vec();
+    for candidate in &mut ranked {
+        candidate
+            .hits
+            .sort_by_key(|hit| (hit.quality, hit.row, hit.column));
+    }
+    let mut selected = vec![Vec::new(); ranked.len()];
+    let mut cursors = vec![0usize; ranked.len()];
+    let mut selected_total = 0usize;
+    while selected_total < options.max_items {
+        let mut advanced = false;
+        for (index, candidate) in ranked.iter().enumerate() {
+            if let Some(hit) = candidate.hits.get(cursors[index]) {
+                selected[index].push(hit.clone());
+                cursors[index] += 1;
+                selected_total += 1;
+                advanced = true;
+                if selected_total == options.max_items {
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    let mut selected_files = Vec::with_capacity(ranked.len());
+    for (candidate, mut hits) in ranked.into_iter().zip(selected) {
+        if hits.is_empty() {
+            continue;
+        }
+        match read_source(&candidate.path) {
+            Ok(source) if hash16(source.as_bytes()) == candidate.source_hash => {
+                hits.sort_by_key(|hit| (hit.row, hit.column));
+                selected_files.push(SelectedSearchFile {
+                    path: candidate.path,
+                    language: candidate.language,
+                    source,
+                    hits,
+                });
+            }
+            Ok(_) => failures.record(
+                display_path(&candidate.path, &root),
+                3,
+                "source changed during search; rerun the command".into(),
+            ),
+            Err(message) => failures.record(display_path(&candidate.path, &root), 2, message),
+        }
+    }
+    let mut render = SearchRenderState::default();
+    render_selected_search_files(
+        &selected_files,
+        options.context,
+        options.max_bytes,
+        cwd,
+        &mut render,
+    )?;
 
     if options.patterns.len() == 1 {
         write!(
@@ -1839,7 +1963,7 @@ fn render_selected_search_files(
 fn parse_search_options(args: &[String]) -> Result<SearchOptions, (i32, String)> {
     let mut positional = Vec::new();
     let mut regex = false;
-    let mut context = 2usize;
+    let mut context = 1usize;
     let mut max_items = DEFAULT_SEARCH_MAX_ITEMS;
     let mut max_bytes = DEFAULT_SEARCH_MAX_BYTES;
     let mut index = 0usize;
@@ -1958,30 +2082,98 @@ fn build_search_engine(
 
 fn scan_source(source: &str, engine: &SearchEngine, collect_limit: usize) -> SearchScan {
     let mut total = 0usize;
-    let mut hits = Vec::with_capacity(collect_limit.min(1_000));
+    let mut hits = BinaryHeap::with_capacity(collect_limit.min(1_000));
+    let mut matched_queries = vec![false; engine.expressions.len()];
+    let mut best_quality = u8::MAX;
     for (row, line) in source.split_terminator('\n').enumerate() {
         let matches = engine.set.matches(line);
         if !matches.matched_any() {
             continue;
         }
         total = total.saturating_add(1);
-        if hits.len() >= collect_limit {
-            continue;
-        }
         let queries = matches.iter().collect::<Vec<_>>();
+        for query in &queries {
+            matched_queries[*query] = true;
+        }
+        let quality = search_line_quality(line);
+        best_quality = best_quality.min(quality);
         let column = queries
             .iter()
             .filter_map(|query| engine.expressions[*query].find(line))
             .map(|matched| line[..matched.start()].chars().count() + 1)
             .min()
             .unwrap_or(1);
-        hits.push(SearchHit {
+        let hit = SearchHit {
             row,
             column,
             queries,
-        });
+            quality,
+        };
+        if hits.len() < collect_limit {
+            hits.push(hit);
+        } else if hits.peek().is_some_and(|worst| hit < *worst) {
+            hits.pop();
+            hits.push(hit);
+        }
     }
-    SearchScan { total, hits }
+    SearchScan {
+        total,
+        hits: hits.into_vec(),
+        query_coverage: matched_queries
+            .into_iter()
+            .filter(|matched| *matched)
+            .count(),
+        best_quality,
+    }
+}
+
+fn search_line_quality(line: &str) -> u8 {
+    let trimmed = line.trim_start();
+    const DECLARATION_PREFIXES: &[&str] = &[
+        "class ",
+        "def ",
+        "enum ",
+        "fn ",
+        "func ",
+        "function ",
+        "interface ",
+        "module ",
+        "proc ",
+        "record ",
+        "struct ",
+        "sub ",
+        "trait ",
+        "type ",
+    ];
+    if DECLARATION_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return 0;
+    }
+    const IMPORT_PREFIXES: &[&str] = &[
+        "#include ",
+        "export ",
+        "from ",
+        "import ",
+        "require ",
+        "use ",
+        "using ",
+    ];
+    if IMPORT_PREFIXES
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return 1;
+    }
+    if trimmed.contains('=')
+        || trimmed.starts_with("return ")
+        || trimmed.starts_with("raise ")
+        || trimmed.starts_with("throw ")
+    {
+        return 2;
+    }
+    3
 }
 
 fn render_search_block(
@@ -3064,7 +3256,7 @@ fn parse_paths_and_limit(
     allow_selectors: bool,
 ) -> Result<(Vec<String>, usize, bool), (i32, String)> {
     let mut paths = Vec::new();
-    let mut max_items = DEFAULT_MAX_ITEMS;
+    let mut max_items = DEFAULT_MAP_MAX_ITEMS;
     let mut selectors = false;
     let mut index = 0;
     while index < args.len() {
@@ -3081,6 +3273,11 @@ fn parse_paths_and_limit(
         } else if args[index] == "--selectors" && allow_selectors {
             selectors = true;
             index += 1;
+        } else if args[index] == "--depth" {
+            return Err((
+                2,
+                "map has no --depth option; pass a narrower DIRECTORY or --max-items N".into(),
+            ));
         } else if args[index].starts_with('-') {
             return Err((2, format!("unknown option `{}`", args[index])));
         } else {

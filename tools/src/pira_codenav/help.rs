@@ -8,7 +8,7 @@ const GLOBAL_HELP_BODY: &str = r#"USAGE
   pira_codenav help SUBCOMMAND
 
 STRUCTURAL COMMANDS
-  map DIRECTORY             bounded repository shape
+  map DIRECTORY [--max-items N]  bounded repository shape
   find PATH QUERY...        ranked declaration lookup with bounded unique source
   search PATH PATTERN...    bounded implementation-text matches and context
   outline FILE...           declarations and ranges without bodies
@@ -29,10 +29,11 @@ LSP COMMANDS
   query OPERATION=LOCATION...  mixed semantic requests sharing LSP state
 
 LANGUAGE AND LSP
-  LANGUAGE is normally inferred from a suffix or shebang. Outline, show, map, and find require and
-  prefer a conventional dedicated LSP discovered on PATH or supplied with
+  LANGUAGE is normally inferred from a suffix or shebang. Outline, map, find, and structural show
+  targets require and prefer a conventional dedicated LSP discovered on PATH or supplied with
   --lsp [LANGUAGE=]ABSOLUTE_PATH. Pass --no-lsp to explicitly use bundled native parsing instead.
-  Semantic commands always require an LSP. Every server is invocation-local.
+  Parser-free show spans/windows and text/file-dependency commands need no LSP. Semantic commands
+  always require an LSP. Every server is invocation-local.
 
 OUTPUT
   Output is bounded and deterministic. Predictable success fields are omitted. backend=lsp,
@@ -118,7 +119,7 @@ OPTIONS
 
 BOUNDS AND OUTPUT
   A single structural target returns the whole item by default. Multiple targets default to 20
-  deduplicated items or spans and 64 KiB; --max-items and --max-bytes omit whole results rather than
+  deduplicated items or spans and 32 KiB; --max-items and --max-bytes omit whole results rather than
   truncating source. Items over 200 lines carry a bounded-retrieval hint. FILE:START-END clamps END
   at EOF. Structural item targets require a PATH-discovered or explicit LSP by default; --no-lsp
   explicitly selects clean native parsing. Parser-free line spans and windows need no LSP.
@@ -144,8 +145,8 @@ USAGE
 
 OUTPUT AND LIMITS
   Prints compact file rows with language and representative top-level declarations. Selection is
-  deterministic and balanced across directories. Default: 1,000 files; use --max-items 200 or a
-  narrower DIRECTORY for an initial repository pass.
+  deterministic and balanced across directories. Default: 200 files; pass a narrower DIRECTORY or
+  raise --max-items deliberately for a larger pass. `map` does not use a depth option.
 
 DISCOVERY AND BACKEND
   Git ignore rules are honored and symlinked directories are not followed. Without LANGUAGE, each
@@ -186,7 +187,7 @@ MATCHING
 OUTPUT AND BACKEND
   Bounded top-K results rank public/close names before hidden/distant matches, then use stable source
   order. Private results remain searchable. One match includes source up to 200 lines/24 KiB under a
-  shared 64 KiB budget. Larger or ambiguous results provide bounded locations/selectors. Clean files
+  shared 32 KiB budget. Larger or ambiguous results provide bounded locations/selectors. Clean files
   use a PATH or explicit LSP by default; clean native symbols fill LSP omissions. --no-lsp selects
   native-only parsing. Peer successes remain visible.
 
@@ -206,9 +207,9 @@ USAGE
 
 MATCHING AND BOUNDS
   Literal matching is case-sensitive. --regex uses Rust regex syntax. One to 32 patterns are scanned
-  together and reported as q1..q32. --context defaults to 2 lines on each side and may be zero.
-  --max-items limits matching lines (default 200, maximum 10,000); --max-bytes limits complete
-  rendered context blocks (default 64 KiB). Overlapping windows merge without duplicating source.
+  together and reported as q1..q32. --context defaults to 1 line on each side and may be zero.
+  --max-items limits matching lines (default 48, maximum 10,000); --max-bytes limits complete
+  rendered context blocks (default 24 KiB). Overlapping windows merge without duplicating source.
   Put `--` before a literal or regex pattern beginning with `-`.
 
 OUTPUT AND SCOPE

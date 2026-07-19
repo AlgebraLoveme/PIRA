@@ -55,7 +55,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `forget` requires explicit user permission and is only for erroneous/sensitive records; never use it to rewrite history.
 
 ### `pira_codenav`
-- Consult `pira_codenav --help`. Start from the narrowest known path and distinctive declaration name or body text; keep default output bounds and narrow the query before raising them.
-- Batch only closely related precise queries. Use `find` for declaration names, `search` for body text, `outline` for known-file structure, `show` for known targets, and `map` when relevant files are unknown. `find` includes small unique source automatically.
-- Once an exact line range is known, prefer a bounded generic read; use `show` when structural selection, selector validation, line numbering, or batched spans add value.
-- Use LSP subcommands for semantic relationships rather than text matching; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
+- Use `pira_codenav` for structural discovery, file relationships, and LSP semantics—not as a blanket replacement for shell text tools. Consult `pira_codenav --help`.
+- Known-path literal/regex body text → `rg`; known line range → bounded generic read. Use codenav `search` only when language filtering, merged bounded context, or enclosing-item annotation adds value.
+- Declaration/outline/repository shape → `find`/`outline`/`map`; batch related names. Exact semantic relationships → one batched `query` when possible; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
+- Keep default bounds and narrow paths before raising them. Without an LSP, choose `--no-lsp` only when structural parsing adds value beyond precise text inspection.

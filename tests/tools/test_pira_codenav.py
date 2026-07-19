@@ -2233,6 +2233,76 @@ class PiraCodeNavTests(unittest.TestCase):
             )
             self.assertIn("matches=1 shown=1", leading_dash.stdout.splitlines()[0])
 
+    def test_search_ranks_multi_term_public_files_before_early_generic_matches(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-search-rank-") as temp:
+            root = Path(temp)
+            for index in range(12):
+                (root / f"_internal_{index:02}.py").write_text(
+                    "def helper():\n"
+                    "    common_target = 1\n"
+                    "    return common_target\n",
+                    encoding="utf-8",
+                )
+            (root / "api.py").write_text(
+                "def public_entry():\n"
+                "    marker_alpha = 1\n"
+                "    marker_beta = 2\n"
+                "    return common_target(marker_alpha, marker_beta)\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_cli(
+                "search",
+                ".",
+                "marker_alpha",
+                "marker_beta",
+                "common_target",
+                "--max-items",
+                "4",
+                "--context",
+                "0",
+                cwd=root,
+            )
+            self.assertIn("matches=27 shown=4", result.stdout.splitlines()[0])
+            self.assertIn("match file=api.py", result.stdout)
+            self.assertIn('items="public_entry"', result.stdout)
+
+    def test_search_keeps_late_declaration_match_over_early_generic_lines(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-search-late-") as temp:
+            root = Path(temp)
+            (root / "sample.py").write_text(
+                "\n".join(["target_name()"] * 12)
+                + "\n\ndef target_name():\n    return 1\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "search",
+                ".",
+                "target_name",
+                "--max-items",
+                "2",
+                "--context",
+                "0",
+                cwd=root,
+            )
+            self.assertIn("matches=13 shown=2", result.stdout.splitlines()[0])
+            self.assertIn(">14 | def target_name():", result.stdout)
+
+    def test_map_defaults_to_200_and_rejects_depth_with_direct_guidance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-codenav-map-bound-") as temp:
+            root = Path(temp)
+            for index in range(205):
+                (root / f"module_{index:03}.py").write_text(
+                    f"def function_{index}():\n    return {index}\n", encoding="utf-8"
+                )
+            result = self.run_cli("map", ".", "--no-lsp", cwd=root)
+            self.assertIn("files=205 shown=200", result.stdout.splitlines()[0])
+            self.assertIn("omitted=5", result.stdout.splitlines()[0])
+
+            depth = self.run_cli("map", ".", "--depth", "2", "--no-lsp", cwd=root, expected=2)
+            self.assertIn("map has no --depth option", depth.stderr)
+            self.assertIn("narrower DIRECTORY", depth.stderr)
+
     def test_show_window_and_find_show_unique_avoid_large_body_expansion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pira-codenav-retrieve-") as temp:
             root = Path(temp)

@@ -378,17 +378,17 @@ Reading an entire repository is slow and context-heavy. `pira_codenav` helps an 
 
 Choose the cheapest operation that can return enough evidence:
 
-1. `search` batches known implementation terms such as calls, assignments, literals, and conditions.
+1. Use ordinary `rg` or a bounded read for exact body text or line ranges already narrowed to known paths.
 2. `find` batches declaration names, tries exact names before substring fallback, ranks public/close matches first, and includes small unique source automatically.
-3. `show` returns a known item, line span, or line window; `outline` gives a known file's declarations without bodies.
-4. `map` gives a bounded repository or subsystem shape when the relevant files are unknown.
+3. `outline` gives a known file's declarations without bodies; structural `show` selects a named item, while parser-free `show` can validate selectors or batch exact spans.
+4. `map` gives a bounded repository or subsystem shape when relevant files are unknown.
 5. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
-6. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a caller-installed language server.
-7. `query` mixes up to 32 semantic operations while sharing the same invocation-local servers and open documents.
+6. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a caller-installed language server; `query` mixes up to 32 operations while sharing servers and open documents.
+7. `search` is the bounded language-filtered alternative when merged context and clean enclosing-item annotations add value beyond plain text matching.
 
 It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. All native parsers are built into one executable. Explicit native mode needs no language runtime, daemon, database, network, project initialization, package manager, or runtime download. Run `pira_codenav --help` for usage.
 
-Output stays compact by omitting routine success details. Failures, incomplete results, omitted items, truncation, ambiguity, unsupported files, and language-server use remain explicit.
+Output stays compact by omitting routine success details. Default `search` returns at most 48 ranked matches and 24 KiB with one context line, multi-target `show` uses 32 KiB, and `map` returns at most 200 balanced files. Explicit limits can be raised when needed. Failures, incomplete results, omitted items, truncation, ambiguity, unsupported files, and language-server use remain explicit.
 
 #### Native and LSP backends
 
@@ -421,7 +421,7 @@ ast-outline and Grove are useful functional baselines for compact structure and 
 | Native structural targets | 1,047 |
 | Location / freshness-selector round trips | 1,047/1,047 each |
 | Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 87 / 17 / 14 |
+| Functional / inert security / Rust tests | 89 / 17 / 14 |
 | Reproducible benchmark tasks | 40 |
 
 The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.

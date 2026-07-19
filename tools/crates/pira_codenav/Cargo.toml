@@ -1,6 +1,6 @@
 [package]
 name = "pira_codenav"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Read-only structural code navigation for PIRA agents"
 license = "Apache-2.0"
