@@ -280,7 +280,9 @@ const EXEC: &str = r#"pira_ctx exec — analyze a stored capture with explicit P
 
 WHEN TO USE
   Use for substantial or custom analysis not covered clearly by transform. Print only the result
-  needed for the current decision; analysis output itself follows non-interactive automatic routing.
+  needed for the current decision: aggregate large collections and prefer counts/coordinates over
+  matching source text unless that text is itself the answer. Retrieve a narrow unresolved
+  diagnostic afterward. Analysis output itself follows non-interactive automatic routing.
 
 USAGE
   pira_ctx exec [--store-dir PATH] RESULT --intent TEXT
