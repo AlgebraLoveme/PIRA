@@ -505,6 +505,16 @@ impl StreamReaders {
         reader.copy_range(0, length, output)
     }
 
+    pub fn read_section_prefix(
+        &mut self,
+        stream: StreamKind,
+        maximum: u64,
+    ) -> Result<Vec<u8>, String> {
+        let reader = self.parts_mut(stream);
+        let length = reader.length().min(maximum);
+        reader.read_range(0, length)
+    }
+
     fn parts_mut(&mut self, stream: StreamKind) -> &mut SectionReader {
         match stream {
             StreamKind::Stdout => &mut self.stdout,

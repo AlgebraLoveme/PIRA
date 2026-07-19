@@ -252,6 +252,8 @@ Automatic mode works as follows:
 2. Long or diagnostic output is stored locally, while the model receives a short evidence-based summary and a capture ID.
 3. The agent can later search, inspect a range, analyze, or replay the retained output.
 
+For complete stdout-only JSON up to 512 KiB, the compact view exposes bounded scalar fields, small containers, and collection sizes before a few line excerpts. This keeps structured analysis results useful without replaying large arrays; the exact JSON remains stored.
+
 Streams remain in memory through 64 KiB and spill only once when they grow larger or a live checkpoint needs an append-only path. Rebuildable event indexes avoid synchronous durability barriers; exact captures and authoritative event records remain durably published.
 
 For jobs where only the outcome matters—such as builds, tests, or linting—`check` stores the log but returns a single PASS/FAIL line, exit code, and capture ID.

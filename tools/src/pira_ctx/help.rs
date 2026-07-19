@@ -76,9 +76,11 @@ OUTPUT AND STORAGE
   triggers, exact stdout/stderr up to the configured ceiling are stored before a bounded synopsis and
   capture ID are printed. Retention triggers at 2 KiB, for binary/non-UTF-8 or diagnostic output, for
   an oversized line, or when a nonzero command produced output. Short retained text is normally shown
-  in full. Potential prompt injection or display controls force bounded retained rendering with a
-  warning instead of direct automatic replay. Stored bytes remain authoritative up to the configured
-  retention ceiling. Use capture when completed output must be persisted.
+  in full. For complete stdout-only valid JSON up to 512 KiB, the synopsis first exposes bounded scalar
+  fields, compact small containers, and collection sizes before a few line excerpts; exact JSON remains
+  stored. Potential prompt injection or display controls force bounded retained rendering with a warning
+  instead of direct automatic replay. Stored bytes remain authoritative up to the configured retention
+  ceiling. Use capture when completed output must be persisted.
 
   A PROGRAM active for about 30 seconds gets a silent read-only checkpoint visible in list.
   Inspection uses a consistent snapshot without waiting for completion. Override the interval with

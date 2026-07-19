@@ -1,9 +1,159 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use crate::model::{CaptureResult, LineMeta, StreamKind, line_flag};
 use crate::util;
+
+const MAX_JSON_SYNOPSIS_INPUT_BYTES: u64 = 512 * 1024;
+const MAX_JSON_PROBE_BYTES: u64 = 256;
+const MAX_JSON_INLINE_BYTES: usize = 768;
+const MAX_JSON_INLINE_ITEMS: usize = 8;
+const MAX_JSON_DEPTH: usize = 6;
+const MAX_JSON_PATH_BYTES: usize = 256;
+
+pub fn json_synopsis(
+    capture: &CaptureResult,
+    maximum_lines: usize,
+) -> Result<Option<Vec<String>>, String> {
+    if maximum_lines == 0
+        || capture.stdout.length == 0
+        || capture.stdout.length > MAX_JSON_SYNOPSIS_INPUT_BYTES
+        || capture.stderr.length != 0
+        || capture.stdout.binary
+        || capture.stdout.non_utf8
+        || capture.retention_truncated
+    {
+        return Ok(None);
+    }
+    let mut readers = capture.readers()?;
+    let prefix = readers.read_section_prefix(StreamKind::Stdout, MAX_JSON_PROBE_BYTES)?;
+    let prefix = prefix
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(&prefix)
+        .trim_ascii_start();
+    if !matches!(prefix.first(), Some(b'{') | Some(b'[')) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(capture.stdout.length as usize);
+    readers.copy_section(StreamKind::Stdout, &mut bytes)?;
+    Ok(json_synopsis_bytes(&bytes, maximum_lines))
+}
+
+fn json_synopsis_bytes(bytes: &[u8], maximum_lines: usize) -> Option<Vec<String>> {
+    let bytes = bytes
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(bytes)
+        .trim_ascii();
+    if !matches!(bytes.first(), Some(b'{') | Some(b'[')) {
+        return None;
+    }
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if !matches!(
+        root,
+        serde_json::Value::Object(_) | serde_json::Value::Array(_)
+    ) {
+        return None;
+    }
+
+    let mut pending = VecDeque::new();
+    match &root {
+        serde_json::Value::Object(values) => {
+            pending.extend(
+                values
+                    .iter()
+                    .map(|(key, value)| (json_path("$", key), value, 1_usize)),
+            );
+        }
+        serde_json::Value::Array(_) => pending.push_back(("$".into(), &root, 0)),
+        _ => unreachable!(),
+    }
+
+    let data_limit = maximum_lines.saturating_sub(1).max(1);
+    let mut lines = Vec::with_capacity(maximum_lines.min(16));
+    while lines.len() < data_limit {
+        let Some((path, value, depth)) = pending.pop_front() else {
+            break;
+        };
+        if let Some(compact) = compact_json(value, 0) {
+            lines.push(format!("{path} = {compact}"));
+            continue;
+        }
+        match value {
+            serde_json::Value::Object(values) if depth < MAX_JSON_DEPTH => {
+                pending.extend(
+                    values
+                        .iter()
+                        .map(|(key, value)| (json_path(&path, key), value, depth + 1)),
+                );
+            }
+            serde_json::Value::Object(values) => {
+                lines.push(format!("{path} = object[{}]", values.len()));
+            }
+            serde_json::Value::Array(values) => {
+                lines.push(format!("{path} = array[{}]", values.len()));
+            }
+            serde_json::Value::String(value) => {
+                lines.push(format!("{path} = string[{} B]", value.len()));
+            }
+            _ => lines.push(format!("{path} = {value}")),
+        }
+    }
+    if !pending.is_empty() && lines.len() < maximum_lines {
+        lines.push("... additional JSON fields omitted".into());
+    }
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn compact_json(value: &serde_json::Value, depth: usize) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+        serde_json::Value::String(value) if value.len() <= 160 => {}
+        serde_json::Value::Array(values) if values.len() <= MAX_JSON_INLINE_ITEMS => {
+            for value in values {
+                compact_json(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) if values.len() <= MAX_JSON_INLINE_ITEMS => {
+            for value in values.values() {
+                compact_json(value, depth + 1)?;
+            }
+        }
+        _ => return None,
+    }
+    let rendered = serde_json::to_string(value).ok()?;
+    (rendered.len() <= MAX_JSON_INLINE_BYTES).then_some(rendered)
+}
+
+fn json_path(base: &str, key: &str) -> String {
+    let next = if is_json_identifier(key) {
+        format!("{base}.{key}")
+    } else {
+        let key = raw_clip(key, 128);
+        format!(
+            "{base}[{}]",
+            serde_json::to_string(key).unwrap_or_else(|_| "\"?\"".into())
+        )
+    };
+    raw_clip(&next, MAX_JSON_PATH_BYTES).into()
+}
+
+fn is_json_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
+fn raw_clip(value: &str, maximum_bytes: usize) -> &str {
+    let mut end = value.len().min(maximum_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
 
 pub fn score_timeline(capture: &mut CaptureResult, keywords: &[String]) -> Result<(), String> {
     let total = capture.total_lines;
@@ -1050,5 +1200,46 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(select_important(&lines, 2).contains(&4));
+    }
+
+    #[test]
+    fn json_synopsis_preserves_scalars_and_compacts_large_arrays() {
+        let value = serde_json::json!({
+            "statuses": [
+                {"name": "tree", "exit": 0},
+                {"name": "tests", "exit": 1}
+            ],
+            "tree": {
+                "path_count": 4559,
+                "prefix": {"nn": 138, "_dynamo": 119},
+                "files": (0..20).collect::<Vec<_>>()
+            },
+            "diagnostics": (0..300).map(|index| format!("warning {index}")).collect::<Vec<_>>(),
+            "counts": {"warnings": 197, "citations": 108}
+        });
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        let lines = json_synopsis_bytes(&bytes, 16).unwrap();
+        assert!(lines.contains(
+            &r#"$.statuses = [{"exit":0,"name":"tree"},{"exit":1,"name":"tests"}]"#.to_string()
+        ));
+        assert!(lines.contains(&"$.tree.path_count = 4559".to_string()));
+        assert!(lines.contains(&"$.diagnostics = array[300]".to_string()));
+        assert!(lines.contains(&r#"$.counts = {"citations":108,"warnings":197}"#.to_string()));
+        assert!(lines.iter().all(|line| !line.contains("warning 299")));
+    }
+
+    #[test]
+    fn json_synopsis_is_bounded_and_requires_one_complete_document() {
+        let hostile_key = format!("key-{}", "x".repeat(1_000));
+        let value = serde_json::json!({
+            hostile_key: {"nested": {"value": 1}},
+            "long": "x".repeat(1_000),
+            "many": (0..100).collect::<Vec<_>>(),
+        });
+        let lines = json_synopsis_bytes(&serde_json::to_vec(&value).unwrap(), 3).unwrap();
+        assert!(lines.len() <= 3);
+        assert!(lines.iter().all(|line| line.len() < 1_100));
+        assert!(json_synopsis_bytes(b"{\"ok\": true}\n{\"ok\": false}", 8).is_none());
+        assert!(json_synopsis_bytes(b"ordinary text", 8).is_none());
     }
 }

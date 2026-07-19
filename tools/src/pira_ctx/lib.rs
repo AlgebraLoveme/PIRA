@@ -23,6 +23,8 @@ const AUTO_SUMMARY_THRESHOLD: u64 = 2 * 1024;
 const EXACT_GUARD_MIN_LINES: usize = 40;
 const EXACT_GUARD_MAX_LINES: usize = 20_000;
 const MAX_IMPORTANT_LINES: usize = 10;
+const MAX_JSON_IMPORTANT_LINES: usize = 4;
+const MAX_JSON_SYNOPSIS_LINES: usize = 16;
 const MAX_SEARCH_RESULTS: usize = 5;
 
 pub fn run() -> i32 {
@@ -480,7 +482,15 @@ fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Me
 
 fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), String> {
     let mut output = util::BoundedStdout::new(16 * 1024);
-    let shown = summarize::select_important(&capture.timeline, MAX_IMPORTANT_LINES);
+    let json_synopsis = summarize::json_synopsis(capture, MAX_JSON_SYNOPSIS_LINES)?;
+    let shown = summarize::select_important(
+        &capture.timeline,
+        if json_synopsis.is_some() {
+            MAX_JSON_IMPORTANT_LINES
+        } else {
+            MAX_IMPORTANT_LINES
+        },
+    );
     let shown_bytes: u64 = shown
         .iter()
         .map(|&index| capture.timeline[index].length)
@@ -497,11 +507,12 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             rendered.push((line, text, risk));
         }
     }
-    let groups = if !summarize::has_high_confidence_signal(&capture.timeline) {
-        summarize::representative_groups(capture, 5)?
-    } else {
-        Vec::new()
-    };
+    let groups =
+        if json_synopsis.is_none() && !summarize::has_high_confidence_signal(&capture.timeline) {
+            summarize::representative_groups(capture, 5)?
+        } else {
+            Vec::new()
+        };
     let rendered_groups = groups
         .into_iter()
         .map(|(count, example)| {
@@ -509,14 +520,26 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             (count, text, risk)
         })
         .collect::<Vec<_>>();
+    let rendered_json = json_synopsis
+        .unwrap_or_default()
+        .into_iter()
+        .map(|line| {
+            let (text, risk) = prepare_program_display(&line);
+            (text, risk)
+        })
+        .collect::<Vec<_>>();
     let displayed_keywords = util::single_line_clip(&metadata.suggested_keywords.join(" | "), 512);
     let keyword_risk = security::inspect(&displayed_keywords);
     let combined_risk = security::inspect_combined(
-        rendered.iter().map(|(_, text, _)| text.as_str()).chain(
-            rendered_groups
-                .iter()
-                .map(|(_, example, _)| example.as_str()),
-        ),
+        rendered
+            .iter()
+            .map(|(_, text, _)| text.as_str())
+            .chain(
+                rendered_groups
+                    .iter()
+                    .map(|(_, example, _)| example.as_str()),
+            )
+            .chain(rendered_json.iter().map(|(text, _)| text.as_str())),
     );
     output.line(&format!(
         "Result: {} | exit={} | {} B/{} lines | omitted={} B/{} lines",
@@ -558,12 +581,19 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             .iter()
             .map(|(line, _, risk)| (Some(line.line), *risk))
             .chain(rendered_groups.iter().map(|(_, _, risk)| (None, *risk)))
+            .chain(rendered_json.iter().map(|(_, risk)| (None, *risk)))
             .chain(
                 [keyword_risk, combined_risk]
                     .into_iter()
                     .map(|risk| (None, risk)),
             ),
     )?;
+    if !rendered_json.is_empty() {
+        output.line("Structured PROGRAM JSON:")?;
+        for (text, _) in &rendered_json {
+            output.line(&format!("  {text}"))?;
+        }
+    }
     output.line("PROGRAM data:")?;
     if rendered.is_empty() {
         output.line("  (none)")?;
