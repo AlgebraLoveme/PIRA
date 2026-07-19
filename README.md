@@ -226,16 +226,16 @@ Each condition was one independent `gpt-5.6-sol` high-reasoning run against a pi
 
 | Repository | Comparison | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| PyTorch | `pira_ctx` / no PIRA | 100% / 100% | — | +144.1% | +56.1% | +55.2% | −44.0% | 9 / 3 |
+| PyTorch | `pira_ctx` / no PIRA | 100% / 100% | — | +160.6% | +18.6% | +75.9% | −48.2% | 6 / 2 |
 | PyTorch | `pira_codenav` / no PIRA | 100% / 100% | (93.3% / 100%) vs (93.3% / 100%) | −21.1% | +51.9% | +6.5% | +41.7% | 9 / 13 |
-| JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +277.5% | −19.2% | +45.8% | +667.1% | 6 / 1 |
+| JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +308.2% | +90.1% | +164.3% | +480.8% | 12 / 3 |
 | JAX | `pira_codenav` / no PIRA | 100% / 98.4% | (64.5% / 76.9%) vs (69.4% / 100%) | −24.0% | −41.4% | −19.1% | −28.9% | 18 / 19 |
 
 `pira_codenav` is now a selective companion to `rg` and bounded reads rather than a blanket replacement. It reduced total tokens on both repositories. On JAX, one batched LSP query also improved answer correctness and reduced noncached tokens, wall time, and output, although the answer cited fewer of the reference sites. On PyTorch, fewer commands reduced repeated cached context, while preemptively enlarged search bounds still increased noncached tokens, output, and wall time. This is useful but not a Pareto improvement on every metric.
 
-The context comparison deliberately gives the baseline the five raw outputs as pre-saved files and permits one aggregate shell/Python command. That duplicates `pira_ctx`'s central storage advantage and isolates post-hoc analysis overhead. In this setting, `pira_ctx` preserved perfect answers and reduced PyTorch output, but extra help and targeted-recovery turns increased total cost; the JAX baseline solved the task in one command. The result therefore does not claim that `pira_ctx` strictly improves already-file-backed analysis. Its main benefit remains automatic protection from unpredictable live command output, measured separately below.
+The context comparison deliberately gives the baseline the five raw outputs as pre-saved files and permits aggregate shell/Python analysis. That duplicates `pira_ctx`'s central storage advantage and isolates post-hoc analysis overhead. In this setting, `pira_ctx` preserved perfect answers and nearly halved PyTorch output, but extra help and repeated context still increased total cost. The JAX tool run made three recoverable mistakes in its custom Python analysis, illustrating the variance and retry cost that a wrapper cannot remove. The result therefore does not claim that `pira_ctx` strictly improves already-file-backed analysis. Its main benefit remains automatic protection from unpredictable live command output, measured separately below.
 
-Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Output bytes measure tool-visible terminal output, not model context directly. Results are final-candidate `pira_ctx` 1.3.0 / `pira_codenav` 0.6.0 development protocols 16 and 7. This is one trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
+Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Output bytes measure tool-visible terminal output, not model context directly. The context rows use final-candidate `pira_ctx` 1.4.0 development protocols 17 and 8; the unchanged navigation rows use `pira_codenav` 0.6.0 protocols 16 and 7. This is one trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
 </details>
 
@@ -295,7 +295,7 @@ PIRA uses `pira_ctx` when a small single-binary wrapper and exact local fallback
 
 #### Comprehensive held-out benchmark
 
-The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.3.0` on that corpus:
+The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, live checkpointing, or structured-JSON rendering; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.4.0` on that corpus:
 
 | Suite | Cases | Holdout source |
 |---|---:|---|
@@ -307,12 +307,12 @@ The remote importer scanned raw logs in memory and persisted only fixed-point sa
 
 | Mode on the same 2,248,456 raw bytes | Returned context | Complete stored state | Median overhead | Immediate labeled evidence |
 |---|---:|---:|---:|---:|
-| `pira_ctx 1.3.0` automatic synopsis | 44,222 B (98.0% reduction) | 628,056 B (72.1% reduction) | +20.0 ms | 5/13 |
+| `pira_ctx 1.4.0` automatic synopsis | 44,222 B (98.0% reduction) | 628,056 B (72.1% reduction) | +20.0 ms | 5/13 |
 | Context Mode generic passthrough | 71,621 B (96.8% reduction) | 17,039,820 B (657.8% overhead) | +16.1 ms | 9/13 |
-| `pira_ctx 1.3.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +19.9 ms | N/A—status only |
+| `pira_ctx 1.4.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +20.3 ms | N/A—status only |
 | Context Mode `ctx_index` receipt | 7,843 B (99.7% reduction) | 13,992,387 B (522.3% overhead) | N/A—no corresponding raw baseline | 0/13 |
 
-All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.3.0 retains the frozen selection and quality counts. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
+All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.4.0 retains the frozen selection and quality counts. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
 
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
@@ -325,7 +325,7 @@ The remote extension was fixed before inspecting output content. It reconstructe
 
 LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
-Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.3.0. Deterministic byte/storage figures were identical across three 1.3.0 replays of the selected 45 fixtures through persistent automatic and `check` stores. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. The table reports the median of the three per-replay case medians. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
+Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.4.0. Deterministic byte/storage figures were identical across three 1.4.0 replays of the selected 45 fixtures through persistent automatic and `check` stores. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. The table reports the median of the three per-replay case medians. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
 
 | Held-out category | Cases | Outcomes | Immediate quality | Context reduction |
 |---|---:|---:|---:|---:|
@@ -527,7 +527,7 @@ The `find` row includes its small unique declaration source by default, trading 
 
 Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
 
-A minimal `pira_codenav --version` call measured 2.781 ms median / 3.274 ms p95 on native macOS. The optimized macOS arm64 binary is 51,307,504 bytes, or 5,779,739 bytes with deterministic gzip level 9.
+A minimal `pira_codenav --version` call measured 2.781 ms median / 3.274 ms p95 on native macOS. The optimized macOS arm64 binary is 51,307,488 bytes, or 5,779,854 bytes with deterministic gzip level 9.
 
 <details>
 <summary>Benchmark method and limitations</summary>
