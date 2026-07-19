@@ -295,8 +295,9 @@ USAGE
                 --intent TEXT (--code CODE | --file PATH) [--python PATH]
 
 BINDINGS
-  CAPTURES            Ordered mapping from each input name to a record containing text, bytes,
-                      private paths, id, exit, state, and generation.
+  CAPTURES            Ordered mapping from each input name to a record. Read content as
+                      CAPTURES[name]["text"] or ["bytes"]. Other keys are path, stdout_path,
+                      stderr_path, id, exit, state, and generation.
   CAPTURE_NAMES       Input names in command order.
   MSGS                Merged texts in command order; MSG_BYTES_LIST and MSG_IDS are parallel lists.
   MSG...              The scalar bindings below exist only for a single RESULT/input.
@@ -325,7 +326,9 @@ BEHAVIOR
 
 EXAMPLES
   pira_ctx exec --last --intent "Count failures" --code 'print(MSG.count("FAILED"))'
-  pira_ctx exec --input build=ID1 --input tests=ID2 --intent "Compare failures" --file -
+  pira_ctx exec --input build=ID1 --input tests=ID2 --intent "Compare failures" --file - <<'PY'
+  print({name: item["text"].count("FAILED") for name, item in CAPTURES.items()})
+  PY
   pira_ctx exec RESULT --intent "Extract errors" --file analysis.py"#;
 
 const RECAP: &str = r#"pira_ctx recap — restore recent same-thread command events after compaction
