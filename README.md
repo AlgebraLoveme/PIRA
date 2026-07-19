@@ -222,18 +222,20 @@ An isolated development benchmark tested whether the tools help a fresh agent an
 <details>
 <summary>Method, results, and interpretation</summary>
 
-Each condition was one independent `gpt-5.6-sol` high-reasoning run against a pinned, read-only PyTorch or JAX checkout. Tool and no-PIRA conditions received the same questions; baselines could use all ordinary read-only shell and Python facilities. Both JAX navigation conditions also received the same pinned Pyright server. All eight runs answered every scored claim correctly and had no tool-protocol violations.
+Each condition was one independent `gpt-5.6-sol` high-reasoning run against a pinned, read-only PyTorch or JAX checkout. Tool and no-PIRA conditions received the same questions; baselines could use all ordinary read-only shell and Python facilities. Both JAX navigation conditions received the same pinned Pyright server, extracted before timing. All eight runs had no tool-protocol violations. Seven answered every claim correctly; the JAX navigation baseline answered 62/63.
 
-| Repository | Comparison | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Command-output bytes |
-|---|---|---:|---:|---:|---:|---:|---:|
-| PyTorch | `pira_ctx` / no PIRA | 100% / 100% | — | +198.0% | +25.8% | +63.8% | −36.5% |
-| PyTorch | `pira_codenav` / no PIRA | 100% / 100% | (80.0% / 100%) vs (82.4% / 100%) | +68.0% | +44.0% | +20.3% | +12.9% |
-| JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +94.2% | +18.1% | +49.3% | +525.5% |
-| JAX | `pira_codenav` / no PIRA | 100% / 100% | (96.0% / 92.3%) vs (96.0% / 92.3%) | −17.0% | −30.8% | −27.4% | +18.6% |
+| Repository | Comparison | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| PyTorch | `pira_ctx` / no PIRA | 100% / 100% | — | +144.1% | +56.1% | +55.2% | −44.0% | 9 / 3 |
+| PyTorch | `pira_codenav` / no PIRA | 100% / 100% | (93.3% / 100%) vs (93.3% / 100%) | −21.1% | +51.9% | +6.5% | +41.7% | 9 / 13 |
+| JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +277.5% | −19.2% | +45.8% | +667.1% | 6 / 1 |
+| JAX | `pira_codenav` / no PIRA | 100% / 98.4% | (64.5% / 76.9%) vs (69.4% / 100%) | −24.0% | −41.4% | −19.1% | −28.9% | 18 / 19 |
 
-The result is deliberately not presented as a universal win. `pira_codenav` helped on the JAX questions because its LSP interface replaced several difficult hand-written protocol scripts, but it added turns and output for the PyTorch questions, which were already tractable with precise `rg` and bounded reads. `pira_ctx` reduced visible output on PyTorch, yet both context tasks favored a baseline that aggregated all five files in one Python call; the agent instead inspected captures one at a time, paid help and retry costs, and accumulated more conversational turns. Those findings motivated labeled multi-capture analysis and stdin-safe multiline Python; the table remains the pre-change diagnostic until a fresh agent-level run replaces it.
+`pira_codenav` is now a selective companion to `rg` and bounded reads rather than a blanket replacement. It reduced total tokens on both repositories. On JAX, one batched LSP query also improved answer correctness and reduced noncached tokens, wall time, and output, although the answer cited fewer of the reference sites. On PyTorch, fewer commands reduced repeated cached context, while preemptively enlarged search bounds still increased noncached tokens, output, and wall time. This is useful but not a Pareto improvement on every metric.
 
-Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Command-output bytes measure tool-visible terminal output, not model context directly. This is a single development trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
+The context comparison deliberately gives the baseline the five raw outputs as pre-saved files and permits one aggregate shell/Python command. That duplicates `pira_ctx`'s central storage advantage and isolates post-hoc analysis overhead. In this setting, `pira_ctx` preserved perfect answers and reduced PyTorch output, but extra help and targeted-recovery turns increased total cost; the JAX baseline solved the task in one command. The result therefore does not claim that `pira_ctx` strictly improves already-file-backed analysis. Its main benefit remains automatic protection from unpredictable live command output, measured separately below.
+
+Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Output bytes measure tool-visible terminal output, not model context directly. Results are final-candidate `pira_ctx` 1.3.0 / `pira_codenav` 0.6.0 development protocols 16 and 7. This is one trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
 </details>
 
@@ -291,7 +293,7 @@ PIRA uses `pira_ctx` when a small single-binary wrapper and exact local fallback
 
 #### Comprehensive held-out benchmark
 
-The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.2.0` on that corpus:
+The fixed benchmark caps each category at five cases and contains **45 sanitized responses across ten categories**. Its individual fixture contents were not seen during development of the output-selection design and were not used to tune selection, scoring, thresholds, injection heuristics, or live checkpointing; the fixed runner served as a regression and final measurement gate. The table reports `pira_ctx 1.3.0` on that corpus:
 
 | Suite | Cases | Holdout source |
 |---|---:|---|
@@ -303,12 +305,12 @@ The remote importer scanned raw logs in memory and persisted only fixed-point sa
 
 | Mode on the same 2,248,456 raw bytes | Returned context | Complete stored state | Median overhead | Immediate labeled evidence |
 |---|---:|---:|---:|---:|
-| `pira_ctx 1.2.0` automatic synopsis | 44,222 B (98.0% reduction) | 628,056 B (72.1% reduction) | +19.8 ms | 5/13 |
+| `pira_ctx 1.3.0` automatic synopsis | 44,222 B (98.0% reduction) | 628,056 B (72.1% reduction) | +20.0 ms | 5/13 |
 | Context Mode generic passthrough | 71,621 B (96.8% reduction) | 17,039,820 B (657.8% overhead) | +16.1 ms | 9/13 |
-| `pira_ctx 1.2.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +19.6 ms | N/A—status only |
+| `pira_ctx 1.3.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +19.9 ms | N/A—status only |
 | Context Mode `ctx_index` receipt | 7,843 B (99.7% reduction) | 13,992,387 B (522.3% overhead) | N/A—no corresponding raw baseline | 0/13 |
 
-All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.2.0 retains the frozen selection and quality counts while reducing median wrapper overhead. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
+All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.3.0 retains the frozen selection and quality counts. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
 
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
@@ -321,7 +323,7 @@ The remote extension was fixed before inspecting output content. It reconstructe
 
 LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
-Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.2.0. The visible aggregate performance figures come from a 1.2.0 replay of the selected 45 fixtures through one persistent automatic store and one persistent `check` store. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`, summarized by the per-case median. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
+Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.3.0. Deterministic byte/storage figures were identical across three 1.3.0 replays of the selected 45 fixtures through persistent automatic and `check` stores. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. The table reports the median of the three per-replay case medians. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
 
 | Held-out category | Cases | Outcomes | Immediate quality | Context reduction |
 |---|---:|---:|---:|---:|
@@ -428,18 +430,18 @@ The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and inc
 
 #### Performance
 
-Each latency is a complete subprocess call through collected output. Native macOS arm64 measurements use the 0.5.0 release with 10 warmups and 100 calls. Same-sandbox Linux arm64 measurements use 5 warmups and 40 calls inside an already-running 2-CPU/4-GiB Docker Sandbox. Those retained columns measure overlapping 0.4.1 commands and do not include the new `query`; cross-tool comparisons use only same-sandbox columns. Host and sandbox timings describe different environments and are not compared directly.
+Each latency is a complete subprocess call through collected output. Native macOS arm64 measurements use the 0.6.0 release with 10 warmups and 100 calls. Same-sandbox Linux arm64 measurements use 5 warmups and 40 calls inside an already-running 2-CPU/4-GiB Docker Sandbox. Those retained columns measure overlapping 0.4.1 commands and do not include `query`; cross-tool comparisons use only same-sandbox columns. Host and sandbox timings describe different environments and are not compared directly.
 
 | Clean operation | PIRA native | PIRA sandbox | ast-outline 1.8.2 sandbox | Grove 0.3.1 sandbox |
 |---|---:|---:|---:|---:|
-| Python outline | 5.528 ms | 2.238 ms | 51.226 ms | 40.466 ms |
-| Rust outline | 7.282 ms | 3.348 ms | 52.752 ms | 42.178 ms |
-| Python exact item | 5.506 ms | 2.065 ms | 50.656 ms | 40.508 ms |
-| Python repository map | 4.635 ms | 0.927 ms | 49.323 ms | 35.797 ms |
-| Rust repository map | 4.589 ms | 0.860 ms | 48.708 ms | 33.463 ms |
-| Java outline | 4.596 ms | 0.951 ms | 47.728 ms | 29.241 ms |
-| C outline | 3.471 ms | 0.351 ms | unsupported | 71.696 ms |
-| C++ outline | 3.656 ms | 0.399 ms | 46.996 ms | 118.023 ms |
+| Python outline | 5.075 ms | 2.238 ms | 51.226 ms | 40.466 ms |
+| Rust outline | 6.719 ms | 3.348 ms | 52.752 ms | 42.178 ms |
+| Python exact item | 5.565 ms | 2.065 ms | 50.656 ms | 40.508 ms |
+| Python repository map | 4.153 ms | 0.927 ms | 49.323 ms | 35.797 ms |
+| Rust repository map | 4.214 ms | 0.860 ms | 48.708 ms | 33.463 ms |
+| Java outline | 3.632 ms | 0.951 ms | 47.728 ms | 29.241 ms |
+| C outline | 2.792 ms | 0.351 ms | unsupported | 71.696 ms |
+| C++ outline | 2.775 ms | 0.399 ms | 46.996 ms | 118.023 ms |
 
 On these tasks, the fastest available baseline took 12.6–204× as long as PIRA in the same sandbox. PIRA used about 4.1–5.6 MiB peak RSS, versus about 15.6–49.7 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
 
@@ -464,7 +466,7 @@ Real-server cost is dominated by server startup, project configuration, and cach
 
 With the deterministic protocol server, two definition targets took 33.056 ms median in one invocation versus 65.337 ms as two calls, a 1.98× speedup from shared startup and document state.
 
-On the native 0.5.0 release, one `query` combining definition, references, and hover took 37.932 ms median. The same three complete calls totaled 105.381 ms by their individual medians, so shared startup and document state reduced latency by 64.0% (2.78×).
+On the native 0.6.0 release, one `query` combining definition, references, and hover took 33.268 ms median. The same three complete calls totaled 96.863 ms by their individual medians, so shared startup and document state reduced latency by 65.7% (2.91×).
 
 ##### Subcommand context and latency
 
@@ -472,56 +474,58 @@ Context reduction compares returned UTF-8 bytes with complete source bytes other
 
 | Subcommand | Returned bytes | Context reduction | Native median | Sandbox median | Sandbox peak RSS |
 |---|---:|---:|---:|---:|---:|
-| `outline` | 1,652 | 92.4% | 5.528 ms | 2.238 ms | 4.1 MiB |
-| `show` | 3,334 | 84.6% | 5.506 ms | 2.065 ms | 4.1 MiB |
-| `map` | 432 | 69.9% | 4.635 ms | 0.927 ms | 4.6 MiB |
-| `find` | 650 | 54.6% | 4.934 ms | 0.976 ms | 4.6 MiB |
-| `imports` | 389 | 56.6% | 3.587 ms | 0.437 ms | 4.1 MiB |
-| `dependents` | 228 | 84.1% | 4.665 ms | 0.838 ms | 4.6 MiB |
-| `deps` | 342 | 76.1% | 4.702 ms | 0.818 ms | 4.6 MiB |
-| `definition` | 147 | 99.3% | 32.771 ms | 16.303 ms | 12.7 MiB |
-| `implementation` | 151 | 99.3% | 32.607 ms | 17.214 ms | 12.7 MiB |
-| `type-definition` | 152 | 99.3% | 33.604 ms | 16.539 ms | 12.7 MiB |
-| `references` | 1,435 | 93.4% | 37.156 ms | 16.461 ms | 12.7 MiB |
-| `callers` | 237 | 98.9% | 35.585 ms | 15.728 ms | 12.7 MiB |
-| `callees` | 237 | 98.9% | 38.017 ms | 16.063 ms | 12.7 MiB |
-| `hover` | 200 | 99.1% | 35.454 ms | 15.920 ms | 12.7 MiB |
-| `languages` | 166 | not applicable | 3.123 ms | 0.269 ms | 2.6 MiB |
+| `outline` | 1,652 | 92.4% | 5.075 ms | 2.238 ms | 4.1 MiB |
+| `show` | 3,334 | 84.6% | 5.565 ms | 2.065 ms | 4.1 MiB |
+| `map` | 432 | 69.9% | 4.153 ms | 0.927 ms | 4.6 MiB |
+| `find` | 650 | 54.6% | 4.430 ms | 0.976 ms | 4.6 MiB |
+| `search` | 2,313 | 89.3% | 6.389 ms | not measured | not measured |
+| `imports` | 389 | 56.6% | 3.034 ms | 0.437 ms | 4.1 MiB |
+| `dependents` | 228 | 84.1% | 4.262 ms | 0.838 ms | 4.6 MiB |
+| `deps` | 342 | 76.1% | 4.240 ms | 0.818 ms | 4.6 MiB |
+| `definition` | 147 | 99.3% | 32.674 ms | 16.303 ms | 12.7 MiB |
+| `implementation` | 151 | 99.3% | 32.504 ms | 17.214 ms | 12.7 MiB |
+| `type-definition` | 152 | 99.3% | 31.929 ms | 16.539 ms | 12.7 MiB |
+| `references` | 1,435 | 93.4% | 32.134 ms | 16.461 ms | 12.7 MiB |
+| `callers` | 237 | 98.9% | 31.570 ms | 15.728 ms | 12.7 MiB |
+| `callees` | 237 | 98.9% | 31.659 ms | 16.063 ms | 12.7 MiB |
+| `hover` | 200 | 99.1% | 32.055 ms | 15.920 ms | 12.7 MiB |
+| `query` | 2,075 | 90.4% | 33.268 ms | not measured | not measured |
+| `languages` | 166 | not applicable | 2.710 ms | 0.269 ms | 2.6 MiB |
 
-`outline`, `show`, and semantic rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
+`outline`, `show`, `search`, and semantic/query rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
 The `find` row includes its small unique declaration source by default, trading some single-call bytes for one fewer retrieval round trip; `--locations-only` keeps only ranked locations.
 
 ##### All-language outline regression
 
 | Language | Fixture | Source | Outline | Reduction | Native | Sandbox |
 |---|---|---:|---:|---:|---:|---:|
-| Python | Click | 21,680 B | 1,652 B | 92.4% | 5.528 ms | 2.238 ms |
-| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 7.282 ms | 3.348 ms |
-| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 4.596 ms | 0.951 ms |
-| C | synthetic | 210 B | 124 B | 41.0% | 3.471 ms | 0.351 ms |
-| C++ | synthetic | 202 B | 272 B | −34.7% | 3.656 ms | 0.399 ms |
-| CUDA | synthetic | 419 B | 198 B | 52.7% | 4.308 ms | 0.430 ms |
-| Bash | bats-core | 16,510 B | 291 B | 98.2% | 5.724 ms | 2.613 ms |
-| Go | synthetic | 119 B | 99 B | 16.8% | 3.621 ms | 0.288 ms |
-| JavaScript | synthetic | 181 B | 211 B | −16.6% | 4.456 ms | 0.311 ms |
-| TypeScript | synthetic | 386 B | 214 B | 44.6% | 4.489 ms | 0.353 ms |
-| C# | synthetic | 235 B | 239 B | −1.7% | 3.961 ms | 0.382 ms |
-| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 6.052 ms | 10.194 ms |
-| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 9.883 ms | 4.612 ms |
-| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 4.723 ms | 0.986 ms |
-| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 9.563 ms | 4.361 ms |
-| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 4.738 ms | 0.667 ms |
-| R | dplyr | 15,796 B | 712 B | 95.5% | 6.402 ms | 1.791 ms |
-| Ruby | Rails | 14,867 B | 142 B | 99.0% | 5.217 ms | 1.154 ms |
-| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 5.653 ms | 4.963 ms |
-| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 29.349 ms | 22.573 ms |
-| Dart | http | 3,856 B | 550 B | 85.7% | 4.660 ms | 1.087 ms |
-| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 9.611 ms | 9.124 ms |
-| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 5.188 ms | 1.072 ms |
+| Python | Click | 21,680 B | 1,652 B | 92.4% | 5.075 ms | 2.238 ms |
+| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 6.719 ms | 3.348 ms |
+| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 3.632 ms | 0.951 ms |
+| C | synthetic | 210 B | 124 B | 41.0% | 2.792 ms | 0.351 ms |
+| C++ | synthetic | 202 B | 272 B | −34.7% | 2.775 ms | 0.399 ms |
+| CUDA | synthetic | 419 B | 198 B | 52.7% | 2.868 ms | 0.430 ms |
+| Bash | bats-core | 16,510 B | 291 B | 98.2% | 4.530 ms | 2.613 ms |
+| Go | synthetic | 119 B | 99 B | 16.8% | 2.812 ms | 0.288 ms |
+| JavaScript | synthetic | 181 B | 211 B | −16.6% | 2.837 ms | 0.311 ms |
+| TypeScript | synthetic | 386 B | 214 B | 44.6% | 2.934 ms | 0.353 ms |
+| C# | synthetic | 235 B | 239 B | −1.7% | 2.936 ms | 0.382 ms |
+| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 4.857 ms | 10.194 ms |
+| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 8.360 ms | 4.612 ms |
+| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 3.498 ms | 0.986 ms |
+| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 7.897 ms | 4.361 ms |
+| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 3.303 ms | 0.667 ms |
+| R | dplyr | 15,796 B | 712 B | 95.5% | 4.606 ms | 1.791 ms |
+| Ruby | Rails | 14,867 B | 142 B | 99.0% | 3.535 ms | 1.154 ms |
+| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 4.299 ms | 4.963 ms |
+| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 27.233 ms | 22.573 ms |
+| Dart | http | 3,856 B | 550 B | 85.7% | 3.833 ms | 1.087 ms |
+| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 8.179 ms | 9.124 ms |
+| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 3.688 ms | 1.072 ms |
 
 Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
 
-A minimal `pira_codenav --version` call measured 3.934 ms median / 4.686 ms p95 on native macOS. The optimized macOS arm64 binary is 51,274,080 bytes, or 5,756,187 bytes with deterministic gzip level 9.
+A minimal `pira_codenav --version` call measured 2.781 ms median / 3.274 ms p95 on native macOS. The optimized macOS arm64 binary is 51,307,504 bytes, or 5,779,739 bytes with deterministic gzip level 9.
 
 <details>
 <summary>Benchmark method and limitations</summary>
