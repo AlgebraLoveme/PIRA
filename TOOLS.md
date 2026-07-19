@@ -56,6 +56,6 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 
 ### `pira_codenav`
 - Use `pira_codenav` for structural discovery, file relationships, and LSP semantics—not as a blanket replacement for shell text tools. Consult `pira_codenav --help`.
-- Known-path literal/regex body text → `rg`; known line range → bounded generic read. Use codenav `search` only when language filtering, merged bounded context, or enclosing-item annotation adds value.
+- One distinctive literal/regex in a known file → `rg` without broad context; a known line range → bounded generic read. Related or broad terms, uncertain match volume, language filtering, merged context, or enclosing-item annotation → codenav `search`, including on a known path.
 - Declaration/outline/repository shape → `find`/`outline`/`map`; batch related names. Exact semantic relationships → one batched `query` when possible; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
-- Keep default bounds and narrow paths before raising them. Without an LSP, choose `--no-lsp` only when structural parsing adds value beyond precise text inspection.
+- Start with a narrow path and default bounds; raise a bound only when a reported omission blocks the answer. Without an LSP, choose `--no-lsp` only when structural parsing adds value beyond precise text inspection.
