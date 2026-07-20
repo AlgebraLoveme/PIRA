@@ -55,7 +55,12 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `forget` requires explicit user permission and is only for erroneous/sensitive records; never use it to rewrite history.
 
 ### `pira_codenav`
-- Use `pira_codenav` for structural discovery, file relationships, and LSP semantics—not as a blanket replacement for shell text tools. Consult `pira_codenav --help`.
-- One distinctive literal/regex in a known file → `rg` without broad context; a known line range → bounded generic read. Related or broad terms, uncertain match volume, language filtering, merged context, or enclosing-item annotation → codenav `search`, including on a known path.
-- Declaration/outline/repository shape → `find`/`outline`/`map`; batch related names. Exact semantic relationships → one batched `query` when possible; conventional PATH servers are discovered automatically and explicit `--lsp` overrides them.
-- Start with a narrow path and default bounds; raise a bound only when a reported omission blocks the answer. Without an LSP, choose `--no-lsp` only when structural parsing adds value beyond precise text inspection.
+- Choose the cheapest sufficient inspection:
+  - known line range → one bounded read;
+  - exact/regex text, matching-file lists, or exhaustive counts → `rg` through `pira_ctx`; use `grep` mainly for stdin or when `rg` is unavailable;
+  - ranked multi-term source search, merged bounded context, language filtering, or enclosing-item annotation → codenav `search`;
+  - declarations, repository shape, items, imports, or file relationships → codenav structural commands;
+  - definitions, implementations, types, references, callers, callees, or hover → one batched codenav `query`.
+- Compose tools without repeating an inspection. Use `rg -l`, `-c`, or `-n` to narrow lexical evidence, then pass the smallest resulting path or location to codenav when structure or semantics is needed. After codenav discovers a symbol or path, use scoped `rg` only for exhaustive textual occurrences or counts.
+- Batch related names, patterns, spans, or semantic operations. Start with the narrowest path and default bounds; increase a bound only when a reported omission blocks the answer.
+- Codenav discovers conventional LSPs from `PATH`; use an explicit server only to override discovery. Use `--no-lsp` only when native structural parsing is deliberately sufficient.
