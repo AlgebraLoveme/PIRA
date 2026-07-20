@@ -240,12 +240,12 @@ Each navigation condition was one independent `gpt-5.6-sol` high-reasoning run a
 
 | Repository | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PyTorch | 100% / 100% | (93.3% / 100%) vs (93.3% / 100%) | −21.1% | +51.9% | +6.5% | +41.7% | 9 / 13 |
-| JAX | 100% / 98.4% | (64.5% / 76.9%) vs (69.4% / 100%) | −24.0% | −41.4% | −19.1% | −28.9% | 18 / 19 |
+| PyTorch | 100% / 100% | (87.5% / 100%) vs (88.2% / 100%) | +51.2% | +3.3% | +8.8% | +1.2% | 7 / 11 |
+| JAX | 100% / 100% | (71.4% / 100%) vs (62.8% / 100%) | −32.0% | −34.7% | −39.2% | −22.0% | 12 / 26 |
 
-`pira_codenav` is a selective companion to `rg` and bounded reads rather than a blanket replacement. It reduced total tokens on both repositories. On JAX, one batched LSP query also improved answer correctness and reduced noncached tokens, wall time, and output, although the answer cited fewer reference sites. On PyTorch, fewer commands reduced repeated cached context, while preemptively enlarged search bounds still increased noncached tokens, output, and wall time. This is useful but not a Pareto improvement on every metric.
+`pira_codenav` is a selective companion to `rg` and bounded reads rather than a blanket replacement. The revised rules correctly made the PyTorch tool condition abstain from codenav: six of seven command turns used `rg`, and both conditions answered every claim with full evidence-site recall. Two broad early lexical responses were then carried through later turns, leaving fresh tokens and output near baseline but increasing repeated cached context and total tokens. On JAX, the tool condition used codenav in nine of twelve turns, including one batched semantic query. It preserved full correctness and site recall, improved evidence precision, and reduced commands, tokens, output, and wall time. The contrast supports selective use when structural or semantic navigation replaces substantial manual inspection, not for text-local questions already solved cheaply by `rg`.
 
-Token totals include repeated cached context; noncached tokens separate that effect. Output bytes measure tool-visible terminal output rather than model context directly. The context result is development protocol 1; navigation uses `pira_codenav` protocols 16 and 7. Every condition is a single trial, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
+Token totals include repeated cached context; noncached tokens separate that effect. Output bytes measure tool-visible terminal output rather than model context directly. The context result is development protocol 1; navigation uses `pira_codenav` protocols 18 and 9. Every condition is a single trial, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
 </details>
 
