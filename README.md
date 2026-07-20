@@ -222,20 +222,30 @@ An isolated development benchmark tested whether the tools help a fresh agent an
 <details>
 <summary>Method, results, and interpretation</summary>
 
-Each condition was one independent `gpt-5.6-sol` high-reasoning run against a pinned, read-only PyTorch or JAX checkout. Tool and no-PIRA conditions received the same questions; baselines could use all ordinary read-only shell and Python facilities. Both JAX navigation conditions received the same pinned Pyright server, extracted before timing. All eight runs had no tool-protocol violations. Seven answered every claim correctly; the JAX navigation baseline answered 62/63.
+#### `pira_ctx`: natural implementation task
 
-| Repository | Comparison | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| PyTorch | `pira_ctx` / no PIRA | 100% / 100% | — | +160.6% | +18.6% | +75.9% | −48.2% | 6 / 2 |
-| PyTorch | `pira_codenav` / no PIRA | 100% / 100% | (93.3% / 100%) vs (93.3% / 100%) | −21.1% | +51.9% | +6.5% | +41.7% | 9 / 13 |
-| JAX | `pira_ctx` / no PIRA | 100% / 100% | — | +308.2% | +90.1% | +164.3% | +480.8% | 12 / 3 |
-| JAX | `pira_codenav` / no PIRA | 100% / 98.4% | (64.5% / 76.9%) vs (69.4% / 100%) | −24.0% | −41.4% | −19.1% | −28.9% | 18 / 19 |
+Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_decision` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had codenav or a decision binary. Both could write their isolated workspace and use ordinary Python and Git.
 
-`pira_codenav` is now a selective companion to `rg` and bounded reads rather than a blanket replacement. It reduced total tokens on both repositories. On JAX, one batched LSP query also improved answer correctness and reduced noncached tokens, wall time, and output, although the answer cited fewer of the reference sites. On PyTorch, fewer commands reduced repeated cached context, while preemptively enlarged search bounds still increased noncached tokens, output, and wall time. This is useful but not a Pareto improvement on every metric.
+Each generated implementation was then run inside its sandbox against the same 20 private black-box cases covering validation, JSON views, search, workspace scope, the checked record envelope, corruption, symlink rejection, safe deletion, concurrency, bounds, and temporary-file isolation.
 
-The context comparison deliberately gives the baseline the five raw outputs as pre-saved files and permits aggregate shell/Python analysis. That duplicates `pira_ctx`'s central storage advantage and isolates post-hoc analysis overhead. In this setting, `pira_ctx` preserved perfect answers and nearly halved PyTorch output, but extra help and repeated context still increased total cost. The JAX tool run made three recoverable mistakes in its custom Python analysis, illustrating the variance and retry cost that a wrapper cannot remove. The result therefore does not claim that `pira_ctx` strictly improves already-file-backed analysis. Its main benefit remains automatic protection from unpredictable live command output, measured separately below.
+| Correctness, tool / baseline | Total tokens, tool / baseline | Noncached tokens | Wall time | Command-output bytes | Commands, tool / baseline |
+|---:|---:|---:|---:|---:|---:|
+| 20/20 / 20/20 | 670,031 / 819,876 (**−18.3%**) | 70,735 / 108,964 (**−35.1%**) | 690.2 / 918.2 s (**−24.8%**) | 21,924 / 26,808 B (**−18.2%**) | 18 / 11 |
 
-Token totals include repeated cached context and therefore amplify extra turns; the noncached column separates that effect. Output bytes measure tool-visible terminal output, not model context directly. The context rows use final-candidate `pira_ctx` 1.4.0 development protocols 17 and 8; the unchanged navigation rows use `pira_codenav` 0.6.0 protocols 16 and 7. This is one trial per condition, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
+The ctx agent used the wrapper for all 18 commands with no protocol violations. It read PIRA help once, adding 3,229 output bytes already included above, and used exact mode for the complete authoritative design. More commands did not imply more context: its median command response was 260 B versus 1,483 B for the baseline, while status-only checks and a failed test retained bounded reports. However, this is one development trial rather than a causal estimate. The agents chose different implementations: the baseline produced 1,348 source/test lines and 14 self-tests, versus 1,086 lines and six self-tests for the ctx agent, although both passed every hidden case. That behavioral variance may explain part of the token and time difference. The valid ctx run was executed first, so run order did not give the tool a later prompt-cache advantage.
+
+#### `pira_codenav`: repository inspection
+
+Each navigation condition was one independent `gpt-5.6-sol` high-reasoning run against a pinned, read-only PyTorch or JAX checkout. Tool and no-PIRA conditions received the same source questions; baselines could use all ordinary read-only shell and Python facilities. Both JAX conditions received the same pinned Pyright server. All four runs had no tool-protocol violations.
+
+| Repository | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PyTorch | 100% / 100% | (93.3% / 100%) vs (93.3% / 100%) | −21.1% | +51.9% | +6.5% | +41.7% | 9 / 13 |
+| JAX | 100% / 98.4% | (64.5% / 76.9%) vs (69.4% / 100%) | −24.0% | −41.4% | −19.1% | −28.9% | 18 / 19 |
+
+`pira_codenav` is a selective companion to `rg` and bounded reads rather than a blanket replacement. It reduced total tokens on both repositories. On JAX, one batched LSP query also improved answer correctness and reduced noncached tokens, wall time, and output, although the answer cited fewer reference sites. On PyTorch, fewer commands reduced repeated cached context, while preemptively enlarged search bounds still increased noncached tokens, output, and wall time. This is useful but not a Pareto improvement on every metric.
+
+Token totals include repeated cached context; noncached tokens separate that effect. Output bytes measure tool-visible terminal output rather than model context directly. The context result is development protocol 1; navigation uses `pira_codenav` protocols 16 and 7. Every condition is a single trial, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
 </details>
 
