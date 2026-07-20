@@ -57,10 +57,11 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_codenav`: Read-Only Structural & Semantic Navigator
 - Choose the cheapest sufficient inspection:
   - known line range → one bounded read;
-  - exact/regex text, matching-file lists, or exhaustive counts → `rg` when available, otherwise `grep`;
+  - one literal or regex in a known or narrow path, with bounded expected matches → `rg -n` when available, otherwise `grep -n`;
+  - matching-file lists, exhaustive counts, or broad/multi-pattern lexical discovery → first narrow with `rg -l` or `rg -c`, otherwise the corresponding `grep` operations;
   - ranked multi-term source search, merged bounded context, language filtering, or enclosing-item annotation → codenav `search`;
   - declarations, repository shape, items, imports, or file relationships → codenav structural commands;
   - definitions, implementations, types, references, callers, callees, or hover → one batched codenav `query`.
-- Compose tools without repeating an inspection. Use `rg -l`, `-c`, or `-n`—or corresponding `grep` operations—to narrow lexical evidence, then pass the smallest resulting path or location to codenav when structure or semantics is needed. After codenav discovers a symbol or path, use scoped text search only for exhaustive occurrences or counts.
+- Compose tools without repeating an inspection. After broad lexical discovery identifies candidate files, produce matching lines only within the narrowed paths, or pass the smallest path or location to codenav when structure or semantics is needed. When broad discovery itself needs ranked snippets or source context, use codenav `search` directly. After codenav discovers a symbol or path, use scoped text search only for exhaustive occurrences or counts.
 - Batch related names, patterns, spans, or semantic operations. Start with the narrowest path and default bounds; increase a bound only when a reported omission blocks the answer.
 - Codenav discovers conventional LSPs from `PATH`; use an explicit server only to override discovery. Use `--no-lsp` only when native structural parsing is deliberately sufficient.
