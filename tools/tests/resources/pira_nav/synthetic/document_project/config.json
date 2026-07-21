@@ -1,0 +1,19 @@
+{
+  "scripts": {
+    "build": "cargo build",
+    "test": "cargo test"
+  },
+  "jobs": [
+    {
+      "name": "lint",
+      "steps": ["format", "clippy"]
+    },
+    {
+      "name": "test",
+      "steps": ["unit", "integration"]
+    }
+  ],
+  "a.b": {
+    "enabled": true
+  }
+}

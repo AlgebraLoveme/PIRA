@@ -2,13 +2,15 @@ use crate::model::{DecisionDraft, Maker};
 use std::path::PathBuf;
 
 const MAX_REGEX_BYTES: usize = 4 * 1024;
+const MAX_TIME_BYTES: usize = 256;
 
 pub const HELP: &str = r#"pira_decision records and searches medium-level workspace decisions.
 
 USAGE
   pira_decision add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
   pira_decision show ID [--json] [--store-dir PATH]
-  pira_decision search --field FIELD --regex PATTERN [--limit N] [--json] [--store-dir PATH]
+  pira_decision search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+                       [--limit N] [--json] [--store-dir PATH]
   pira_decision forget EXACT_ID --yes [--store-dir PATH]
   pira_decision help [COMMAND]
 
@@ -26,7 +28,7 @@ FIELDS
   --context TEXT    Concise problem and decisive constraints; exactly once.
   --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
   --decision N      One-based index selecting one listed choice.
-  --maker VALUE     Decision authority: human or agent; repeat to record a joint decision.
+  --maker VALUE     Decision authority: human or agent; human overrides agent if repeated.
 
 OPTIONS
   --store-dir PATH  Override the durable per-user store.
@@ -42,10 +44,11 @@ ID may be complete or an unambiguous prefix. The requested record is integrity-c
 display. Use --json for stable programmatic output.
 "#;
 
-const SEARCH_HELP: &str = r#"pira_decision search — regex-search one field across workspace decisions
+const SEARCH_HELP: &str = r#"pira_decision search — filter workspace decisions
 
 USAGE
-  pira_decision search --field FIELD --regex PATTERN [--limit N] [--json] [--store-dir PATH]
+  pira_decision search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+                       [--limit N] [--json] [--store-dir PATH]
 
 FIELDS
   id         Generated decision ID.
@@ -55,10 +58,16 @@ FIELDS
   maker      human or agent.
   timestamp  RFC 3339 UTC timestamp.
 
-Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are newest
-first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records, reports
-them as warnings, and may omit a record published concurrently. Use --json for structured matches
-and skipped-record details.
+TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since includes records at or after its
+bound; --until excludes records at or after its bound. Use either a field/regex pair, a time bound,
+or both. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
+newest first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records,
+reports them as warnings, and may omit a record published concurrently. Use --json for structured
+matches and skipped-record details.
+
+EXAMPLES
+  pira_decision search --since 7d --limit 20
+  pira_decision search --field context --regex '(?i)cache' --since 30d
 "#;
 
 const FORGET_HELP: &str = r#"pira_decision forget — logically delete one exact decision record
@@ -127,8 +136,10 @@ pub enum Command {
         json: bool,
     },
     Search {
-        field: SearchField,
-        pattern: String,
+        field: Option<SearchField>,
+        pattern: Option<String>,
+        since: Option<String>,
+        until: Option<String>,
         limit: usize,
         json: bool,
     },
@@ -197,7 +208,7 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
     let mut context = None;
     let mut choices = Vec::new();
     let mut decision = None;
-    let mut makers = Vec::new();
+    let mut maker = None;
     let mut store_dir = None;
     let mut index = 0;
     while index < args.len() {
@@ -215,7 +226,14 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
                     .map_err(|_| "--decision must be an unsigned integer".to_string())?;
                 set_once(&mut decision, parsed, "--decision")?;
             }
-            "--maker" => makers.push(Maker::parse(&value(args, &mut index, "--maker")?)?),
+            "--maker" => {
+                let next = Maker::parse(&value(args, &mut index, "--maker")?)?;
+                maker = Some(if maker == Some(Maker::Human) || next == Maker::Human {
+                    Maker::Human
+                } else {
+                    Maker::Agent
+                });
+            }
             "--store-dir" => {
                 let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
                 set_once(&mut store_dir, path, "--store-dir")?;
@@ -229,7 +247,7 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
             context: context.ok_or_else(|| "add requires --context".to_string())?,
             choices,
             decision: decision.ok_or_else(|| "add requires --decision".to_string())?,
-            makers,
+            maker: maker.ok_or_else(|| "add requires --maker".to_string())?,
         }),
         store_dir,
     })
@@ -270,6 +288,8 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
     }
     let mut field = None;
     let mut pattern = None;
+    let mut since = None;
+    let mut until = None;
     let mut limit = 20_usize;
     let mut limit_set = false;
     let mut json = false;
@@ -287,6 +307,20 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
                     return Err(format!("--regex exceeds {MAX_REGEX_BYTES} UTF-8 bytes"));
                 }
                 set_once(&mut pattern, raw, "--regex")?;
+            }
+            "--since" => {
+                let raw = value(args, &mut index, "--since")?;
+                if raw.len() > MAX_TIME_BYTES {
+                    return Err(format!("--since exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+                }
+                set_once(&mut since, raw, "--since")?;
+            }
+            "--until" => {
+                let raw = value(args, &mut index, "--until")?;
+                if raw.len() > MAX_TIME_BYTES {
+                    return Err(format!("--until exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+                }
+                set_once(&mut until, raw, "--until")?;
             }
             "--limit" => {
                 if limit_set {
@@ -310,10 +344,18 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
         }
         index += 1;
     }
+    if field.is_some() != pattern.is_some() {
+        return Err("search requires --field and --regex together".into());
+    }
+    if field.is_none() && since.is_none() && until.is_none() {
+        return Err("search requires --field with --regex, --since, or --until".into());
+    }
     Ok(Config {
         command: Command::Search {
-            field: field.ok_or_else(|| "search requires --field".to_string())?,
-            pattern: pattern.ok_or_else(|| "search requires --regex".to_string())?,
+            field,
+            pattern,
+            since,
+            until,
             limit,
             json,
         },
@@ -377,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_add_with_joint_makers() {
+    fn human_maker_overrides_agent() {
         let config = parse_args(&args(&[
             "add",
             "--context",
@@ -399,7 +441,7 @@ mod tests {
         };
         assert_eq!(draft.choices.len(), 2);
         assert_eq!(draft.decision, 2);
-        assert_eq!(draft.makers.len(), 2);
+        assert_eq!(draft.maker, Maker::Human);
     }
 
     #[test]
@@ -409,6 +451,50 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(error.contains("1 through 1000"));
+    }
+
+    #[test]
+    fn parses_time_only_search() {
+        let config = parse_args(&args(&[
+            "search", "--since", "7d", "--until", "now", "--limit", "5",
+        ]))
+        .unwrap();
+        let Command::Search {
+            field,
+            pattern,
+            since,
+            until,
+            limit,
+            ..
+        } = config.command
+        else {
+            panic!("expected search command");
+        };
+        assert!(field.is_none());
+        assert!(pattern.is_none());
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, 5);
+    }
+
+    #[test]
+    fn search_requires_field_and_regex_together() {
+        let error =
+            parse_args(&args(&["search", "--field", "context", "--since", "7d"])).unwrap_err();
+        assert!(error.contains("--field and --regex together"));
+    }
+
+    #[test]
+    fn search_requires_at_least_one_filter() {
+        let error = parse_args(&args(&["search", "--limit", "5"])).unwrap_err();
+        assert!(error.contains("--since, or --until"));
+    }
+
+    #[test]
+    fn rejects_oversized_search_time() {
+        let oversized = "1".repeat(MAX_TIME_BYTES + 1);
+        let error = parse_args(&["search".into(), "--since".into(), oversized]).unwrap_err();
+        assert!(error.contains("--since exceeds"));
     }
 
     #[test]

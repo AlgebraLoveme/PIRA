@@ -53,7 +53,7 @@ pub struct DecisionDraft {
     pub context: String,
     pub choices: Vec<String>,
     pub decision: u32,
-    pub makers: Vec<Maker>,
+    pub maker: Maker,
 }
 
 impl DecisionDraft {
@@ -64,8 +64,7 @@ impl DecisionDraft {
             .into_iter()
             .map(|choice| choice.trim().to_string())
             .collect();
-        self.makers.sort_unstable();
-        validate_fields(&self.context, &self.choices, self.decision, &self.makers)?;
+        validate_fields(&self.context, &self.choices, self.decision)?;
         Ok(self)
     }
 }
@@ -77,7 +76,7 @@ pub struct DecisionRecord {
     pub context: String,
     pub choices: Vec<String>,
     pub decision: u32,
-    pub makers: Vec<Maker>,
+    pub maker: Maker,
 }
 
 impl DecisionRecord {
@@ -92,7 +91,7 @@ impl DecisionRecord {
             context: draft.context.clone(),
             choices: draft.choices.clone(),
             decision: draft.decision,
-            makers: draft.makers.clone(),
+            maker: draft.maker,
         };
         record.validate()?;
         Ok(record)
@@ -112,15 +111,12 @@ impl DecisionRecord {
     pub fn validate(&self) -> Result<(), String> {
         validate_id(&self.id, self.timestamp_ms)?;
         util::validate_timestamp(self.timestamp_ms)?;
-        validate_fields(&self.context, &self.choices, self.decision, &self.makers)?;
+        validate_fields(&self.context, &self.choices, self.decision)?;
         if self.context.trim() != self.context {
             return Err("context is not stored in normalized form".into());
         }
         if self.choices.iter().any(|choice| choice.trim() != choice) {
             return Err("choice is not stored in normalized form".into());
-        }
-        if !self.makers.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err("makers are not stored as a unique ordered set".into());
         }
         Ok(())
     }
@@ -134,11 +130,7 @@ impl DecisionRecord {
             choices: self.choices.clone(),
             decision: self.decision,
             decision_text: self.selected_text()?.to_string(),
-            makers: self
-                .makers
-                .iter()
-                .map(|maker| maker.as_str().to_string())
-                .collect(),
+            maker: self.maker.as_str().to_string(),
         })
     }
 }
@@ -152,15 +144,10 @@ pub struct DecisionView {
     pub choices: Vec<String>,
     pub decision: u32,
     pub decision_text: String,
-    pub makers: Vec<String>,
+    pub maker: String,
 }
 
-fn validate_fields(
-    context: &str,
-    choices: &[String],
-    decision: u32,
-    makers: &[Maker],
-) -> Result<(), String> {
+fn validate_fields(context: &str, choices: &[String], decision: u32) -> Result<(), String> {
     if context.is_empty() {
         return Err("context must not be empty".into());
     }
@@ -184,12 +171,6 @@ fn validate_fields(
     }
     if decision == 0 || usize::try_from(decision).map_or(true, |value| value > choices.len()) {
         return Err("decision must select an existing one-based choice".into());
-    }
-    if makers.is_empty() || makers.len() > 2 {
-        return Err("makers must contain human, agent, or both".into());
-    }
-    if !makers.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err("makers must be unique".into());
     }
     Ok(())
 }
@@ -231,9 +212,7 @@ pub fn encode(record: &DecisionRecord) -> Result<Vec<u8>, String> {
         put_tlv(&mut body, 4, choice.as_bytes())?;
     }
     put_tlv(&mut body, 5, &record.decision.to_le_bytes())?;
-    for maker in &record.makers {
-        put_tlv(&mut body, 6, &[maker.byte()])?;
-    }
+    put_tlv(&mut body, 6, &[record.maker.byte()])?;
     let body_len = u32::try_from(body.len()).map_err(|_| "decision body is too large")?;
     let total = 8 + 4 + body.len() + 32;
     if total > MAX_RECORD_BYTES {
@@ -313,13 +292,20 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
             _ => return Err("unknown decision TLV tag".into()),
         }
     }
+    let maker = if makers.contains(&Maker::Human) {
+        Maker::Human
+    } else if makers.contains(&Maker::Agent) {
+        Maker::Agent
+    } else {
+        return Err("missing decision maker".into());
+    };
     let record = DecisionRecord {
         id: id.ok_or_else(|| "missing decision id".to_string())?,
         timestamp_ms: timestamp_ms.ok_or_else(|| "missing decision timestamp".to_string())?,
         context: context.ok_or_else(|| "missing decision context".to_string())?,
         choices,
         decision: decision.ok_or_else(|| "missing selected decision".to_string())?,
-        makers,
+        maker,
     };
     record.validate()?;
     Ok(record)
@@ -353,7 +339,7 @@ mod tests {
             context: "Choose storage.".into(),
             choices: vec!["Use SQL.".into(), "Use checked files.".into()],
             decision: 2,
-            makers: vec![Maker::Human],
+            maker: Maker::Human,
         }
     }
 
@@ -361,6 +347,23 @@ mod tests {
     fn record_round_trips() {
         let record = sample();
         assert_eq!(decode(&encode(&record).unwrap()).unwrap(), record);
+    }
+
+    #[test]
+    fn legacy_joint_record_decodes_with_human_authority() {
+        let encoded = encode(&sample()).unwrap();
+        let body_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+        let mut body = encoded[12..12 + body_len].to_vec();
+        put_tlv(&mut body, 6, &[Maker::Agent.byte()]).unwrap();
+        let digest = Sha256::digest(&body);
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(MAGIC);
+        legacy.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        legacy.extend_from_slice(&body);
+        legacy.extend_from_slice(&digest);
+
+        let decoded = decode(&legacy).unwrap();
+        assert_eq!(decoded.maker, Maker::Human);
     }
 
     #[test]

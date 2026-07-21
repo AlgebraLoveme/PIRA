@@ -74,9 +74,10 @@ OUTPUT AND STORAGE
   is not stored as a capture; pira_ctx records its command-purpose intent and outcome as a separate
   history event. An event-storage failure is warned without changing child status. When retention
   triggers, exact stdout/stderr up to the configured ceiling are stored before a bounded synopsis and
-  capture ID are printed. Retention triggers at 2 KiB, for binary/non-UTF-8 or diagnostic output, for
-  an oversized line, or when a nonzero command produced output. Short retained text is normally shown
-  in full. For complete stdout-only valid JSON up to 512 KiB, the synopsis first exposes bounded scalar
+  capture ID are printed. Ordinary output up to 4 KiB is replayed exactly. Non-repetitive output up to
+  64 lines and 16 KiB is also replayed exactly; larger, repetitive, binary/non-UTF-8, truncated, or live
+  output is retained. Short risky text is retained so its warning cannot be bypassed. For complete
+  stdout-only valid JSON up to 512 KiB, the synopsis first exposes bounded scalar
   fields, compact small containers, and collection sizes before a few line excerpts; exact JSON remains
   stored. Potential prompt injection or display controls force bounded retained rendering with a warning
   instead of direct automatic replay. Stored bytes remain authoritative up to the configured retention
@@ -105,7 +106,7 @@ USAGE
 BEHAVIOR
   pira_ctx does not allocate a terminal. With a caller-provided terminal, stdout/stderr stream
   unchanged. Without one, output is buffered and replayed exactly unless textual output is both at
-  least 2 KiB and at least 40 eligible lines, with substantial repeated-form coverage and a dominant
+  least 4 KiB and at least 40 eligible lines, with substantial repeated-form coverage and a dominant
   repeated form. Retention or line-index truncation also forces an auto-switch so buffered exact
   replay never silently drops retained bytes. An auto-switch stores retained streams, prints a
   notice, synopsis, and capture ID, and preserves child status.

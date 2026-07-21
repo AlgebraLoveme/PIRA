@@ -38,9 +38,19 @@ fn real_main() -> Result<i32, String> {
         Command::Search {
             field,
             pattern,
+            since,
+            until,
             limit,
             json,
-        } => run_search(store, field, &pattern, limit, json),
+        } => run_search(
+            store,
+            field,
+            pattern.as_deref(),
+            since.as_deref(),
+            until.as_deref(),
+            limit,
+            json,
+        ),
         Command::Forget { id, confirmed } => run_forget(store, &id, confirmed),
     }
 }
@@ -99,12 +109,40 @@ struct SearchOutput {
 
 fn run_search(
     store: Option<&Path>,
-    field: SearchField,
-    pattern: &str,
+    field: Option<SearchField>,
+    pattern: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
     limit: usize,
     json: bool,
 ) -> Result<i32, String> {
-    let expression = Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?;
+    let expression = match (field, pattern) {
+        (Some(field), Some(pattern)) => Some((
+            field,
+            Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?,
+        )),
+        (None, None) => None,
+        _ => return Err("search requires --field and --regex together".into()),
+    };
+    let (since_ms, until_ms) = if since.is_some() || until.is_some() {
+        let now_ms = util::now_ms()?;
+        (
+            since
+                .map(|value| util::parse_time_bound(value, now_ms))
+                .transpose()?,
+            until
+                .map(|value| util::parse_time_bound(value, now_ms))
+                .transpose()?,
+        )
+    } else {
+        (None, None)
+    };
+    if since_ms
+        .zip(until_ms)
+        .is_some_and(|(since, until)| since >= until)
+    {
+        return Err("search --since must be earlier than --until".into());
+    }
     let layout = storage::Layout::current(store)?;
     let mut records = Vec::new();
     let mut skipped = Vec::new();
@@ -134,7 +172,14 @@ fn run_search(
     });
     let mut matches = Vec::new();
     for record in records {
-        if record_matches(&record, field, &expression)? {
+        if !time_matches(&record, since_ms, until_ms) {
+            continue;
+        }
+        let text_matches = match expression.as_ref() {
+            Some((field, expression)) => record_matches(&record, *field, expression)?,
+            None => true,
+        };
+        if text_matches {
             matches.push(record.view()?);
             if matches.len() == limit {
                 break;
@@ -155,12 +200,17 @@ fn run_search(
                 "{} | {} | {} | {}",
                 record.id,
                 record.timestamp,
-                record.makers.join(","),
+                record.maker,
                 util::single_line_clip(&record.decision_text, 200)
             ))?;
         }
     }
     Ok(if found { 0 } else { 1 })
+}
+
+fn time_matches(record: &DecisionRecord, since_ms: Option<u64>, until_ms: Option<u64>) -> bool {
+    since_ms.is_none_or(|since| record.timestamp_ms >= since)
+        && until_ms.is_none_or(|until| record.timestamp_ms < until)
 }
 
 fn run_forget(store: Option<&Path>, id: &str, confirmed: bool) -> Result<i32, String> {
@@ -195,10 +245,7 @@ fn record_matches(
         SearchField::Context => regex.is_match(&record.context),
         SearchField::Choice => record.choices.iter().any(|choice| regex.is_match(choice)),
         SearchField::Decision => regex.is_match(record.selected_text()?),
-        SearchField::Maker => record
-            .makers
-            .iter()
-            .any(|maker| regex.is_match(maker.as_str())),
+        SearchField::Maker => regex.is_match(record.maker.as_str()),
         SearchField::Timestamp => regex.is_match(&util::format_rfc3339(record.timestamp_ms)?),
     })
 }
@@ -211,15 +258,7 @@ fn print_human_record(record: &DecisionRecord) -> Result<(), String> {
         util::format_rfc3339(record.timestamp_ms)?,
         record.timestamp_ms
     ));
-    output.push_str(&format!(
-        "Makers: {}\n",
-        record
-            .makers
-            .iter()
-            .map(|maker| maker.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
+    output.push_str(&format!("Maker: {}\n", record.maker.as_str()));
     output.push_str("Context:\n");
     output.push_str(&record.context);
     output.push_str("\nChoices:\n");
@@ -249,4 +288,29 @@ fn filename_only(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .map(|value| util::single_line_clip(value, 200))
         .unwrap_or_else(|| "<invalid-filename>".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Maker;
+
+    fn record(timestamp_ms: u64) -> DecisionRecord {
+        DecisionRecord {
+            id: format!("D-19700101T000000000Z-{timestamp_ms:016x}"),
+            timestamp_ms,
+            context: "Choose cache format".into(),
+            choices: vec!["SQLite".into(), "JSON".into()],
+            decision: 1,
+            maker: Maker::Agent,
+        }
+    }
+
+    #[test]
+    fn time_window_is_since_inclusive_and_until_exclusive() {
+        let record = record(2_000);
+        assert!(time_matches(&record, Some(2_000), Some(2_001)));
+        assert!(!time_matches(&record, Some(2_001), None));
+        assert!(!time_matches(&record, None, Some(2_000)));
+    }
 }

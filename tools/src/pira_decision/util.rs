@@ -28,6 +28,48 @@ pub fn now_ms() -> Result<u64, String> {
     Ok(millis)
 }
 
+pub fn parse_time_bound(value: &str, now_ms: u64) -> Result<u64, String> {
+    if value == "now" {
+        return Ok(now_ms);
+    }
+    if let Some((amount, multiplier)) = parse_age(value)? {
+        let age_ms = amount
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("search time {value:?} is too large"))?;
+        return Ok(now_ms.saturating_sub(age_ms));
+    }
+    let timestamp = value.parse::<jiff::Timestamp>().map_err(|_| {
+        format!(
+            "search time {value:?} must be RFC 3339, `now`, or a relative age such as 30m, 24h, or 7d"
+        )
+    })?;
+    let millis = u64::try_from(timestamp.as_millisecond())
+        .map_err(|_| "search timestamps before 1970 are unsupported".to_string())?;
+    validate_timestamp(millis)?;
+    Ok(millis)
+}
+
+fn parse_age(value: &str) -> Result<Option<(u64, u64)>, String> {
+    let Some((amount, unit)) = value.split_at_checked(value.len().saturating_sub(1)) else {
+        return Ok(None);
+    };
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return Ok(None),
+    };
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let amount = amount
+        .parse()
+        .map_err(|_| format!("search time {value:?} is too large"))?;
+    Ok(Some((amount, multiplier)))
+}
+
 pub fn validate_timestamp(timestamp_ms: u64) -> Result<(), String> {
     if timestamp_ms > MAX_TIMESTAMP_MS {
         return Err("timestamp is outside the supported UTC range".into());
@@ -192,5 +234,24 @@ mod tests {
             single_line_clip("alpha\n beta\t gamma", 100),
             "alpha beta gamma"
         );
+    }
+
+    #[test]
+    fn parses_absolute_and_relative_search_times() {
+        let now = 10 * 3_600_000;
+        assert_eq!(parse_time_bound("2h", now).unwrap(), 8 * 3_600_000);
+        assert_eq!(parse_time_bound("now", now).unwrap(), now);
+
+        let timestamp = parse_time_bound("2026-07-21T10:00:00+08:00", now).unwrap();
+        assert_eq!(
+            format_rfc3339(timestamp).unwrap(),
+            "2026-07-21T02:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_search_time() {
+        let error = parse_time_bound("yesterday", 1_000).unwrap_err();
+        assert!(error.contains("must be RFC 3339"));
     }
 }

@@ -150,7 +150,7 @@ py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the same bundled r
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
 ```
 
-The updater verifies every selected bundle before installation. Use `--tool pira_ctx` or `--tool pira_codenav` to select one tool, and repeat `--tool` to select several. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Restart the shell or agent process if setup says the new PATH is not active yet.
+The updater verifies every selected bundle before installation. `--tool NAME` selects one tool present in this checkout's `tools/dist` directory, and the option may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 </details>
 
@@ -213,18 +213,18 @@ PIRA includes three small tools that help agents work with less noise and better
 |---|---|
 | `pira_ctx` | Keeps large command output available without flooding the active conversation. |
 | `pira_decision` | Records important choices in a consistent, searchable form. |
-| `pira_codenav` | Lets an agent inspect code structure and relationships without editing or executing the code. |
+| `pira_nav` | Provides portable lexical, structural, dependency, and optional IDE-semantic repository navigation. |
 
 ### Agent-level evaluation
 
-An isolated development benchmark tested whether the tools help a fresh agent answer exact questions, not merely whether the binaries are fast in microbenchmarks.
+An isolated development benchmark tested whether `pira_ctx` helps a fresh agent complete an exact task, not merely whether the binary is fast in microbenchmarks.
 
 <details>
 <summary>Method, results, and interpretation</summary>
 
 #### `pira_ctx`: natural implementation task
 
-Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_decision` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had codenav or a decision binary. Both could write their isolated workspace and use ordinary Python and Git.
+Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_decision` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had a navigation or decision binary. Both could write their isolated workspace and use ordinary Python and Git.
 
 Each generated implementation was then run inside its sandbox against the same 20 private black-box cases covering validation, JSON views, search, workspace scope, the checked record envelope, corruption, symlink rejection, safe deletion, concurrency, bounds, and temporary-file isolation.
 
@@ -233,19 +233,6 @@ Each generated implementation was then run inside its sandbox against the same 2
 | 20/20 / 20/20 | 670,031 / 819,876 (**−18.3%**) | 70,735 / 108,964 (**−35.1%**) | 690.2 / 918.2 s (**−24.8%**) | 21,924 / 26,808 B (**−18.2%**) | 18 / 11 |
 
 The ctx agent used the wrapper for all 18 commands with no protocol violations. It read PIRA help once, adding 3,229 output bytes already included above, and used exact mode for the complete authoritative design. More commands did not imply more context: its median command response was 260 B versus 1,483 B for the baseline, while status-only checks and a failed test retained bounded reports. However, this is one development trial rather than a causal estimate. The agents chose different implementations: the baseline produced 1,348 source/test lines and 14 self-tests, versus 1,086 lines and six self-tests for the ctx agent, although both passed every hidden case. That behavioral variance may explain part of the token and time difference. The valid ctx run was executed first, so run order did not give the tool a later prompt-cache advantage.
-
-#### `pira_codenav`: repository inspection
-
-Each navigation condition was one independent `gpt-5.6-sol` high-reasoning run against a pinned, read-only PyTorch or JAX checkout. Tool and no-PIRA conditions received the same source questions; baselines could use all ordinary read-only shell and Python facilities. Both JAX conditions received the same pinned Pyright server. All four runs had no tool-protocol violations.
-
-| Repository | Answer correctness, tool / baseline | Evidence (precision / site recall), tool vs baseline | Total tokens | Noncached tokens | Wall time | Output bytes | Commands, tool / baseline |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PyTorch | 100% / 100% | (87.5% / 100%) vs (88.2% / 100%) | +51.2% | +3.3% | +8.8% | +1.2% | 7 / 11 |
-| JAX | 100% / 100% | (71.4% / 100%) vs (62.8% / 100%) | −32.0% | −34.7% | −39.2% | −22.0% | 12 / 26 |
-
-`pira_codenav` is a selective companion to `rg` and bounded reads rather than a blanket replacement. The revised rules correctly made the PyTorch tool condition abstain from codenav: six of seven command turns used `rg`, and both conditions answered every claim with full evidence-site recall. Two broad early lexical responses were then carried through later turns, leaving fresh tokens and output near baseline but increasing repeated cached context and total tokens. On JAX, the tool condition used codenav in nine of twelve turns, including one batched semantic query. It preserved full correctness and site recall, improved evidence precision, and reduced commands, tokens, output, and wall time. The contrast supports selective use when structural or semantic navigation replaces substantial manual inspection, not for text-local questions already solved cheaply by `rg`.
-
-Token totals include repeated cached context; noncached tokens separate that effect. Output bytes measure tool-visible terminal output rather than model context directly. The context result is development protocol 1; navigation uses `pira_codenav` protocols 18 and 9. Every condition is a single trial, useful for diagnosing agent behavior but not a statistical or held-out performance claim.
 
 </details>
 
@@ -258,8 +245,8 @@ Long build logs, test output, and file listings can consume a model's working co
 
 Automatic mode works as follows:
 
-1. Ordinary short output is returned directly.
-2. Long or diagnostic output is stored locally, while the model receives a short evidence-based summary and a capture ID.
+1. Ordinary output up to 4 KiB, or non-repetitive output up to 64 lines and 16 KiB, is returned directly.
+2. Larger, repetitive, binary/non-UTF-8, risky, truncated, or live output is stored locally, while the model receives a short evidence-based summary and a capture ID.
 3. The agent can later search, inspect a range, analyze, or replay the retained output.
 
 For complete stdout-only JSON up to 512 KiB, the compact view exposes bounded scalar fields, small containers, and collection sizes before a few line excerpts. This keeps structured analysis results useful without replaying large arrays; the exact JSON remains stored.
@@ -313,16 +300,16 @@ The fixed benchmark caps each category at five cases and contains **45 sanitized
 | Remote status workloads | 15 | Previously unseen Codex outputs streamed from a remote machine after the freeze |
 | arXiv LaTeX supplement | 5 | Isolated builds of seeded recent arXiv papers, including natural and controlled failures |
 
-The remote importer scanned raw logs in memory and persisted only fixed-point sanitized, privacy-audited fixtures; unsanitized server output was not written locally. Final selection is independent of PIRA output: SHA-256 order with a five-case cap, while build and test categories prefer three successes and two failures. No output routing, scoring, threshold, or security behavior changed after the final reported replay.
+The remote importer scanned raw logs in memory and persisted only fixed-point sanitized, privacy-audited fixtures; unsanitized server output was not written locally. Final selection is independent of PIRA output: SHA-256 order with a five-case cap, while build and test categories prefer three successes and two failures. The current routing policy was fixed from live tool-use findings before this post-change replay, and no behavior changed afterward.
 
-| Mode on the same 2,248,456 raw bytes | Returned context | Complete stored state | Median overhead | Immediate labeled evidence |
+| Mode on the same 2,248,456 raw bytes | Returned context | Retained state | Median overhead | Immediate annotated evidence |
 |---|---:|---:|---:|---:|
-| `pira_ctx 1.4.0` automatic synopsis | 44,222 B (98.0% reduction) | 628,056 B (72.1% reduction) | +20.0 ms | 5/13 |
+| `pira_ctx 1.4.0` automatic routing | 67,672 B (97.0% reduction) | 590,920 B (73.7% reduction) | +20.3 ms | 8/13 |
 | Context Mode generic passthrough | 71,621 B (96.8% reduction) | 17,039,820 B (657.8% overhead) | +16.1 ms | 9/13 |
 | `pira_ctx 1.4.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +20.3 ms | N/A—status only |
 | Context Mode `ctx_index` receipt | 7,843 B (99.7% reduction) | 13,992,387 B (522.3% overhead) | N/A—no corresponding raw baseline | 0/13 |
 
-All 45 PIRA cases preserved child status, entered full automatic-summary mode, reconstructed every sanitized output exactly, and passed integrity verification. Suggestions correctly abstained in 32/32 successful unlabeled cases; immediate evidence covered 5/8 failure markers and 0/5 changed basenames. Version 1.4.0 retains the frozen selection and quality counts. Context Mode generic passthrough classified all 45 recorded statuses correctly and immediately exposed 7/8 failure markers plus 2/5 changed basenames. These quality figures were not used for tuning.
+All 45 PIRA cases preserved child status and exact immediate content. Thirty-seven long or repetitive responses entered summary mode, were retained exactly, reconstructed, and passed integrity verification; eight bounded non-repetitive responses were replayed exactly and intentionally not retained. Across the 13 frozen marker/basename annotations, immediate output exposed 8, versus 9 for Context Mode generic passthrough. The one-point context-reduction trade-off buys direct readability for dense outputs that previously required a second retrieval. These quality figures were not used for tuning.
 
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
@@ -335,20 +322,20 @@ The remote extension was fixed before inspecting output content. It reconstructe
 
 LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
-Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.4.0. Deterministic byte/storage figures were identical across three 1.4.0 replays of the selected 45 fixtures through persistent automatic and `check` stores. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. The table reports the median of the three per-replay case medians. Stored state includes captures, indexes, and event history but excludes installed binaries and runtimes.
+Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.4.0. The current routing thresholds and common-form filtering were fixed from live use before the selected fixtures were replayed. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. Retained state includes captures, indexes, and event history but excludes installed binaries, runtimes, and the eight exact-replayed outputs that deliberately created no capture.
 
-| Held-out category | Cases | Outcomes | Immediate quality | Context reduction |
+| Held-out category | Cases | Outcomes | Summary / exact | Context reduction |
 |---|---:|---:|---:|---:|
-| File reads | 5 | 5 success | 5/5 abstentions | 99.2% |
-| GitHub pull retrieval | 5 | 5 success | 5/5 abstentions | 99.4% |
-| Search and listing | 5 | 5 success | 5/5 abstentions | 98.9% |
-| Terminal logs | 5 | 5 success | 5/5 abstentions | 95.5% |
-| Version-control diffs | 5 | 5 success | 0/5 changed basenames | 91.1% |
-| Builds | 5 | 3 success, 2 failure | 3/3 abstentions; 0/2 markers | 75.4% |
-| Test runs | 5 | 3 success, 2 failure | 3/3 abstentions; 2/2 markers | 87.9% |
-| Setup and installation | 4 | 4 success | 4/4 abstentions | 78.5% |
-| Static analysis | 1 | 1 success | 1/1 abstention | 92.5% |
-| LaTeX compilation | 5 | 1 success, 4 failure | 1/1 abstention; 3/4 markers | 94.6% |
+| File reads | 5 | 5 success | 5 / 0 | 99.2% |
+| GitHub pull retrieval | 5 | 5 success | 5 / 0 | 99.4% |
+| Search and listing | 5 | 5 success | 5 / 0 | 98.9% |
+| Terminal logs | 5 | 5 success | 5 / 0 | 95.8% |
+| Version-control diffs | 5 | 5 success | 4 / 1 | 77.9% |
+| Builds | 5 | 3 success, 2 failure | 1 / 4 | 17.5% |
+| Test runs | 5 | 3 success, 2 failure | 4 / 1 | 81.9% |
+| Setup and installation | 4 | 4 success | 4 / 0 | 78.7% |
+| Static analysis | 1 | 1 success | 1 / 0 | 92.5% |
+| LaTeX compilation | 5 | 1 success, 4 failure | 3 / 2 | 89.2% |
 
 ##### Context Mode comparison on the final corpus
 
@@ -373,9 +360,9 @@ Projects often lose the reason behind a choice. `pira_decision` keeps the contex
 <details>
 <summary>Technical behavior, storage, and concurrency</summary>
 
-Each record contains an ID, UTC timestamp, short context, ordered alternatives, the selected option, and whether the decision came from a human, an agent, or both. Saved records are not edited in place.
+Each record contains an ID, UTC timestamp, short context, ordered alternatives, the selected option, and one decision-maker: human or agent. Human authorization takes precedence. Saved records are not edited in place.
 
-The tool can add a decision, show one record, search individual fields with regular expressions, or explicitly forget one exact record. Search can distinguish every considered choice from the option that was selected, and returns newer matches first.
+The tool can add a decision, show one record, search individual fields with regular expressions, filter by inclusive `--since` and exclusive `--until` time bounds, or explicitly forget one exact record. Search can distinguish every considered choice from the option that was selected, and returns newer matches first.
 
 Records live in private per-user application data and are separated by workspace. Multiple agents can write safely at the same time. Readers see only complete records, although a decision saved during a search may not appear until the next search. Invalid unrelated records are reported and skipped. No SQL database, daemon, network service, or repository-local metadata is required.
 
@@ -383,172 +370,60 @@ Public source is under `tools/src/pira_decision`. Build it with `cargo build --m
 
 </details>
 
-### `pira_codenav`: lightweight code navigation
+### `pira_nav`: lightweight repository navigation
 
-Reading an entire repository is slow and context-heavy. `pira_codenav` helps an agent narrow repository shape, declarations, implementation text, relationships, and exact source. It is read-only: it never edits or executes repository code, and it is not a mandatory replacement for a bounded read when the exact file and range are already known.
+Reading an entire repository is slow and context-heavy. `pira_nav` provides portable text search plus bounded code structure, structured-document paths, file relationships, and optional language-server semantics in one read-only native executable. Run `pira_nav --help` for the command chooser and `pira_nav COMMAND --help` for exact syntax.
 
 <details>
 <summary>Technical behavior, language support, security, and validation</summary>
 
-Choose the cheapest operation that can return enough evidence:
+#### Command surface
 
-1. Use ordinary `rg` or a bounded read for exact body text or line ranges already narrowed to known paths.
-2. `find` batches declaration names, tries exact names before substring fallback, ranks public/close matches first, and includes small unique source automatically.
-3. `outline` gives a known file's declarations without bodies; structural `show` selects a named item, while parser-free `show` can validate selectors or batch exact spans.
-4. `map` gives a bounded repository or subsystem shape when relevant files are unknown.
-5. `imports`, `dependents`, and `deps` expose conservative file relationships without a build system.
-6. Semantic commands such as `definition`, `references`, `callers`, and `hover` use a caller-installed language server; `query` mixes up to 32 operations while sharing servers and open documents.
-7. `search` is the bounded language-filtered alternative when merged context and clean enclosing-item annotations add value beyond plain text matching.
+- `search` scans ordinary unignored UTF-8 repository text. Literals are the default and may be stated with `-F`; bounded Rust regular expressions, case-insensitive and Unicode half-word matching, multiple patterns, snippets, matching-file rows, and exact matching-line counts are available. Repeated patterns and up to 64 deduplicated file or directory scopes share one traversal. Missing peers in a multi-scope search are reported as incomplete while valid peers continue; a lone missing target remains an error. Every pattern is ranked independently so declaration-like production matches precede test/generated peers, while snippets remain query-balanced, capped at eight ranked lines per pattern and 8 KiB of rendered source blocks by default, and report exact shown/omitted counts. `--max-per-query` and `--max-bytes` expand deliberately, while `--owners` optionally adds enclosing clean declarations. `--max-results` aliases `--max-items`. Binary, oversized, non-UTF-8, and unreadable files are reported as aggregate completeness counts without routine per-file noise.
+- `map`, `symbols` (`declaration`/`declarations` aliases), `outline`, and `show` narrow repository shape, code declarations, structured-document paths, Markdown sections, and exact source. A default map shows at most 20 balanced root-relative code/document rows and 16 landmarks balanced by kind, ranks production paths first, and counts but skips recognizable fixture/corpus subtrees; mapping such a subtree directly inspects it normally. Outline output defaults to 64 items across the invocation, while `--depth 0` limits it to top-level items. Exact line ranges and windows work on any readable UTF-8 text file without language inference. Clean code uses bundled parsers; syntax-dirty code uses a conventional language server discovered on `PATH` or selected with `--lsp`. Native documents expose JSON/JSONC/YAML/TOML keys, indices, references, and tables or hierarchical Markdown headings rather than code semantics.
+- `imports`, `dependents`, and `deps` expose conservative syntax-level local file relationships, including common Python absolute/relative modules, Rust module/`crate::` paths, and Java/Kotlin package paths within nested source roots. Dependency targets resolve from the current directory first and then `--root`, and must remain inside that root. Results distinguish local, external, unresolved, ambiguous, blocked, failed, and omitted work rather than claiming a complete build graph.
+- `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, `supertypes`, `subtypes`, and `hover` use a caller-installed language server. Targets may be one-based `FILE:LINE:COLUMN`, unique `FILE::QUALIFIED-NAME`, or freshness-checked selectors. `query` batches ordered mixed semantic requests and shares invocation-local server and document state.
+- `languages` lists 23 compiled code languages with the discovered conventional server name or `missing`, plus five native document formats.
 
-It supports 23 languages: Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia. All native parsers are built into one executable. Explicit native mode needs no language runtime, daemon, database, network, project initialization, package manager, or runtime download. Run `pira_codenav --help` for usage.
+Language is normally inferred from the file suffix or supported shebang; `--language` handles ambiguous paths or restricts a scan. Bundled code support covers Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, and Julia; bundled document support covers JSON, JSONC, YAML, TOML, and Markdown. Ordinary readable UTF-8 text remains searchable and exactly range-readable without a parser. No language runtime, daemon, persistent index, project initialization, or network access is required for native work. Semantic accuracy and startup cost depend on the caller's language server and project configuration.
 
-Output stays compact by omitting routine success details. Default `search` returns at most 48 ranked matches and 24 KiB with one context line, multi-target `show` uses 32 KiB, and `map` returns at most 200 balanced files. Explicit limits can be raised when needed. Failures, incomplete results, omitted items, truncation, ambiguity, unsupported files, and language-server use remain explicit.
+#### Relationship to existing tools
 
-#### Native and LSP backends
-
-File relationships, language detection, and implementation-text search do not need a language server. `outline`, structural `show`, `map`, and `find` instead require and prefer a suitable PATH-discovered or explicit LSP by default. This matches active code-inspection environments and keeps syntax-broken work on the more authoritative backend. Because standard `documentSymbol` responses often omit imports and module bindings, clean built-in parsing cheaply supplements only missing declaration names while LSP symbols remain primary; dirty files use LSP alone. `--no-lsp` is the single explicit opt-out: it uses only the built-in Tree-sitter parsers and rejects syntax-dirty files rather than presenting best-effort recovery as clean.
-
-Semantic commands use one-based `FILE:LINE:COLUMN` positions and never fall back to textual guesses. Up to 32 same-operation targets share one invocation; `query` accepts mixed `OPERATION=FILE:LINE:COLUMN` requests. Both reuse matching language servers and opened documents. Optional JSON files can provide server initialization and workspace settings.
-
-PIRA checks only fixed conventional dedicated server names such as `pyright-langserver`, `rust-analyzer`, or `clangd` on `PATH`; it never derives an executable from repository text. Explicit `--lsp` configuration overrides discovery. If no matching server exists, structural navigation stops with a concise warning and points to `--no-lsp`. Servers are reused within one invocation and then shut down. PIRA keeps no daemon or persistent code index, and processes repositories in bounded batches.
-
-Batch commands keep useful successful results even when some files fail. They clearly report incomplete processing, errors, and omitted output. If everything fails, the command returns the underlying failure.
-
-#### Relationship to ast-outline and Grove
-
-ast-outline and Grove are useful functional baselines for compact structure and broad-to-narrow retrieval. PIRA keeps those ideas while avoiding runtime/project initialization and persistent state, and adds conservative file relationships plus a standard optional-LSP path. The comparison includes only overlapping clean tasks with task-specific correctness assertions. Unsupported or empty operations are omitted rather than counted as fast results; output schemas and exact retrieval semantics differ.
+ast-outline demonstrates compact declarations and name-based retrieval; Grove demonstrates repository maps and stable broad-to-narrow identities; ripgrep/grep-class tools demonstrate fast ignored-aware lexical discovery. `pira_nav` combines the common agent-facing subset without a runtime download, persistent database, or required host search utility, then uses the standard LSP protocol when IDE semantics are needed. It deliberately leaves PCRE-only or multiline search, archive inspection, symlink traversal, replacement, diagnostics, rename, formatting, code actions, and build-system graphs to specialized tools.
 
 #### Read-only and security boundary
 
-- Repository code is parsed but never executed or edited. Ignore rules are honored, symlinked directories are not followed, and dependency targets outside the selected root are blocked.
-- Exact source and LSP hover are framed as untrusted data. Unsafe terminal controls are escaped in source, hover, paths, symbols, signatures, dependency/call metadata, and errors.
-- PIRA rejects `workspace/applyEdit`. An explicit or PATH-discovered server remains an external executable and may maintain its own caches; trust PATH as executable configuration or select built-in parsing with `--no-lsp`.
-- Source, syntax depth, regex compilation, LSP messages/headers, configuration files, symbols, locations, call relations/ranges, hover, stderr, and reported errors are bounded. PIRA imposes no command timeout; the caller controls cancellation.
+Repository code is read and parsed but never edited, built, imported, or executed. Directory discovery honors ignore and hidden rules and does not follow symlinked directories; explicit search operands reject symlink components, and local dependency targets cannot escape the selected root. Source files, syntax, patterns, protocol messages, server output, results, and rendered bytes are bounded.
+
+Source and hover text is framed as untrusted data, and unsafe terminal controls are escaped. A conservative English-keyword heuristic adds one short warning when rendered content resembles prompt injection; it never redacts, reorders, or expands source and is not a general multilingual classifier. The LSP client rejects `workspace/applyEdit`. A selected or `PATH`-discovered language server is still an external executable and may create its own caches, so its executable configuration remains part of the caller's trust boundary. PIRA imposes no timeout; the caller controls cancellation.
 
 #### Validation
 
-| Property | Result |
-|---|---:|
-| Supported languages | 23 |
-| Public correctness files | 74 |
-| Explicit-native clean / correctly rejected dirty files | 67 / 7 |
-| Native structural targets | 1,047 |
-| Location / freshness-selector round trips | 1,047/1,047 each |
-| Curated essential-target recall | 72/72 |
-| Functional / inert security / Rust tests | 89 / 17 / 14 |
-| Reproducible benchmark tasks | 40 |
-
-The retained Linux arm64 sandbox validates clangd 21.1.8 for definitions and incoming/outgoing call hierarchy, and basedpyright 1.39.9 for definition, implementation, type-definition, references, and hover. Deterministic fake-server tests additionally cover multi-target process reuse, initialization/settings forwarding, call-site normalization, independent capabilities, UTF-16 positions, rejected edits, malformed/oversized/hostile protocol data, lazy startup, and cached startup/parse failures.
+The public correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files are rejected by `--native` and routed to an LSP when available. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips plus 74/74 curated essential target checks. Current validation also includes 32 functional black-box tests, 12 inert security tests, 22 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 28 code/document formats. These are implementation tests, not an agentic evaluation.
 
 #### Performance
 
-Each latency is a complete subprocess call through collected output. Native macOS arm64 measurements use the 0.6.0 release with 10 warmups and 100 calls. Same-sandbox Linux arm64 measurements use 5 warmups and 40 calls inside an already-running 2-CPU/4-GiB Docker Sandbox. Those retained columns measure overlapping 0.4.1 commands and do not include `query`; cross-tool comparisons use only same-sandbox columns. Host and sandbox timings describe different environments and are not compared directly.
+The table reports complete subprocess calls for the optimized 0.8.0 macOS arm64 binary on an Apple M1 Pro. Each row uses five warmups and 40 measured calls over committed fixtures. Semantic rows use a deterministic minimal Python LSP server to measure PIRA's protocol path; they are not production-language-server latency estimates.
 
-| Clean operation | PIRA native | PIRA sandbox | ast-outline 1.8.2 sandbox | Grove 0.3.1 sandbox |
-|---|---:|---:|---:|---:|
-| Python outline | 5.075 ms | 2.238 ms | 51.226 ms | 40.466 ms |
-| Rust outline | 6.719 ms | 3.348 ms | 52.752 ms | 42.178 ms |
-| Python exact item | 5.565 ms | 2.065 ms | 50.656 ms | 40.508 ms |
-| Python repository map | 4.153 ms | 0.927 ms | 49.323 ms | 35.797 ms |
-| Rust repository map | 4.214 ms | 0.860 ms | 48.708 ms | 33.463 ms |
-| Java outline | 3.632 ms | 0.951 ms | 47.728 ms | 29.241 ms |
-| C outline | 2.792 ms | 0.351 ms | unsupported | 71.696 ms |
-| C++ outline | 2.775 ms | 0.399 ms | 46.996 ms | 118.023 ms |
+| Operation | Median latency | Peak RSS | Output |
+|---|---:|---:|---:|
+| `search` snippets | 4.037 ms | 4.4 MiB | 2,272 B |
+| `search --files-with-matches` | 3.903 ms | 4.4 MiB | 128 B |
+| `search --count` | 4.026 ms | 4.4 MiB | 164 B |
+| Python `map` | 4.954 ms | 5.1 MiB | 467 B |
+| Python `symbols` | 4.574 ms | 5.1 MiB | 588 B |
+| Python `outline` | 5.019 ms | 3.5 MiB | 1,650 B |
+| Python `show` | 5.590 ms | 3.6 MiB | 3,312 B |
+| Document `outline` (five formats) | 3.016–3.279 ms | 2.1–2.6 MiB | 249–806 B |
+| Python `imports` | 3.094 ms | 2.8 MiB | 423 B |
+| Python `dependents` | 4.206 ms | 5.0 MiB | 281 B |
+| Python `deps` | 4.233 ms | 5.0 MiB | 403 B |
+| LSP `definition` | 32.326 ms | 17.7 MiB | 145 B |
+| Three-operation LSP `query` | 33.734 ms | 18.1 MiB | 2,109 B |
 
-On these tasks, the fastest available baseline took 12.6–204× as long as PIRA in the same sandbox. PIRA used about 4.1–5.6 MiB peak RSS, versus about 15.6–49.7 MiB for the available baselines. The largest ratios use tiny synthetic C/C++ fixtures and principally measure complete-call overhead.
+Across all 49 tasks, the median of task medians was 4.206 ms; task medians ranged from 2.784 to 33.734 ms, median peak RSS was 4.2 MiB, and maximum peak RSS was 18.1 MiB. On a repository-scale default `map --native` of this development workspace, 153 navigable code/document files contained 1,681,918 bytes; the bounded 6,141-byte map reduced returned text by 99.6%, took 97.294 ms median / 103.101 ms p95 over five warmups and 20 measured calls, and used 44.5 MiB peak RSS. An untimed deliberately expanded inventory was 22,446 bytes. Broad-map fixture skipping excluded low-value fixture/corpus subtrees from structural rows; seven deliberately dirty non-skipped fixtures remained explicit failures in `--native` mode. Context reduction compares UTF-8 bytes, not model-specific tokens.
 
-##### LSP cost
-
-Each row is a cold complete call: PIRA starts and initializes the server, performs the request, then shuts it down. Measurements use 2 warmups and 15 calls in the same sandbox.
-
-| Server and operation | Median | p95 |
-|---|---:|---:|
-| clangd definition | 158.495 ms | 162.704 ms |
-| clangd references | 158.617 ms | 162.876 ms |
-| clangd hover | 158.407 ms | 163.975 ms |
-| clangd callers | 157.946 ms | 168.538 ms |
-| clangd callees | 155.893 ms | 166.187 ms |
-| basedpyright definition | 404.028 ms | 449.634 ms |
-| basedpyright implementation | 560.360 ms | 604.304 ms |
-| basedpyright type-definition | 566.938 ms | 613.717 ms |
-| basedpyright references | 534.363 ms | 589.496 ms |
-| basedpyright hover | 570.874 ms | 606.642 ms |
-
-Real-server cost is dominated by server startup, project configuration, and caches. Batch semantic targets amortize that startup within one PIRA invocation.
-
-With the deterministic protocol server, two definition targets took 33.056 ms median in one invocation versus 65.337 ms as two calls, a 1.98× speedup from shared startup and document state.
-
-On the native 0.6.0 release, one `query` combining definition, references, and hover took 33.268 ms median. The same three complete calls totaled 96.863 ms by their individual medians, so shared startup and document state reduced latency by 65.7% (2.91×).
-
-##### Subcommand context and latency
-
-Context reduction compares returned UTF-8 bytes with complete source bytes otherwise needed by the fixed task. It is not a tokenizer-specific token count. Semantic rows use a deterministic minimal protocol server to isolate wrapper behavior rather than production-server initialization.
-
-| Subcommand | Returned bytes | Context reduction | Native median | Sandbox median | Sandbox peak RSS |
-|---|---:|---:|---:|---:|---:|
-| `outline` | 1,652 | 92.4% | 5.075 ms | 2.238 ms | 4.1 MiB |
-| `show` | 3,334 | 84.6% | 5.565 ms | 2.065 ms | 4.1 MiB |
-| `map` | 432 | 69.9% | 4.153 ms | 0.927 ms | 4.6 MiB |
-| `find` | 650 | 54.6% | 4.430 ms | 0.976 ms | 4.6 MiB |
-| `search` | 2,313 | 89.3% | 6.389 ms | not measured | not measured |
-| `imports` | 389 | 56.6% | 3.034 ms | 0.437 ms | 4.1 MiB |
-| `dependents` | 228 | 84.1% | 4.262 ms | 0.838 ms | 4.6 MiB |
-| `deps` | 342 | 76.1% | 4.240 ms | 0.818 ms | 4.6 MiB |
-| `definition` | 147 | 99.3% | 32.674 ms | 16.303 ms | 12.7 MiB |
-| `implementation` | 151 | 99.3% | 32.504 ms | 17.214 ms | 12.7 MiB |
-| `type-definition` | 152 | 99.3% | 31.929 ms | 16.539 ms | 12.7 MiB |
-| `references` | 1,435 | 93.4% | 32.134 ms | 16.461 ms | 12.7 MiB |
-| `callers` | 237 | 98.9% | 31.570 ms | 15.728 ms | 12.7 MiB |
-| `callees` | 237 | 98.9% | 31.659 ms | 16.063 ms | 12.7 MiB |
-| `hover` | 200 | 99.1% | 32.055 ms | 15.920 ms | 12.7 MiB |
-| `query` | 2,075 | 90.4% | 33.268 ms | not measured | not measured |
-| `languages` | 166 | not applicable | 2.710 ms | 0.269 ms | 2.6 MiB |
-
-`outline`, `show`, `search`, and semantic/query rows use the complete 21,680-byte pinned Click file. `find`, `map`, `dependents`, and `deps` use all 1,433 supported source bytes in the deterministic Python repository; `imports` uses its 896-byte file.
-The `find` row includes its small unique declaration source by default, trading some single-call bytes for one fewer retrieval round trip; `--locations-only` keeps only ranked locations.
-
-##### All-language outline regression
-
-| Language | Fixture | Source | Outline | Reduction | Native | Sandbox |
-|---|---|---:|---:|---:|---:|---:|
-| Python | Click | 21,680 B | 1,652 B | 92.4% | 5.075 ms | 2.238 ms |
-| Rust | ripgrep | 32,269 B | 2,884 B | 91.1% | 6.719 ms | 3.348 ms |
-| Java | JUnit | 12,572 B | 1,371 B | 89.1% | 3.632 ms | 0.951 ms |
-| C | synthetic | 210 B | 124 B | 41.0% | 2.792 ms | 0.351 ms |
-| C++ | synthetic | 202 B | 272 B | −34.7% | 2.775 ms | 0.399 ms |
-| CUDA | synthetic | 419 B | 198 B | 52.7% | 2.868 ms | 0.430 ms |
-| Bash | bats-core | 16,510 B | 291 B | 98.2% | 4.530 ms | 2.613 ms |
-| Go | synthetic | 119 B | 99 B | 16.8% | 2.812 ms | 0.288 ms |
-| JavaScript | synthetic | 181 B | 211 B | −16.6% | 2.837 ms | 0.311 ms |
-| TypeScript | synthetic | 386 B | 214 B | 44.6% | 2.934 ms | 0.353 ms |
-| C# | synthetic | 235 B | 239 B | −1.7% | 2.936 ms | 0.382 ms |
-| PowerShell | PowerShell | 17,197 B | 1,519 B | 91.2% | 4.857 ms | 10.194 ms |
-| PHP | Laravel | 55,672 B | 7,444 B | 86.6% | 8.360 ms | 4.612 ms |
-| Kotlin | kotlinx.coroutines | 17,043 B | 795 B | 95.3% | 3.498 ms | 0.986 ms |
-| Lua | Neovim | 53,653 B | 2,071 B | 96.1% | 7.897 ms | 4.361 ms |
-| HCL | Terraform | 2,248 B | 2,006 B | 10.8% | 3.303 ms | 0.667 ms |
-| R | dplyr | 15,796 B | 712 B | 95.5% | 4.606 ms | 1.791 ms |
-| Ruby | Rails | 14,867 B | 142 B | 99.0% | 3.535 ms | 1.154 ms |
-| Swift | ArgumentParser | 10,088 B | 1,233 B | 87.8% | 4.299 ms | 4.963 ms |
-| Scala | cats-effect | 82,458 B | 13,913 B | 83.1% | 27.233 ms | 22.573 ms |
-| Dart | http | 3,856 B | 550 B | 85.7% | 3.833 ms | 1.087 ms |
-| Elixir | Elixir | 42,726 B | 3,237 B | 92.4% | 8.179 ms | 9.124 ms |
-| Julia | HTTP.jl | 4,675 B | 131 B | 97.2% | 3.688 ms | 1.072 ms |
-
-Negative reduction means fixed structural metadata exceeds a tiny source fixture; it does not indicate lost source. This table is a parser-path regression check, not a repository-scale compression claim.
-
-A minimal `pira_codenav --version` call measured 2.781 ms median / 3.274 ms p95 on native macOS. The optimized macOS arm64 binary is 51,307,488 bytes, or 5,779,854 bytes with deterministic gzip level 9.
-
-<details>
-<summary>Benchmark method and limitations</summary>
-
-Pinned real fixtures are stored unmodified with adjacent licenses, immutable upstream commits, and SHA-256 records in `tests/resources/pira_codenav/SOURCES.md`; synthetic fixtures exercise compact language-specific constructs. Fixture source is parsed and read but never executed. Every timed task has a task-specific output assertion, so empty or incorrect output fails.
-
-Baseline operations are functionally similar, not identical. Grove runtime grammar provisioning is excluded from repeated-call latency. LSP measurements depend on server, project size, initialization, flags, filesystem, and server caches. Real-server validation demonstrates protocol interoperability, not universal result completeness; the deterministic server validates PIRA protocol, bounds, and context behavior rather than production latency.
-
-Measurements come from one Apple M1 Pro/macOS host and one Linux arm64 Docker Sandbox on that host. Complete-call latency is the product metric but does not isolate grammar throughput. Non-UTF-8 input, malformed syntax, path/symlink escapes, stale selectors, controls, closed output consumers, and hostile LSP messages are covered by functional/security tests rather than these tables. Reproducible runners are under `tests/tools`.
-
-</details>
+Pinned real fixtures retain upstream source, provenance, hashes, and adjacent licenses under `tools/tests/resources/pira_nav`; fixture code is parsed but never executed. Reproducible functional, security, correctness, and benchmark runners live under `tools/tests`. Machine, filesystem, caches, source mix, server choice, and project configuration affect results.
 
 </details>
 
@@ -642,10 +517,10 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `assets/scripts/` — setup and helper scripts
 - `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
-- `tools/build/build_pira_codenav_platform_bins.py` — package-isolated release entry point for `pira_codenav`
-- `tools/src/pira_ctx/`, `tools/src/pira_decision/`, and `tools/src/pira_codenav/` — public Rust implementations
-- `tools/dist/pira_ctx/` and `tools/dist/pira_codenav/` — verified platform executables and per-tool bundle manifests
-- `tests/tools/` and `tests/resources/pira_codenav/` — public codenav checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
+- `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
+- `tools/src/pira_ctx/`, `tools/src/pira_decision/`, and `tools/src/pira_nav/` — public Rust implementations
+- `tools/dist/` — published, verified platform executables and per-tool bundle manifests
+- `tools/tests/` and `tools/tests/resources/pira_nav/` — public tool checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
 Most PIRA instruction files use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.

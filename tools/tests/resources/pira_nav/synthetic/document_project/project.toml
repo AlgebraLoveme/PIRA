@@ -1,0 +1,15 @@
+[package]
+name = "pira-document-fixture"
+version = "0.1.0"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+
+features = ["json", "yaml", "toml"]
+metadata = { enabled = true, owner = "PIRA" }
+
+[[servers]]
+host = "one.example"
+
+[[servers]]
+host = "two.example"

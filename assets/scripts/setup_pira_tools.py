@@ -20,6 +20,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
+RETIRED_TOOLS = {"pira_codenav"}
+LEGACY_MANAGED_HASHES = {
+    "pira_codenav": {
+        "c2cba4a149da97ef68a233b7ddb37b70e13efb097f14d1045b48320645cb52dc",
+        "c97cf837ba97ccc71f5fd64ed3415227473847aef8957ddeca0663848837558a",
+        "cf11c7f6f9c0d8213d3391da875866ea6a493812c20a145f749191ed68da4eca",
+        "d5846ff161b53072fc7303b5a024e4d3a72a732e5635db24adfb0528fded6516",
+        "5b839a231b41e87b9186c834316ad26804ad16ab3141f54b284edeb7644f6b7d",
+    }
+}
 
 
 @dataclass(frozen=True)
@@ -218,7 +228,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def selected_tools(selector: ModuleType, requested: list[str] | None) -> list[str]:
-    bundled = selector.discover_tools()
+    bundled = [
+        tool for tool in selector.discover_tools() if tool not in RETIRED_TOOLS
+    ]
     if not bundled:
         raise RuntimeError("no bundled PIRA tools were found")
     if requested is None:
@@ -231,6 +243,18 @@ def selected_tools(selector: ModuleType, requested: list[str] | None) -> list[st
             f"available: {', '.join(bundled)}"
         )
     return tools
+
+
+def remove_managed_legacy_tools(install_dir: Path, dry_run: bool) -> None:
+    for tool_name, known_hashes in LEGACY_MANAGED_HASHES.items():
+        path = executable_path(install_dir, tool_name)
+        if not path.is_file() or path.is_symlink() or sha256(path) not in known_hashes:
+            continue
+        if dry_run:
+            print(f"DRY-RUN: would remove retired managed tool {path}")
+        else:
+            path.unlink()
+            print(f"Removed retired managed tool: {path}")
 
 
 def version_matches(tool_name: str, manifest: dict[str, object], version: str) -> bool:
@@ -322,6 +346,9 @@ def main(argv: list[str] | None = None) -> int:
                 "unchanged": "Refreshed",
             }[selection.action]
             print(f"{completed_action}: {installed}")
+
+    if any(selection.name == "pira_nav" for selection in selections):
+        remove_managed_legacy_tools(install_dir, args.dry_run)
 
     if not args.no_path:
         ensure_path(install_dir, args.dry_run)

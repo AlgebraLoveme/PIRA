@@ -1,0 +1,12 @@
+defaults: &defaults
+  retries: 2
+jobs:
+  build:
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: test
+        run: cargo test
+  release:
+    <<: *defaults
+    steps: [{name: package, run: cargo package}]

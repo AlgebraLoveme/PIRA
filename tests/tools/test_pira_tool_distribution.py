@@ -84,8 +84,8 @@ class PiraToolDistributionTests(unittest.TestCase):
 
     def test_selector_discovers_selects_and_installs_distinct_tools(self) -> None:
         self.add_bundle("pira_ctx", "0.9.0")
-        self.add_bundle("pira_codenav", "0.1.0")
-        self.assertEqual(["pira_codenav", "pira_ctx"], SELECTOR.discover_tools())
+        self.add_bundle("pira_nav", "0.1.0")
+        self.assertEqual(["pira_ctx", "pira_nav"], SELECTOR.discover_tools())
 
         install_dir = self.root / "bin"
         for tool_name in SELECTOR.discover_tools():
@@ -99,10 +99,36 @@ class PiraToolDistributionTests(unittest.TestCase):
             self.assertEqual(tool_name, installed.stem)
             self.assertEqual(record["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
 
+    def test_setup_filters_retired_bundle_name(self) -> None:
+        self.add_bundle("pira_ctx", "0.9.0")
+        self.add_bundle("pira_nav", "0.7.0")
+        self.add_bundle("pira_codenav", "0.1.0")
+        self.assertEqual(
+            ["pira_ctx", "pira_nav"],
+            SETUP.selected_tools(SELECTOR, None),
+        )
+
+    def test_setup_removes_only_hash_recognized_legacy_binary(self) -> None:
+        install_dir = self.root / "bin"
+        install_dir.mkdir()
+        legacy = install_dir / ("pira_codenav.exe" if os.name == "nt" else "pira_codenav")
+        legacy.write_bytes(b"known managed legacy binary")
+        digest = hashlib.sha256(legacy.read_bytes()).hexdigest()
+        original = SETUP.LEGACY_MANAGED_HASHES
+        try:
+            SETUP.LEGACY_MANAGED_HASHES = {"pira_codenav": {digest}}
+            SETUP.remove_managed_legacy_tools(install_dir, False)
+            self.assertFalse(legacy.exists())
+            legacy.write_bytes(b"unrelated user executable")
+            SETUP.remove_managed_legacy_tools(install_dir, False)
+            self.assertEqual(b"unrelated user executable", legacy.read_bytes())
+        finally:
+            SETUP.LEGACY_MANAGED_HASHES = original
+
     @unittest.skipIf(os.name == "nt", "fixture executables are POSIX shell scripts")
     def test_setup_installs_refreshes_and_verifies_all_bundled_tools(self) -> None:
         self.add_bundle("pira_ctx", "0.9.0")
-        self.add_bundle("pira_codenav", "0.1.0")
+        self.add_bundle("pira_nav", "0.1.0")
         install_dir = self.root / "bin"
         original_loader = SETUP.load_selector
         SETUP.load_selector = lambda: SELECTOR
@@ -119,9 +145,9 @@ class PiraToolDistributionTests(unittest.TestCase):
                     ),
                 )
             ctx = install_dir / "pira_ctx"
-            codenav = install_dir / "pira_codenav"
-            self.assertTrue(ctx.is_file() and codenav.is_file())
-            codenav_before = codenav.read_bytes()
+            nav = install_dir / "pira_nav"
+            self.assertTrue(ctx.is_file() and nav.is_file())
+            nav_before = nav.read_bytes()
             ctx.write_text("stale", encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
@@ -136,7 +162,7 @@ class PiraToolDistributionTests(unittest.TestCase):
                         ]
                     ),
                 )
-            self.assertEqual(codenav_before, codenav.read_bytes())
+            self.assertEqual(nav_before, nav.read_bytes())
             self.assertIn(b"pira_ctx 0.9.0", ctx.read_bytes())
         finally:
             SETUP.load_selector = original_loader
@@ -144,7 +170,7 @@ class PiraToolDistributionTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "fixture executables are POSIX shell scripts")
     def test_setup_validates_every_bundle_before_writing(self) -> None:
         self.add_bundle("pira_ctx", "0.9.0")
-        self.add_bundle("pira_codenav", "0.1.0", executable_version="9.9.9")
+        self.add_bundle("pira_nav", "0.1.0", executable_version="9.9.9")
         install_dir = self.root / "bin"
         original_loader = SETUP.load_selector
         SETUP.load_selector = lambda: SELECTOR
@@ -156,7 +182,7 @@ class PiraToolDistributionTests(unittest.TestCase):
             SETUP.load_selector = original_loader
 
     def test_builder_creates_first_release_manifest(self) -> None:
-        BUILDER.configure_tool("pira_codenav")
+        BUILDER.configure_tool("pira_nav")
         bundle = self.root / "bundle"
         target = BUILDER.TARGETS["darwin-arm64"]
         artifact = bundle / target.platform_dir / target.exe_name
@@ -165,7 +191,7 @@ class PiraToolDistributionTests(unittest.TestCase):
 
         BUILDER.update_bundle_manifest(bundle, [artifact], "1.96.1")
         manifest = json.loads((bundle / "bundle.json").read_text(encoding="utf-8"))
-        self.assertEqual("pira_codenav", manifest["tool_name"])
+        self.assertEqual("pira_nav", manifest["tool_name"])
         self.assertEqual(BUILDER.cargo_package_version(), manifest["tool_version"])
         self.assertEqual("aarch64-apple-darwin", manifest["binaries"]["darwin-arm64"]["target"])
         self.assertEqual("11.0", manifest["binaries"]["darwin-arm64"]["min_os"])
@@ -211,7 +237,7 @@ class PiraToolDistributionTests(unittest.TestCase):
     def test_zig_is_required_only_for_tools_with_c_compilation(self) -> None:
         BUILDER.configure_tool("pira_ctx")
         self.assertFalse(BUILDER.uses_zig_for_target(BUILDER.TARGETS["linux-arm64"]))
-        BUILDER.configure_tool("pira_codenav", uses_c_compiler=True)
+        BUILDER.configure_tool("pira_nav", uses_c_compiler=True)
         self.assertTrue(BUILDER.uses_zig_for_target(BUILDER.TARGETS["linux-arm64"]))
 
     def test_c_remap_flags_are_stable_and_shell_safe(self) -> None:

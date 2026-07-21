@@ -227,6 +227,25 @@ pub fn select_important(lines: &[LineMeta], maximum: usize) -> Vec<usize> {
             selected.push(index);
         }
     }
+    let boundary_budget = maximum
+        .div_ceil(3)
+        .min(maximum.saturating_sub(selected.len()));
+    if boundary_budget > 0 {
+        let mut boundaries_added = 0;
+        for index in lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.has(line_flag::COMMAND_BOUNDARY).then_some(index))
+        {
+            if selected_set.insert(index) {
+                selected.push(index);
+                boundaries_added += 1;
+                if boundaries_added == boundary_budget {
+                    break;
+                }
+            }
+        }
+    }
     let mut templates: HashMap<(StreamKind, u32), usize> = HashMap::new();
     let mut successful_checks = selected
         .iter()
@@ -293,7 +312,7 @@ pub fn representative_groups(
     for line in capture.timeline.iter().step_by(stride) {
         let text = reader.read_display_line(line)?;
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_summary_boilerplate(trimmed) {
             continue;
         }
         let normalized = identifier
@@ -311,6 +330,50 @@ pub fn representative_groups(
     values.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     values.truncate(maximum);
     Ok(values)
+}
+
+fn is_summary_boilerplate(trimmed: &str) -> bool {
+    if trimmed.starts_with("--- begin ")
+        || trimmed.starts_with("--- end ")
+        || trimmed == "PROGRAM data:"
+        || trimmed == "Common PROGRAM line forms:"
+        || trimmed.starts_with("# pira_")
+    {
+        return true;
+    }
+    if trimmed.eq_ignore_ascii_case("ok")
+        || trimmed
+            .chars()
+            .all(|character| character.is_ascii_punctuation() || character.is_whitespace())
+        || is_pretty_json_scaffolding(trimmed)
+    {
+        return true;
+    }
+    let without_marker = trimmed
+        .strip_prefix('>')
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let Some((left, right)) = without_marker.split_once('|') else {
+        return false;
+    };
+    right.trim().is_empty()
+        && !left.trim().is_empty()
+        && left.trim().bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_pretty_json_scaffolding(trimmed: &str) -> bool {
+    let Some((key, value)) = trimmed.split_once(':') else {
+        return false;
+    };
+    if !(key.starts_with('"') && key.ends_with('"')) {
+        return false;
+    }
+    let value = value.trim().trim_end_matches(',').trim();
+    matches!(value, "{" | "[" | "}" | "]")
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("null")
+        || value.parse::<f64>().is_ok()
 }
 
 fn reason_template(line: &LineMeta) -> (StreamKind, u32) {
@@ -662,6 +725,9 @@ fn score_line(
     exit_code: i32,
     keywords: &[String],
 ) -> (i64, u32) {
+    if is_rendering_scaffolding(clean.trim()) {
+        return (-100, 0);
+    }
     let lower = clean.to_lowercase();
     let trimmed = lower.trim_start();
     let tokens = lexical_tokens(&lower);
@@ -738,6 +804,10 @@ fn score_line(
         score += 20;
         flags |= line_flag::MARKER;
     }
+    if is_command_boundary(clean) {
+        score += 80;
+        flags |= line_flag::COMMAND_BOUNDARY;
+    }
     if lower.contains(" at ")
         || lower.trim_start().starts_with("at ")
         || lower.contains("stack backtrace")
@@ -772,6 +842,33 @@ fn score_line(
         flags |= line_flag::INFORMATIVE;
     }
     (score, flags)
+}
+
+fn is_rendering_scaffolding(trimmed: &str) -> bool {
+    if trimmed.starts_with("--- begin ")
+        || trimmed.starts_with("--- end ")
+        || trimmed == "PROGRAM data:"
+        || trimmed == "Common PROGRAM line forms:"
+        || trimmed
+            .chars()
+            .all(|character| character.is_ascii_punctuation() || character.is_whitespace())
+    {
+        return true;
+    }
+    let without_marker = trimmed
+        .strip_prefix('>')
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let Some((left, right)) = without_marker.split_once('|') else {
+        return false;
+    };
+    right.trim().is_empty()
+        && !left.trim().is_empty()
+        && left.trim().bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_command_boundary(clean: &str) -> bool {
+    clean.trim_start().starts_with("# pira_")
 }
 
 struct TokenFacts {
@@ -1200,6 +1297,56 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(select_important(&lines, 2).contains(&4));
+    }
+
+    #[test]
+    fn summary_boilerplate_and_command_boundaries_are_separated() {
+        assert!(is_summary_boilerplate(
+            "--- begin untrusted repository source ---"
+        ));
+        assert!(is_summary_boilerplate("# pira_nav outline file=\"x.py\""));
+        assert!(is_summary_boilerplate("21 |"));
+        assert!(is_summary_boilerplate("----------------"));
+        assert!(is_summary_boilerplate("OK"));
+        assert!(is_summary_boilerplate("\"runs\": 20,"));
+        assert!(is_summary_boilerplate("\"command\": ["));
+        assert!(!is_summary_boilerplate("error: compilation failed"));
+        assert!(!is_summary_boilerplate(
+            "\"message\": \"compilation failed\""
+        ));
+        assert!(is_command_boundary("# pira_nav search path=\".\""));
+        assert!(!is_command_boundary("ordinary program output"));
+        assert!(is_rendering_scaffolding(
+            "--- begin untrusted repository source ---"
+        ));
+        assert!(!is_rendering_scaffolding("error: compilation failed"));
+    }
+
+    #[test]
+    fn command_boundaries_do_not_displace_failure_evidence() {
+        let mut lines = (0..12)
+            .map(|index| LineMeta {
+                line: index + 1,
+                stream: StreamKind::Stdout,
+                offset: 0,
+                length: 1,
+                score: 10,
+                flags: if index % 3 == 0 {
+                    line_flag::COMMAND_BOUNDARY
+                } else {
+                    0
+                },
+            })
+            .collect::<Vec<_>>();
+        lines[10].score = 300;
+        lines[10].flags = line_flag::FAILURE;
+        let selected = select_important(&lines, 6);
+        assert!(selected.contains(&10));
+        assert!(
+            selected
+                .iter()
+                .any(|&index| lines[index].has(line_flag::COMMAND_BOUNDARY))
+        );
     }
 
     #[test]

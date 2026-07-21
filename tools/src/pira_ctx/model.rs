@@ -58,6 +58,7 @@ pub mod line_flag {
     pub const NONZERO_TAIL: u32 = 1 << 15;
     pub const NUMERIC_ANOMALY: u32 = 1 << 16;
     pub const INFORMATIVE: u32 = 1 << 17;
+    pub const COMMAND_BOUNDARY: u32 = 1 << 18;
 
     pub const HIGH_CONFIDENCE: u32 =
         FAILURE | SUCCESS | ERROR | FAILED_TEST | WARNING | NUMERIC_ANOMALY;
@@ -76,7 +77,8 @@ pub mod line_flag {
         | STACK
         | STDERR
         | NONZERO_TAIL
-        | NUMERIC_ANOMALY;
+        | NUMERIC_ANOMALY
+        | COMMAND_BOUNDARY;
 }
 
 impl LineMeta {

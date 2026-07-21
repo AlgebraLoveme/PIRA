@@ -18,7 +18,7 @@ __pycache__/
 # Private local tool planning
 tool_todo.md
 
-# Keep only public PIRA tool build inputs, selectors, source, and releases.
+# Keep only public PIRA tool build inputs, selectors, source, tests, and release
 # bundles. Setup scripts live under assets/scripts/ and remain public.
 tools/*
 !tools/Cargo.toml
@@ -29,9 +29,22 @@ tools/*
 !tools/build/
 tools/build/*
 !tools/build/build_pira_ctx_platform_bins.py
-!tools/build/build_pira_codenav_platform_bins.py
+!tools/build/build_pira_nav_platform_bins.py
 !tools/src/
 !tools/src/**
+!tools/tests/
+tools/tests/*
+!tools/tests/README.md
+!tools/tests/test_pira_nav.py
+!tools/tests/test_pira_nav_security.py
+!tools/tests/benchmark_pira_nav.py
+!tools/tests/benchmark_pira_nav_correctness.py
+!tools/tests/benchmark_pira_nav_repositories.py
+!tools/tests/fake_lsp_server.py
+!tools/tests/resources/
+tools/tests/resources/*
+!tools/tests/resources/pira_nav/
+!tools/tests/resources/pira_nav/**
 !tools/dist/
 !tools/dist/**
 

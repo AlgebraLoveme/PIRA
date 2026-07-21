@@ -1,0 +1,10 @@
+{
+  // JSONC comments and trailing commas retain exact source offsets.
+  "editor": {
+    "formatOnSave": true,
+  },
+  "files.exclude": [
+    "target",
+    "build",
+  ],
+}

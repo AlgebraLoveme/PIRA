@@ -15,7 +15,7 @@ Retrieve only the smallest relevant memory when the task depends on it; never pr
 
 ## `pira_decision`
 - Add only concluded decisions likely to guide later work—not routine actions, unresolved proposals, evidence, or transient details.
-- Keep records concise and self-contained: decisive context, serious choices only, and makers assigned by decision authority (`human`, `agent`, or both when substantively joint).
+- Keep records concise and self-contained: decisive context, serious choices only, and one maker assigned by authority—`human` when the user selects or authorizes the conclusion; otherwise `agent`.
 - Before revisiting an issue, search for prior/conflicting decisions; preserve conflicts rather than replacing history.
 
 ## `AGENT_WORKBOOK.md`

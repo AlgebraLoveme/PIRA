@@ -19,7 +19,9 @@ use cli::{Config, HistoryScope, Mode, RawStream};
 use model::{CaptureResult, ListedEntry, Metadata, StreamKind};
 use storage::{StoredResult, effective_store_dir};
 
-const AUTO_SUMMARY_THRESHOLD: u64 = 2 * 1024;
+const AUTO_SUMMARY_THRESHOLD: u64 = 4 * 1024;
+const AUTO_DENSE_EXACT_MAX_BYTES: u64 = 16 * 1024;
+const AUTO_DENSE_EXACT_MAX_LINES: usize = 64;
 const EXACT_GUARD_MIN_LINES: usize = 40;
 const EXACT_GUARD_MAX_LINES: usize = 20_000;
 const MAX_IMPORTANT_LINES: usize = 10;
@@ -94,8 +96,7 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    summarize::score_timeline(&mut capture, &ranking)?;
-    if !should_capture(&capture) {
+    if !should_retain_output(&capture)? {
         let replay_risk = inspect_capture_for_context(&capture)?;
         if replay_risk == security::ContentRisk::default() {
             record_event(
@@ -108,7 +109,8 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
             return Ok(capture.exit_code);
         }
     }
-    let compact = capture.total_bytes() < AUTO_SUMMARY_THRESHOLD
+    summarize::score_timeline(&mut capture, &ranking)?;
+    let compact = capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
         && !capture.stdout.binary
         && !capture.stderr.binary
         && !capture.stdout.non_utf8
@@ -219,7 +221,7 @@ fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
     if capture.timeline_truncated {
         return Ok(true);
     }
-    if capture.total_bytes() < AUTO_SUMMARY_THRESHOLD
+    if capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
         || capture.total_lines < EXACT_GUARD_MIN_LINES
         || capture.stdout.binary
         || capture.stderr.binary
@@ -300,8 +302,7 @@ fn run_auto(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    summarize::score_timeline(&mut capture, &ranking)?;
-    let normally_captured = should_capture(&capture);
+    let normally_captured = should_retain_output(&capture)?;
     let replay_risk = if normally_captured {
         security::ContentRisk::default()
     } else {
@@ -312,7 +313,8 @@ fn run_auto(config: &Config) -> Result<i32, String> {
         replay_capture(&capture)?;
         return Ok(capture.exit_code);
     }
-    let compact = capture.total_bytes() < AUTO_SUMMARY_THRESHOLD
+    summarize::score_timeline(&mut capture, &ranking)?;
+    let compact = capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
         && !capture.stdout.binary
         && !capture.stderr.binary
         && !capture.stdout.non_utf8
@@ -383,24 +385,31 @@ fn check_label(exit_code: i32) -> &'static str {
     if exit_code == 0 { "PASS" } else { "FAIL" }
 }
 
-fn should_capture(capture: &CaptureResult) -> bool {
-    use model::line_flag;
-    capture.live_id.is_some()
-        || capture.total_bytes() >= AUTO_SUMMARY_THRESHOLD
+fn should_retain_output(capture: &CaptureResult) -> Result<bool, String> {
+    if capture.live_id.is_some()
+        || capture.timeline_truncated
+        || capture.retention_truncated
         || capture.stdout.binary
         || capture.stderr.binary
         || capture.stdout.non_utf8
         || capture.stderr.non_utf8
-        || capture.timeline.iter().any(|line| {
-            line.length > 2048
-                || line.has(
-                    line_flag::FAILURE
-                        | line_flag::ERROR
-                        | line_flag::FAILED_TEST
-                        | line_flag::WARNING,
-                )
-        })
-        || (capture.exit_code != 0 && capture.total_bytes() > 0)
+    {
+        return Ok(true);
+    }
+    let repetitive = capture.total_bytes() > AUTO_SUMMARY_THRESHOLD
+        && capture.total_bytes() <= AUTO_DENSE_EXACT_MAX_BYTES
+        && capture.total_lines <= AUTO_DENSE_EXACT_MAX_LINES
+        && should_guard_exact(capture)?;
+    Ok(retain_text_shape(
+        capture.total_bytes(),
+        capture.total_lines,
+        repetitive,
+    ))
+}
+
+fn retain_text_shape(bytes: u64, lines: usize, repetitive: bool) -> bool {
+    bytes > AUTO_SUMMARY_THRESHOLD
+        && (bytes > AUTO_DENSE_EXACT_MAX_BYTES || lines > AUTO_DENSE_EXACT_MAX_LINES || repetitive)
 }
 
 fn run_capture(config: &Config) -> Result<i32, String> {
@@ -1646,7 +1655,8 @@ mod output_format_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        exact_repetition_key, is_highly_repetitive, parse_history_time, stream_description,
+        exact_repetition_key, is_highly_repetitive, parse_history_time, retain_text_shape,
+        stream_description,
     };
     use std::collections::HashMap;
 
@@ -1671,6 +1681,15 @@ mod tests {
             .map(|index| (format!("line-{index}"), 1))
             .collect::<HashMap<_, _>>();
         assert!(!is_highly_repetitive(&varied, 100));
+    }
+
+    #[test]
+    fn automatic_shape_keeps_small_dense_output_exact() {
+        assert!(!retain_text_shape(4 * 1024, 500, true));
+        assert!(!retain_text_shape(16 * 1024, 64, false));
+        assert!(retain_text_shape(16 * 1024, 64, true));
+        assert!(retain_text_shape(16 * 1024 + 1, 10, false));
+        assert!(retain_text_shape(5 * 1024, 65, false));
     }
 
     #[test]
