@@ -37,3 +37,12 @@ synthetic fixtures, provenance, hashes, and adjacent licenses are under
 `tests/resources/pira_nav/`. `benchmark_pira_nav.py` measures assertion-checked
 subcommands; `benchmark_pira_nav_repositories.py` measures repository-scale
 maps. Public Rust source is under `tools/src/pira_nav/`.
+
+## Distribution and setup
+
+Run the cross-tool distribution, selection, setup, and builder tests from the
+repository root:
+
+```bash
+python3 tools/tests/test_pira_tool_distribution.py
+```
