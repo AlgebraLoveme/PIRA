@@ -3,7 +3,7 @@
 ## Goal and Strategy
 - Read one research paper efficiently; default to the minimum decision-useful extraction.
 - First identify the goal: relevance/triage, main idea/background, method, evidence quality, limitations, citation support, implementation, critique, reproduction, or review. Goal determines depth; if unclear from context, confirm before reading.
-- Escalate to one full read only when context clearly requires it or the user asks. Always end with a depth-scaled structured note.
+- Escalate to one full read only under the Progressive Depth conditions below. Always end with a depth-scaled structured note.
 
 ## Context-Efficient Reading
 - Do not read the whole paper by default. Start with title, abstract, introduction, figures/tables, and conclusion.
@@ -31,7 +31,7 @@ Perform a full read when the user asks, the paper is project-central, an importa
 ## Structured Note and Citations
 - Focus the note on claims, support, and uncertainty. If the task shifts to teaching, use `LEARNING_STYLE.md`; search online for background when needed.
 - Cite paper locations when practical and precisely when available: section + paragraph, figure/table, theorem/lemma/proposition, or appendix section (for example, `Section 2, second paragraph`, `Figure 3`, `Appendix B, first paragraph`).
-- Reuse one numbered reference for repeated citations to the same source; list its link once at the end, e.g. `(Table 1, [1])`, `(Table 2, [1])`, then `[1] <link>`.
+- Follow the active platform's citation format. When it permits a reference list, reuse one number for repeated citations to the same source and list its link once, e.g. `(Table 1, [1])`, `(Table 2, [1])`, then `[1] <link>`.
 
 ## Default Output
 1. Problem.
@@ -63,5 +63,3 @@ Transferable takeaways are mandatory after a full read; if none are meaningful, 
 ## Guardrails
 - Do not overread by default, overstate what the paper proves, or rely only on abstract/conclusion when the decision matters.
 - Do not present tentative critique as fact or expose reading-process metadata unless directly useful.
-- Keep teaching policy in `LEARNING_STYLE.md`; do not turn this module into general teaching.
-- Use precise locations when available; do not repeat source links when one grouped numbered reference suffices.

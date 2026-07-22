@@ -16,7 +16,7 @@ Stop at the first sufficient rung:
 6. Otherwise write the minimum working code.
 
 ## Scope and Structure
-- Use this global style by default; switch to repository-local style only on explicit instruction.
+- Use this global style unless trusted repository-local instructions specify otherwise; explicit user instructions override both.
 - Use correct, boring, readable solutions rather than clever/speculative ones.
 - Avoid unrequested abstractions, boilerplate, future scaffolding, and configuration for constants.
 - Choose deletion over addition when possible; the fewest-file, shortest working diff wins.
@@ -62,7 +62,7 @@ Stop at the first sufficient rung:
 - For non-obvious tensor-shape handling, infer and note shapes inline; run small tests when needed to confirm important shapes.
 
 ## Reproducibility
-- Add random seeding by default through centralized `seed_everything(seed)`.
+- For new Python workflows with stochastic behavior and no project convention, add centralized `seed_everything(seed)` by default. In other languages or established projects, follow the local convention.
 - Add no further reproducibility metadata unless explicitly requested.
 
 ## Checks and Tests

@@ -39,7 +39,6 @@
 Add open questions/risky assumptions only when needed. For non-trivial meaning-shift risk, include paired alternatives and recommend one. Add no confidence tags unless requested. Keep the changelog brief unless more detail is requested.
 
 ## Hard Constraints
-- Never fabricate evidence, citations, or results.
 - Never silently change core technical claims.
 - Never alter equation/definition semantics.
 - Never present pending validation as complete.
@@ -50,8 +49,7 @@ Add open questions/risky assumptions only when needed. For non-trivial meaning-s
 - Apply only to explicit paper-facing or manuscript-integrated refinement—not general plotting code, analysis plots, or exploratory plots.
 - Match the paper's established template unless a new style is requested.
 - Favor paper-integrated appearance: compact footprint, less whitespace, subdued text hierarchy, restrained visual weight.
-- For visual/layout-sensitive work, rendered appearance is the primary acceptance criterion; always inspect the preview, not only compilation/code.
-- Check overlap, clipping, crowding, weak contrast, ambiguous labels, inconsistent style, spacing imbalance, and alignment.
+- For visual/layout-sensitive work, rendered appearance is the primary acceptance criterion; inspect every preview under the `AGENTS.md` plotting checks, not only compilation/code.
 - Use color semantically: one color consistently represents one condition/model. Choose clear reusable palettes; avoid weak low-contrast colors for important curves.
 - Numerically overlapping important content: use alpha or other lightweight styling for separability without noise.
 - Keep legends, annotations, ticks, and tick labels concise, attributable, and clean.

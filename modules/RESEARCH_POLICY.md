@@ -14,7 +14,7 @@
 
 ## Evidence
 - Prefer primary sources when available: papers, official docs, source code, benchmark specifications.
-- Use numbered references for key claims; link them at the end.
+- Cite key claims in the active platform's required format. Otherwise place descriptive links near supported claims; use a numbered reference list only when the medium or user requests it.
 - Mark speculation explicitly; use concrete dates when recency matters.
 
 ## Analysis Quality
