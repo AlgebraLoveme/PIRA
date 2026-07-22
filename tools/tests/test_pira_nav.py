@@ -118,6 +118,42 @@ class PiraNavTests(unittest.TestCase):
         missing_path = self.run_cli("search", "python_project", "Client", expected=2)
         self.assertIn("search target does not exist", missing_path.stderr)
 
+    def test_common_call_mistakes_have_actionable_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-nav-recovery-") as temp:
+            root = Path(temp)
+            (root / "src" / "history_cell").mkdir(parents=True)
+            (root / "src" / "history_cell" / "mod.rs").write_text(
+                "pub trait HistoryCell {}\n", encoding="utf-8"
+            )
+            (root / "justfile").write_text("test:\n    cargo test\n", encoding="utf-8")
+
+            semantic = self.run_cli(
+                "definition", "src/history_cell.rs::HistoryCell", cwd=root, expected=2
+            )
+            self.assertIn("semantic target file does not exist", semantic.stderr)
+            self.assertIn("did you mean `src/history_cell/mod.rs`", semantic.stderr)
+
+            search = self.run_cli(
+                "search", "cargo test", "src/justfile", cwd=root, expected=2
+            )
+            self.assertIn("did you mean `justfile`", search.stderr)
+
+            outline = self.run_cli("outline", "justfile", cwd=root, expected=2)
+            self.assertIn("pira_nav search PATTERN PATH", outline.stderr)
+            self.assertIn("pira_nav show PATH:START-END", outline.stderr)
+
+            regex = self.run_cli(
+                "search", "HistoryCell {", ".", "--regex", cwd=root, expected=2
+            )
+            self.assertIn("repeat `-e PATTERN` without --regex", regex.stderr)
+
+            bounded_map = self.run_cli(
+                "map", ".", "--max-depth", "2", "--max-files", "200", cwd=root, expected=2
+            )
+            self.assertIn("pass a narrower DIRECTORY", bounded_map.stderr)
+            self.assertIn("--max-items", bounded_map.stderr)
+            self.assertIn("--max-depth, --max-files", bounded_map.stderr)
+
     def test_languages_report_compiled_and_path_status(self) -> None:
         result = self.run_cli("languages")
         lines = result.stdout.splitlines()
@@ -285,6 +321,38 @@ class PiraNavTests(unittest.TestCase):
         self.assertIn("query index=1", multi.stdout)
         self.assertIn('file="src/parser.rs"', multi.stdout)
         self.assertNotIn('file="rust_project/src/parser.rs"', multi.stdout)
+
+    def test_symbols_accepts_deduplicated_multiple_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pira-nav-symbol-paths-") as temp:
+            root = Path(temp)
+            (root / "left").mkdir()
+            (root / "right").mkdir()
+            (root / "left" / "a.py").write_text(
+                "class ParserLeft:\n    pass\n", encoding="utf-8"
+            )
+            (root / "right" / "b.py").write_text(
+                "class ParserRight:\n    pass\n", encoding="utf-8"
+            )
+
+            multiple = self.run_cli(
+                "symbols", "Parser", "left/a.py", "right", "--locations-only", cwd=root
+            )
+            self.assertIn("roots=2", multiple.stdout.splitlines()[0])
+            self.assertIn("files=2 matches=2", multiple.stdout.splitlines()[0])
+            self.assertIn('file="left/a.py"', multiple.stdout)
+            self.assertIn('file="right/b.py"', multiple.stdout)
+
+            overlapping = self.run_cli(
+                "symbols", "Parser", "left", "left/a.py", "--locations-only", cwd=root
+            )
+            self.assertIn("files=1 matches=1", overlapping.stdout.splitlines()[0])
+            self.assertEqual(1, overlapping.stdout.count('file="left/a.py"'))
+
+            partial = self.run_cli(
+                "symbols", "Parser", "missing", "right", "--locations-only", cwd=root
+            )
+            self.assertIn("missing_roots=1 complete=0", partial.stdout.splitlines()[0])
+            self.assertIn('file="right/b.py"', partial.stdout)
 
     def test_selector_round_trip_and_staleness(self) -> None:
         outline = self.run_cli(

@@ -9,7 +9,7 @@ const GLOBAL: &str = r#"USAGE
 COMMANDS
   map [PATH]                     Repository shape, documents, and declarations.
   search -e PATTERN... [PATH...] Bounded search over ordinary unignored UTF-8 text.
-  symbols QUERY [PATH]           Declarations, keys, or headings (`declarations` alias).
+  symbols QUERY [PATH...]        Declarations, keys, or headings (`declarations` alias).
   outline FILE...                Declarations or document paths without bodies.
   show TARGET...                 Exact items, position windows, or line ranges.
   imports | dependents | deps    Conservative syntax-level file relationships.
@@ -116,12 +116,13 @@ EXAMPLES
         "symbols" => format!(r#"pira_nav symbols — ranked declaration and key discovery
 
 USAGE
-  pira_nav symbols QUERY [PATH] [OPTIONS]
-  pira_nav symbols --query QUERY [--query QUERY]... [PATH] [OPTIONS]
+  pira_nav symbols QUERY [PATH...] [OPTIONS]
+  pira_nav symbols --query QUERY [--query QUERY]... [PATH...] [OPTIONS]
 
-PATH defaults to `.`. Searches code declaration names, JSON/JSONC/YAML/TOML key paths, and Markdown
-headings, not arbitrary body text. Unique matches include bounded exact source by default; use
---locations-only to suppress it.
+PATH defaults to `.`; up to 64 overlapping paths are deduplicated. Searches code declaration names,
+JSON/JSONC/YAML/TOML key paths, and Markdown headings, not arbitrary body text. With several paths,
+missing peers mark output incomplete while valid peers are searched. Unique matches include bounded
+exact source by default; use --locations-only to suppress it.
 
 OPTIONS
 {STRUCTURAL_OPTIONS}
@@ -134,7 +135,7 @@ OPTIONS
   --show-unique | --locations-only
 
 EXAMPLE
-  pira_nav symbols Parser src"#),
+  pira_nav symbols Parser src tests"#),
         "outline" => format!(r#"pira_nav outline — declarations or document paths without bodies
 
 USAGE

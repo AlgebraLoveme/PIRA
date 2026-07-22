@@ -12,7 +12,7 @@ use crate::command::{
     positive_usize,
 };
 use crate::deps;
-use crate::discovery::{DiscoverySelection, discover_files};
+use crate::discovery::{DiscoverySelection, discover_files, discover_files_many};
 use crate::document::MAX_DOCUMENT_SYMBOLS;
 use crate::language::Language;
 use crate::lsp_options::{self, LspOptions};
@@ -24,7 +24,8 @@ use crate::semantic;
 use crate::structural::StructuralResolver;
 use crate::util::{
     absolute_lexical, display_path, escape_untrusted_text, hash16, is_broad_map_fixture,
-    percent_decode, quote_metadata, read_source, repository_path_penalty, sanitize_metadata,
+    nearby_existing_path, percent_decode, quote_metadata, read_source, repository_path_penalty,
+    sanitize_metadata,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,6 +40,7 @@ const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
 const PARSE_BATCH_FILES: usize = 16;
 const MAX_SYMBOL_ITEMS: usize = 100_000;
 const MAX_SYMBOL_QUERIES: usize = 32;
+const MAX_SYMBOL_PATHS: usize = 64;
 const MAX_SYMBOL_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SYMBOL_TOTAL_QUERY_BYTES: usize = 32 * 1024;
 const DEFAULT_SYMBOL_MAX_ITEMS: usize = 20;
@@ -1140,7 +1142,7 @@ impl SymbolMatcher {
 }
 
 struct SymbolOptions {
-    root: String,
+    paths: Vec<String>,
     queries: Vec<SymbolQuery>,
     kind: Option<String>,
     max_items: usize,
@@ -1338,21 +1340,48 @@ fn command_symbols(
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_symbol_options(args)?;
-    let root = absolute_lexical(Path::new(&options.root), cwd);
-    if !root.is_dir() && !root.is_file() {
-        return Err(input_error(format!(
-            "symbols target is not a file or directory: {}",
-            root.display()
-        )));
+    let requested_roots = options
+        .paths
+        .iter()
+        .map(|path| absolute_lexical(Path::new(path), cwd))
+        .collect::<Vec<_>>();
+    let mut roots = Vec::with_capacity(requested_roots.len());
+    let mut missing_roots = 0usize;
+    for root in &requested_roots {
+        if root.is_file() || root.is_dir() {
+            roots.push(root.clone());
+            continue;
+        }
+        if requested_roots.len() == 1 {
+            let mut message = format!(
+                "symbols target is not a file or directory: {}",
+                root.display()
+            );
+            if let Some(suggestion) = nearby_existing_path(root, cwd, false) {
+                message.push_str(&format!(
+                    "; did you mean `{}`?",
+                    display_path(&suggestion, cwd)
+                ));
+            }
+            return Err(input_error(message));
+        }
+        missing_roots += 1;
     }
-    let discovery = discover_files(
-        &root,
-        explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
-    );
-    let lsp_root = if root.is_dir() {
-        root.as_path()
+    if roots.is_empty() {
+        return Err(input_error("none of the requested symbols targets exist"));
+    }
+    let selection = explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact);
+    let discovery = if roots.len() == 1 {
+        discover_files(&roots[0], selection)
     } else {
-        root.parent().unwrap_or(cwd)
+        discover_files_many(roots.iter(), selection)
+    };
+    let lsp_root = if requested_roots.len() == 1 && roots[0].is_dir() {
+        roots[0].as_path()
+    } else if requested_roots.len() == 1 {
+        roots[0].parent().unwrap_or(cwd)
+    } else {
+        cwd
     };
     let mut resolver = structural_resolver(lsp, lsp_root)?;
     let mut failures = FailureCollector::default();
@@ -1372,12 +1401,12 @@ fn command_symbols(
                 Ok(parsed) => match resolver.resolve_parsed(parsed) {
                     Ok(parsed) => parsed,
                     Err((code, message)) => {
-                        failures.record(display_path(path, &root), code, message);
+                        failures.record(display_path(path, cwd), code, message);
                         continue;
                     }
                 },
                 Err(message) => {
-                    failures.record(display_path(path, &root), 2, message);
+                    failures.record(display_path(path, cwd), 2, message);
                     continue;
                 }
             };
@@ -1431,7 +1460,11 @@ fn command_symbols(
         .iter()
         .map(|selection| selection.rows.len())
         .sum::<usize>();
-    let result_base = if root.is_dir() { root.as_path() } else { cwd };
+    let result_base = if requested_roots.len() == 1 && roots[0].is_dir() {
+        roots[0].as_path()
+    } else {
+        cwd
+    };
     let metadata_warning = selections.iter().any(|selection| {
         selection.rows.iter().any(|row| {
             possible_prompt_injection(&display_path(&row.path, result_base))
@@ -1442,8 +1475,12 @@ fn command_symbols(
     if multi_query {
         write!(
             output,
-            "# pira_nav symbols root={} queries={} files={} matches={} shown={}",
-            quote_metadata(&display_path(&root, cwd)),
+            "# pira_nav symbols {} queries={} files={} matches={} shown={}",
+            if requested_roots.len() == 1 {
+                format!("root={}", quote_metadata(&display_path(&roots[0], cwd)))
+            } else {
+                format!("roots={}", requested_roots.len())
+            },
             options.queries.len(),
             discovery.files.len(),
             matched_total,
@@ -1453,8 +1490,12 @@ fn command_symbols(
     } else {
         write!(
             output,
-            "# pira_nav symbols root={} query={} mode={} files={} matches={} shown={}",
-            quote_metadata(&display_path(&root, cwd)),
+            "# pira_nav symbols {} query={} mode={} files={} matches={} shown={}",
+            if requested_roots.len() == 1 {
+                format!("root={}", quote_metadata(&display_path(&roots[0], cwd)))
+            } else {
+                format!("roots={}", requested_roots.len())
+            },
             quote_metadata(&options.queries[0].text),
             options.queries[0].matcher.name(selections[0].fallback_used),
             discovery.files.len(),
@@ -1470,6 +1511,9 @@ fn command_symbols(
             parsed_count, failures.total
         )
         .map_err(output_error)?;
+    }
+    if missing_roots > 0 {
+        write!(output, " missing_roots={missing_roots} complete=0").map_err(output_error)?;
     }
     if lsp_count > 0 {
         write!(output, " lsp={lsp_count}").map_err(output_error)?;
@@ -1724,23 +1768,31 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
             }
         }
     }
-    let root;
+    let paths;
     let queries;
     if explicit_queries.is_empty() {
-        if positional.is_empty() || positional.len() > 2 {
-            return Err((2, "symbols requires QUERY [PATH]".into()));
+        if positional.is_empty() {
+            return Err((2, "symbols requires QUERY [PATH...]".into()));
         }
         queries = vec![positional.remove(0)];
-        root = positional.pop().unwrap_or_else(|| ".".into());
+        paths = if positional.is_empty() {
+            vec![".".into()]
+        } else {
+            positional
+        };
     } else {
-        if positional.len() > 1 {
-            return Err((
-                2,
-                "with --query, symbols accepts at most one positional PATH".into(),
-            ));
-        }
         queries = explicit_queries;
-        root = positional.pop().unwrap_or_else(|| ".".into());
+        paths = if positional.is_empty() {
+            vec![".".into()]
+        } else {
+            positional
+        };
+    }
+    if paths.len() > MAX_SYMBOL_PATHS {
+        return Err((
+            2,
+            format!("symbols accepts at most {MAX_SYMBOL_PATHS} paths"),
+        ));
     }
     if queries.len() > MAX_SYMBOL_QUERIES {
         return Err((
@@ -1800,7 +1852,7 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
         })
         .collect::<Result<Vec<_>, (i32, String)>>()?;
     Ok(SymbolOptions {
-        root,
+        paths,
         queries,
         kind,
         max_items,
@@ -2977,6 +3029,23 @@ fn parse_paths_and_limit(
     args: &[String],
     allow_selectors: bool,
 ) -> Result<(Vec<String>, usize, bool), (i32, String)> {
+    let unsupported_bounds = args
+        .iter()
+        .filter(|value| matches!(value.as_str(), "--depth" | "--max-depth" | "--max-files"))
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if !unsupported_bounds.is_empty() {
+        return Err((
+            2,
+            format!(
+                "map does not support {}; pass a narrower DIRECTORY to limit traversal or use --max-items N to bound output",
+                unsupported_bounds
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     let mut paths = Vec::new();
     let mut max_items = DEFAULT_MAP_MAX_ITEMS;
     let mut selectors = false;
@@ -2995,11 +3064,6 @@ fn parse_paths_and_limit(
         } else if args[index] == "--selectors" && allow_selectors {
             selectors = true;
             index += 1;
-        } else if args[index] == "--depth" {
-            return Err((
-                2,
-                "map has no --depth option; pass a narrower DIRECTORY or --max-items N".into(),
-            ));
         } else if args[index].starts_with('-') {
             return Err((2, format!("unknown option `{}`", args[index])));
         } else {

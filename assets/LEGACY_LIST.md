@@ -4,3 +4,6 @@ Legacy files removed from the active scheme. During setup or migration, if any o
 
 - `~/agent/MEMORY.md`
 - `~/agent/assets/MEMORY_INIT.md`
+- `~/agent/SOUL.md`
+- `~/agent/TOOLS.md`
+- `~/agent/MEMORY_SYSTEM.md`

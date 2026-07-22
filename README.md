@@ -1,4 +1,4 @@
-# PIRA — PI Research Assistant
+# PIRA
 
 PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
 
@@ -36,7 +36,7 @@ The recommended command installs or updates PIRA, then connects it to Codex. It:
 - uses the existing `~/agent` git checkout when present, otherwise clones PIRA into `~/agent`;
 - enables **soft-safe** mode;
 - keeps audio notifications **off**;
-- links PIRA into Codex;
+- configures Codex to load PIRA's canonical `AGENTS.md` once;
 - installs or refreshes bundled PIRA tools in the user's `PATH`;
 - moves old PIRA-managed legacy files into backup;
 - creates a private `USER.md` placeholder only if `USER.md` is missing.
@@ -44,13 +44,13 @@ The recommended command installs or updates PIRA, then connects it to Codex. It:
 macOS/Linux:
 
 ```bash
-if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent && cd ~/agent; fi && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode placeholder --global-agents link --legacy remove
+if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent && cd ~/agent; fi && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
 ```
 
 Windows PowerShell:
 
 ```powershell
-if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode placeholder --global-agents link --legacy remove
+if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
 ```
 
 If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-mode keep`:
@@ -58,13 +58,13 @@ If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-
 macOS/Linux:
 
 ```bash
-cd ~/agent && git pull --ff-only && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode keep --global-agents link --legacy remove
+cd ~/agent && git pull --ff-only && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
 ```
 
 Windows PowerShell:
 
 ```powershell
-Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode keep --global-agents link --legacy remove
+Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
 ```
 
 `git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
@@ -120,7 +120,6 @@ Most users can keep the recommended defaults. Open this section when you want st
 | --- | --- |
 | `--yes` | Accepts setup confirmations. It does **not** enable audio unless `--audio yes` is also set. |
 | `--audio yes\|no\|ask` | Controls optional Codex audio notifications. Use `--audio no` for a quiet install. |
-| `--global-agents link\|copy\|skip\|ask` | Controls whether `~/.codex/AGENTS.md` points to PIRA by symlink, copy, or not at all. |
 | `--legacy remove\|keep\|ask` | Controls paths listed in `assets/LEGACY_LIST.md`; `remove` moves active legacy files into `.backup/setup_pira_legacy/`. |
 | `--agent-dir PATH` | Installs against a path other than `~/agent`. |
 | `--skip-tools` | Skips installation or refresh of bundled native PIRA tools. |
@@ -165,7 +164,7 @@ In plain language, setup connects PIRA to Codex, installs its tools, and checks 
 2. Initializes a private `USER.md` placeholder when needed.
 3. Moves legacy files listed in `assets/LEGACY_LIST.md` into `.backup/setup_pira_legacy/` when approved.
 4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536`.
-5. Optionally links or copies `~/.codex/AGENTS.md` for Codex's global AGENTS discovery path.
+5. Creates a local repository guard that prevents the same `AGENTS.md` from being rediscovered while working inside the PIRA checkout, and removes an older `~/.codex/AGENTS.md` symlink only when it duplicates PIRA.
 6. Selects and verifies the bundled native tools for the current platform, then installs or refreshes them in a per-user PATH directory. Existing stale copies are atomically replaced; matching copies are left unchanged.
 7. Optionally delegates audio setup to the platform-specific audio helper.
 8. Verifies the setup, including the PIRA verification token and installed native tools.
@@ -185,6 +184,8 @@ PIRA separates memory by how long it should remain useful. This prevents raw com
 | Project knowledge | Durable state, validated results, lessons, and limitations | `AGENT_WORKBOOK.md` | Agents and humans read it directly |
 
 Detailed activity remains searchable for as long as retention allows. After a conversation is compacted, `pira_ctx recap` can restore the recent activity needed to continue the work; it is part of the activity layer, not another memory layer.
+
+PIRA creates `AGENT_WORKBOOK.md` lazily at the workspace root only when the first durable project entry is warranted. It starts with only the needed headings and uses Git's local exclude file without changing the project's shared `.gitignore`.
 
 <details>
 <summary><strong>Difference from a Codex session log</strong></summary>
@@ -508,10 +509,7 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 <details>
 <summary>Source, policy, setup, and bundled-tool files</summary>
 
-- `AGENTS.md` — bootstrap instructions and module routing policy
-- `SOUL.md` — PI's identity, tone, and non-negotiable behaviors
-- `TOOLS.md` — tool-use and safety rules
-- `MEMORY_SYSTEM.md` — three-layer workspace-memory policy
+- `AGENTS.md` — canonical always-on identity, behavior, tool, safety, memory, and module-routing policy
 - `USER.md` — user-specific knowledge and working preferences; keep this private
 - `modules/` — optional task-specific modules for research, coding, writing, learning, guidance, and maintenance
 - `assets/scripts/` — setup and helper scripts
@@ -523,7 +521,7 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/tests/` and `tools/tests/resources/pira_nav/` — public tool checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
-Most PIRA instruction files use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
+PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
 
 </details>
 
@@ -540,10 +538,6 @@ The public repository contains the shared policy framework. Personal context sho
 
 </details>
 
-## Why the name PIRA
-
-PIRA stands for PI Research Assistant, giving PI a clear public-facing project name.
-
 ## Acknowledgement and citation
 
 If PIRA materially assists a research project, disclose that assistance where appropriate, such as in an acknowledgement, LLM-use disclosure, or reproducibility checklist, and cite this repository. Adapt the scope of assistance to what was actually used, and include the actual model/version or reasoning setting if your venue asks for that level of detail.
@@ -557,7 +551,7 @@ Suggested BibTeX entry:
 ```bibtex
 @misc{pira,
   author = {{PIRA Project}},
-  title = {{PIRA}: {PI} Research Assistant},
+  title = {{PIRA}: A Research Assistant},
   year = {2026},
   howpublished = {\url{https://github.com/AlgebraLoveme/PIRA}}
 }

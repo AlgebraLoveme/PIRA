@@ -2,6 +2,8 @@
 USER.md
 MEMORY.md
 AGENT_WORKBOOK.md
+# Local Codex guard: prevents this repository's global AGENTS.md from loading twice.
+AGENTS.override.md
 backup/
 .backup/
 

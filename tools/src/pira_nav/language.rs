@@ -269,8 +269,7 @@ impl Language {
 
     fn inference_error(path: &Path) -> String {
         format!(
-            "cannot determine language for `{}`; rerun with an explicit language, for example: pira_nav outline {} --language LANGUAGE",
-            path.display(),
+            "cannot determine a supported language for `{}`; pass --language LANGUAGE for extensionless supported source, or use `pira_nav search PATTERN PATH` / `pira_nav show PATH:START-END` for ordinary text",
             path.display()
         )
     }

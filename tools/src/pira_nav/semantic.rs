@@ -17,8 +17,8 @@ use crate::parse::parse_file;
 use crate::security::possible_prompt_injection;
 use crate::structural::StructuralResolver;
 use crate::util::{
-    absolute_lexical, display_path, escape_untrusted_text, hash16, percent_decode, quote_metadata,
-    read_source, sanitize_metadata,
+    absolute_lexical, display_path, escape_untrusted_text, hash16, nearby_existing_path,
+    percent_decode, quote_metadata, read_source, sanitize_metadata,
 };
 
 const DEFAULT_DEFINITION_MAX_ITEMS: usize = 20;
@@ -76,13 +76,27 @@ fn parse_semantic_target(
     {
         parse_selector_target(selector, cwd)?
     } else {
-        let (path, name) = split_qualified_target(value, cwd).ok_or_else(|| {
-                (
+        let (path, name) = match split_qualified_target(value, cwd) {
+            Some(target) => target,
+            None => {
+                if let Some((path, _)) = qualified_target_candidate(value, cwd) {
+                    let mut message =
+                        format!("semantic target file does not exist: {}", path.display());
+                    if let Some(suggestion) = nearby_existing_path(&path, cwd, true) {
+                        message.push_str(&format!(
+                            "; did you mean `{}`?",
+                            display_path(&suggestion, cwd)
+                        ));
+                    }
+                    return Err((2, message));
+                }
+                return Err((
                     2,
                     "semantic target must be FILE:LINE:COLUMN, FILE::QUALIFIED-NAME, or pira://selector"
                         .into(),
-                )
-            })?;
+                ));
+            }
+        };
         (path, None, None, name, None)
     };
     let language = language_for(&path, explicit)?;
@@ -216,6 +230,21 @@ fn split_qualified_target(value: &str, cwd: &Path) -> Option<(PathBuf, String)> 
         let path = absolute_lexical(Path::new(&value[..index]), cwd);
         if path.is_file() && index + 2 < value.len() {
             return Some((path, value[index + 2..].to_string()));
+        }
+    }
+    None
+}
+
+fn qualified_target_candidate(value: &str, cwd: &Path) -> Option<(PathBuf, String)> {
+    for (index, _) in value.match_indices("::") {
+        let raw_path = &value[..index];
+        let name = &value[index + 2..];
+        if raw_path.is_empty() || name.is_empty() {
+            continue;
+        }
+        let path = Path::new(raw_path);
+        if path.extension().is_some() || raw_path.contains('/') || raw_path.contains('\\') {
+            return Some((absolute_lexical(path, cwd), name.to_owned()));
         }
     }
     None

@@ -39,6 +39,10 @@ USER_PLACEHOLDER_TEXT = """# USER
 ## Working Preferences
 - fill manually
 """
+PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
+
+PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
+"""
 
 
 @dataclass
@@ -335,7 +339,6 @@ def configure_codex(
     state: SetupState,
     config_path: Path,
     execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
-    global_agents: Literal["ask", "link", "copy", "skip"],
     replace_permissions: bool,
 ) -> None:
     if execution_mode == "ask":
@@ -376,52 +379,34 @@ def configure_codex(
 
     new_text = upsert_top_level(existing, updates, remove_keys=remove_keys)
     write_text(state, config_path, new_text, "Codex config.toml")
-
-    global_agents_path = config_path.parent / "AGENTS.md"
-    pira_agents_path = state.agent_dir / "AGENTS.md"
-    if global_agents == "ask":
-        if global_agents_path.exists():
-            if same_location(global_agents_path, pira_agents_path):
-                global_agents = "link"
-            elif state.yes or not sys.stdin.isatty():
-                global_agents = "skip"
-                state.warn(f"Skipped existing global {display_path(global_agents_path)}; pass --global-agents link or copy to replace it")
-            else:
-                global_agents = "link" if prompt_yes_no(f"Replace existing {display_path(global_agents_path)} with a symlink to PIRA AGENTS.md?", default=False) else "skip"
-        else:
-            global_agents = "link"
-    if global_agents == "link":
-        ensure_global_agents_link(state, global_agents_path, pira_agents_path)
-    elif global_agents == "copy":
-        source = pira_source_root(state) / "AGENTS.md"
-        write_text(state, global_agents_path, source.read_text(encoding="utf-8"), "Codex global AGENTS.md PIRA copy")
-    else:
-        print("OK: skipped Codex global AGENTS.md link/copy")
+    ensure_project_agents_guard(state)
+    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)
 
 
-def ensure_global_agents_link(state: SetupState, link_path: Path, target_path: Path) -> None:
-    if same_location(link_path, target_path):
-        print(f"OK: Codex global AGENTS.md already points to {display_path(target_path)}")
+def ensure_project_agents_guard(state: SetupState) -> None:
+    """Prevent the configured global policy from being rediscovered in the PIRA repo."""
+    write_text(
+        state,
+        state.agent_dir / "AGENTS.override.md",
+        PROJECT_AGENTS_GUARD,
+        "local PIRA repository AGENTS guard",
+        backup=False,
+    )
+
+
+def remove_duplicate_global_agents(state: SetupState, global_path: Path, pira_path: Path) -> None:
+    """Remove only the old PIRA symlink; preserve unrelated global instructions."""
+    global_label = config_path_string(global_path)
+    if not global_path.is_symlink() or not same_location(global_path, pira_path):
+        if global_path.exists() or global_path.is_symlink():
+            state.warn(f"Preserved separate global instructions at {global_label}")
         return
     if state.dry_run:
-        action = "replace" if link_path.exists() or link_path.is_symlink() else "create"
-        print(f"DRY-RUN: would {action} symlink {display_path(link_path)} -> {display_path(target_path)}")
-        state.note_change(f"would link {display_path(link_path)} to PIRA AGENTS.md")
+        print(f"DRY-RUN: would remove duplicate PIRA symlink {global_label}")
+        state.note_change(f"would remove duplicate {global_label} symlink")
         return
-    link_path.parent.mkdir(parents=True, exist_ok=True)
-    if link_path.exists() or link_path.is_symlink():
-        backup = backup_path(link_path)
-        link_path.rename(backup)
-        print(f"Backup: {display_path(link_path)} -> {display_path(backup)}")
-    try:
-        link_path.symlink_to(target_path)
-    except OSError as exc:
-        source = pira_source_root(state) / "AGENTS.md"
-        state.warn(f"Could not create symlink ({exc}); copying AGENTS.md instead")
-        link_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-        state.note_change(f"copied PIRA AGENTS.md to {display_path(link_path)}")
-        return
-    state.note_change(f"linked {display_path(link_path)} -> {display_path(target_path)}")
+    global_path.unlink()
+    state.note_change(f"removed duplicate {global_label} symlink")
 
 
 def configure_audio(
@@ -485,8 +470,7 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
     add("AGENTS.md exists", agents.exists(), display_path(agents))
     user = state.agent_dir / "USER.md"
     add("USER.md exists", user.exists(), display_path(user))
-    soul = state.agent_dir / "SOUL.md"
-    token_ok = soul.exists() and VERIFY_TOKEN in soul.read_text(encoding="utf-8")
+    token_ok = agents.exists() and VERIFY_TOKEN in agents.read_text(encoding="utf-8")
     add("verification token", token_ok, VERIFY_TOKEN)
     legacy_existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
     add("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
@@ -500,6 +484,8 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
             expected_instructions = toml_string(config_path_string(state.agent_dir / "AGENTS.md"))
             add("Codex config points to PIRA", keys.get("model_instructions_file") == expected_instructions, f"{display_path(config_path)} -> {expected_instructions}")
             add("Codex project_doc_max_bytes", keys.get("project_doc_max_bytes") == DEFAULT_PROJECT_DOC_MAX_BYTES, keys.get("project_doc_max_bytes", "missing"))
+            guard = state.agent_dir / "AGENTS.override.md"
+            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == PROJECT_AGENTS_GUARD, display_path(guard))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -511,7 +497,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
     parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")
-    parser.add_argument("--global-agents", choices=["ask", "link", "copy", "skip"], default="ask", help="How to handle ~/.codex/AGENTS.md.")
     parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
     parser.add_argument("--legacy", choices=["ask", "remove", "keep"], default="ask", help="How to handle paths listed in assets/LEGACY_LIST.md.")
     parser.add_argument("--force-agent-link", action="store_true", help="Move a conflicting --agent-dir aside and symlink this repo there.")
@@ -556,7 +541,7 @@ def main(argv: list[str] | None = None) -> int:
             ensure_user_md(state, args.user_mode)
             remove_legacy_files(state, args.legacy)
             if not args.skip_codex:
-                configure_codex(state, config_path, args.execution_mode, args.global_agents, args.replace_permissions)
+                configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
             configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
             if not args.skip_tools:
                 configure_tools(state, args.tools_install_dir, verify_only=False)

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -103,6 +104,50 @@ pub fn discover_files(root: &Path, selection: DiscoverySelection) -> FileDiscove
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
+    FileDiscovery {
+        files,
+        discovered,
+        unsupported,
+        ambiguous,
+    }
+}
+
+/// Discover and deduplicate supported files across overlapping roots.
+pub fn discover_files_many<I, P>(roots: I, selection: DiscoverySelection) -> FileDiscovery
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let mut paths = BTreeSet::new();
+    for root in roots {
+        let root = root.as_ref();
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .parents(true)
+            .require_git(false)
+            .follow_links(false);
+        for entry in builder.build().filter_map(Result::ok) {
+            if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                paths.insert(absolute_lexical(entry.path(), root));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    let mut discovered = 0;
+    let mut unsupported = 0;
+    let mut ambiguous = 0;
+    for path in paths {
+        discovered += 1;
+        match classify(&path, selection) {
+            DiscoveredLanguage::Eligible(language) => files.push((path, language)),
+            DiscoveredLanguage::Unsupported => unsupported += 1,
+            DiscoveredLanguage::Ambiguous => ambiguous += 1,
+        }
+    }
     FileDiscovery {
         files,
         discovered,

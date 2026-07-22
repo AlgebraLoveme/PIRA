@@ -12,8 +12,8 @@ use crate::language::Language;
 use crate::parse::parse_source_symbols;
 use crate::security::possible_prompt_injection;
 use crate::util::{
-    MAX_FILE_BYTES, absolute_lexical, display_path, escape_untrusted_text, hash16, quote_metadata,
-    repository_path_penalty,
+    MAX_FILE_BYTES, absolute_lexical, display_path, escape_untrusted_text, hash16,
+    nearby_existing_path, quote_metadata, repository_path_penalty,
 };
 
 const MAX_PATTERNS: usize = 32;
@@ -117,10 +117,14 @@ pub fn run(
         }
         if !root.is_file() && !root.is_dir() {
             if requested_roots.len() == 1 {
-                return Err(input_error(format!(
-                    "search target does not exist: {}",
-                    root.display()
-                )));
+                let mut message = format!("search target does not exist: {}", root.display());
+                if let Some(suggestion) = nearby_existing_path(root, cwd, false) {
+                    message.push_str(&format!(
+                        "; did you mean `{}`?",
+                        display_path(&suggestion, cwd)
+                    ));
+                }
+                return Err(input_error(message));
             }
             missing_roots += 1;
             continue;
@@ -447,7 +451,7 @@ fn build_engine(options: &Options) -> Result<Engine, (i32, String)> {
         .size_limit(4 * 1024 * 1024)
         .dfa_size_limit(4 * 1024 * 1024)
         .build()
-        .map_err(|error| (2, format!("invalid search regex: {error}")))?;
+        .map_err(invalid_regex)?;
     let expressions = patterns
         .iter()
         .map(|pattern| {
@@ -456,10 +460,19 @@ fn build_engine(options: &Options) -> Result<Engine, (i32, String)> {
                 .size_limit(1024 * 1024)
                 .dfa_size_limit(1024 * 1024)
                 .build()
-                .map_err(|error| (2, format!("invalid search regex: {error}")))
+                .map_err(invalid_regex)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Engine { set, expressions })
+}
+
+fn invalid_regex(error: regex::Error) -> (i32, String) {
+    (
+        2,
+        format!(
+            "invalid search regex: {error}; escape `{{` as `\\{{`, or repeat `-e PATTERN` without --regex for literal terms"
+        ),
+    )
 }
 
 fn discover_text_files(root: &Path, language: Option<Language>) -> Vec<PathBuf> {

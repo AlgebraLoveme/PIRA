@@ -81,6 +81,30 @@ pub fn absolute_lexical(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+/// Return one cheap, deterministic correction for a missing path.
+///
+/// Keep this deliberately bounded: command errors should be helpful without
+/// turning a typo into a repository-wide search. The two cases cover common
+/// agent mistakes: naming a Rust module as `name.rs` when it is `name/mod.rs`,
+/// and accidentally prefixing a repository-root file with a subdirectory.
+pub fn nearby_existing_path(path: &Path, cwd: &Path, want_file: bool) -> Option<PathBuf> {
+    let matches_kind = |candidate: &Path| {
+        if want_file {
+            candidate.is_file()
+        } else {
+            candidate.is_file() || candidate.is_dir()
+        }
+    };
+    if want_file && path.extension().is_some_and(|extension| extension == "rs") {
+        let module = path.parent()?.join(path.file_stem()?).join("mod.rs");
+        if module != path && module.is_file() {
+            return Some(module);
+        }
+    }
+    let root_candidate = cwd.join(path.file_name()?);
+    (root_candidate != path && matches_kind(&root_candidate)).then_some(root_candidate)
+}
+
 pub fn repository_path_penalty(path: &Path) -> usize {
     let mut penalty = 0;
     for component in path.components() {
