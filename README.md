@@ -231,10 +231,10 @@ A private behavior-based evaluator was added only after each agent finished. It 
 
 | Condition | Correctness | Base-rate cost estimate | Wall time | Command-output bytes | Commands | Frozen rule bytes |
 |---|---:|---:|---:|---:|---:|---:|
-| Baseline | 7/7 | $7.504 | 1,908.6 s | 907,239 B | 72 | 14,328 B |
-| PIRA tools | 7/7 | $4.808 (**−35.9%**) | 1,824.2 s (**−4.4%**) | 234,285 B (**−74.2%**) | 100 | 22,836 B |
+| Baseline | 7/7 | \$7.504 | 1,908.6 s | 907,239 B | 72 | 14,328 B |
+| PIRA tools | 7/7 | \$4.808 (**−35.9%**) | 1,824.2 s (**−4.4%**) | 234,285 B (**−74.2%**) | 100 | 22,836 B |
 
-The estimate applies a fixed table matching standard GPT-5.6 Sol rates at run time—$5 per million uncached input tokens, $0.50 per million cached input tokens, and $30 per million output tokens—to aggregate usage telemetry. It is not an observed invoice and does not model request-level long-context multipliers, cache-write pricing, tool charges, fast mode, included plan usage, or account-specific terms. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls, but exposed substantially less command text and reduced the base-rate estimate. Its 8,508 additional instruction bytes are reported rather than subtracted through an unsupported token estimate. This is one controlled task and two agent trajectories, not a general causal estimate; it demonstrates a successful difficult case rather than guaranteed savings on every task.
+The estimate applies a fixed table matching standard GPT-5.6 Sol rates at run time—\$5 per million uncached input tokens, \$0.50 per million cached input tokens, and \$30 per million output tokens—to aggregate usage telemetry. It is not an observed invoice and does not model request-level long-context multipliers, cache-write pricing, tool charges, fast mode, included plan usage, or account-specific terms. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls, but exposed substantially less command text and reduced the base-rate estimate. Its 8,508 additional instruction bytes are reported rather than subtracted through an unsupported token estimate. This is one controlled task and two agent trajectories, not a general causal estimate; it demonstrates a successful difficult case rather than guaranteed savings on every task.
 
 #### `pira_ctx`: natural implementation task
 
