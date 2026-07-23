@@ -218,7 +218,7 @@ PIRA includes three small tools that help agents work with less noise and better
 
 ### Agent-level evaluation
 
-An isolated development benchmark tested whether `pira_ctx` helps a fresh agent complete an exact task, not merely whether the binary is fast in microbenchmarks.
+Isolated agentic benchmarks tested whether PIRA's internal tools help fresh agents complete real tasks, not merely whether individual binaries are fast in microbenchmarks.
 
 <details>
 <summary>Method, results, and interpretation</summary>
