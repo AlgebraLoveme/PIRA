@@ -3,9 +3,10 @@
 
 The release inputs are the tracked Cargo manifest, lockfile, and Rust source.
 The builder pins Rust by default, uses locked dependencies, disables incremental
-compilation, normalizes locale/time/build paths, and builds every selected
-target twice in independent directories. Artifacts are published only when the
-two builds are byte-identical and contain none of the known host paths.
+compilation, normalizes locale/time/build paths with a fixed default epoch, and
+builds every selected target twice in independent directories. Artifacts are
+published only when the two builds are byte-identical and contain none of the
+known host paths.
 
 End users install prebuilt artifacts and do not need this script or Rust. A
 release maintainer can run, from the repository root:
@@ -40,6 +41,7 @@ DEFAULT_BUNDLE_DIR = TOOLS_DIR / "dist" / "pira_ctx"
 DEFAULT_BUILD_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-build"
 DEFAULT_RUSTUP_ROOT = Path(tempfile.gettempdir()) / "pira_ctx-release-rustup"
 DEFAULT_TOOLCHAIN = "1.96.1"
+DEFAULT_SOURCE_DATE_EPOCH = "946684800"  # 2000-01-01 UTC
 DEFAULT_ZIG_VERSION = "0.16.0"
 DEFAULT_ZIG_ROOT = Path(tempfile.gettempdir()) / f"pira-release-zig-{DEFAULT_ZIG_VERSION}"
 TOOL_NAME = "pira_ctx"
@@ -331,10 +333,7 @@ def source_date_epoch(env: dict[str, str]) -> str:
         if not configured.isdigit():
             raise BuildError("SOURCE_DATE_EPOCH must be an integer Unix timestamp")
         return configured
-    try:
-        return output(["git", "log", "-1", "--format=%ct"], env=env)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return "0"
+    return DEFAULT_SOURCE_DATE_EPOCH
 
 
 def prepare_toolchain(

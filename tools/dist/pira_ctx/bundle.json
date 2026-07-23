@@ -30,7 +30,7 @@
     "windows-x64": {
       "path": "windows-x64/pira_ctx.exe",
       "target": "x86_64-pc-windows-gnu",
-      "sha256": "8425fd435b5bbefaa0515002694bac1d65197d292418f60eab733911345d2fc3",
+      "sha256": "eee89600d20a1a8141e252333cc7df631aa52b5b90fe2b8307c9b4d97e49608d",
       "min_os": "10"
     }
   },

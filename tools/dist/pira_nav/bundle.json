@@ -28,7 +28,7 @@
     "windows-x64": {
       "path": "windows-x64/pira_nav.exe",
       "target": "x86_64-pc-windows-gnu",
-      "sha256": "4da72548cca54d408a779e6a9fc922d0044410df82284ad41767b68b573c4d37",
+      "sha256": "1392fa81caeaf691a8e57445d6e4c48250ab8ef17e03eb67cc3f048e8b704812",
       "min_os": "10"
     }
   },

@@ -28,7 +28,7 @@
     "windows-x64": {
       "path": "windows-x64/pira_dec.exe",
       "target": "x86_64-pc-windows-gnu",
-      "sha256": "bc7d661db41481dd627c6ea00d81b01bde01653c8f143cc2354e7f0e58b16d57",
+      "sha256": "eb031fbb1142a361e75009cf07b9ac4f6874c7042d77e78972580c13661feaa3",
       "min_os": "10"
     }
   },
