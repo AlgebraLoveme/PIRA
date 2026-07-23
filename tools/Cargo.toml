@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pira_ctx", "crates/pira_nav", "crates/pira_decision"]
+members = ["crates/pira_ctx", "crates/pira_nav", "crates/pira_dec"]
 resolver = "3"
 
 [profile.release]

@@ -4,25 +4,27 @@ use std::path::PathBuf;
 const MAX_REGEX_BYTES: usize = 4 * 1024;
 const MAX_TIME_BYTES: usize = 256;
 
-pub const HELP: &str = r#"pira_decision records and searches medium-level workspace decisions.
+pub const HELP: &str = r#"pira_dec records, retrieves, and exports medium-level workspace decisions.
 
 USAGE
-  pira_decision add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
-  pira_decision show ID [--json] [--store-dir PATH]
-  pira_decision search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+  pira_dec add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
+  pira_dec show ID [--json] [--store-dir PATH]
+  pira_dec list [--since TIME] [--until TIME] [--limit N] [--json] [--store-dir PATH]
+  pira_dec export --output FILE [--since TIME] [--until TIME] [--limit N] [--store-dir PATH]
+  pira_dec search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
                        [--limit N] [--json] [--store-dir PATH]
-  pira_decision forget EXACT_ID --yes [--store-dir PATH]
-  pira_decision help [COMMAND]
+  pira_dec forget EXACT_ID --yes [--store-dir PATH]
+  pira_dec help [COMMAND]
 
 Records are scoped to the nearest Git root, otherwise the current directory.
-Search is lock-free and may omit a decision published concurrently.
-Run `pira_decision COMMAND --help` for exact fields, options, and behavior.
+Reads are lock-free and may omit a decision published concurrently.
+Run `pira_dec COMMAND --help` for exact fields, options, and behavior.
 "#;
 
-const ADD_HELP: &str = r#"pira_decision add — record one concluded workspace decision
+const ADD_HELP: &str = r#"pira_dec add — record one concluded workspace decision
 
 USAGE
-  pira_decision add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
+  pira_dec add --context TEXT --choice TEXT --choice TEXT --decision N --maker human|agent [OPTIONS]
 
 FIELDS
   --context TEXT    Concise problem and decisive constraints; exactly once.
@@ -35,19 +37,43 @@ OPTIONS
   -h, --help        Show this help.
 "#;
 
-const SHOW_HELP: &str = r#"pira_decision show — display one validated decision record
+const SHOW_HELP: &str = r#"pira_dec show — display one validated decision record
 
 USAGE
-  pira_decision show ID [--json] [--store-dir PATH]
+  pira_dec show ID [--json] [--store-dir PATH]
 
 ID may be complete or an unambiguous prefix. The requested record is integrity-checked before
 display. Use --json for stable programmatic output.
 "#;
 
-const SEARCH_HELP: &str = r#"pira_decision search — filter workspace decisions
+const LIST_HELP: &str = r#"pira_dec list — show recent decisions concisely
 
 USAGE
-  pira_decision search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+  pira_dec list [--since TIME] [--until TIME] [--limit N] [--json] [--store-dir PATH]
+
+Results are newest first. Default rows contain only ID and selected decision text; context,
+alternatives, maker, and a separate timestamp are omitted. --limit accepts 1..1000 and defaults to 20.
+TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since is inclusive and --until
+exclusive. An empty list prints no rows and succeeds. Invalid unrelated records are skipped with a
+warning. Use --json for stable structured rows and skipped-record details.
+"#;
+
+const EXPORT_HELP: &str = r#"pira_dec export — write standalone human-readable decision HTML
+
+USAGE
+  pira_dec export --output FILE [--since TIME] [--until TIME] [--limit N] [--store-dir PATH]
+
+Exports all workspace decisions by default, newest first. --since is inclusive; --until is exclusive;
+TIME accepts RFC 3339, `now`, or an age such as 30m, 24h, or 7d. An explicit --limit accepts 1..1000.
+The static HTML contains full context, alternatives, selected choice, maker, and timestamp. It uses no
+scripts or external resources and escapes stored text. FILE is created with private Unix permissions
+when supported and never overwritten.
+"#;
+
+const SEARCH_HELP: &str = r#"pira_dec search — filter workspace decisions
+
+USAGE
+  pira_dec search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
                        [--limit N] [--json] [--store-dir PATH]
 
 FIELDS
@@ -66,14 +92,14 @@ reports them as warnings, and may omit a record published concurrently. Use --js
 matches and skipped-record details.
 
 EXAMPLES
-  pira_decision search --since 7d --limit 20
-  pira_decision search --field context --regex '(?i)cache' --since 30d
+  pira_dec search --since 7d --limit 20
+  pira_dec search --field context --regex '(?i)cache' --since 30d
 "#;
 
-const FORGET_HELP: &str = r#"pira_decision forget — logically delete one exact decision record
+const FORGET_HELP: &str = r#"pira_dec forget — logically delete one exact decision record
 
 USAGE
-  pira_decision forget EXACT_ID --yes [--store-dir PATH]
+  pira_dec forget EXACT_ID --yes [--store-dir PATH]
 
 The complete ID and explicit --yes are required. Deletion removes the managed record but does not
 claim secure physical erasure.
@@ -84,6 +110,8 @@ pub enum HelpTopic {
     Global,
     Add,
     Show,
+    List,
+    Export,
     Search,
     Forget,
 }
@@ -94,6 +122,8 @@ impl HelpTopic {
             Self::Global => HELP,
             Self::Add => ADD_HELP,
             Self::Show => SHOW_HELP,
+            Self::List => LIST_HELP,
+            Self::Export => EXPORT_HELP,
             Self::Search => SEARCH_HELP,
             Self::Forget => FORGET_HELP,
         }
@@ -135,6 +165,18 @@ pub enum Command {
         id: String,
         json: bool,
     },
+    List {
+        since: Option<String>,
+        until: Option<String>,
+        limit: usize,
+        json: bool,
+    },
+    Export {
+        output: PathBuf,
+        since: Option<String>,
+        until: Option<String>,
+        limit: Option<usize>,
+    },
     Search {
         field: Option<SearchField>,
         pattern: Option<String>,
@@ -168,11 +210,11 @@ pub fn parse_args(args: &[String]) -> Result<Config, String> {
         "-V" | "--version" | "version" => simple(Command::Version, &args[1..]),
         "add" => parse_add(&args[1..]),
         "show" => parse_show(&args[1..]),
+        "list" => parse_list(&args[1..]),
+        "export" => parse_export(&args[1..]),
         "search" => parse_search(&args[1..]),
         "forget" => parse_forget(&args[1..]),
-        _ => Err(format!(
-            "unknown command {command:?}; run pira_decision --help"
-        )),
+        _ => Err(format!("unknown command {command:?}; run pira_dec --help")),
     }
 }
 
@@ -182,6 +224,8 @@ fn parse_help(args: &[String]) -> Result<Config, String> {
         [command] => match command.as_str() {
             "add" => HelpTopic::Add,
             "show" => HelpTopic::Show,
+            "list" => HelpTopic::List,
+            "export" => HelpTopic::Export,
             "search" => HelpTopic::Search,
             "forget" => HelpTopic::Forget,
             _ => return Err(format!("unknown help command {command:?}")),
@@ -282,18 +326,78 @@ fn parse_show(args: &[String]) -> Result<Config, String> {
     })
 }
 
+#[derive(Debug, Default)]
+struct BrowseArgs {
+    since: Option<String>,
+    until: Option<String>,
+    limit: Option<usize>,
+    json: bool,
+    store_dir: Option<PathBuf>,
+}
+
+fn parse_list(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::List), &[]);
+    }
+    let mut browse = BrowseArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        if !parse_browse_option(args, &mut index, &mut browse)? {
+            return Err(format!("unknown list argument {:?}", args[index]));
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::List {
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit.unwrap_or(20),
+            json: browse.json,
+        },
+        store_dir: browse.store_dir,
+    })
+}
+
+fn parse_export(args: &[String]) -> Result<Config, String> {
+    if wants_help(args) {
+        return simple(Command::Help(HelpTopic::Export), &[]);
+    }
+    let mut output = None;
+    let mut browse = BrowseArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" => {
+                let path = PathBuf::from(value(args, &mut index, "--output")?);
+                set_once(&mut output, path, "--output")?;
+            }
+            "--json" => return Err("export writes HTML and does not accept --json".into()),
+            other => {
+                if !parse_browse_option(args, &mut index, &mut browse)? {
+                    return Err(format!("unknown export argument {other:?}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(Config {
+        command: Command::Export {
+            output: output.ok_or_else(|| "export requires --output FILE".to_string())?,
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit,
+        },
+        store_dir: browse.store_dir,
+    })
+}
+
 fn parse_search(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
         return simple(Command::Help(HelpTopic::Search), &[]);
     }
     let mut field = None;
     let mut pattern = None;
-    let mut since = None;
-    let mut until = None;
-    let mut limit = 20_usize;
-    let mut limit_set = false;
-    let mut json = false;
-    let mut store_dir = None;
+    let mut browse = BrowseArgs::default();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -308,59 +412,71 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
                 }
                 set_once(&mut pattern, raw, "--regex")?;
             }
-            "--since" => {
-                let raw = value(args, &mut index, "--since")?;
-                if raw.len() > MAX_TIME_BYTES {
-                    return Err(format!("--since exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+            other => {
+                if !parse_browse_option(args, &mut index, &mut browse)? {
+                    return Err(format!("unknown search argument {other:?}"));
                 }
-                set_once(&mut since, raw, "--since")?;
             }
-            "--until" => {
-                let raw = value(args, &mut index, "--until")?;
-                if raw.len() > MAX_TIME_BYTES {
-                    return Err(format!("--until exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
-                }
-                set_once(&mut until, raw, "--until")?;
-            }
-            "--limit" => {
-                if limit_set {
-                    return Err("--limit may appear only once".into());
-                }
-                let raw = value(args, &mut index, "--limit")?;
-                limit = raw
-                    .parse::<usize>()
-                    .map_err(|_| "--limit must be an integer from 1 through 1000".to_string())?;
-                if !(1..=1_000).contains(&limit) {
-                    return Err("--limit must be from 1 through 1000".into());
-                }
-                limit_set = true;
-            }
-            "--json" => json = true,
-            "--store-dir" => {
-                let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
-                set_once(&mut store_dir, path, "--store-dir")?;
-            }
-            other => return Err(format!("unknown search argument {other:?}")),
         }
         index += 1;
     }
     if field.is_some() != pattern.is_some() {
         return Err("search requires --field and --regex together".into());
     }
-    if field.is_none() && since.is_none() && until.is_none() {
+    if field.is_none() && browse.since.is_none() && browse.until.is_none() {
         return Err("search requires --field with --regex, --since, or --until".into());
     }
     Ok(Config {
         command: Command::Search {
             field,
             pattern,
-            since,
-            until,
-            limit,
-            json,
+            since: browse.since,
+            until: browse.until,
+            limit: browse.limit.unwrap_or(20),
+            json: browse.json,
         },
-        store_dir,
+        store_dir: browse.store_dir,
     })
+}
+
+fn parse_browse_option(
+    args: &[String],
+    index: &mut usize,
+    browse: &mut BrowseArgs,
+) -> Result<bool, String> {
+    match args[*index].as_str() {
+        "--since" => {
+            let raw = value(args, index, "--since")?;
+            if raw.len() > MAX_TIME_BYTES {
+                return Err(format!("--since exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+            }
+            set_once(&mut browse.since, raw, "--since")?;
+        }
+        "--until" => {
+            let raw = value(args, index, "--until")?;
+            if raw.len() > MAX_TIME_BYTES {
+                return Err(format!("--until exceeds {MAX_TIME_BYTES} UTF-8 bytes"));
+            }
+            set_once(&mut browse.until, raw, "--until")?;
+        }
+        "--limit" => {
+            let raw = value(args, index, "--limit")?;
+            let limit = raw
+                .parse::<usize>()
+                .map_err(|_| "--limit must be an integer from 1 through 1000".to_string())?;
+            if !(1..=1_000).contains(&limit) {
+                return Err("--limit must be from 1 through 1000".into());
+            }
+            set_once(&mut browse.limit, limit, "--limit")?;
+        }
+        "--json" => browse.json = true,
+        "--store-dir" => {
+            let path = PathBuf::from(value(args, index, "--store-dir")?);
+            set_once(&mut browse.store_dir, path, "--store-dir")?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn parse_forget(args: &[String]) -> Result<Config, String> {
@@ -454,6 +570,102 @@ mod tests {
     }
 
     #[test]
+    fn parses_list_defaults_and_bounds() {
+        let config = parse_args(&args(&["list"])).unwrap();
+        let Command::List {
+            since,
+            until,
+            limit,
+            json,
+        } = config.command
+        else {
+            panic!("expected list command");
+        };
+        assert!(since.is_none());
+        assert!(until.is_none());
+        assert_eq!(limit, 20);
+        assert!(!json);
+
+        let config = parse_args(&args(&[
+            "list", "--since", "7d", "--until", "now", "--limit", "5", "--json",
+        ]))
+        .unwrap();
+        let Command::List {
+            since,
+            until,
+            limit,
+            json,
+        } = config.command
+        else {
+            panic!("expected list command");
+        };
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, 5);
+        assert!(json);
+    }
+
+    #[test]
+    fn list_rejects_search_filters_and_invalid_limits() {
+        let error = parse_args(&args(&["list", "--field", "context"])).unwrap_err();
+        assert!(error.contains("unknown list argument"));
+        let error = parse_args(&args(&["list", "--limit", "0"])).unwrap_err();
+        assert!(error.contains("1 through 1000"));
+    }
+
+    #[test]
+    fn parses_export_defaults_and_bounds() {
+        let config = parse_args(&args(&["export", "--output", "decisions.html"])).unwrap();
+        let Command::Export {
+            output,
+            since,
+            until,
+            limit,
+        } = config.command
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(output, PathBuf::from("decisions.html"));
+        assert!(since.is_none());
+        assert!(until.is_none());
+        assert!(limit.is_none());
+
+        let config = parse_args(&args(&[
+            "export",
+            "--output",
+            "recent.html",
+            "--since",
+            "7d",
+            "--until",
+            "now",
+            "--limit",
+            "5",
+        ]))
+        .unwrap();
+        let Command::Export {
+            output,
+            since,
+            until,
+            limit,
+        } = config.command
+        else {
+            panic!("expected export command");
+        };
+        assert_eq!(output, PathBuf::from("recent.html"));
+        assert_eq!(since.as_deref(), Some("7d"));
+        assert_eq!(until.as_deref(), Some("now"));
+        assert_eq!(limit, Some(5));
+    }
+
+    #[test]
+    fn export_requires_output_and_rejects_json() {
+        let error = parse_args(&args(&["export"])).unwrap_err();
+        assert!(error.contains("requires --output"));
+        let error = parse_args(&args(&["export", "--output", "x.html", "--json"])).unwrap_err();
+        assert!(error.contains("does not accept --json"));
+    }
+
+    #[test]
     fn parses_time_only_search() {
         let config = parse_args(&args(&[
             "search", "--since", "7d", "--until", "now", "--limit", "5",
@@ -509,5 +721,11 @@ mod tests {
 
         let config = parse_args(&args(&["help", "add"])).expect("parse help alias");
         assert!(matches!(config.command, Command::Help(HelpTopic::Add)));
+
+        let config = parse_args(&args(&["list", "--help"])).expect("parse list help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::List)));
+
+        let config = parse_args(&args(&["help", "export"])).expect("parse export help");
+        assert!(matches!(config.command, Command::Help(HelpTopic::Export)));
     }
 }

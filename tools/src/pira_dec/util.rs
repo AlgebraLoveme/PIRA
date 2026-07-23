@@ -1,9 +1,11 @@
 use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const BROKEN_PIPE: &str = "__PIRA_DECISION_BROKEN_PIPE__";
+pub const BROKEN_PIPE: &str = "__PIRA_DEC_BROKEN_PIPE__";
 pub const MAX_TIMESTAMP_MS: u64 = 253_402_300_799_999;
 
 static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -204,6 +206,30 @@ pub fn stdout_text(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            format!("output already exists: {}", path.display())
+        } else {
+            format!("create output {}: {error}", path.display())
+        }
+    })?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(path);
+        return Err(format!("write output {}: {error}", path.display()));
+    }
+    Ok(())
+}
+
 fn output_error(error: io::Error) -> String {
     if error.kind() == io::ErrorKind::BrokenPipe {
         BROKEN_PIPE.into()
@@ -253,5 +279,23 @@ mod tests {
     fn rejects_invalid_search_time() {
         let error = parse_time_bound("yesterday", 1_000).unwrap_err();
         assert!(error.contains("must be RFC 3339"));
+    }
+
+    #[test]
+    fn private_output_is_new_and_never_overwritten() {
+        let path = std::env::temp_dir().join(format!("pira-dec-output-{}", nonce_hex()));
+        write_private_new(&path, b"first").unwrap();
+        let error = write_private_new(&path, b"second").unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).unwrap();
     }
 }

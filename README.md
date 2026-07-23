@@ -180,7 +180,7 @@ PIRA separates memory by how long it should remain useful. This prevents raw com
 | Layer | What it remembers | Where it lives | Who reads it |
 |---|---|---|---|
 | Activity | Commands, actions, and detailed evidence | `pira_ctx` | Agents search it when needed |
-| Decisions | Important choices, alternatives, and reasons | `pira_decision` | Agents search it when needed |
+| Decisions | Important choices, alternatives, and reasons | `pira_dec` | Agents search it when needed |
 | Project knowledge | Durable state, validated results, lessons, and limitations | `AGENT_WORKBOOK.md` | Agents and humans read it directly |
 
 Detailed activity remains searchable for as long as retention allows. After a conversation is compacted, `pira_ctx recap` can restore the recent activity needed to continue the work; it is part of the activity layer, not another memory layer.
@@ -204,7 +204,7 @@ The two are complementary. A session log answers **“what happened in this conv
 
 </details>
 
-Information moves upward only when its lasting value increases. Activity stays in `pira_ctx`; concluded choices go to `pira_decision`; durable consequences become self-contained workbook entries. The workbook never requires a reader to look up a lower-level record.
+Information moves upward only when its lasting value increases. Activity stays in `pira_ctx`; concluded choices go to `pira_dec`; durable consequences become self-contained workbook entries. The workbook never requires a reader to look up a lower-level record.
 
 ## PIRA Internal Tools
 
@@ -213,7 +213,7 @@ PIRA includes three small tools that help agents work with less noise and better
 | Tool | What problem it solves |
 |---|---|
 | `pira_ctx` | Keeps large command output available without flooding the active conversation. |
-| `pira_decision` | Records important choices in a consistent, searchable form. |
+| `pira_dec` | Records important choices in a consistent, searchable form. |
 | `pira_nav` | Provides portable lexical, structural, dependency, and optional IDE-semantic repository navigation. |
 
 ### Agent-level evaluation
@@ -223,9 +223,22 @@ An isolated development benchmark tested whether `pira_ctx` helps a fresh agent 
 <details>
 <summary>Method, results, and interpretation</summary>
 
+#### Joint tools: real-world Codex maintenance
+
+Two fresh `gpt-5.6-sol` high-reasoning agents received the same pinned `openai/codex` source, issue-derived prompt, sanitized synthetic ultra-long rollout, upstream instructions, development toolchain, warmed caches, and one task turn. The task was an authentic, then-unsolved performance bug: capped session resume had to avoid formatting every historical terminal cell while preserving the complete ordered transcript, uncapped behavior, persisted data, and public defaults. The baseline received PIRA's common identity, safety, research, and coding policy; the tool condition received the same byte prefix plus the internal-tool rules and binaries. Neither condition received a solution or task-time web access.
+
+A private behavior-based evaluator was added only after each agent finished. It checked the build and focused upstream tests, tail-first capped replay, unchanged uncapped replay, complete transcript retention, unchanged defaults and rollout data, formatting, and the agent's regression tests.
+
+| Condition | Correctness | Base-rate cost estimate | Wall time | Command-output bytes | Commands | Frozen rule bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| Baseline | 7/7 | $7.504 | 1,908.6 s | 907,239 B | 72 | 14,328 B |
+| PIRA tools | 7/7 | $4.808 (**−35.9%**) | 1,824.2 s (**−4.4%**) | 234,285 B (**−74.2%**) | 100 | 22,836 B |
+
+The estimate applies a fixed table matching standard GPT-5.6 Sol rates at run time—$5 per million uncached input tokens, $0.50 per million cached input tokens, and $30 per million output tokens—to aggregate usage telemetry. It is not an observed invoice and does not model request-level long-context multipliers, cache-write pricing, tool charges, fast mode, included plan usage, or account-specific terms. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls, but exposed substantially less command text and reduced the base-rate estimate. Its 8,508 additional instruction bytes are reported rather than subtracted through an unsupported token estimate. This is one controlled task and two agent trajectories, not a general causal estimate; it demonstrates a successful difficult case rather than guaranteed savings on every task.
+
 #### `pira_ctx`: natural implementation task
 
-Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_decision` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had a navigation or decision binary. Both could write their isolated workspace and use ordinary Python and Git.
+Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_dec` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had a navigation or decision binary. Both could write their isolated workspace and use ordinary Python and Git.
 
 Each generated implementation was then run inside its sandbox against the same 20 private black-box cases covering validation, JSON views, search, workspace scope, the checked record envelope, corruption, symlink rejection, safe deletion, concurrency, bounds, and temporary-file isolation.
 
@@ -354,20 +367,22 @@ This remains a private implementation benchmark on one arm64 macOS evaluation ho
 
 </details>
 
-### `pira_decision`: structured decision memory
+### `pira_dec`: structured decision memory
 
-Projects often lose the reason behind a choice. `pira_decision` keeps the context, serious alternatives, selected option, decision-maker, and time in one searchable record.
+Projects often lose the reason behind a choice. `pira_dec` keeps the context, serious alternatives, selected option, decision-maker, and time in one searchable record.
 
 <details>
 <summary>Technical behavior, storage, and concurrency</summary>
 
 Each record contains an ID, UTC timestamp, short context, ordered alternatives, the selected option, and one decision-maker: human or agent. Human authorization takes precedence. Saved records are not edited in place.
 
-The tool can add a decision, show one record, search individual fields with regular expressions, filter by inclusive `--since` and exclusive `--until` time bounds, or explicitly forget one exact record. Search can distinguish every considered choice from the option that was selected, and returns newer matches first.
+The tool can add a decision, show one full record, list recent selected decisions concisely, search individual fields with regular expressions, export a selected time range as a polished standalone HTML report, or explicitly forget one exact record. Lists, searches, and exports return newer records first. Time ranges use inclusive `--since` and exclusive `--until` bounds.
 
-Records live in private per-user application data and are separated by workspace. Multiple agents can write safely at the same time. Readers see only complete records, although a decision saved during a search may not appear until the next search. Invalid unrelated records are reported and skipped. No SQL database, daemon, network service, or repository-local metadata is required.
+HTML exports include full context, alternatives, selected choices, makers, timestamps, a compact index, responsive dark/light styling, and print support. They contain no scripts, network assets, or workspace path, and all stored text is escaped. Export creates a new file without overwriting an existing one.
 
-Public source is under `tools/src/pira_decision`. Build it with `cargo build --manifest-path tools/Cargo.toml -p pira_decision --release`, then run `pira_decision --help` or command-specific help for exact usage.
+Records live in private per-user application data and are separated by workspace. Multiple agents can write safely at the same time. Readers see only complete records, although a decision saved during a read may not appear until the next read. Invalid unrelated records are reported and skipped. No SQL database, daemon, network service, or repository-local metadata is required.
+
+Public source is under `tools/src/pira_dec`. Build it with `cargo build --manifest-path tools/Cargo.toml -p pira_dec --release`, then run `pira_dec --help` or command-specific help for exact usage.
 
 </details>
 
@@ -516,7 +531,7 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
-- `tools/src/pira_ctx/`, `tools/src/pira_decision/`, and `tools/src/pira_nav/` — public Rust implementations
+- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, and `tools/src/pira_nav/` — public Rust implementations
 - `tools/dist/` — published, verified platform executables and per-tool bundle manifests
 - `tools/tests/` and `tools/tests/resources/pira_nav/` — public tool checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications

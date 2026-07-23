@@ -276,7 +276,7 @@ fn publish_no_clobber(temporary: &Path, final_path: &Path) -> Result<(), String>
         Ok(()) => {
             if fs::remove_file(temporary).is_err() {
                 eprintln!(
-                    "pira_decision: warning: decision was published but its temporary link remains"
+                    "pira_dec: warning: decision was published but its temporary link remains"
                 );
             }
             Ok(())
@@ -296,7 +296,7 @@ fn effective_store_dir(option: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = option {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = std::env::var_os("PIRA_DECISION_STORE_DIR") {
+    if let Some(path) = std::env::var_os("PIRA_DEC_STORE_DIR") {
         return Ok(PathBuf::from(path));
     }
     #[cfg(target_os = "windows")]
@@ -324,7 +324,7 @@ fn effective_store_dir(option: Option<&Path>) -> Result<PathBuf, String> {
                 .join("decision"));
         }
     }
-    Err("cannot determine a per-user pira_decision store; set PIRA_DECISION_STORE_DIR or --store-dir".into())
+    Err("cannot determine a per-user pira_dec store; set PIRA_DEC_STORE_DIR or --store-dir".into())
 }
 
 fn current_workspace_hash() -> Result<String, String> {
