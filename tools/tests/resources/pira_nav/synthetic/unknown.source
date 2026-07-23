@@ -1,3 +1,0 @@
-item unknown_language_item() {
-    return nothing;
-}

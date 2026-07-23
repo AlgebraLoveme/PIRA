@@ -1,3 +1,0 @@
-output "label" {
-  value = "child"
-}

@@ -439,7 +439,7 @@ The table reports complete subprocess calls for the optimized 0.8.0 macOS arm64 
 
 Across all 49 tasks, the median of task medians was 4.206 ms; task medians ranged from 2.784 to 33.734 ms, median peak RSS was 4.2 MiB, and maximum peak RSS was 18.1 MiB. On a repository-scale default `map --native` of this development workspace, 153 navigable code/document files contained 1,681,918 bytes; the bounded 6,141-byte map reduced returned text by 99.6%, took 97.294 ms median / 103.101 ms p95 over five warmups and 20 measured calls, and used 44.5 MiB peak RSS. An untimed deliberately expanded inventory was 22,446 bytes. Broad-map fixture skipping excluded low-value fixture/corpus subtrees from structural rows; seven deliberately dirty non-skipped fixtures remained explicit failures in `--native` mode. Context reduction compares UTF-8 bytes, not model-specific tokens.
 
-Pinned real fixtures retain upstream source, provenance, hashes, and adjacent licenses under `tools/tests/resources/pira_nav`; fixture code is parsed but never executed. Reproducible functional, security, correctness, and benchmark runners live under `tools/tests`. Machine, filesystem, caches, source mix, server choice, and project configuration affect results.
+Validation used pinned real fixtures with retained upstream provenance, hashes, and adjacent licenses; fixture code was parsed but never executed. The fixtures and functional, security, correctness, and benchmark runners remain local rather than shipping in the release repository. Machine, filesystem, caches, source mix, server choice, and project configuration affect results.
 
 </details>
 
@@ -530,10 +530,10 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `assets/scripts/` — setup and helper scripts
 - `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
+- `tools/build/build_pira_dec_platform_bins.py` — package-isolated release entry point for `pira_dec`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
 - `tools/src/pira_ctx/`, `tools/src/pira_dec/`, and `tools/src/pira_nav/` — public Rust implementations
 - `tools/dist/` — published, verified platform executables and per-tool bundle manifests
-- `tools/tests/` and `tools/tests/resources/pira_nav/` — public tool checks, benchmarks, pinned fixtures, provenance, and adjacent licenses
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
 PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
@@ -545,10 +545,11 @@ PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: fil
 <details>
 <summary>What belongs in the public repository and what stays local</summary>
 
-The public repository contains the shared policy framework. Personal context should stay local:
+The public repository contains the shared policy framework plus tool source, reproducible build inputs, and verified release bundles. Local-only material should stay private:
 
 - keep `USER.md` private;
 - keep workspace-specific memory in local `AGENT_WORKBOOK.md` files;
+- keep tool tests, benchmarks, fixtures, downloaded toolchains, and build work local;
 - do not commit secrets or sensitive personal information.
 
 </details>

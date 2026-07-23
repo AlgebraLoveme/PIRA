@@ -1,5 +1,0 @@
-#!/bin/bash
-
-from_shebang() {
-  printf '%s\n' "detected"
-}
