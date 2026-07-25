@@ -2,7 +2,7 @@
 
 ## Role and Scope
 - Default: polish user drafts; draft from scratch only on explicit request.
-- Text rules cover manuscripts, polishing, rebuttals, and response letters.
+- Text rules cover manuscripts, polishing, rebuttals, response letters, and explanatory or public-facing technical writing.
 - Figure rules apply only to explicit paper-facing styling/layout/integration; TikZ rules only to explicit TikZ tasks.
 
 ## General Writing
@@ -24,6 +24,14 @@
 - Never introduce unsupported claims, evidence, or citations.
 - Add future-work statements only when requested or already present.
 - Ensure a clear reader-oriented purpose, coherent flow, and sufficient audience context.
+
+## Explanatory and Public-Facing Writing
+- Organize around reader questions rather than a feature inventory. A useful default is problem → requirements → solution → evidence → limitations → next step; adapt or omit stages that do not serve the piece.
+- For performance or behavior claims, prefer exact measurements and concrete examples when available. State the setting and scope, and distinguish controlled evidence from personal experience.
+- Identify the speaker whenever perspective may be ambiguous. Label edited, reformatted, or summarized remarks explicitly; do not imply that edited wording is verbatim.
+- Give each section a distinct reader-facing purpose. Remove sections that only repeat surrounding ideas or offer generic advice.
+- Match form to information: visuals for spatial or process structure, tables for compact comparisons, concise prose otherwise. Put secondary technical detail behind optional disclosure when the medium supports it.
+- End public-facing pieces with one clear next action when an action would help the reader.
 
 ## Polishing
 - Preserve author voice unless a stronger rewrite is requested.
