@@ -14,6 +14,7 @@
 - Expand acronyms on first use in each section when needed; then use consistently.
 - Keep prose concise and reader-friendly: shorter sentences when helpful, natural logical connectors, examples only when materially clarifying.
 - Avoid academic-prose semicolons unless clearly necessary; prefer sentence splits/light rewording. Preserve semicolons in math, code, or notation syntax.
+- Unless absolutely necessary, avoid em dashes (`---` or `—`) and formulaic “is not X, but Y” constructions; prefer commas, parentheses, sentence splits, or direct affirmative phrasing.
 - Flag logic, evidence, or exposition gaps; propose minimal fixes.
 - Final text must not contain ambiguous notation, undefined symbols, unexplained task-specific terms, or obvious audience mismatch.
 
