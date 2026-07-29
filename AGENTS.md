@@ -191,7 +191,7 @@ pira_dec help [COMMAND]
 - `show` accepts `FILE:START-END`, `FILE:LINE[:COLUMN]`, or `FILE::ITEM`. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
 - Semantic commands accept `FILE:LINE:COLUMN` or `FILE::CODE_ITEM` and require an LSP.
 - Start with the operation directly answering the question. Use `map` only for topology discovery; when text/name/file/target is known, start with `search`, `symbols`, `outline`, or `show`.
-- Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, `-C N` for context, `--files-with-matches` for paths only, and `--count` for counts only.
+- Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, `-C N` for symmetric context, `-B N`/`-A N` for before/after context, `--files-with-matches` for paths only, and `--count` for counts only.
 - First pass: use default context/output bounds. Reuse verified paths, targets, and evidence; answer once they support every answer part. Increase only an omission-reported bound, or broaden/repeat for a named unresolved gap.
 - Combine related same-scope discovery terms in one bounded regex alternation; batch confirmed independent targets in one `show`/semantic command. Use `query` for mixed semantic operations; split only when later targets depend on earlier evidence.
 - Lexical matches do not establish semantic identity. When identity matters, use LSP semantic commands; report unavailable LSP rather than substituting text matches.

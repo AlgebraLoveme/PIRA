@@ -41,7 +41,8 @@ struct Options {
     ignore_case: bool,
     word: bool,
     mode: Mode,
-    context: usize,
+    before_context: usize,
+    after_context: usize,
     max_items: usize,
     max_per_query: usize,
     max_bytes: usize,
@@ -239,7 +240,10 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
     let mut word = false;
     let mut mode = Mode::Snippets;
     let mut mode_set = false;
-    let mut context = 2;
+    let mut before_context = 2;
+    let mut after_context = 2;
+    let mut symmetric_context_set = false;
+    let mut directional_context_set = false;
     let mut max_items = DEFAULT_ITEMS;
     let mut max_per_query = DEFAULT_MAX_PER_QUERY;
     let mut max_per_query_set = false;
@@ -310,14 +314,47 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
                 index += 1;
             }
             "--context" | "-C" => {
-                context = args
-                    .get(index + 1)
-                    .ok_or_else(|| (2, "--context requires a value".into()))?
-                    .parse::<usize>()
-                    .map_err(|_| (2, "--context must be a non-negative integer".into()))?;
-                if context > MAX_CONTEXT {
-                    return Err((2, format!("--context may not exceed {MAX_CONTEXT}")));
+                if directional_context_set {
+                    return Err((
+                        2,
+                        "--context and --before-context/--after-context are mutually exclusive"
+                            .into(),
+                    ));
                 }
+                let context = parse_context(args.get(index + 1), "--context")?;
+                before_context = context;
+                after_context = context;
+                symmetric_context_set = true;
+                index += 2;
+            }
+            "--before-context" | "-B" => {
+                if symmetric_context_set {
+                    return Err((
+                        2,
+                        "--context and --before-context/--after-context are mutually exclusive"
+                            .into(),
+                    ));
+                }
+                if !directional_context_set {
+                    after_context = 0;
+                }
+                before_context = parse_context(args.get(index + 1), "--before-context")?;
+                directional_context_set = true;
+                index += 2;
+            }
+            "--after-context" | "-A" => {
+                if symmetric_context_set {
+                    return Err((
+                        2,
+                        "--context and --before-context/--after-context are mutually exclusive"
+                            .into(),
+                    ));
+                }
+                if !directional_context_set {
+                    before_context = 0;
+                }
+                after_context = parse_context(args.get(index + 1), "--after-context")?;
+                directional_context_set = true;
                 index += 2;
             }
             "--max-items" | "--max-results" => {
@@ -399,12 +436,24 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
         ignore_case,
         word,
         mode,
-        context,
+        before_context,
+        after_context,
         max_items,
         max_per_query,
         max_bytes,
         owners,
     })
+}
+
+fn parse_context(value: Option<&String>, option: &str) -> Result<usize, (i32, String)> {
+    let context = value
+        .ok_or_else(|| (2, format!("{option} requires a value")))?
+        .parse::<usize>()
+        .map_err(|_| (2, format!("{option} must be a non-negative integer")))?;
+    if context > MAX_CONTEXT {
+        return Err((2, format!("{option} may not exceed {MAX_CONTEXT}")));
+    }
+    Ok(context)
 }
 
 fn validate_patterns(patterns: &[String]) -> Result<(), (i32, String)> {
@@ -897,8 +946,8 @@ fn render_snippets(
 
         let mut windows: Vec<HitWindow> = Vec::new();
         for (order, hit) in selected {
-            let start = hit.row.saturating_sub(options.context);
-            let end = (hit.row + options.context + 1).min(lines.len());
+            let start = hit.row.saturating_sub(options.before_context);
+            let end = (hit.row + options.after_context + 1).min(lines.len());
             if let Some(last) = windows.last_mut()
                 && start <= last.1
             {
@@ -1181,7 +1230,43 @@ fn skip_counts(skips: &[Skip]) -> [(&'static str, usize); 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Options, build_engine};
+    use super::{Mode, Options, build_engine, parse_options};
+
+    fn options(args: &[&str]) -> Result<Options, (i32, String)> {
+        parse_options(
+            &args
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn directional_context_is_unilateral_and_composable() {
+        let after = options(&["Needle", "--after-context", "8"]).expect("after context");
+        assert_eq!(after.before_context, 0);
+        assert_eq!(after.after_context, 8);
+
+        let before = options(&["Needle", "-B", "3"]).expect("before context");
+        assert_eq!(before.before_context, 3);
+        assert_eq!(before.after_context, 0);
+
+        let asymmetric = options(&["Needle", "-A", "8", "-B", "3"]).expect("asymmetric context");
+        assert_eq!(asymmetric.before_context, 3);
+        assert_eq!(asymmetric.after_context, 8);
+    }
+
+    #[test]
+    fn symmetric_and_directional_context_are_mutually_exclusive() {
+        for args in [
+            ["Needle", "--context", "2", "--after-context", "8"],
+            ["Needle", "--before-context", "3", "--context", "2"],
+        ] {
+            let error = options(&args).err().expect("context conflict");
+            assert_eq!(error.0, 2);
+            assert!(error.1.contains("mutually exclusive"));
+        }
+    }
 
     #[test]
     fn unicode_half_word_boundaries_match_identifiers_as_expected() {
@@ -1192,7 +1277,8 @@ mod tests {
             ignore_case: false,
             word: true,
             mode: Mode::Count,
-            context: 0,
+            before_context: 0,
+            after_context: 0,
             max_items: 10,
             max_per_query: 10,
             max_bytes: 10,

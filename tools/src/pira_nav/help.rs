@@ -99,13 +99,16 @@ OPTIONS
   -w, --word                Require Unicode half-word boundaries.
   -l, --files-with-matches  Print matching paths and query coverage only.
   -c, --count               Print exact matching-line counts per file/query.
-  -C, --context N           Context lines for snippets (default 2, maximum 1000).
+  -B, --before-context N    Lines before each snippet match (maximum 1000).
+  -A, --after-context N     Lines after each snippet match (maximum 1000).
+  -C, --context N           Lines before and after each match (default 2, maximum 1000).
   --max-items, --max-results N  Maximum shown lines/file rows (default 48).
   --max-per-query N         Maximum snippet lines selected per pattern (default 8).
   --max-bytes N             Maximum rendered source-block bytes (default 8192).
   --owners                  Annotate snippet matches with enclosing clean declarations when available.
 
-One scan serves all patterns. Each ranks independently, preferring declaration-like production hits;
+Combine -B and -A for asymmetric context; either conflicts with -C. One scan serves all patterns.
+Each ranks independently, preferring declaration-like production hits;
 batches remain query-balanced with exact shown/omitted counts. Zero matches is success. Source is
 framed as untrusted data; an overlong matching line is identified but not truncated.
 

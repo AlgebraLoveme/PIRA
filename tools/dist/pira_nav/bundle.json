@@ -4,35 +4,35 @@
     "darwin-arm64": {
       "path": "darwin-arm64/pira_nav",
       "target": "aarch64-apple-darwin",
-      "sha256": "e9a6471bffc525c34c2c076fe996ddd830fa56b4b4e18e393b4d8bb0cd1525a8",
+      "sha256": "155bc46e34581a5045dd0b5c8a98c20af5917cb24bb2eeffa8a8f6f2b12e2045",
       "min_os": "11.0"
     },
     "darwin-x64": {
       "path": "darwin-x64/pira_nav",
       "target": "x86_64-apple-darwin",
-      "sha256": "47d995378bc7db5895dacd6127355a6edac69e28b047a731c024fd165e5a09d0",
+      "sha256": "468b660999b884273e7086e37dc3de214bfdd7e2418aeb445f94788bff470451",
       "min_os": "10.12"
     },
     "linux-arm64": {
       "path": "linux-arm64/pira_nav",
       "target": "aarch64-unknown-linux-musl",
-      "sha256": "cd1efedd0fb8f1a02aeb58ccd0a473cf136dc345c67149a6f8200e79fadf75f8",
+      "sha256": "764cc7adfb2a53f349d51ac238ea9ccfab649c0690d1b08ef2ad641c11e2bc29",
       "linkage": "static"
     },
     "linux-x64": {
       "path": "linux-x64/pira_nav",
       "target": "x86_64-unknown-linux-musl",
-      "sha256": "9cf94fd869ed0dc27e7cbc6447ef92fdf5582f0e2a0bd906106598f20dbf84ae",
+      "sha256": "234f165437183a91e6f80710e844228e09003e07989a3904e35d34a81c905881",
       "linkage": "static-pie"
     },
     "windows-x64": {
       "path": "windows-x64/pira_nav.exe",
       "target": "x86_64-pc-windows-gnu",
-      "sha256": "1392fa81caeaf691a8e57445d6e4c48250ab8ef17e03eb67cc3f048e8b704812",
+      "sha256": "a1d938d7de11df353c8fa3e3e667554370d78c6267716fc03f3c27df35682a7c",
       "min_os": "10"
     }
   },
   "tool_name": "pira_nav",
-  "tool_version": "0.8.0",
+  "tool_version": "0.9.0",
   "rust_toolchain": "1.96.1"
 }
