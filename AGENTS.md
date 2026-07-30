@@ -189,6 +189,7 @@ pira_dec help [COMMAND]
 #### Rules
 - `search`, `symbols`, and `map` default omitted path to cwd; `dependents`/`deps` default omitted `--root` to cwd.
 - `show` accepts `FILE:START-END`, `FILE:LINE[:COLUMN]`, or `FILE::ITEM`. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
+- `show` is exact by default. For orientation across ultra-long lines, use `--glance` to show line numbers and at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata; do not use it when exact source is required.
 - Semantic commands accept `FILE:LINE:COLUMN` or `FILE::CODE_ITEM` and require an LSP.
 - Start with the operation directly answering the question. Use `map` only for topology discovery; when text/name/file/target is known, start with `search`, `symbols`, `outline`, or `show`.
 - Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, `-C N` for symmetric context, `-B N`/`-A N` for before/after context, `--files-with-matches` for paths only, and `--count` for counts only.

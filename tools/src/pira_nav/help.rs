@@ -156,7 +156,7 @@ EXAMPLE
   pira_nav outline src/parser.rs
   pira_nav outline .github/workflows/test.yaml
   pira_nav outline README.md"#),
-        "show" => format!(r#"pira_nav show — exact bounded source retrieval
+        "show" => format!(r#"pira_nav show — bounded source retrieval
 
 USAGE
   pira_nav show TARGET... [OPTIONS]
@@ -164,7 +164,9 @@ USAGE
 TARGET is FILE::QUALIFIED-NAME, a unique qualified-name suffix, pira://selector, FILE:LINE[:COLUMN], or
 FILE:START-END. A position selects the smallest enclosing named item; --window N selects parser-free surrounding lines. Exact line ranges
 and windows work for any readable UTF-8 text file without language inference. Source is printed exactly
-apart from terminal-control escaping and is framed as untrusted data.
+apart from terminal-control escaping and is framed as untrusted data. --glance is a non-exact
+orientation view: it prefixes every physical line with its line number and shows at most the first
+160 source bytes, clipping only at UTF-8 boundaries and visibly marking omitted bytes.
 
 Structured-document names use dot-separated keys, [N] array indices, and JSON-quoted brackets for
 special keys, for example ["a.b"]. Markdown names use `Parent > Child`. Shell-quote targets containing
@@ -173,6 +175,7 @@ brackets, `>`, or other metacharacters.
 OPTIONS
 {STRUCTURAL_OPTIONS}
   --window N
+  --glance
   --max-items N
   --max-bytes N
 
@@ -181,7 +184,8 @@ EXAMPLES
   pira_nav show 'package.json::scripts.build'
   pira_nav show 'workflow.yaml::jobs.test.steps[2]'
   pira_nav show 'README.md::Install > Linux'
-  pira_nav show src/parser.rs:120-160"#),
+  pira_nav show src/parser.rs:120-160
+  pira_nav show generated.json:1-20 --glance"#),
         "imports" => r#"pira_nav imports — syntax-level file imports
 
 USAGE
