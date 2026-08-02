@@ -105,6 +105,42 @@ pub fn nearby_existing_path(path: &Path, cwd: &Path, want_file: bool) -> Option<
     (root_candidate != path && matches_kind(&root_candidate)).then_some(root_candidate)
 }
 
+#[derive(Clone, Copy)]
+pub enum PathExpectation {
+    File,
+    Directory,
+    FileOrDirectory,
+}
+
+pub fn missing_path_message(
+    command: &str,
+    kind: &str,
+    path: &Path,
+    cwd: &Path,
+    expectation: PathExpectation,
+) -> String {
+    let mut message = format!(
+        "{command} {kind} does not exist: {}",
+        display_path(path, cwd)
+    );
+    let want_file = matches!(expectation, PathExpectation::File);
+    if let Some(candidate) =
+        nearby_existing_path(path, cwd, want_file).filter(|candidate| match expectation {
+            PathExpectation::File => candidate.is_file(),
+            PathExpectation::Directory => candidate.is_dir(),
+            PathExpectation::FileOrDirectory => candidate.is_file() || candidate.is_dir(),
+        })
+    {
+        message.push_str(&format!(
+            "; did you mean `{}`?",
+            display_path(&candidate, cwd)
+        ));
+    } else if path.strip_prefix(cwd).is_ok() {
+        message.push_str(&format!("; current directory is `{}`", cwd.display()));
+    }
+    message
+}
+
 pub fn repository_path_penalty(path: &Path) -> usize {
     let mut penalty = 0;
     for component in path.components() {

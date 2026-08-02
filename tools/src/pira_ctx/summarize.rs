@@ -155,12 +155,16 @@ fn raw_clip(value: &str, maximum_bytes: usize) -> &str {
     &value[..end]
 }
 
-pub fn score_timeline(capture: &mut CaptureResult, keywords: &[String]) -> Result<(), String> {
+pub fn score_timeline(
+    capture: &mut CaptureResult,
+    keywords: &[String],
+    interest: Option<&regex::Regex>,
+) -> Result<(), String> {
     let total = capture.total_lines;
     let mut readers = capture.readers()?;
     for line in &mut capture.timeline {
         let clean = readers.read_display_line(line)?;
-        let (score, flags) = score_line(
+        let (score, mut flags) = score_line(
             &clean,
             line.stream,
             line.line,
@@ -168,6 +172,9 @@ pub fn score_timeline(capture: &mut CaptureResult, keywords: &[String]) -> Resul
             capture.exit_code,
             keywords,
         );
+        if interest.is_some_and(|pattern| pattern.is_match(&clean)) {
+            flags |= line_flag::INTEREST;
+        }
         line.score = score;
         line.flags = flags;
     }
@@ -195,19 +202,100 @@ pub fn select_important(lines: &[LineMeta], maximum: usize) -> Vec<usize> {
     if maximum == 0 {
         return Vec::new();
     }
+    let interested = lines
+        .iter()
+        .filter(|line| line.has(line_flag::INTEREST))
+        .count();
+    if interested == 0 {
+        return select_important_group(lines, maximum, InterestGroup::All);
+    }
+
+    let interested_budget = interested.min(maximum);
+    let mut selected = select_important_group(lines, interested_budget, InterestGroup::Matched);
+    fill_group_by_score(
+        lines,
+        &mut selected,
+        interested_budget,
+        InterestGroup::Matched,
+    );
+    if interested < maximum {
+        let remaining = maximum.saturating_sub(selected.len());
+        selected.extend(select_important_group(
+            lines,
+            remaining,
+            InterestGroup::Unmatched,
+        ));
+    }
+    selected.sort_by_key(|&index| lines[index].line);
+    selected
+}
+
+#[derive(Clone, Copy)]
+enum InterestGroup {
+    All,
+    Matched,
+    Unmatched,
+}
+
+impl InterestGroup {
+    fn accepts(self, line: &LineMeta) -> bool {
+        match self {
+            Self::All => true,
+            Self::Matched => line.has(line_flag::INTEREST),
+            Self::Unmatched => !line.has(line_flag::INTEREST),
+        }
+    }
+}
+
+fn fill_group_by_score(
+    lines: &[LineMeta],
+    selected: &mut Vec<usize>,
+    maximum: usize,
+    group: InterestGroup,
+) {
+    if selected.len() >= maximum {
+        return;
+    }
+    let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+    let mut remaining = lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| group.accepts(line) && !selected_set.contains(index))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    remaining.sort_by(|&left, &right| {
+        lines[right]
+            .score
+            .cmp(&lines[left].score)
+            .then_with(|| lines[left].line.cmp(&lines[right].line))
+    });
+    selected.extend(
+        remaining
+            .into_iter()
+            .take(maximum.saturating_sub(selected.len())),
+    );
+}
+
+fn select_important_group(lines: &[LineMeta], maximum: usize, group: InterestGroup) -> Vec<usize> {
+    if maximum == 0 {
+        return Vec::new();
+    }
     let mut selected = Vec::new();
     let mut selected_set = HashSet::new();
-    let has_failure = lines.iter().any(|line| line.has(line_flag::FAILURE));
+    let has_failure = lines
+        .iter()
+        .any(|line| group.accepts(line) && line.has(line_flag::FAILURE));
     let failure_budget = maximum.div_ceil(2);
     for index in (0..lines.len())
         .rev()
-        .filter(|&index| lines[index].has(line_flag::FAILURE))
+        .filter(|&index| group.accepts(&lines[index]) && lines[index].has(line_flag::FAILURE))
     {
         for nearby in [index.checked_sub(1), Some(index), index.checked_add(1)] {
             if selected.len() >= failure_budget {
                 break;
             }
-            if let Some(nearby) = nearby.filter(|&value| value < lines.len())
+            if let Some(nearby) =
+                nearby.filter(|&value| value < lines.len() && group.accepts(&lines[value]))
                 && selected_set.insert(nearby)
             {
                 selected.push(nearby);
@@ -218,10 +306,12 @@ pub fn select_important(lines: &[LineMeta], maximum: usize) -> Vec<usize> {
         }
     }
     if !has_failure {
-        let latest_outcome = lines.iter().rposition(|line| line.has(line_flag::SUCCESS));
+        let latest_outcome = lines
+            .iter()
+            .rposition(|line| group.accepts(line) && line.has(line_flag::SUCCESS));
         let latest_check = lines
             .iter()
-            .rposition(|line| line.has(line_flag::SUCCESSFUL_CHECK));
+            .rposition(|line| group.accepts(line) && line.has(line_flag::SUCCESSFUL_CHECK));
         if let Some(index) = latest_outcome.or(latest_check) {
             selected_set.insert(index);
             selected.push(index);
@@ -232,11 +322,9 @@ pub fn select_important(lines: &[LineMeta], maximum: usize) -> Vec<usize> {
         .min(maximum.saturating_sub(selected.len()));
     if boundary_budget > 0 {
         let mut boundaries_added = 0;
-        for index in lines
-            .iter()
-            .enumerate()
-            .filter_map(|(index, line)| line.has(line_flag::COMMAND_BOUNDARY).then_some(index))
-        {
+        for index in lines.iter().enumerate().filter_map(|(index, line)| {
+            (group.accepts(line) && line.has(line_flag::COMMAND_BOUNDARY)).then_some(index)
+        }) {
             if selected_set.insert(index) {
                 selected.push(index);
                 boundaries_added += 1;
@@ -254,7 +342,10 @@ pub fn select_important(lines: &[LineMeta], maximum: usize) -> Vec<usize> {
     while selected.len() < maximum {
         let mut best = None;
         for (index, line) in lines.iter().enumerate() {
-            if selected_set.contains(&index) || (has_failure && line.has(line_flag::SUCCESS)) {
+            if !group.accepts(line)
+                || selected_set.contains(&index)
+                || (has_failure && line.has(line_flag::SUCCESS))
+            {
                 continue;
             }
             if line.has(line_flag::SUCCESSFUL_CHECK) && successful_checks >= 2 {
@@ -386,14 +477,24 @@ fn top_indices<'a>(
 ) -> Vec<usize> {
     let mut heap = BinaryHeap::with_capacity(maximum.saturating_add(1));
     for (index, line) in lines {
-        heap.push((Reverse(line.score), line.line, index));
+        heap.push((
+            Reverse(line.has(line_flag::INTEREST)),
+            Reverse(line.score),
+            line.line,
+            index,
+        ));
         if heap.len() > maximum {
             heap.pop();
         }
     }
     let mut selected = heap.into_vec();
-    selected.sort_by(|a, b| b.0.0.cmp(&a.0.0).then_with(|| a.1.cmp(&b.1)));
-    selected.into_iter().map(|(_, _, index)| index).collect()
+    selected.sort_by(|a, b| {
+        b.0.0
+            .cmp(&a.0.0)
+            .then_with(|| b.1.0.cmp(&a.1.0))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    selected.into_iter().map(|(_, _, _, index)| index).collect()
 }
 
 pub fn detected_paths(capture: &CaptureResult) -> Result<Vec<String>, String> {
@@ -1136,6 +1237,61 @@ fn is_stopword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranked_line(line: usize, score: i64, interested: bool) -> LineMeta {
+        LineMeta {
+            line,
+            stream: StreamKind::Stdout,
+            offset: 0,
+            length: 1,
+            score,
+            flags: if interested { line_flag::INTEREST } else { 0 },
+        }
+    }
+
+    #[test]
+    fn interest_tier_exhausts_matches_before_selecting_unmatched_lines() {
+        let lines = vec![
+            ranked_line(1, 1, true),
+            ranked_line(2, 2, true),
+            ranked_line(3, 10_000, false),
+            ranked_line(4, 9_000, false),
+        ];
+        let selected = select_important(&lines, 3);
+        assert_eq!(selected.len(), 3);
+        assert!(selected.contains(&0));
+        assert!(selected.contains(&1));
+        assert!(
+            selected
+                .iter()
+                .any(|&index| !lines[index].has(line_flag::INTEREST))
+        );
+        assert!(
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !selected.contains(index))
+                .all(|(_, line)| !line.has(line_flag::INTEREST))
+        );
+    }
+
+    #[test]
+    fn interest_tier_uses_existing_scores_within_a_match_saturated_top_k() {
+        let lines = vec![
+            ranked_line(1, 20, true),
+            ranked_line(2, 50, true),
+            ranked_line(3, 10_000, false),
+            ranked_line(4, 40, true),
+            ranked_line(5, 30, true),
+        ];
+        let selected = select_important(&lines, 3);
+        assert_eq!(selected, vec![1, 3, 4]);
+        assert!(
+            selected
+                .iter()
+                .all(|&index| lines[index].has(line_flag::INTEREST))
+        );
+    }
 
     #[test]
     fn successful_test_name_is_not_a_diagnostic() {

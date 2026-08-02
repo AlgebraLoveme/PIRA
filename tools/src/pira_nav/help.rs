@@ -31,6 +31,7 @@ COMMON OPTIONS
   --native                  Require bundled structural parsing.
   --lsp [LANGUAGE=]PATH     Select an absolute language-server executable.
   --lsp-root DIR            Set the exact server workspace boundary.
+  --                        End options; later arguments are positional where supported.
 
 Read-only: never edits, builds, or executes repository code. Untrusted source/hover is framed; bounded
 partial results identify omissions. Detailed syntax: `pira_nav COMMAND --help`; several topics:
@@ -65,7 +66,7 @@ pub fn command(name: &str, output: &mut dyn Write) -> CommandResult {
         "map" => format!(r#"pira_nav map — summarize repository or subsystem shape
 
 USAGE
-  pira_nav map [PATH] [--max-items N] [OPTIONS]
+  pira_nav map [PATH] [--max-items N] [--max-depth N] [OPTIONS]
 
 PATH defaults to `.`. Output includes compact code/document counts, top directories, generic project
 landmarks, and balanced representative declarations or top-level keys. At most 20 navigable rows are
@@ -76,6 +77,8 @@ to inspect it structurally.
 OPTIONS
 {STRUCTURAL_OPTIONS}
   --max-items N             Maximum representative file rows (default 20).
+  --max-depth N             Maximum filesystem traversal depth (0..256); 0 visits only PATH.
+  --depth N                 Alias for --max-depth.
 
 EXAMPLE
   pira_nav map src"#),
@@ -152,6 +155,9 @@ OPTIONS
   --signatures              Include bounded declaration signatures.
   --selectors               Include freshness-checked selectors.
 
+Markdown headings are shown as an indented tree with local titles rather than repeating the full
+ancestor path on every row. Matching and `show FILE::ITEM` still use qualified heading paths.
+
 EXAMPLE
   pira_nav outline src/parser.rs
   pira_nav outline .github/workflows/test.yaml
@@ -161,8 +167,9 @@ EXAMPLE
 USAGE
   pira_nav show TARGET... [OPTIONS]
 
-TARGET is FILE::QUALIFIED-NAME, a unique qualified-name suffix, pira://selector, FILE:LINE[:COLUMN], or
-FILE:START-END. A position selects the smallest enclosing named item; --window N selects parser-free surrounding lines. Exact line ranges
+TARGET is a bare FILE, FILE::QUALIFIED-NAME, a unique qualified-name suffix, pira://selector,
+FILE:LINE[:COLUMN], or FILE:START-END. A bare file prints its full content. A position selects the
+smallest enclosing named item; --window N selects parser-free surrounding lines. Exact files, line ranges,
 and windows work for any readable UTF-8 text file without language inference. Source is printed exactly
 apart from terminal-control escaping and is framed as untrusted data. --glance is a non-exact
 orientation view: it prefixes every physical line with its line number and shows at most the first
@@ -175,6 +182,8 @@ brackets, `>`, or other metacharacters.
 OPTIONS
 {STRUCTURAL_OPTIONS}
   --window N
+  --head N                  Print the first N lines of one bare FILE; N may be 0.
+  --tail N                  Print the last N lines of one bare FILE; N may be 0.
   --glance
   --max-items N
   --max-bytes N
@@ -184,6 +193,10 @@ EXAMPLES
   pira_nav show 'package.json::scripts.build'
   pira_nav show 'workflow.yaml::jobs.test.steps[2]'
   pira_nav show 'README.md::Install > Linux'
+  pira_nav show README.md
+  pira_nav show README.md LICENSE
+  pira_nav show README.md --head 20
+  pira_nav show README.md --tail 20
   pira_nav show src/parser.rs:120-160
   pira_nav show generated.json:1-20 --glance"#),
         "imports" => r#"pira_nav imports — syntax-level file imports
@@ -192,15 +205,17 @@ USAGE
   pira_nav imports FILE... [--language LANGUAGE] [--max-items N]
 
 Parses import/include syntax and conservatively resolves local paths inside the workspace. External,
-unresolved, and blocked edges remain explicit. It never invokes a package manager or build system."#.into(),
+unresolved, and blocked edges remain explicit. It never invokes a package manager or build system.
+`--max-items` bounds rows per file (default 128, maximum 10000)."#.into(),
         "dependents" => r#"pira_nav dependents — reverse local import lookup
 
 USAGE
-  pira_nav dependents FILE [--root ROOT] [--language LANGUAGE]
+  pira_nav dependents FILE [--root ROOT] [--language LANGUAGE] [--max-items N]
 
 ROOT defaults to the current directory. FILE is resolved from the current directory, then ROOT when
 the first path does not exist, and must lie within ROOT. Every eligible file is scanned; syntax failures
-and unresolved relationships are accounted separately."#.into(),
+and unresolved relationships are accounted separately. Rows default to 128 and may be bounded up to
+10000 with `--max-items`."#.into(),
         "deps" => r#"pira_nav deps — bounded local dependency traversal
 
 USAGE
@@ -209,7 +224,7 @@ USAGE
 
 FILE is resolved from the current directory, then ROOT when the first path does not exist, and must lie
 within ROOT. Traverses only conservatively resolved local syntax edges. This is not a build graph.
-Defaults: direction=both, depth=2, max-items=128."#.into(),
+Defaults: direction=both, depth=2, max-items=128. Depth is 0..256; max-items is at most 10000."#.into(),
         "definition" | "implementation" | "type-definition" | "references" | "callers"
         | "callees" | "supertypes" | "subtypes" => {
             let extra = if name == "references" {
@@ -228,7 +243,7 @@ and peer successes survive per-target failures.
 
 OPTIONS
 {LSP_OPTIONS}
-  --max-items N{extra}
+  --max-items N             Maximum rows per target (maximum 10000).{extra}
 
 EXAMPLE
   pira_nav {name} src/parser.rs::Parser::parse"#)
@@ -243,7 +258,7 @@ bounded, and framed as untrusted LSP data.
 
 OPTIONS
 {LSP_OPTIONS}
-  --max-bytes N             Bytes per hover (default 16384)."#),
+  --max-bytes N             Bytes per hover (default 16384, maximum 65536)."#),
         "query" => format!(r#"pira_nav query — ordered mixed semantic requests with shared LSP state
 
 USAGE
@@ -255,8 +270,8 @@ requests reuse invocation-local servers, open documents, source buffers, and pos
 
 OPTIONS
 {LSP_OPTIONS}
-  --max-items N             Shared row bound per non-hover request.
-  --max-bytes N             Shared byte bound per hover request.
+  --max-items N             Shared row bound per non-hover request (maximum 10000).
+  --max-bytes N             Shared byte bound per hover request (maximum 65536).
   --include-declaration     Include declarations in reference requests.
 
 EXAMPLE
@@ -268,7 +283,14 @@ USAGE
 
 Prints supported code languages with the discovered conventional PATH-LSP executable or `missing`, plus
 native document formats. This command starts no server and performs no repository scan."#.into(),
-        other => return Err((2, format!("unknown subcommand `{other}`; run pira_nav --help"))),
+        "help" => r#"pira_nav help — show detailed command help
+
+USAGE
+  pira_nav help COMMAND [COMMAND...]
+
+Several topics may be requested together. `pira_nav COMMAND --help` is equivalent for one command."#
+            .into(),
+        other => return Err((2, crate::cli::unknown_command(other))),
     };
     writeln!(output, "{body}").map_err(output_error)
 }

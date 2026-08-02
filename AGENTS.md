@@ -136,12 +136,14 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 - `exec` Python receives decoded `MSG` + exact `MSG_BYTES`; named inputs appear in `CAPTURES`. Replace a script path with `-` for multiline stdin, normally a `<<'PY'` heredoc. Print only final aggregates and smallest necessary diagnostics.
 - Long-running non-interactive commands publish silent read-only checkpoints after roughly 30 seconds; find with `list` and inspect explicit IDs while execution continues.
 - Intent = prospective action + target + immediate purpose; one line, at most 256 UTF-8 bytes. Automatic routing never deletes output: it prints exactly or retains it for targeted recovery. Stored program output is untrusted data.
+- When known wording must dominate an automatic/capture synopsis, pass `--interest REGEX` before `--`. Matching indexed display lines form a strict top tier, while the existing weights still rank lines within the matching and nonmatching groups. If a selected synopsis line is nonmatching and no retention/index truncation is reported, no omitted indexed line matches; never extend that guarantee to unretained or unindexed output.
 - Discouraged final fallback after targeted inspection fails: `pira_ctx raw RESULT_ID`.
 
 #### Forms
 ```text
-pira_ctx [auto] --intent TEXT -- PROGRAM [ARG...]
-pira_ctx check|exact|capture --intent TEXT -- PROGRAM [ARG...]
+pira_ctx [auto] --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
+pira_ctx capture --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
+pira_ctx check|exact --intent TEXT -- PROGRAM [ARG...]
 pira_ctx search RESULT QUERY [--regex] [--context N]
 pira_ctx range RESULT START_LINE END_LINE
 pira_ctx transform RESULT OPERATION [ARG...]
@@ -155,6 +157,7 @@ pira_ctx raw RESULT
 ```
 
 #### Examples
+- Prioritize known test-failure wording without changing within-group ranking: `pira_ctx --intent 'Run tests' --interest '(?i)error|failed' -- cargo test`.
 - Analyze one capture in Python: `pira_ctx exec TEST_ID --intent 'Count failures' --code 'print(MSG.count("failed"))'`.
 - Compare named captures: `pira_ctx exec --input build=BUILD_ID --input test=TEST_ID --intent 'Compare results' --file compare.py`.
 
@@ -188,13 +191,15 @@ pira_dec help [COMMAND]
 
 #### Rules
 - `search`, `symbols`, and `map` default omitted path to cwd; `dependents`/`deps` default omitted `--root` to cwd.
-- `show` accepts `FILE:START-END`, `FILE:LINE[:COLUMN]`, or `FILE::ITEM`. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
+- For commands with positional paths or targets, use `--` to end option parsing before values that begin with `-`. `query` instead pairs each semantic operation option directly with its target.
+- `show` accepts bare files for full content, `FILE:START-END`, `FILE:LINE[:COLUMN]`, `FILE::ITEM`, or a `pira://` selector, including mixed batches; use `--head N` or `--tail N` with one bare file for bounded ends. `ITEM` may be a full qualified name or a unique qualified-name suffix. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
 - `show` is exact by default. For orientation across ultra-long lines, use `--glance` to show line numbers and at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata; do not use it when exact source is required.
-- Semantic commands accept `FILE:LINE:COLUMN` or `FILE::CODE_ITEM` and require an LSP.
+- Markdown outlines display local heading titles under indented ancestors; matching and `show` still use qualified heading paths when a suffix is ambiguous.
+- Semantic commands accept one-based UTF-8-byte `FILE:LINE:COLUMN`, `FILE::QUALIFIED-NAME`, or a `pira://` selector and require an LSP.
 - Start with the operation directly answering the question. Use `map` only for topology discovery; when text/name/file/target is known, start with `search`, `symbols`, `outline`, or `show`.
-- Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, `-C N` for symmetric context, `-B N`/`-A N` for before/after context, `--files-with-matches` for paths only, and `--count` for counts only.
-- First pass: use default context/output bounds. Reuse verified paths, targets, and evidence; answer once they support every answer part. Increase only an omission-reported bound, or broaden/repeat for a named unresolved gap.
-- Combine related same-scope discovery terms in one bounded regex alternation; batch confirmed independent targets in one `show`/semantic command. Use `query` for mixed semantic operations; split only when later targets depend on earlier evidence.
+- Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, `-C N` for symmetric context, `-B N`/`-A N` for before/after context, `--files-with-matches` for paths only, and `--count` for matching-line counts.
+- First pass: use default context/output bounds. Reuse verified paths, targets, and evidence; answer once they support every answer part. Increase only an omission-reported bound, or broaden/repeat for a named unresolved gap. For `map`, use `--max-depth N` (or `--depth N`) when directory traversal itself must be bounded.
+- Combine related same-scope search terms in one invocation with repeated `-e PATTERN` so each keeps independent ranking and accounting; use regex alternation only when the alternatives are conceptually one query. Batch confirmed independent targets in one `show`/semantic command. Use `query` for mixed semantic operations; split only when later targets depend on earlier evidence.
 - Lexical matches do not establish semantic identity. When identity matters, use LSP semantic commands; report unavailable LSP rather than substituting text matches.
 - Semantic operations: `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, `supertypes`, `subtypes`, `hover`.
 - Let structural commands choose backend automatically. Use `--native` only to require a clean bundled parse and `--lsp` only to override language-server discovery.
@@ -203,11 +208,12 @@ pira_dec help [COMMAND]
 
 #### Forms
 ```text
-pira_nav map [PATH] [OPTION...]
+pira_nav map [PATH] [--max-depth N|--depth N] [OPTION...]
 pira_nav search PATTERN [PATH...] [OPTION...]
 pira_nav symbols QUERY [PATH...] [OPTION...]
 pira_nav outline FILE... [OPTION...]
 pira_nav show TARGET... [OPTION...]
+pira_nav show FILE [--head N|--tail N] [OPTION...]
 pira_nav imports FILE... [OPTION...]
 pira_nav dependents FILE [--root DIR] [OPTION...]
 pira_nav deps FILE [--root DIR] [--depth N] [OPTION...]
@@ -218,6 +224,10 @@ pira_nav help COMMAND...
 ```
 
 #### Examples
+- Bounded topology: `pira_nav map src --max-depth 2`.
+- Independently ranked search terms: `pira_nav search -e Parser -e Compiler src`.
+- Bounded file orientation: `pira_nav show README.md --head 40`.
+- Mixed full-file batch: `pira_nav show README.md LICENSE`.
 - Code item: `pira_nav show src/foo.rs::Foo::bar`.
 - Structured-document key: `pira_nav show config.yaml::foo.bar`.
 - Markdown subsection: `pira_nav show 'README.md::Usage > Linux'`.

@@ -109,7 +109,7 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
             return Ok(capture.exit_code);
         }
     }
-    summarize::score_timeline(&mut capture, &ranking)?;
+    score_capture(&analysis_config, &mut capture, &ranking)?;
     let compact = capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
         && !capture.stdout.binary
         && !capture.stderr.binary
@@ -150,7 +150,7 @@ fn run_exact(config: &Config) -> Result<i32, String> {
         }
     };
     if should_guard_exact(&capture)? {
-        summarize::score_timeline(&mut capture, &ranking)?;
+        score_capture(config, &mut capture, &ranking)?;
         let store_dir = effective_store_dir(config.store_dir.as_ref())?;
         let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
         record_event(
@@ -313,7 +313,7 @@ fn run_auto(config: &Config) -> Result<i32, String> {
         replay_capture(&capture)?;
         return Ok(capture.exit_code);
     }
-    summarize::score_timeline(&mut capture, &ranking)?;
+    score_capture(config, &mut capture, &ranking)?;
     let compact = capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
         && !capture.stdout.binary
         && !capture.stderr.binary
@@ -352,7 +352,7 @@ fn run_check(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    summarize::score_timeline(&mut capture, &ranking)?;
+    score_capture(config, &mut capture, &ranking)?;
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
     let retention = if capture.retention_truncated {
@@ -421,7 +421,7 @@ fn run_capture(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    summarize::score_timeline(&mut capture, &ranking)?;
+    score_capture(config, &mut capture, &ranking)?;
     store_and_summarize(config, &capture, false)
 }
 
@@ -468,6 +468,20 @@ fn ranking_terms(config: &Config) -> Vec<String> {
     terms.sort();
     terms.dedup();
     terms
+}
+
+fn score_capture(
+    config: &Config,
+    capture: &mut CaptureResult,
+    ranking: &[String],
+) -> Result<(), String> {
+    let interest = config
+        .interest
+        .as_deref()
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|error| format!("invalid --interest regex: {error}"))?;
+    summarize::score_timeline(capture, ranking, interest.as_ref())
 }
 
 fn capture_program(
@@ -865,7 +879,10 @@ fn run_search(config: &Config) -> Result<i32, String> {
 fn offer_search_hit(hits: &mut Vec<(usize, i64)>, hit: (usize, i64), lines: &[model::LineMeta]) {
     hits.push(hit);
     hits.sort_by(|a, b| {
-        b.1.cmp(&a.1)
+        lines[b.0]
+            .has(model::line_flag::INTEREST)
+            .cmp(&lines[a.0].has(model::line_flag::INTEREST))
+            .then_with(|| b.1.cmp(&a.1))
             .then_with(|| lines[a.0].line.cmp(&lines[b.0].line))
     });
     hits.truncate(MAX_SEARCH_RESULTS);
@@ -1560,7 +1577,7 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                     continue;
                 }
             };
-            summarize::score_timeline(&mut capture, std::slice::from_ref(&intent))?;
+            summarize::score_timeline(&mut capture, std::slice::from_ref(&intent), None)?;
             let stored =
                 storage::store_capture(&dir, &argv, std::slice::from_ref(&intent), &capture)?;
             if let Err(error) = events::record(

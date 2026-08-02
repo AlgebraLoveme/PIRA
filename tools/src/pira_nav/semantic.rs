@@ -17,8 +17,8 @@ use crate::parse::parse_file;
 use crate::security::possible_prompt_injection;
 use crate::structural::StructuralResolver;
 use crate::util::{
-    absolute_lexical, display_path, escape_untrusted_text, hash16, nearby_existing_path,
-    percent_decode, quote_metadata, read_source, sanitize_metadata,
+    PathExpectation, absolute_lexical, display_path, escape_untrusted_text, hash16,
+    missing_path_message, percent_decode, quote_metadata, read_source, sanitize_metadata,
 };
 
 const DEFAULT_DEFINITION_MAX_ITEMS: usize = 20;
@@ -28,8 +28,8 @@ const DEFAULT_CALL_SITE_MAX_ITEMS: usize = 8;
 const DEFAULT_HOVER_MAX_BYTES: usize = 16 * 1024;
 const MAX_SEMANTIC_TARGETS: usize = 32;
 const MAX_BATCH_ERRORS: usize = 16;
-const MAX_QUERY_ITEMS_PER_REQUEST: usize = 1_000;
-const MAX_QUERY_HOVER_BYTES: usize = 64 * 1024;
+const MAX_SEMANTIC_ITEMS_PER_REQUEST: usize = 10_000;
+const MAX_SEMANTIC_HOVER_BYTES: usize = 64 * 1024;
 
 struct SemanticTarget {
     path: PathBuf,
@@ -60,6 +60,7 @@ fn parse_semantic_target(
         }
         let path = absolute_lexical(Path::new(path), cwd);
         ensure_target_root(&path, lsp.root(cwd), cwd)?;
+        ensure_semantic_file(&path, cwd)?;
         let language = language_for(&path, explicit)?;
         reject_document_semantics(language)?;
         let source = cached_source(&path, sources)?;
@@ -80,15 +81,16 @@ fn parse_semantic_target(
             Some(target) => target,
             None => {
                 if let Some((path, _)) = qualified_target_candidate(value, cwd) {
-                    let mut message =
-                        format!("semantic target file does not exist: {}", path.display());
-                    if let Some(suggestion) = nearby_existing_path(&path, cwd, true) {
-                        message.push_str(&format!(
-                            "; did you mean `{}`?",
-                            display_path(&suggestion, cwd)
-                        ));
-                    }
-                    return Err((2, message));
+                    return Err((
+                        2,
+                        missing_path_message(
+                            "semantic",
+                            "target file",
+                            &path,
+                            cwd,
+                            PathExpectation::File,
+                        ),
+                    ));
                 }
                 return Err((
                     2,
@@ -99,6 +101,7 @@ fn parse_semantic_target(
         };
         (path, None, None, name, None)
     };
+    ensure_semantic_file(&path, cwd)?;
     let language = language_for(&path, explicit)?;
     reject_document_semantics(language)?;
     ensure_target_root(&path, lsp.root(cwd), cwd)?;
@@ -127,7 +130,13 @@ fn parse_semantic_target(
         })
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        return Err((2, format!("symbol not found: {name}")));
+        return Err((
+            2,
+            format!(
+                "symbol not found: {name}; run `pira_nav outline {}` to inspect available items",
+                display_path(&path, cwd)
+            ),
+        ));
     }
     if matches.len() > 1 {
         let candidates = matches
@@ -163,6 +172,30 @@ fn parse_semantic_target(
         row,
         byte_column,
     })
+}
+
+fn ensure_semantic_file(path: &Path, cwd: &Path) -> Result<(), (i32, String)> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err((
+            2,
+            format!(
+                "semantic target is not a regular file: {}",
+                display_path(path, cwd)
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err((
+            2,
+            missing_path_message("semantic", "target file", path, cwd, PathExpectation::File),
+        )),
+        Err(error) => Err((
+            2,
+            format!(
+                "cannot inspect semantic target file {}: {error}",
+                display_path(path, cwd)
+            ),
+        )),
+    }
 }
 
 fn reject_document_semantics(language: Language) -> Result<(), (i32, String)> {
@@ -402,26 +435,43 @@ fn parse_options(
     while index < args.len() {
         let option = args[index].as_str();
         match option {
+            "--" => {
+                targets.extend(args[index + 1..].iter().cloned());
+                break;
+            }
             "--max-items" if !matches!(command, SemanticCommand::Hover) => {
                 if max_items.is_some() {
                     return usage("--max-items may be specified only once");
                 }
-                max_items = Some(positive_usize(
+                let value = positive_usize(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--max-items requires a value".into()))?,
                     "--max-items",
-                )?);
+                )?;
+                if value > MAX_SEMANTIC_ITEMS_PER_REQUEST {
+                    return usage(format!(
+                        "{} --max-items may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}",
+                        command.name()
+                    ));
+                }
+                max_items = Some(value);
                 index += 2;
             }
             "--max-bytes" if matches!(command, SemanticCommand::Hover) => {
                 if max_bytes.is_some() {
                     return usage("--max-bytes may be specified only once");
                 }
-                max_bytes = Some(positive_usize(
+                let value = positive_usize(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--max-bytes requires a value".into()))?,
                     "--max-bytes",
-                )?);
+                )?;
+                if value > MAX_SEMANTIC_HOVER_BYTES {
+                    return usage(format!(
+                        "hover --max-bytes may not exceed {MAX_SEMANTIC_HOVER_BYTES}"
+                    ));
+                }
+                max_bytes = Some(value);
                 index += 2;
             }
             "--include-declaration" if matches!(command, SemanticCommand::References) => {
@@ -432,7 +482,11 @@ fn parse_options(
                 index += 1;
             }
             value if value.starts_with('-') => {
-                return usage(format!("unknown {} option `{value}`", command.name()));
+                return usage(format!(
+                    "unknown {} option `{value}`; run pira_nav {} --help",
+                    command.name(),
+                    command.name()
+                ));
             }
             value => {
                 if targets.len() >= MAX_SEMANTIC_TARGETS {
@@ -450,9 +504,15 @@ fn parse_options(
         return Err((
             2,
             format!(
-                "{} requires at least one FILE:LINE:COLUMN target",
+                "{} requires at least one FILE:LINE:COLUMN, FILE::QUALIFIED-NAME, or pira://selector target",
                 command.name()
             ),
+        ));
+    }
+    if targets.len() > MAX_SEMANTIC_TARGETS {
+        return usage(format!(
+            "{} accepts at most {MAX_SEMANTIC_TARGETS} targets",
+            command.name()
         ));
     }
     Ok(SemanticOptions {
@@ -597,7 +657,7 @@ pub fn query(
 ) -> CommandResult {
     let options = parse_query_options(args)?;
     let mut sources = BTreeMap::new();
-    let requests = prepare_requests(
+    let prepared = prepare_requests(
         options.requests,
         explicit,
         cwd,
@@ -609,7 +669,7 @@ pub fn query(
         },
         lsp,
     )?;
-    run_requests(requests, lsp, cwd, BatchKind::Query, output)
+    run_requests(prepared, lsp, cwd, BatchKind::Query, output)
 }
 
 struct QueryOptions {
@@ -636,9 +696,9 @@ fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
                         .ok_or_else(|| (2, "--max-items requires a value".into()))?,
                     "--max-items",
                 )?;
-                if value > MAX_QUERY_ITEMS_PER_REQUEST {
+                if value > MAX_SEMANTIC_ITEMS_PER_REQUEST {
                     return usage(format!(
-                        "query --max-items may not exceed {MAX_QUERY_ITEMS_PER_REQUEST}"
+                        "query --max-items may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}"
                     ));
                 }
                 max_items = Some(value);
@@ -653,9 +713,9 @@ fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
                         .ok_or_else(|| (2, "--max-bytes requires a value".into()))?,
                     "--max-bytes",
                 )?;
-                if value > MAX_QUERY_HOVER_BYTES {
+                if value > MAX_SEMANTIC_HOVER_BYTES {
                     return usage(format!(
-                        "query --max-bytes may not exceed {MAX_QUERY_HOVER_BYTES}"
+                        "query --max-bytes may not exceed {MAX_SEMANTIC_HOVER_BYTES}"
                     ));
                 }
                 max_bytes = Some(value);
@@ -726,6 +786,21 @@ struct RequestDefaults {
     include_declaration: bool,
 }
 
+struct RequestFailure {
+    command: SemanticCommand,
+    value: String,
+    code: i32,
+    message: String,
+}
+
+struct PreparedRequests {
+    attempted: usize,
+    requests: Vec<SemanticRequest>,
+    failures: Vec<RequestFailure>,
+    omitted_errors: usize,
+    first_failure: Option<(i32, String)>,
+}
+
 fn prepare_requests(
     specs: Vec<(SemanticCommand, String)>,
     explicit: Option<Language>,
@@ -733,22 +808,46 @@ fn prepare_requests(
     sources: &mut BTreeMap<PathBuf, Arc<str>>,
     defaults: RequestDefaults,
     lsp: &LspOptions,
-) -> Result<Vec<SemanticRequest>, (i32, String)> {
+) -> Result<PreparedRequests, (i32, String)> {
+    let attempted = specs.len();
     let mut dirty_resolver = None;
     let mut requests = Vec::with_capacity(specs.len());
+    let mut failures = Vec::new();
+    let mut omitted_errors = 0usize;
+    let mut first_failure = None;
     for (command, value) in specs {
-        let target =
-            parse_semantic_target(&value, explicit, cwd, sources, lsp, &mut dirty_resolver)?;
-        requests.push(SemanticRequest {
-            command,
-            value,
-            target,
-            max_items: defaults.max_items.unwrap_or(command.default_max_items()),
-            max_bytes: defaults.max_bytes,
-            include_declaration: defaults.include_declaration,
-        });
+        match parse_semantic_target(&value, explicit, cwd, sources, lsp, &mut dirty_resolver) {
+            Ok(target) => requests.push(SemanticRequest {
+                command,
+                value,
+                target,
+                max_items: defaults.max_items.unwrap_or(command.default_max_items()),
+                max_bytes: defaults.max_bytes,
+                include_declaration: defaults.include_declaration,
+            }),
+            Err(error) if error.0 <= 1 => return Err(error),
+            Err((code, message)) => {
+                first_failure.get_or_insert((code, message.clone()));
+                if failures.len() < MAX_BATCH_ERRORS {
+                    failures.push(RequestFailure {
+                        command,
+                        value,
+                        code,
+                        message,
+                    });
+                } else {
+                    omitted_errors += 1;
+                }
+            }
+        }
     }
-    Ok(requests)
+    Ok(PreparedRequests {
+        attempted,
+        requests,
+        failures,
+        omitted_errors,
+        first_failure,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -772,7 +871,7 @@ fn run_command(
         .iter()
         .map(|value| (command, value.clone()))
         .collect();
-    let requests = prepare_requests(
+    let prepared = prepare_requests(
         specs,
         explicit,
         cwd,
@@ -784,31 +883,48 @@ fn run_command(
         },
         lsp,
     )?;
-    run_requests(requests, lsp, cwd, BatchKind::Homogeneous(command), output)
+    run_requests(prepared, lsp, cwd, BatchKind::Homogeneous(command), output)
 }
 
 fn run_requests(
-    requests: Vec<SemanticRequest>,
+    prepared: PreparedRequests,
     lsp: &LspOptions,
     cwd: &Path,
     batch: BatchKind,
     output: &mut dyn Write,
 ) -> CommandResult {
+    let PreparedRequests {
+        attempted,
+        requests,
+        failures: preparation_failures,
+        mut omitted_errors,
+        mut first_failure,
+    } = prepared;
     let label = match batch {
         BatchKind::Homogeneous(command) => command.name(),
         BatchKind::Query => "query",
     };
+    if requests.is_empty() {
+        return Err(first_failure.unwrap_or_else(|| (3, format!("all {label} requests failed"))));
+    }
     let mut service = semantic_service(lsp, &requests, cwd, label)?;
     let mut succeeded = 0usize;
-    let mut failures = Vec::new();
-    let mut omitted_errors = 0usize;
-    let mut first_failure = None;
+    let mut failures = preparation_failures
+        .into_iter()
+        .map(|failure| {
+            let subject = match batch {
+                BatchKind::Homogeneous(_) => failure.value,
+                BatchKind::Query => format!("{}={}", failure.command.name(), failure.value),
+            };
+            (subject, failure.code, failure.message)
+        })
+        .collect::<Vec<_>>();
     for request in &requests {
         match execute_one(request, &mut service, cwd, output) {
             Ok(()) => succeeded += 1,
             Err((code, message)) if code <= 1 => return Err((code, message)),
             Err((code, message))
-                if requests.len() == 1 && matches!(batch, BatchKind::Homogeneous(_)) =>
+                if attempted == 1 && matches!(batch, BatchKind::Homogeneous(_)) =>
             {
                 return Err((code, message));
             }
@@ -839,24 +955,23 @@ fn run_requests(
         )
         .map_err(output_error)?;
     }
-    if requests.len() > 1 || matches!(batch, BatchKind::Query) {
+    if attempted > 1 || matches!(batch, BatchKind::Query) {
         match batch {
             BatchKind::Homogeneous(command) => write!(
                 output,
                 "# pira_nav {} batch targets={} succeeded={}",
                 command.name(),
-                requests.len(),
+                attempted,
                 succeeded
             ),
             BatchKind::Query => write!(
                 output,
                 "# pira_nav query requests={} succeeded={}",
-                requests.len(),
-                succeeded
+                attempted, succeeded
             ),
         }
         .map_err(output_error)?;
-        let failed = requests.len().saturating_sub(succeeded);
+        let failed = attempted.saturating_sub(succeeded);
         if failed > 0 {
             write!(output, " failed={failed} complete=0").map_err(output_error)?;
         }
@@ -1370,7 +1485,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::parse_semantic_target;
+    use super::{RequestDefaults, SemanticCommand, parse_semantic_target, prepare_requests};
 
     #[test]
     fn repeated_targets_share_one_source_allocation() {
@@ -1407,6 +1522,28 @@ mod tests {
         .expect("second target");
         assert!(Arc::ptr_eq(&first.source, &second.source));
         assert_eq!(sources.len(), 1);
+
+        let missing = format!("{}-missing.py::target", path.display());
+        let prepared = prepare_requests(
+            vec![
+                (SemanticCommand::Definition, value.clone()),
+                (SemanticCommand::Definition, missing),
+            ],
+            None,
+            &std::env::temp_dir(),
+            &mut sources,
+            RequestDefaults {
+                max_items: None,
+                max_bytes: 1024,
+                include_declaration: false,
+            },
+            &lsp,
+        )
+        .expect("peer target preparation");
+        assert_eq!(prepared.attempted, 2);
+        assert_eq!(prepared.requests.len(), 1);
+        assert_eq!(prepared.failures.len(), 1);
+
         fs::remove_file(path).expect("remove temporary source");
     }
 }

@@ -12,8 +12,8 @@ use crate::language::Language;
 use crate::parse::parse_source_symbols;
 use crate::security::possible_prompt_injection;
 use crate::util::{
-    MAX_FILE_BYTES, absolute_lexical, display_path, escape_untrusted_text, hash16,
-    nearby_existing_path, quote_metadata, repository_path_penalty,
+    MAX_FILE_BYTES, PathExpectation, absolute_lexical, display_path, escape_untrusted_text, hash16,
+    missing_path_message, quote_metadata, repository_path_penalty,
 };
 
 const MAX_PATTERNS: usize = 32;
@@ -113,19 +113,18 @@ pub fn run(
         if path_contains_symlink(root) {
             return Err(input_error(format!(
                 "search does not follow symlinks: {}",
-                root.display()
+                display_path(root, cwd)
             )));
         }
         if !root.is_file() && !root.is_dir() {
             if requested_roots.len() == 1 {
-                let mut message = format!("search target does not exist: {}", root.display());
-                if let Some(suggestion) = nearby_existing_path(root, cwd, false) {
-                    message.push_str(&format!(
-                        "; did you mean `{}`?",
-                        display_path(&suggestion, cwd)
-                    ));
-                }
-                return Err(input_error(message));
+                return Err(input_error(missing_path_message(
+                    "search",
+                    "target",
+                    root,
+                    cwd,
+                    PathExpectation::FileOrDirectory,
+                )));
             }
             missing_roots += 1;
             continue;
@@ -133,7 +132,18 @@ pub fn run(
         roots.push(root.clone());
     }
     if roots.is_empty() {
-        return Err(input_error("none of the requested search targets exist"));
+        let mut message = missing_path_message(
+            "search",
+            "target",
+            &requested_roots[0],
+            cwd,
+            PathExpectation::FileOrDirectory,
+        );
+        message.push_str(&format!(
+            "; none of the {} requested targets exist",
+            requested_roots.len()
+        ));
+        return Err(input_error(message));
     }
     let engine = build_engine(&options)?;
     let paths = roots
@@ -397,7 +407,10 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
                 break;
             }
             value if value.starts_with('-') => {
-                return Err((2, format!("unknown search option `{value}`")));
+                return Err((
+                    2,
+                    format!("unknown search option `{value}`; run pira_nav search --help"),
+                ));
             }
             value => {
                 positional.push(value.to_string());

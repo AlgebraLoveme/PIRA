@@ -71,6 +71,7 @@ pub struct Config {
     pub store_dir: Option<PathBuf>,
     pub intent: Option<String>,
     pub keywords: Vec<String>,
+    pub interest: Option<String>,
     pub cmd: Vec<String>,
     pub target: Option<String>,
     pub stats_targets: Vec<String>,
@@ -108,6 +109,7 @@ impl Default for Config {
             store_dir: None,
             intent: None,
             keywords: vec![],
+            interest: None,
             cmd: vec![],
             target: None,
             stats_targets: vec![],
@@ -334,6 +336,7 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
         }
     }
     validate_keywords(&c.keywords)?;
+    validate_interest(c.interest.as_deref())?;
     Ok(c)
 }
 
@@ -511,6 +514,22 @@ fn validate_keywords(keywords: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_interest(interest: Option<&str>) -> Result<(), String> {
+    let Some(pattern) = interest else {
+        return Ok(());
+    };
+    if pattern.is_empty()
+        || pattern.len() > MAX_QUERY_BYTES
+        || pattern.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "--interest must be a non-empty, single-line Rust regex of at most {MAX_QUERY_BYTES} UTF-8 bytes"
+        ));
+    }
+    regex::Regex::new(pattern).map_err(|error| format!("invalid --interest regex: {error}"))?;
+    Ok(())
+}
+
 fn require_intent(c: &mut Config) -> Result<(), String> {
     let value = c
         .intent
@@ -573,6 +592,13 @@ fn parse_exec_options(
             "--keyword" if keywords => {
                 p += 1;
                 c.keywords.push(take(args, &mut p, "--keyword")?.into())
+            }
+            "--interest" if keywords => {
+                p += 1;
+                let pattern = take(args, &mut p, "--interest")?.to_string();
+                if c.interest.replace(pattern).is_some() {
+                    return Err("--interest may be specified only once".into());
+                }
             }
             "--" => break,
             _ => return Err(USAGE.into()),
@@ -1154,5 +1180,47 @@ mod tests {
         assert!(validate_keywords(&vec!["x".into(); MAX_KEYWORDS]).is_ok());
         assert!(validate_keywords(&vec!["x".into(); MAX_KEYWORDS + 1]).is_err());
         assert!(validate_keywords(&["x".repeat(MAX_KEYWORD_BYTES + 1)]).is_err());
+    }
+
+    #[test]
+    fn interest_regex_is_validated_before_program_arguments() {
+        let config = parse_args(&a(&[
+            "auto",
+            "--intent",
+            "inspect selected diagnostics",
+            "--interest",
+            "(?i)error|failed",
+            "--",
+            "program",
+            "--interest",
+            "child-value",
+        ]))
+        .unwrap();
+        assert_eq!(config.interest.as_deref(), Some("(?i)error|failed"));
+        assert_eq!(config.cmd, a(&["program", "--interest", "child-value"]));
+
+        let invalid = parse_args(&a(&[
+            "--intent",
+            "inspect selected diagnostics",
+            "--interest",
+            "[",
+            "--",
+            "program",
+        ]))
+        .unwrap_err();
+        assert!(invalid.contains("invalid --interest regex"));
+
+        let duplicate = parse_args(&a(&[
+            "--intent",
+            "inspect selected diagnostics",
+            "--interest",
+            "error",
+            "--interest",
+            "failed",
+            "--",
+            "program",
+        ]))
+        .unwrap_err();
+        assert!(duplicate.contains("only once"));
     }
 }

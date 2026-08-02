@@ -78,6 +78,14 @@ fn classify(path: &Path, selection: DiscoverySelection) -> DiscoveredLanguage {
 }
 
 pub fn discover_files(root: &Path, selection: DiscoverySelection) -> FileDiscovery {
+    discover_files_with_max_depth(root, selection, None)
+}
+
+pub fn discover_files_with_max_depth(
+    root: &Path,
+    selection: DiscoverySelection,
+    max_depth: Option<usize>,
+) -> FileDiscovery {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -87,6 +95,7 @@ pub fn discover_files(root: &Path, selection: DiscoverySelection) -> FileDiscove
         .parents(true)
         .require_git(false)
         .follow_links(false);
+    builder.max_depth(max_depth);
     let mut files = Vec::new();
     let mut discovered = 0;
     let mut unsupported = 0;

@@ -23,7 +23,7 @@ Choosing a command:
     prune / forget           Enforce retention or explicitly remove stored data/history.
 
 Common forms:
-  pira_ctx [auto] --intent TEXT -- PROGRAM [ARG...]
+  pira_ctx [auto] --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
   pira_ctx exact|check|capture --intent TEXT -- PROGRAM [ARG...]
   pira_ctx search RESULT QUERY [--regex] [--context N]
   pira_ctx range RESULT START_LINE END_LINE
@@ -61,11 +61,14 @@ WHEN TO USE
   mandatory. `auto` may be omitted; both forms are equivalent.
 
 USAGE
-  pira_ctx [auto] [--store-dir PATH] --intent TEXT [--keyword QUERY ...] -- PROGRAM [ARG...]
+  pira_ctx [auto] [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
 
 OPTIONS
   --intent TEXT       Immediate purpose; required, single-line, at most 256 UTF-8 bytes.
   --keyword QUERY     Additional ranking term; repeatable up to 16 times.
+  --interest REGEX    Put matching indexed display lines in a strict top ranking tier. Rust regex;
+                      case-sensitive unless it contains an inline flag such as (?i). At most 4096
+                      UTF-8 bytes. Invalid regex prevents PROGRAM from starting.
   --store-dir PATH    Override the private per-user capture store.
 
 OUTPUT AND STORAGE
@@ -83,6 +86,12 @@ OUTPUT AND STORAGE
   instead of direct automatic replay. Stored bytes remain authoritative up to the configured retention
   ceiling. Use capture when completed output must be persisted.
 
+  --interest changes only ranking: the existing line weights still order matching lines among
+  themselves and nonmatching lines among themselves. If the bounded synopsis contains any
+  nonmatching selected line, no omitted indexed line matches REGEX. Retention or line-index
+  truncation is reported explicitly; this guarantee cannot cover output that was not retained or
+  indexed.
+
   A PROGRAM active for about 30 seconds gets a silent read-only checkpoint visible in list.
   Inspection uses a consistent snapshot without waiting for completion. Override the interval with
   PIRA_CTX_LIVE_CHECKPOINT_MS (minimum 100 ms).
@@ -91,7 +100,8 @@ EXIT STATUS
   Preserves the child status. Missing/non-executable commands use 127/126; wrapper failures use 125.
 
 EXAMPLE
-  pira_ctx --intent "Inspect repository status" -- git status --short"#;
+  pira_ctx --intent "Inspect repository status" -- git status --short
+  pira_ctx --intent "Run tests" --interest '(?i)error|failed' -- cargo test"#;
 
 const EXACT: &str = r#"pira_ctx exact — request original output with a repetition guard
 
@@ -143,7 +153,7 @@ WHEN TO USE
   Use automatic mode when unconditional retention is unnecessary. `summary` is an alias.
 
 USAGE
-  pira_ctx capture [--store-dir PATH] --intent TEXT [--keyword QUERY ...] -- PROGRAM [ARG...]
+  pira_ctx capture [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
 
 OUTPUT AND STORAGE
   Every completed child is stored with retained stdout/stderr, metadata, indexes, compression, and
@@ -151,8 +161,11 @@ OUTPUT AND STORAGE
   If the configured byte ceiling is reached, excess output is drained without storage and the report
   states the observed and retained sizes. Spawn failures have no capture. Child status is preserved.
 
+  --interest REGEX has the same validation, strict-tier ranking, and indexed-output guarantee as in
+  automatic mode. Existing weights still rank lines within the matching and nonmatching groups.
+
 EXAMPLE
-  pira_ctx capture --intent "Retain deployment diagnostics" -- ./deploy --diagnose"#;
+  pira_ctx capture --intent "Retain deployment diagnostics" --interest '(?i)error|warning' -- ./deploy --diagnose"#;
 
 const BATCH: &str = r#"pira_ctx batch — run bounded groups of independent intent-tagged commands
 

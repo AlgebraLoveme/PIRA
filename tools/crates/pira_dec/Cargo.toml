@@ -1,6 +1,6 @@
 [package]
 name = "pira_dec"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Structured medium-level decision memory for PIRA agents"
@@ -12,7 +12,7 @@ jiff = { version = "0.2", default-features = false, features = ["std"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [lib]
 path = "../../src/pira_dec/lib.rs"
