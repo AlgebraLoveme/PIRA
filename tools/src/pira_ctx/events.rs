@@ -163,7 +163,11 @@ struct RetentionLoad {
 }
 
 pub fn current_scope(workspace_hash: &str) -> Scope {
-    for (provider, name) in [("pira", "PIRA_CTX_THREAD_ID"), ("codex", "CODEX_THREAD_ID")] {
+    for (provider, name) in [
+        ("pira", "PIRA_CTX_THREAD_ID"),
+        ("codex", "CODEX_THREAD_ID"),
+        ("claude", "CLAUDE_CODE_SESSION_ID"),
+    ] {
         let Some(value) = std::env::var(name).ok().filter(|value| {
             !value.is_empty() && value.len() <= 4_096 && !value.chars().any(char::is_control)
         }) else {

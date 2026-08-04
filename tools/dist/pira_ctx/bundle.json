@@ -24,7 +24,7 @@
     "linux-x64": {
       "path": "linux-x64/pira_ctx",
       "target": "x86_64-unknown-linux-musl",
-      "sha256": "d20771078bb03ef1c5e1b200fff31a9157e6421b488ed39a0335d38f8b2fb7de",
+      "sha256": "a29bfc333f6a6525fa7078cd9a811c19b1f88b5678426d0e617bef07f1d24465",
       "linkage": "static-pie"
     },
     "windows-x64": {

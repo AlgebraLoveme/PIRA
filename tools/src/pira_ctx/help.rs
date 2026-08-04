@@ -368,9 +368,10 @@ MATCHING AND SCOPE
   Without QUERY, newest events are shown. Literal QUERY matching lowercases Unicode text before
   substring comparison; it is not fuzzy, normalized, or semantic search. --regex uses Rust regex
   syntax and is case-sensitive unless the pattern requests otherwise. Filters inspect only intent.
-  --scope current is the default and uses PIRA_CTX_THREAD_ID, then CODEX_THREAD_ID, without storing
-  either raw value. With neither, it uses a labeled workspace-local unscoped fallback that cannot
-  guarantee thread isolation. --scope workspace explicitly merges anonymous thread catalogs.
+  --scope current is the default and uses PIRA_CTX_THREAD_ID, then CODEX_THREAD_ID, then
+  CLAUDE_CODE_SESSION_ID, without storing any raw value. With none, it uses a labeled
+  workspace-local unscoped fallback that cannot guarantee thread isolation. --scope workspace
+  explicitly merges anonymous thread catalogs.
 
 BOUNDS AND OUTPUT
   Search covers all retained events by default and always returns a bounded result. --limit N stops
