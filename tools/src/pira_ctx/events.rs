@@ -163,12 +163,19 @@ struct RetentionLoad {
 }
 
 pub fn current_scope(workspace_hash: &str) -> Scope {
+    scope_from_environment(workspace_hash, |name| std::env::var(name).ok())
+}
+
+fn scope_from_environment<F>(workspace_hash: &str, mut read: F) -> Scope
+where
+    F: FnMut(&str) -> Option<String>,
+{
     for (provider, name) in [
         ("pira", "PIRA_CTX_THREAD_ID"),
         ("codex", "CODEX_THREAD_ID"),
         ("claude", "CLAUDE_CODE_SESSION_ID"),
     ] {
-        let Some(value) = std::env::var(name).ok().filter(|value| {
+        let Some(value) = read(name).filter(|value| {
             !value.is_empty() && value.len() <= 4_096 && !value.chars().any(char::is_control)
         }) else {
             continue;
@@ -1797,6 +1804,38 @@ mod tests {
         assert_ne!(first, scope_hash("b", "codex", "thread"));
         assert_ne!(first, scope_hash("a", "pira", "thread"));
         assert!(!first.contains("thread"));
+    }
+
+    #[test]
+    fn scope_resolution_supports_claude_and_preserves_priority() {
+        let claude = scope_from_environment("workspace", |name| {
+            (name == "CLAUDE_CODE_SESSION_ID").then(|| "claude-session".into())
+        });
+        assert!(claude.detected);
+        assert_eq!(
+            claude.hash,
+            scope_hash("workspace", "claude", "claude-session")
+        );
+
+        let preferred = scope_from_environment("workspace", |name| match name {
+            "PIRA_CTX_THREAD_ID" => Some("pira-session".into()),
+            "CODEX_THREAD_ID" => Some("codex-session".into()),
+            "CLAUDE_CODE_SESSION_ID" => Some("claude-session".into()),
+            _ => None,
+        });
+        assert_eq!(
+            preferred.hash,
+            scope_hash("workspace", "pira", "pira-session")
+        );
+
+        let fallback = scope_from_environment("workspace", |name| match name {
+            "PIRA_CTX_THREAD_ID" => Some("invalid\nvalue".into()),
+            "CODEX_THREAD_ID" => Some(String::new()),
+            "CLAUDE_CODE_SESSION_ID" => Some("claude-session".into()),
+            _ => None,
+        });
+        assert!(fallback.detected);
+        assert_eq!(fallback.hash, claude.hash);
     }
 
     #[test]

@@ -1,0 +1,95 @@
+name: Build PIRA tool bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "pira-tools-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pira-tool-bundles-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.tool }} bundle
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: pira_ctx
+            script: tools/build/build_pira_ctx_platform_bins.py
+            needs_zig: false
+          - tool: pira_dec
+            script: tools/build/build_pira_dec_platform_bins.py
+            needs_zig: false
+          - tool: pira_nav
+            script: tools/build/build_pira_nav_platform_bins.py
+            needs_zig: true
+
+    env:
+      TOOL: ${{ matrix.tool }}
+      BUILD_SCRIPT: ${{ matrix.script }}
+      NEEDS_ZIG: ${{ matrix.needs_zig }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check source and tests
+        run: |
+          cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
+          cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
+
+      - name: Install Windows cross-linker
+        run: |
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null; then
+            brew install mingw-w64
+          fi
+          x86_64-w64-mingw32-gcc --version | head -1
+
+      - name: Build every platform twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--bootstrap-rustup)
+          if [[ "${NEEDS_ZIG}" == "true" ]]; then
+            args+=(--bootstrap-zig)
+          fi
+          python3 "${BUILD_SCRIPT}" "${args[@]}"
+
+      - name: Package verified bundle
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(TOOL="${TOOL}" python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          tool = os.environ["TOOL"]
+          manifest = tomllib.loads(Path(f"tools/crates/{tool}/Cargo.toml").read_text())
+          print(manifest["package"]["version"])
+          PY
+          )"
+          archive="${TOOL}-${version}-bundle.tar.gz"
+          tar -czf "${archive}" -C tools/dist "${TOOL}"
+          shasum -a 256 "${archive}" > "${archive}.sha256"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload complete bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.tool }}-${{ steps.package.outputs.version }}-bundle
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30

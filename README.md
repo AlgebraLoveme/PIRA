@@ -540,6 +540,7 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
 - `tools/build/build_pira_dec_platform_bins.py` — package-isolated release entry point for `pira_dec`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
+- `.github/workflows/build-pira-tool-bundles.yml` — manually or tag-triggered GitHub matrix build of complete verified `pira_ctx`, `pira_dec`, and `pira_nav` platform bundles
 - `tools/src/pira_ctx/`, `tools/src/pira_dec/`, and `tools/src/pira_nav/` — public Rust implementations
 - `tools/dist/` — published, verified platform executables and per-tool bundle manifests
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
