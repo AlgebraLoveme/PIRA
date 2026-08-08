@@ -43,6 +43,7 @@ jobs:
 
       - name: Check source and tests
         run: |
+          python3 -m unittest tools.build.test_build_pira_ctx_platform_bins
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
           cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
 

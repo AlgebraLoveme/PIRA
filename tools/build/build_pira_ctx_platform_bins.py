@@ -311,7 +311,9 @@ def rust_tools(args: argparse.Namespace) -> tuple[Path, dict[str, str]]:
         if not args.bootstrap_rustup:
             raise BuildError("rustup not found; install rustup or rerun with --bootstrap-rustup")
         return bootstrap_rustup(args.rustup_root.resolve(), args.toolchain)
-    return Path(rustup_path).resolve(), env
+    # Preserve the multicall executable name: resolving a `rustup` symlink to
+    # `rustup-init` makes the binary parse toolchain commands as installer flags.
+    return Path(rustup_path), env
 
 
 def require_release_inputs() -> None:
