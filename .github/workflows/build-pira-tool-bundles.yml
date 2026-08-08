@@ -2,9 +2,6 @@ name: Build PIRA tool bundles
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "pira-tools-*"
 
 permissions:
   contents: read
@@ -14,8 +11,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    name: Authorize release build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require owner dispatch from master
+        env:
+          ACTOR: ${{ github.actor }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${ACTOR}" == "AlgebraLoveme" ]] || {
+            echo "Only AlgebraLoveme may publish a PIRA tools release." >&2
+            exit 1
+          }
+          [[ "${REF}" == "refs/heads/master" ]] || {
+            echo "Run this workflow from the master branch, not ${REF}." >&2
+            exit 1
+          }
+
   build:
     name: Build ${{ matrix.tool }} bundle
+    needs: authorize
     runs-on: macos-15
     timeout-minutes: 120
     strategy:
@@ -43,7 +60,10 @@ jobs:
 
       - name: Check source and tests
         run: |
-          python3 -m unittest tools.build.test_build_pira_ctx_platform_bins
+          python3 -m unittest \
+            assets.scripts.test_setup_pira_tools \
+            tools.build.test_build_pira_ctx_platform_bins \
+            tools.build.test_package_github_release
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
           cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
 
@@ -94,3 +114,66 @@ jobs:
             ${{ steps.package.outputs.archive }}.sha256
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release packaging code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pira_*-bundle
+          path: ${{ runner.temp }}/pira-build-artifacts
+
+      - name: Prepare direct release assets
+        id: release
+        shell: bash
+        env:
+          ARTIFACTS_DIR: ${{ runner.temp }}/pira-build-artifacts
+          ASSETS_DIR: ${{ runner.temp }}/pira-release-assets
+        run: |
+          set -euo pipefail
+          tag="pira-tools-r${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:12}"
+          python3 tools/build/package_github_release.py \
+            --artifacts-dir "${ARTIFACTS_DIR}" \
+            --output-dir "${ASSETS_DIR}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --tag "${tag}" \
+            --source-sha "${GITHUB_SHA}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish immutable-versioned release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ASSETS_DIR: ${{ runner.temp }}/pira-release-assets
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            draft="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+            [[ "${draft}" == "true" ]] || {
+              echo "Refusing to replace existing published release ${TAG}." >&2
+              exit 1
+            }
+          else
+            gh release create "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --draft \
+              --title "PIRA tools ${TAG#pira-tools-}" \
+              --notes "Cloud-built PIRA tool binaries from ${GITHUB_SHA}."
+          fi
+          gh release upload "${TAG}" "${ASSETS_DIR}"/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+          gh release edit "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest

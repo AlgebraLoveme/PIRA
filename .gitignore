@@ -21,7 +21,7 @@ __pycache__/
 tool_todo.md
 
 # Keep only public PIRA tool source, reproducible build inputs, selectors, and
-# release bundles. Tests, benchmarks, toolchains, and build work stay local.
+# release packaging code. Generated binaries, toolchains, and build work stay local.
 tools/*
 !tools/Cargo.toml
 !tools/Cargo.lock
@@ -34,10 +34,10 @@ tools/build/*
 !tools/build/build_pira_dec_platform_bins.py
 !tools/build/build_pira_nav_platform_bins.py
 !tools/build/test_build_pira_ctx_platform_bins.py
+!tools/build/package_github_release.py
+!tools/build/test_package_github_release.py
 !tools/src/
 !tools/src/**
-!tools/dist/
-!tools/dist/**
 
 # Local captures may be created outside the tool tree.
 *.piractx

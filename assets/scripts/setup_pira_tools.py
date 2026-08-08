@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or refresh bundled PIRA tools in a per-user PATH directory."""
+"""Install or refresh released PIRA tools in a per-user PATH directory."""
 
 from __future__ import annotations
 
@@ -7,20 +7,34 @@ import argparse
 import ctypes
 import hashlib
 import importlib.util
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
 RETIRED_TOOLS = {"pira_codenav"}
+RELEASE_REPOSITORY = "AlgebraLoveme/PIRA"
+RELEASE_INDEX_NAME = "pira-tools-release.json"
+LATEST_RELEASE_BASE = (
+    f"https://github.com/{RELEASE_REPOSITORY}/releases/latest/download"
+)
+RELEASES_API = f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases"
+MAX_INDEX_BYTES = 1024 * 1024
+MAX_BINARY_BYTES = 128 * 1024 * 1024
 LEGACY_MANAGED_HASHES = {
     "pira_codenav": {
         "c2cba4a149da97ef68a233b7ddb37b70e13efb097f14d1045b48320645cb52dc",
@@ -35,8 +49,9 @@ LEGACY_MANAGED_HASHES = {
 @dataclass(frozen=True)
 class ToolSelection:
     name: str
-    manifest: dict[str, object]
-    source: Path
+    version: str
+    release_tag: str
+    asset: str
     record: dict[str, object]
     destination: Path
     expected_hash: str
@@ -69,6 +84,181 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def request_bytes(
+    url: str, *, limit: int, accept: str = "application/octet-stream"
+) -> bytes:
+    request = Request(
+        url,
+        headers={
+            "Accept": accept,
+            "User-Agent": "PIRA-setup",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None:
+                try:
+                    recorded_length = int(length)
+                except ValueError as error:
+                    raise RuntimeError("release asset has an invalid Content-Length") from error
+                if recorded_length > limit:
+                    raise RuntimeError(f"release asset exceeds the {limit}-byte safety limit")
+            data = response.read(limit + 1)
+    except (HTTPError, URLError, TimeoutError) as error:
+        raise RuntimeError(f"cannot download {url}: {error}") from error
+    if len(data) > limit:
+        raise RuntimeError(f"release asset exceeds the {limit}-byte safety limit")
+    return data
+
+
+def release_index(tag: str | None = None) -> dict[str, object]:
+    requested_tag = tag
+    if requested_tag is not None and not re.fullmatch(
+        r"pira-tools-[A-Za-z0-9_.-]+", requested_tag
+    ):
+        raise RuntimeError(f"invalid PIRA tools release tag: {requested_tag}")
+    base = (
+        f"https://github.com/{RELEASE_REPOSITORY}/releases/download/"
+        f"{quote(requested_tag, safe='')}"
+        if requested_tag
+        else LATEST_RELEASE_BASE
+    )
+    url = f"{base}/{RELEASE_INDEX_NAME}"
+    try:
+        index = json.loads(request_bytes(url, limit=MAX_INDEX_BYTES))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid PIRA release index: {error}") from error
+    if (
+        not isinstance(index, dict)
+        or index.get("schema_version") != 1
+        or index.get("repository") != RELEASE_REPOSITORY
+        or not isinstance(index.get("tools"), dict)
+    ):
+        raise RuntimeError("unsupported PIRA release index")
+    index_tag = index.get("tag")
+    source_sha = index.get("source_sha")
+    if not isinstance(index_tag, str) or not re.fullmatch(
+        r"pira-tools-[A-Za-z0-9_.-]+", index_tag
+    ):
+        raise RuntimeError("invalid tag in PIRA release index")
+    if requested_tag is not None and index_tag != requested_tag:
+        raise RuntimeError(
+            f"release index tag mismatch: expected {requested_tag}, found {index_tag}"
+        )
+    if not isinstance(source_sha, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}", source_sha
+    ):
+        raise RuntimeError("invalid source commit in PIRA release index")
+    return index
+
+
+def parse_versions(values: list[str] | None) -> dict[str, str]:
+    aliases = {"ctx": "pira_ctx", "dec": "pira_dec", "nav": "pira_nav"}
+    versions: dict[str, str] = {}
+    for value in values or []:
+        if "=" not in value:
+            raise RuntimeError(f"invalid tool version {value!r}; expected TOOL=VERSION")
+        name, version = value.split("=", 1)
+        name = aliases.get(name, name)
+        if name not in aliases.values():
+            raise RuntimeError(f"unknown versioned tool: {name}")
+        if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]*", version):
+            raise RuntimeError(f"invalid version for {name}: {version}")
+        if name in versions and versions[name] != version:
+            raise RuntimeError(f"conflicting versions requested for {name}")
+        versions[name] = version
+    return versions
+
+
+def release_tags_for_versions(
+    versions: dict[str, str], platform_key: str
+) -> dict[str, str]:
+    if not versions:
+        return {}
+    suffix = ".exe" if platform_key.startswith("windows-") else ""
+    expected_assets = {
+        tool_name: f"{tool_name}-{version}-{platform_key}{suffix}"
+        for tool_name, version in versions.items()
+    }
+    found: dict[str, str] = {}
+    for page in range(1, 11):
+        url = f"{RELEASES_API}?per_page=100&page={page}"
+        try:
+            releases = json.loads(
+                request_bytes(
+                    url,
+                    limit=4 * 1024 * 1024,
+                    accept="application/vnd.github+json",
+                )
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid GitHub releases response: {error}") from error
+        if not isinstance(releases, list):
+            raise RuntimeError("invalid GitHub releases response")
+        for release in releases:
+            if not isinstance(release, dict) or release.get("draft") is True:
+                continue
+            tag = release.get("tag_name")
+            assets = release.get("assets")
+            if not (
+                isinstance(tag, str)
+                and re.fullmatch(r"pira-tools-[A-Za-z0-9_.-]+", tag)
+                and isinstance(assets, list)
+            ):
+                continue
+            names = {
+                asset.get("name")
+                for asset in assets
+                if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+            }
+            for tool_name, expected_asset in expected_assets.items():
+                if tool_name not in found and expected_asset in names:
+                    found[tool_name] = tag
+            if len(found) == len(expected_assets):
+                return found
+        if len(releases) < 100:
+            break
+    missing = [
+        f"{tool_name}={versions[tool_name]}"
+        for tool_name in versions
+        if tool_name not in found
+    ]
+    raise RuntimeError(
+        f"no cloud build is available for {', '.join(missing)} on {platform_key}; "
+        "exact-version history starts with the GitHub Release build system"
+    )
+
+
+def release_asset_url(tag: str, asset: str) -> str:
+    return (
+        f"https://github.com/{RELEASE_REPOSITORY}/releases/download/"
+        f"{quote(tag, safe='')}/{quote(asset, safe='')}"
+    )
+
+
+def download_binary(tag: str, selection: ToolSelection, directory: Path) -> Path:
+    data = request_bytes(
+        release_asset_url(tag, selection.asset), limit=MAX_BINARY_BYTES
+    )
+    if len(data) != selection.record["size"]:
+        raise RuntimeError(
+            f"downloaded {selection.name} size mismatch: "
+            f"expected {selection.record['size']}, got {len(data)}"
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != selection.expected_hash:
+        raise RuntimeError(
+            f"downloaded {selection.name} checksum mismatch: "
+            f"expected {selection.expected_hash}, got {actual}"
+        )
+    path = directory / selection.asset
+    path.write_bytes(data)
+    if os.name != "nt":
+        path.chmod(0o755)
+    return path
 
 
 def executable_path(directory: Path, tool_name: str) -> Path:
@@ -205,7 +395,7 @@ def direct_version(binary: Path) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Install or refresh bundled PIRA tools for this user."
+        description="Install or refresh cloud-built PIRA tools for this user."
     )
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
@@ -222,25 +412,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--tool",
         action="append",
         dest="tools",
-        help="Install or verify only this bundled tool; repeatable. Default: all bundled tools.",
+        help="Install or verify only this released tool; repeatable. Default: all tools.",
+    )
+    parser.add_argument(
+        "--version",
+        action="append",
+        help=(
+            "Pin one tool as ctx=VERSION, dec=VERSION, or nav=VERSION; repeatable. "
+            "Unspecified tools use latest. Exact history begins with cloud releases."
+        ),
     )
     return parser
 
 
-def selected_tools(selector: ModuleType, requested: list[str] | None) -> list[str]:
-    bundled = [
-        tool for tool in selector.discover_tools() if tool not in RETIRED_TOOLS
-    ]
-    if not bundled:
-        raise RuntimeError("no bundled PIRA tools were found")
+def selected_tools(index: dict[str, object], requested: list[str] | None) -> list[str]:
+    released = sorted(
+        tool
+        for tool in index["tools"]
+        if isinstance(tool, str) and tool not in RETIRED_TOOLS
+    )
+    if not released:
+        raise RuntimeError("no PIRA tools were found in the latest release")
     if requested is None:
-        return bundled
+        return released
     tools = sorted(set(requested))
-    missing = [name for name in tools if name not in bundled]
+    missing = [name for name in tools if name not in released]
     if missing:
         raise RuntimeError(
-            f"requested tool is not bundled: {', '.join(missing)}; "
-            f"available: {', '.join(bundled)}"
+            f"requested tool is not released: {', '.join(missing)}; "
+            f"available: {', '.join(released)}"
         )
     return tools
 
@@ -257,49 +457,105 @@ def remove_managed_legacy_tools(install_dir: Path, dry_run: bool) -> None:
             print(f"Removed retired managed tool: {path}")
 
 
-def version_matches(tool_name: str, manifest: dict[str, object], version: str) -> bool:
-    expected = manifest.get("tool_version")
-    return not expected or version == f"{tool_name} {expected}"
+def version_matches(tool_name: str, expected: str, version: str) -> bool:
+    return version == f"{tool_name} {expected}"
+
+
+def tool_selection(
+    index: dict[str, object],
+    tool_name: str,
+    platform_key: str,
+    install_dir: Path,
+) -> ToolSelection:
+    tool = index["tools"].get(tool_name)
+    if not isinstance(tool, dict):
+        raise RuntimeError(f"invalid release record for {tool_name}")
+    version = tool.get("version")
+    binaries = tool.get("binaries")
+    if not isinstance(version, str) or not isinstance(binaries, dict):
+        raise RuntimeError(f"incomplete release record for {tool_name}")
+    record = binaries.get(platform_key)
+    if not isinstance(record, dict):
+        supported = ", ".join(sorted(str(key) for key in binaries))
+        raise RuntimeError(
+            f"unsupported platform {platform_key}; supported: {supported}"
+        )
+    asset = record.get("asset")
+    expected = record.get("sha256")
+    size = record.get("size")
+    suffix = ".exe" if platform_key.startswith("windows-") else ""
+    expected_asset = f"{tool_name}-{version}-{platform_key}{suffix}"
+    if asset != expected_asset:
+        raise RuntimeError(f"invalid release asset name for {tool_name}: {asset}")
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+        raise RuntimeError(f"invalid release checksum for {tool_name}")
+    if not isinstance(size, int) or size <= 0 or size > MAX_BINARY_BYTES:
+        raise RuntimeError(f"invalid release size for {tool_name}")
+    destination = executable_path(install_dir, tool_name)
+    existing_hash = (
+        sha256(destination)
+        if destination.is_file() and not destination.is_symlink()
+        else None
+    )
+    action = (
+        "unchanged"
+        if existing_hash == expected.lower()
+        else ("refresh" if destination.exists() or destination.is_symlink() else "install")
+    )
+    return ToolSelection(
+        name=tool_name,
+        version=version,
+        release_tag=str(index["tag"]),
+        asset=asset,
+        record=record,
+        destination=destination,
+        expected_hash=expected.lower(),
+        existing_hash=existing_hash,
+        action=action,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selector = load_selector()
     install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
-    tools = selected_tools(selector, args.tools)
-    selections: list[ToolSelection] = []
-    for tool_name in tools:
-        manifest = selector.load_manifest(tool_name=tool_name)
-        source, record = selector.select_binary(tool_name=tool_name, manifest=manifest)
-        source_version = direct_version(source)
-        if not version_matches(tool_name, manifest, source_version):
-            raise RuntimeError(f"unexpected bundled version for {tool_name}: {source_version}")
-        destination = executable_path(install_dir, tool_name)
-        expected = record["sha256"].lower()
-        existing_hash = (
-            sha256(destination)
-            if destination.is_file() and not destination.is_symlink()
-            else None
+    index = release_index()
+    platform_key = selector.current_platform()
+    tools = selected_tools(index, args.tools)
+    requested_versions = parse_versions(args.version)
+    unselected_versions = sorted(set(requested_versions) - set(tools))
+    if unselected_versions:
+        raise RuntimeError(
+            "version specified for tool excluded by --tool: "
+            + ", ".join(unselected_versions)
         )
-        action = (
-            "unchanged"
-            if existing_hash == expected
-            else ("refresh" if destination.exists() or destination.is_symlink() else "install")
-        )
-        selections.append(
-            ToolSelection(
-                name=tool_name,
-                manifest=manifest,
-                source=source,
-                record=record,
-                destination=destination,
-                expected_hash=expected,
-                existing_hash=existing_hash,
-                action=action,
+    indexes = {tool_name: index for tool_name in index["tools"]}
+    historical_versions: dict[str, str] = {}
+    for tool_name, version in requested_versions.items():
+        latest_tool = index["tools"].get(tool_name)
+        if isinstance(latest_tool, dict) and latest_tool.get("version") == version:
+            continue
+        historical_versions[tool_name] = version
+    historical_tags = release_tags_for_versions(historical_versions, platform_key)
+    tagged_indexes: dict[str, dict[str, object]] = {}
+    for tool_name, version in historical_versions.items():
+        tag = historical_tags[tool_name]
+        if tag not in tagged_indexes:
+            tagged_indexes[tag] = release_index(tag)
+        exact_index = tagged_indexes[tag]
+        exact_tool = exact_index["tools"].get(tool_name)
+        if not isinstance(exact_tool, dict) or exact_tool.get("version") != version:
+            raise RuntimeError(
+                f"release {tag} does not contain requested {tool_name}={version}"
             )
-        )
+        indexes[tool_name] = exact_index
+    selections = [
+        tool_selection(indexes[tool_name], tool_name, platform_key, install_dir)
+        for tool_name in tools
+    ]
 
-    print(f"Platform: {selector.current_platform()}")
+    print(f"Latest release: {index['tag']}")
+    print(f"Platform: {platform_key}")
 
     if args.verify:
         failures: list[str] = []
@@ -308,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
                 failures.append(f"{selection.name}: installed binary is missing or stale")
                 continue
             version = direct_version(selection.destination)
-            if not version_matches(selection.name, selection.manifest, version):
+            if not version_matches(selection.name, selection.version, version):
                 failures.append(f"{selection.name}: unexpected version: {version}")
         if not args.no_path and not path_is_configured(install_dir):
             failures.append("install directory is not configured in the user PATH")
@@ -320,32 +576,41 @@ def main(argv: list[str] | None = None) -> int:
             print(f"OK: {direct_version(selection.destination)}; SHA-256 verified")
         return 0
 
-    for selection in selections:
-        print(f"\nTool:     {selection.name}")
-        print(f"Bundled:  {selection.source}")
-        print(f"Target:   {selection.destination}")
-        if selection.action == "unchanged" and not args.force:
-            print("OK: installed tool already matches the bundled release")
-        elif args.dry_run:
-            print(f"DRY-RUN: would {selection.action} {selection.destination}")
-        else:
-            installed = selector.install_binary(
-                selection.source,
-                selection.record,
-                install_dir,
-                tool_name=selection.name,
-            )
-            actual = sha256(installed)
-            if actual != selection.expected_hash:
-                raise RuntimeError(
-                    f"installed {selection.name} hash does not match bundle manifest"
+    with tempfile.TemporaryDirectory(prefix="pira-tools-download-") as temporary:
+        download_dir = Path(temporary)
+        for selection in selections:
+            print(f"\nTool:     {selection.name} {selection.version}")
+            print(f"Release:  {selection.release_tag}")
+            print(f"Asset:    {selection.asset}")
+            print(f"Target:   {selection.destination}")
+            if selection.action == "unchanged" and not args.force:
+                print("OK: installed tool already matches the selected release")
+            elif args.dry_run:
+                print(f"DRY-RUN: would download and {selection.action} {selection.destination}")
+            else:
+                source = download_binary(selection.release_tag, selection, download_dir)
+                source_version = direct_version(source)
+                if not version_matches(selection.name, selection.version, source_version):
+                    raise RuntimeError(
+                        f"unexpected downloaded version for {selection.name}: {source_version}"
+                    )
+                installed = selector.install_binary(
+                    source,
+                    selection.record,
+                    install_dir,
+                    tool_name=selection.name,
                 )
-            completed_action = {
-                "install": "Installed",
-                "refresh": "Refreshed",
-                "unchanged": "Refreshed",
-            }[selection.action]
-            print(f"{completed_action}: {installed}")
+                actual = sha256(installed)
+                if actual != selection.expected_hash:
+                    raise RuntimeError(
+                        f"installed {selection.name} hash does not match release index"
+                    )
+                completed_action = {
+                    "install": "Installed",
+                    "refresh": "Refreshed",
+                    "unchanged": "Refreshed",
+                }[selection.action]
+                print(f"{completed_action}: {installed}")
 
     if any(selection.name == "pira_nav" for selection in selections):
         remove_managed_legacy_tools(install_dir, args.dry_run)
@@ -357,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
         restart_needed = False
         for selection in selections:
             version = direct_version(selection.destination)
-            if not version_matches(selection.name, selection.manifest, version):
+            if not version_matches(selection.name, selection.version, version):
                 raise RuntimeError(
                     f"unexpected installed version for {selection.name}: {version}"
                 )

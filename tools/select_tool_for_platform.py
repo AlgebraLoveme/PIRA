@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Select, verify, and optionally install a bundled PIRA tool.
+"""Identify the platform or select a locally built PIRA tool bundle.
 
-Selection is local and deterministic. The script does not invoke an agent or a
-shell, install dependencies, or build code. PIRA setup should call ``--install``
-once; runtime callers should then execute the canonical installed path directly.
+Selection is local and deterministic. Network download and release selection
+belong to ``assets/scripts/setup_pira_tools.py``. This helper remains useful to
+build/release tooling and can print the current platform without local binaries.
 """
 from __future__ import annotations
 
@@ -285,14 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     tool_name = validate_tool_name(args.tool)
     key = current_platform()
+    if args.platform:
+        print(key)
+        return 0
     binary, record = select_binary(key, tool_name=tool_name, verify=not args.no_verify)
     source_binary = binary
     if args.install:
         install_dir = args.install_dir or (TOOLS_DIR / "bin" / tool_name)
         binary = install_binary(binary, record, install_dir, tool_name=tool_name)
-    if args.platform:
-        print(key)
-    elif args.json:
+    if args.json:
         print(
             json.dumps(
                 {

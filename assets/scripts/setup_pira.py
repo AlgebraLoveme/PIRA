@@ -495,6 +495,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
+    parser.add_argument(
+        "--tools-version",
+        action="append",
+        default=None,
+        help="Pin a native tool as ctx=VERSION, dec=VERSION, or nav=VERSION; repeatable.",
+    )
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
     parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")
     parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
@@ -509,13 +515,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def configure_tools(state: SetupState, install_dir: str | None, *, verify_only: bool) -> None:
+def configure_tools(
+    state: SetupState,
+    install_dir: str | None,
+    versions: list[str] | None,
+    *,
+    verify_only: bool,
+) -> None:
     script = state.repo_root / "assets" / "scripts" / "setup_pira_tools.py"
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
     command = [sys.executable, str(script)]
     if install_dir:
         command.extend(["--install-dir", str(expand_path(install_dir))])
+    for version in versions or []:
+        command.extend(["--version", version])
     if verify_only:
         command.append("--verify")
     elif state.dry_run:
@@ -544,13 +558,23 @@ def main(argv: list[str] | None = None) -> int:
                 configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
             configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
             if not args.skip_tools:
-                configure_tools(state, args.tools_install_dir, verify_only=False)
+                configure_tools(
+                    state,
+                    args.tools_install_dir,
+                    args.tools_version,
+                    verify_only=False,
+                )
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
             verify(state, config_path, skip_codex=args.skip_codex)
             if args.verify and not args.skip_tools:
-                configure_tools(state, args.tools_install_dir, verify_only=True)
+                configure_tools(
+                    state,
+                    args.tools_install_dir,
+                    args.tools_version,
+                    verify_only=True,
+                )
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

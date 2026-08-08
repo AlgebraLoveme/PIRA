@@ -122,22 +122,24 @@ Most users can keep the recommended defaults. Open this section when you want st
 | `--audio yes\|no\|ask` | Controls optional Codex audio notifications. Use `--audio no` for a quiet install. |
 | `--legacy remove\|keep\|ask` | Controls paths listed in `assets/LEGACY_LIST.md`; `remove` moves active legacy files into `.backup/setup_pira_legacy/`. |
 | `--agent-dir PATH` | Installs against a path other than `~/agent`. |
-| `--skip-tools` | Skips installation or refresh of bundled native PIRA tools. |
+| `--skip-tools` | Skips installation or refresh of released native PIRA tools. |
 | `--tools-install-dir PATH` | Overrides the per-user tools directory (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows). |
+| `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.6.0`; repeat for multiple tools. Unspecified tools use the latest release. |
 | `--verify` | Checks the current setup without writing. |
 | `--dry-run` | Prints planned changes without applying them. |
 
 ### Install or refresh only the PIRA tools
 
-If PIRA itself is already configured, these commands update only its bundled tools. A normal run installs missing tools, replaces outdated copies, and leaves verified matching copies unchanged.
+If PIRA itself is already configured, these commands update only its native tools. A normal run downloads the latest GitHub Release for this platform, installs missing tools, replaces outdated copies, and leaves verified matching copies unchanged.
 
 On macOS or Linux:
 
 ```bash
 cd ~/agent
 python3 assets/scripts/setup_pira_tools.py          # install or refresh
-python3 assets/scripts/setup_pira_tools.py --force  # reinstall the same bundled release
+python3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 python3 assets/scripts/setup_pira_tools.py --verify # verify without writing
+python3 assets/scripts/setup_pira_tools.py --version ctx=1.6.0 --version nav=0.11.0
 ```
 
 On Windows PowerShell:
@@ -145,11 +147,16 @@ On Windows PowerShell:
 ```powershell
 cd $HOME\agent
 py -3 assets/scripts/setup_pira_tools.py          # install or refresh
-py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the same bundled release
+py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
+py -3 assets/scripts/setup_pira_tools.py --version ctx=1.6.0 --version nav=0.11.0
 ```
 
-The updater verifies every selected bundle before installation. `--tool NAME` selects one tool present in this checkout's `tools/dist` directory, and the option may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Restart the shell or agent process if setup says the new PATH is not active yet.
+The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, or `nav=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
+
+### Maintainer release procedure
+
+PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all three tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -285,7 +292,7 @@ Each recorded event keeps the purpose of a command without copying its output. T
 
 Version 1.0 stores checked, write-once event records and builds disposable per-thread search catalogs. If a catalog is missing or corrupt, it is rebuilt from the authoritative records. Older JSON ledgers are preserved but ignored until the user explicitly removes them.
 
-Setup installs a verified native executable in the user's `PATH`. Normal use needs no Python, Rust toolchain, daemon, database, network, or model call. The optional `exec` analysis command uses Python 3; it can analyze up to 32 labeled captures together and accepts multiline analysis through stdin without temporary user files. Captures are private user-cache files with compressed, integrity-checked blocks. `pira_ctx` keeps the caller's permissions and does **not** sandbox commands. Run `pira_ctx --help` for usage. Source is under `tools/src/pira_ctx`; verified builds are under `tools/dist/pira_ctx`.
+Setup downloads a checksum-verified native executable from GitHub Releases into the user's `PATH`. Normal use needs no Python, Rust toolchain, daemon, database, network, or model call. The optional `exec` analysis command uses Python 3; it can analyze up to 32 labeled captures together and accepts multiline analysis through stdin without temporary user files. Captures are private user-cache files with compressed, integrity-checked blocks. `pira_ctx` keeps the caller's permissions and does **not** sandbox commands. Run `pira_ctx --help` for usage. Source is under `tools/src/pira_ctx`.
 
 #### Security design
 
@@ -540,9 +547,10 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
 - `tools/build/build_pira_dec_platform_bins.py` — package-isolated release entry point for `pira_dec`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
-- `.github/workflows/build-pira-tool-bundles.yml` — manually or tag-triggered GitHub matrix build of complete verified `pira_ctx`, `pira_dec`, and `pira_nav` platform bundles
+- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all three tools, builds every platform twice, and publishes direct GitHub Release assets
+- `tools/build/package_github_release.py` — validates build archives and produces the versioned release assets and checksum index consumed by setup
 - `tools/src/pira_ctx/`, `tools/src/pira_dec/`, and `tools/src/pira_nav/` — public Rust implementations
-- `tools/dist/` — published, verified platform executables and per-tool bundle manifests
+- GitHub Releases — published platform executables; generated binaries are not stored on a second branch or in the source tree
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
 PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
