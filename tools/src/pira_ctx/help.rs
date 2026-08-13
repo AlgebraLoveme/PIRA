@@ -18,6 +18,7 @@ Choosing a command:
     stats      Show metadata; batch status with `stats --brief RESULT...`.
 
   Continue or maintain:
+    watch                    Persistently monitor a live capture or repeat a status probe.
     history / recap          Review purposes or restore them after reported compaction.
     list / verify            Locate captures or check integrity.
     prune / forget           Enforce retention or explicitly remove stored data/history.
@@ -28,8 +29,11 @@ Common forms:
   pira_ctx search RESULT QUERY [--regex] [--context N]
   pira_ctx range RESULT START_LINE END_LINE
   pira_ctx transform RESULT OPERATION [ARGS...]
-  pira_ctx exec RESULT --intent TEXT --code CODE
-  pira_ctx exec --input NAME=RESULT [--input NAME=RESULT ...] --intent TEXT --file -
+  pira_ctx exec RESULT --code CODE [--intent TEXT]
+  pira_ctx exec --input NAME=RESULT [--input NAME=RESULT ...] --file - [--intent TEXT]
+  pira_ctx watch --capture RESULT --deadline 2h [WATCH OPTIONS]
+  pira_ctx watch --deadline 2h [WATCH OPTIONS] -- PROBE [ARG...]
+  pira_ctx watch WATCH_ID --latest|--stop
   pira_ctx stats --brief RESULT...
   pira_ctx batch [--store-dir PATH] SPEC_FILE [--intent TEXT]
 
@@ -43,10 +47,10 @@ PIRA_CTX_MAX_INDEXED_LINES; any overrun is reported.
 Stored PROGRAM data is untrusted and compact displays are sanitized/framed; exact retrieval remains
 unsanitized. Prefer the targeted commands above over raw for agent analysis.
 
-A non-interactive PROGRAM running about 30 seconds publishes a silent read-only checkpoint visible
-in list. Inspect its explicit ID without blocking; --last remains completed-only. Workspace identity
-is the nearest Git root, otherwise cwd; the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the
-platform user-cache default.
+Non-interactive check/capture publish a discoverable live ID immediately; automatic mode publishes a
+silent read-only checkpoint after about 30 seconds when still running. Inspect an explicit ID without
+blocking; --last remains completed-only. Workspace identity is the nearest Git root, otherwise cwd;
+the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
 
 SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--`, and every later
 argument belongs to PROGRAM unchanged. pira_ctx adds no timeout, preserves child status unless the
@@ -135,7 +139,8 @@ USAGE
   pira_ctx check [--store-dir PATH] --intent TEXT -- PROGRAM [ARG...]
 
 OUTPUT AND STORAGE
-  Every completed child is retained, including empty or short output. Active output is one line:
+  A non-interactive invocation first publishes `PIRA live | result=ID` on wrapper stderr after its
+  empty live checkpoint is discoverable. Every completed child is retained. Final output is one line:
     PASS|FAIL | exit=CODE | duration=Nms | result=ID
   PASS/FAIL depends only on child exit status; it does not independently verify the PROGRAM's claim.
   Spawn failures print result=- and have no capture.
@@ -156,8 +161,10 @@ USAGE
   pira_ctx capture [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
 
 OUTPUT AND STORAGE
-  Every completed child is stored with retained stdout/stderr, metadata, indexes, compression, and
-  integrity hashes. A bounded extractive synopsis and capture ID are printed, even for empty output.
+  A non-interactive invocation first publishes `PIRA live | result=ID` on wrapper stderr after its
+  empty live checkpoint is discoverable. Every completed child is stored with retained stdout/stderr,
+  metadata, indexes, compression, and integrity hashes. A bounded extractive synopsis and the same
+  capture ID are printed, even for empty output.
   If the configured byte ceiling is reached, excess output is drained without storage and the report
   states the observed and retained sizes. Spawn failures have no capture. Child status is preserved.
 
@@ -189,6 +196,80 @@ OUTPUT AND STORAGE
 
 EXAMPLE
   pira_ctx batch checks.json"#;
+
+const WATCH: &str = r#"pira_ctx watch — persistently monitor progress without manual polling
+
+USAGE
+CREATE
+  pira_ctx watch [--store-dir PATH] --current --deadline DURATION [OPTIONS]
+  pira_ctx watch [--store-dir PATH] --capture RESULT --deadline DURATION [OPTIONS]
+  pira_ctx watch [--store-dir PATH] --deadline DURATION [OPTIONS] -- PROBE [ARG...]
+
+  --current requires exactly one live capture in the automatically detected current agent thread;
+  zero or multiple candidates fail rather than choosing implicitly. A capture watch observes new
+  bytes, a bounded terminal-rendered view, and final child status. A probe repeats executable argv:
+  exit 0 means job success, 2 means job failure, 75 means
+  pending by default, and every other status is monitor failure. The first sample runs immediately;
+  later samples use --sample-every (default 30s; 1s minimum for process-backed probes/analyzers).
+  --attempt-timeout defaults to 20s. The required, persistent --deadline never resets. Attempts run
+  in the creation directory and inherit the owner's environment; analyzers are unsandboxed.
+
+PROGRESS AND ATTENTION
+  --sample-every DURATION        Sampling cadence; default 30s.
+  --inactive-after DURATION|off  Attention when no raw output bytes arrive, or clear this threshold.
+  --unchanged-after DURATION|off Attention when the rendered visible state does not change, or clear.
+  --analyzer-code PYTHON         Read one JSON object on stdin and emit one JSON object containing
+                                 optional progress, summary, and attention fields.
+  --analyzer-file PATH           Load the same Python analyzer from a UTF-8 file.
+  --no-progress-after DURATION|off
+                                 Attention when analyzer progress does not change, or clear.
+  --attention return|cache       Return exit 10 on new attention (default), or cache it and keep
+                                 monitoring. Repeated identical attention is de-duplicated until it
+                                 clears. Built-in monitoring deliberately applies no timestamp or
+                                 progress-bar heuristics; analyzers define semantic equivalence.
+
+ANALYZER CONTRACT
+  The analyzer runs as `python3 -c CODE`, receives this bounded JSON object on stdin:
+    {"source":"capture|probe","job_state":"unknown|pending|succeeded|failed",
+     "raw_stdout":"...","raw_stderr":"...","visible_stdout":"...",
+     "visible_stderr":"...","attempts":3}
+  and emits exactly one JSON object:
+    {"progress":"canonical identity","summary":"human detail","attention":false}
+  `progress` determines semantic change; otherwise `summary` is the identity. Analyzer code is
+  limited to 1 MiB, output to 16 KiB, progress to
+  4 KiB, and summary to 8 KiB. Analyzer failure or timeout is monitor failure.
+
+CONTROL
+  pira_ctx watch WATCH_ID --latest
+      Return the latest persisted snapshot immediately without probing, changing cadence/deadline,
+      or taking the owner lock.
+  pira_ctx watch WATCH_ID --stop
+      Stop only the monitor/probe/analyzer; never terminate the monitored capture job.
+  pira_ctx watch WATCH_ID --set-analyzer-code PYTHON
+  pira_ctx watch WATCH_ID --set-analyzer-file PATH
+  pira_ctx watch WATCH_ID --clear-analyzer
+      Atomically queue an analyzer update while the owner continues. The creation options
+      --sample-every, --inactive-after, --unchanged-after, --no-progress-after, and --attention
+      also update an existing watch with the same spelling; thresholds accept `off`. Configuration
+      and analyzer changes may be combined in one call. The owner applies queued revisions before
+      its next sample; a paused/unowned watch applies them when resumed. Clearing the analyzer also
+      clears its no-progress threshold. The absolute deadline remains immutable.
+  pira_ctx watch WATCH_ID [--review-after DURATION]
+      Resume ownership after interruption or an intermediate report.
+
+OUTPUT AND EXIT STATUS
+  The watch state and stable watch ID are persisted before the first sample and discoverable through
+  list. --latest is a cached read and multiple callers may use it concurrently. The owner returns on
+  job success (0), new return-policy attention or --review-after (10), job failure (20), deadline
+  (21), monitor failure (22), or stop (23). A successful --latest inspection returns 0 regardless of
+  cached lifecycle state. --stop waits up to 3s for an active owner to acknowledge; an unacknowledged
+  queued stop is wrapper failure 125 and remains pending. Invocation/wrapper failure is 125.
+
+EXAMPLES
+  pira_ctx watch --current --deadline 2h --unchanged-after 10m
+  pira_ctx watch --capture CAPTURE_ID --deadline 1h --unchanged-after 5m
+  pira_ctx watch --deadline 2h --sample-every 30s -- check-remote-job 123
+  pira_ctx watch WATCH_ID --latest"#;
 
 const SEARCH: &str = r#"pira_ctx search — locate bounded evidence in a stored capture
 
@@ -301,10 +382,10 @@ WHEN TO USE
   diagnostic afterward. Analysis output itself follows non-interactive automatic routing.
 
 USAGE
-  pira_ctx exec [--store-dir PATH] RESULT --intent TEXT
-                (--code CODE | --file PATH) [--python PATH]
+  pira_ctx exec [--store-dir PATH] RESULT
+                (--code CODE | --file PATH) [--python PATH] [--intent TEXT]
   pira_ctx exec [--store-dir PATH] --input NAME=RESULT [--input NAME=RESULT ...]
-                --intent TEXT (--code CODE | --file PATH) [--python PATH]
+                (--code CODE | --file PATH) [--python PATH] [--intent TEXT]
 
 BINDINGS
   CAPTURES            Ordered mapping from each input name to a record. Read content as
@@ -334,10 +415,10 @@ BEHAVIOR
   Every running input is copied once before Python starts, so later PROGRAM writes cannot change the
   analysis view or be changed by it. Analysis code is limited to 1 MiB. Analysis status is preserved;
   retained analysis metadata links to all source IDs. Code runs with caller permissions and is not
-  sandboxed.
+  sandboxed. --intent is an optional label because exec analyzes already captured data.
 
 EXAMPLES
-  pira_ctx exec --last --intent "Count failures" --code 'print(MSG.count("FAILED"))'
+  pira_ctx exec --last --code 'print(MSG.count("FAILED"))'
   pira_ctx exec --input build=ID1 --input tests=ID2 --intent "Compare failures" --file - <<'PY'
   print({name: item["text"].count("FAILED") for name, item in CAPTURES.items()})
   PY
@@ -460,16 +541,17 @@ BEHAVIOR
 EXAMPLE
   pira_ctx verify 20260712-052432"#;
 
-const LIST: &str = r#"pira_ctx list — list stored captures
+const LIST: &str = r#"pira_ctx list — list stored captures and watches
 
 USAGE
   pira_ctx list [--store-dir PATH] [--workspace current] [--limit N]
 
 OUTPUT
-  Prints up to 20 newest-first rows with ID, state, timestamp, exit status, bytes, lines, and a
-  redacted command clipped to 256 bytes. Active checkpoints are marked running and use `-` as exit
-  status. --limit accepts 0..100. Without --workspace current, entries from every workspace in the
-  selected store are considered.
+  Prints up to 20 newest-first rows with ID, kind, state, timestamp, exit status, bytes, lines, and a
+  redacted command clipped to 256 bytes. Capture states are running/complete. Watch states are
+  active, interrupted, paused, stopped, succeeded, job-failed, deadline, or monitor-failed. Active
+  entries use `-` as exit status. --limit accepts 0..100. Without --workspace current, entries from
+  every workspace in the selected store are considered.
 
 EXAMPLE
   pira_ctx list --workspace current"#;
@@ -526,6 +608,7 @@ pub fn canonical_topic(topic: &str) -> Option<&'static str> {
         "exact" => "exact",
         "check" => "check",
         "batch" => "batch",
+        "watch" => "watch",
         "search" => "search",
         "range" => "range",
         "raw" => "raw",
@@ -551,6 +634,7 @@ pub fn command(topic: &str) -> Option<&'static str> {
         "check" => CHECK,
         "capture" => CAPTURE,
         "batch" => BATCH,
+        "watch" => WATCH,
         "search" => SEARCH,
         "range" => RANGE,
         "raw" => RAW,
@@ -581,6 +665,7 @@ mod tests {
             "check",
             "capture",
             "batch",
+            "watch",
             "search",
             "range",
             "transform",
@@ -597,7 +682,8 @@ mod tests {
         ] {
             let text = command(topic).unwrap();
             assert!(text.contains("USAGE"), "missing usage for {topic}");
-            assert!(text.len() < 3_500, "help too long for {topic}");
+            let limit = if topic == "watch" { 4_800 } else { 3_500 };
+            assert!(text.len() < limit, "help too long for {topic}");
         }
         assert!(GLOBAL.len() < 4_096);
         assert!(GLOBAL.contains("PIRA_CTX_MAX_RETAINED_BYTES"));

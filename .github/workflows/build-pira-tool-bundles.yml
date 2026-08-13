@@ -115,9 +115,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  test-windows:
+    name: Test native Windows behavior
+    needs: authorize
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Run native Windows tests
+        run: |
+          python -m unittest `
+            assets.scripts.test_setup_pira_tools `
+            tools.build.test_build_pira_ctx_platform_bins `
+            tools.build.test_package_github_release
+          cargo test --manifest-path tools/Cargo.toml --workspace --locked
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, test-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -8,9 +8,12 @@ use crate::util::absolute_lexical;
 
 pub struct FileDiscovery {
     pub files: Vec<(PathBuf, Language)>,
+    pub all_files: Vec<PathBuf>,
     pub discovered: usize,
     pub unsupported: usize,
     pub ambiguous: usize,
+    pub walk_errors: Vec<String>,
+    pub walk_errors_total: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -100,12 +103,26 @@ pub fn discover_files_with_max_depth(
     let mut discovered = 0;
     let mut unsupported = 0;
     let mut ambiguous = 0;
-    for entry in builder.build().filter_map(Result::ok) {
+    let mut all_files = Vec::new();
+    let mut walk_errors = Vec::new();
+    let mut walk_errors_total = 0usize;
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                walk_errors_total += 1;
+                if walk_errors.len() < 20 {
+                    walk_errors.push(error.to_string());
+                }
+                continue;
+            }
+        };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
         discovered += 1;
         let path = absolute_lexical(entry.path(), root);
+        all_files.push(path.clone());
         match classify(&path, selection) {
             DiscoveredLanguage::Eligible(language) => files.push((path, language)),
             DiscoveredLanguage::Unsupported => unsupported += 1,
@@ -113,11 +130,15 @@ pub fn discover_files_with_max_depth(
         }
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
+    all_files.sort();
     FileDiscovery {
         files,
+        all_files,
         discovered,
         unsupported,
         ambiguous,
+        walk_errors,
+        walk_errors_total,
     }
 }
 
@@ -128,6 +149,8 @@ where
     P: AsRef<Path>,
 {
     let mut paths = BTreeSet::new();
+    let mut walk_errors = Vec::new();
+    let mut walk_errors_total = 0usize;
     for root in roots {
         let root = root.as_ref();
         let mut builder = WalkBuilder::new(root);
@@ -139,7 +162,17 @@ where
             .parents(true)
             .require_git(false)
             .follow_links(false);
-        for entry in builder.build().filter_map(Result::ok) {
+        for entry in builder.build() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    walk_errors_total += 1;
+                    if walk_errors.len() < 20 {
+                        walk_errors.push(error.to_string());
+                    }
+                    continue;
+                }
+            };
             if entry.file_type().is_some_and(|kind| kind.is_file()) {
                 paths.insert(absolute_lexical(entry.path(), root));
             }
@@ -149,6 +182,7 @@ where
     let mut discovered = 0;
     let mut unsupported = 0;
     let mut ambiguous = 0;
+    let all_files = paths.iter().cloned().collect();
     for path in paths {
         discovered += 1;
         match classify(&path, selection) {
@@ -159,9 +193,12 @@ where
     }
     FileDiscovery {
         files,
+        all_files,
         discovered,
         unsupported,
         ambiguous,
+        walk_errors,
+        walk_errors_total,
     }
 }
 

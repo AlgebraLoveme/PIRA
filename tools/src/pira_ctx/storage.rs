@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
 
 use crate::model::{
@@ -50,10 +51,19 @@ pub struct StoredResult {
     live: Option<LiveState>,
 }
 
+pub(crate) struct StreamGrowth {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_total: u64,
+    pub stderr_total: u64,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveState {
     pub generation: u64,
     pub checkpoint_unix_ms: u128,
+    owner_lock: bool,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
 }
@@ -101,6 +111,63 @@ impl StoredResult {
             self.stderr_offset,
             self.metadata.stderr_bytes,
         )
+    }
+
+    pub(crate) fn current_stream_lengths(&self) -> Result<(u64, u64), String> {
+        if let Some(live) = &self.live {
+            return Ok((
+                fs::metadata(&live.stdout_path)
+                    .map_err(|error| format!("read live stdout metadata: {error}"))?
+                    .len(),
+                fs::metadata(&live.stderr_path)
+                    .map_err(|error| format!("read live stderr metadata: {error}"))?
+                    .len(),
+            ));
+        }
+        Ok((self.metadata.stdout_bytes, self.metadata.stderr_bytes))
+    }
+
+    pub(crate) fn read_stream_growth(
+        &self,
+        stdout_from: u64,
+        stderr_from: u64,
+        maximum_each: u64,
+    ) -> Result<StreamGrowth, String> {
+        let (stdout_total, stderr_total) = self.current_stream_lengths()?;
+        if stdout_total < stdout_from || stderr_total < stderr_from {
+            return Err("capture streams became shorter than the watch cursor".into());
+        }
+        let stdout_start = stdout_from.max(stdout_total.saturating_sub(maximum_each));
+        let stderr_start = stderr_from.max(stderr_total.saturating_sub(maximum_each));
+        let mut readers = if let Some(live) = &self.live {
+            StreamReaders::from_paths(
+                &live.stdout_path,
+                0,
+                stdout_total,
+                &live.stderr_path,
+                0,
+                stderr_total,
+            )?
+        } else {
+            self.reader()?
+        };
+        let stdout = readers.read_section_range(
+            StreamKind::Stdout,
+            stdout_start,
+            stdout_total.saturating_sub(stdout_start),
+        )?;
+        let stderr = readers.read_section_range(
+            StreamKind::Stderr,
+            stderr_start,
+            stderr_total.saturating_sub(stderr_start),
+        )?;
+        Ok(StreamGrowth {
+            stdout,
+            stderr,
+            stdout_total,
+            stderr_total,
+            truncated: stdout_start > stdout_from || stderr_start > stderr_from,
+        })
     }
 
     pub fn verify(&self) -> Result<(), String> {
@@ -151,7 +218,51 @@ struct LiveManifest {
     checkpoint_unix_ms: u128,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    #[serde(default)]
+    owner_lock: bool,
     metadata: Metadata,
+}
+
+#[derive(Debug)]
+pub struct LiveOwnerLease {
+    _file: File,
+}
+
+fn live_owner_path(store_dir: &Path, result_id: &str) -> PathBuf {
+    store_dir
+        .join("live")
+        .join("owners")
+        .join(format!("{result_id}.lock"))
+}
+
+fn acquire_live_owner(store_dir: &Path, result_id: &str) -> Result<LiveOwnerLease, String> {
+    let path = live_owner_path(store_dir, result_id);
+    ensure_private_dir(path.parent().expect("live owner path has parent"))?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    file.try_lock_exclusive()
+        .map_err(|_| "live result id already has an owner".to_string())?;
+    Ok(LiveOwnerLease { _file: file })
+}
+
+fn live_owner_is_active(store_dir: &Path, result_id: &str) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(live_owner_path(store_dir, result_id))
+    else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 #[derive(Debug)]
@@ -175,6 +286,7 @@ pub fn write_live_checkpoint(
     store_dir: &Path,
     result_id: Option<&str>,
     generation: u64,
+    owner_lock: bool,
     snapshot: &LiveCheckpoint<'_>,
 ) -> Result<String, String> {
     ensure_private_dir(store_dir)?;
@@ -182,15 +294,7 @@ pub fn write_live_checkpoint(
     ensure_private_dir(&live_dir)?;
     let result_id = match result_id {
         Some(value) => value.to_string(),
-        None => {
-            let timestamp = format_utc_timestamp(snapshot.start_ms / 1000);
-            let mut seed = Vec::new();
-            seed.extend_from_slice(snapshot.cwd.as_bytes());
-            seed.extend_from_slice(&snapshot.start_ms.to_le_bytes());
-            seed.extend_from_slice(&std::process::id().to_le_bytes());
-            seed.extend_from_slice(&RESULT_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-            format!("{}-{}", timestamp, short_hash(&seed, 12))
-        }
+        None => new_live_result_id(snapshot),
     };
     if !result_id
         .bytes()
@@ -200,6 +304,7 @@ pub fn write_live_checkpoint(
     }
     let workspace_id = workspace_id()?;
     let workspace_hash = short_hash(workspace_id.as_bytes(), 16);
+    let scope_hash = crate::events::current_scope(&workspace_hash).hash;
     let total_bytes = snapshot.stdout_bytes.saturating_add(snapshot.stderr_bytes);
     let checkpoint_unix_ms = util::millis(SystemTime::now());
     let filename = format!("{result_id}.live.json");
@@ -238,6 +343,7 @@ pub fn write_live_checkpoint(
         result_id: result_id.clone(),
         workspace_id,
         workspace_hash,
+        scope_hash,
         stdout_sha256: String::new(),
         stderr_sha256: String::new(),
         timeline_truncated: snapshot.timeline_truncated,
@@ -248,6 +354,7 @@ pub fn write_live_checkpoint(
         checkpoint_unix_ms,
         stdout_path: snapshot.stdout_path.to_path_buf(),
         stderr_path: snapshot.stderr_path.to_path_buf(),
+        owner_lock,
         metadata,
     };
     let bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
@@ -256,23 +363,65 @@ pub fn write_live_checkpoint(
     }
     let temporary = live_dir.join(format!(".{result_id}.{}.tmp", std::process::id()));
     write_private_file_relaxed(&temporary, &bytes)?;
-    if let Err(error) = fs::rename(&temporary, &path) {
-        #[cfg(windows)]
-        {
-            // Windows rename does not replace an existing destination. Readers
-            // see either the previous complete manifest or a brief absence.
-            if path.is_file() {
-                fs::remove_file(&path)
-                    .and_then(|()| fs::rename(&temporary, &path))
-                    .map_err(|retry| format!("publish live checkpoint: {retry}"))?;
-            } else {
-                return Err(format!("publish live checkpoint: {error}"));
-            }
-        }
-        #[cfg(not(windows))]
-        return Err(format!("publish live checkpoint: {error}"));
-    }
+    atomic_replace(&temporary, &path)
+        .map_err(|error| format!("publish live checkpoint: {error}"))?;
     Ok(result_id)
+}
+
+pub fn begin_live_capture(
+    store_dir: &Path,
+    snapshot: &LiveCheckpoint<'_>,
+) -> Result<(String, LiveOwnerLease), String> {
+    let result_id = new_live_result_id(snapshot);
+    let lease = acquire_live_owner(store_dir, &result_id)?;
+    write_live_checkpoint(store_dir, Some(&result_id), 1, true, snapshot)?;
+    Ok((result_id, lease))
+}
+
+fn new_live_result_id(snapshot: &LiveCheckpoint<'_>) -> String {
+    let timestamp = format_utc_timestamp(snapshot.start_ms / 1000);
+    let mut seed = Vec::new();
+    seed.extend_from_slice(snapshot.cwd.as_bytes());
+    seed.extend_from_slice(&snapshot.start_ms.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&RESULT_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    format!("{}-{}", timestamp, short_hash(&seed, 12))
+}
+
+/// Atomically publishes a fully written temporary file at `destination`.
+/// Both paths must be on the same filesystem and in the same trust boundary.
+pub(crate) fn atomic_replace(temporary: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        fs::rename(temporary, destination)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: both pointers refer to live, NUL-terminated UTF-16 buffers for this call.
+        let ok = unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn live_manifest_path(store_dir: &Path, result_id: &str) -> PathBuf {
@@ -283,6 +432,7 @@ fn live_manifest_path(store_dir: &Path, result_id: &str) -> PathBuf {
 
 pub fn remove_live_checkpoint(store_dir: &Path, result_id: &str) {
     let _ = fs::remove_file(live_manifest_path(store_dir, result_id));
+    let _ = fs::remove_file(live_owner_path(store_dir, result_id));
 }
 
 struct HashSink(Sha256);
@@ -348,6 +498,7 @@ pub fn store_capture(
     ensure_private_dir(&store_dir.join("indexes"))?;
     let workspace_id = workspace_id()?;
     let workspace_hash = short_hash(workspace_id.as_bytes(), 16);
+    let scope_hash = crate::events::current_scope(&workspace_hash).hash;
     let timestamp = format_utc_timestamp(capture.start_ms / 1000);
     let mut seed = Vec::new();
     seed.extend_from_slice(capture.cwd.as_bytes());
@@ -407,6 +558,7 @@ pub fn store_capture(
         result_id: result_id.clone(),
         workspace_id,
         workspace_hash: workspace_hash.clone(),
+        scope_hash,
         stdout_sha256: util::hex(&capture.stdout.sha256),
         stderr_sha256: util::hex(&capture.stderr.sha256),
         timeline_truncated: capture.timeline_truncated,
@@ -631,6 +783,7 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
         live: Some(LiveState {
             generation: manifest.generation,
             checkpoint_unix_ms: manifest.checkpoint_unix_ms,
+            owner_lock: manifest.owner_lock,
             stdout_path: manifest.stdout_path,
             stderr_path: manifest.stderr_path,
         }),
@@ -1394,7 +1547,13 @@ pub fn scan_store(
     } else {
         scan_result_headers(store_dir, workspace_filter)?
     };
-    entries.extend(scan_live_headers(store_dir, workspace_filter));
+    let completed_ids: std::collections::HashSet<_> =
+        entries.iter().map(|entry| entry.id.clone()).collect();
+    entries.extend(
+        scan_live_headers(store_dir, workspace_filter)
+            .into_iter()
+            .filter(|entry| !completed_ids.contains(&entry.id)),
+    );
     sort_entries(&mut entries);
     Ok(entries)
 }
@@ -1413,11 +1572,60 @@ fn scan_live_headers(store_dir: &Path, workspace_filter: Option<&str>) -> Vec<Li
                 return None;
             }
             let mut entry = ListedEntry::from_metadata(&stored.metadata, path);
-            entry.running = true;
+            let active = live_result_is_active(store_dir, &stored);
+            entry.running = active;
+            entry.state = if active { "running" } else { "interrupted" }.into();
             entry.exit = 0;
             Some(entry)
         })
         .collect()
+}
+
+pub(crate) fn resolve_current_live_capture(store_dir: &Path) -> Result<String, String> {
+    let workspace_hash = current_workspace_hash()?;
+    let scope = crate::events::current_scope(&workspace_hash);
+    if !scope.detected {
+        return Err("--current requires an automatically detected agent thread".into());
+    }
+    let live_dir = store_dir.join("live");
+    let mut matches = fs::read_dir(&live_dir)
+        .map(|items| {
+            items
+                .filter_map(Result::ok)
+                .filter_map(|item| read_result_path(&item.path()).ok())
+                .filter(|stored| {
+                    stored.metadata.workspace_hash == workspace_hash
+                        && stored.metadata.scope_hash == scope.hash
+                        && live_result_is_active(store_dir, stored)
+                        && !store_dir
+                            .join(stored.metadata.filename.replace(".live.json", ".piractx"))
+                            .exists()
+                })
+                .map(|stored| stored.metadata.result_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    matches.sort();
+    match matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Err("--current found no live capture in the current agent thread".into()),
+        _ => Err(format!(
+            "--current found multiple live captures in the current agent thread: {}; use --capture ID",
+            matches.join(", ")
+        )),
+    }
+}
+
+fn live_result_is_active(store_dir: &Path, stored: &StoredResult) -> bool {
+    let Some(live) = stored.live.as_ref() else {
+        return false;
+    };
+    if live.owner_lock {
+        return live_owner_is_active(store_dir, &stored.metadata.result_id);
+    }
+    // Compatibility for checkpoints written before owner leases existed. They are
+    // considered live only while checkpoints are still reasonably fresh.
+    util::millis(SystemTime::now()).saturating_sub(live.checkpoint_unix_ms) < 120_000
 }
 
 fn scan_result_headers(
@@ -1609,6 +1817,23 @@ pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String>
         let candidate = store_dir.join(target);
         if candidate.exists() {
             return Ok(candidate);
+        }
+    }
+    if target
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && let Ok(items) = fs::read_dir(store_dir)
+    {
+        for item in items.flatten() {
+            let path = item.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("piractx") {
+                continue;
+            }
+            if let Ok(stored) = read_result_path(&path)
+                && stored.metadata.result_id == target
+            {
+                return Ok(path);
+            }
         }
     }
     let workspace = current_workspace_hash()?;
@@ -1837,7 +2062,7 @@ fn short_hash(bytes: &[u8], characters: usize) -> String {
     util::hex(&digest)[..characters].to_string()
 }
 
-fn format_utc_timestamp(seconds: u128) -> String {
+pub(crate) fn format_utc_timestamp(seconds: u128) -> String {
     let days = (seconds / 86_400) as i64;
     let seconds_of_day = (seconds % 86_400) as u32;
     let (year, month, day) = civil_from_days(days);

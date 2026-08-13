@@ -18,6 +18,7 @@ pub enum Mode {
     Exact,
     Check,
     Capture,
+    Watch,
     Search,
     Range,
     Raw,
@@ -48,6 +49,12 @@ pub enum HistoryScope {
     Workspace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchAttention {
+    Return,
+    Cache,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TransformOptions {
     pub plan: Option<PathBuf>,
@@ -74,6 +81,27 @@ pub struct Config {
     pub interest: Option<String>,
     pub cmd: Vec<String>,
     pub target: Option<String>,
+    pub watch_capture: Option<String>,
+    pub watch_current: bool,
+    pub watch_latest: bool,
+    pub watch_stop: bool,
+    pub watch_clear_analyzer: bool,
+    pub watch_analyzer_file: Option<PathBuf>,
+    pub watch_analyzer_code: Option<String>,
+    pub watch_sample_every_ms: u64,
+    pub watch_sample_every_set: bool,
+    pub watch_attempt_timeout_ms: u64,
+    pub watch_deadline_ms: Option<u64>,
+    pub watch_review_after_ms: Option<u64>,
+    pub watch_inactive_after_ms: Option<u64>,
+    pub watch_inactive_after_set: bool,
+    pub watch_unchanged_after_ms: Option<u64>,
+    pub watch_unchanged_after_set: bool,
+    pub watch_no_progress_after_ms: Option<u64>,
+    pub watch_no_progress_after_set: bool,
+    pub watch_pending_exit: i32,
+    pub watch_attention: WatchAttention,
+    pub watch_attention_set: bool,
     pub stats_targets: Vec<String>,
     pub stats_brief: bool,
     pub query: Option<String>,
@@ -112,6 +140,27 @@ impl Default for Config {
             interest: None,
             cmd: vec![],
             target: None,
+            watch_capture: None,
+            watch_current: false,
+            watch_latest: false,
+            watch_stop: false,
+            watch_clear_analyzer: false,
+            watch_analyzer_file: None,
+            watch_analyzer_code: None,
+            watch_sample_every_ms: 30_000,
+            watch_sample_every_set: false,
+            watch_attempt_timeout_ms: 20_000,
+            watch_deadline_ms: None,
+            watch_review_after_ms: None,
+            watch_inactive_after_ms: None,
+            watch_inactive_after_set: false,
+            watch_unchanged_after_ms: None,
+            watch_unchanged_after_set: false,
+            watch_no_progress_after_ms: None,
+            watch_no_progress_after_set: false,
+            watch_pending_exit: 75,
+            watch_attention: WatchAttention::Return,
+            watch_attention_set: false,
             stats_targets: vec![],
             stats_brief: false,
             query: None,
@@ -191,6 +240,7 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
             parse_command(&mut c, args, p)?;
             require_intent(&mut c)?;
         }
+        "watch" => parse_watch(&mut c, args)?,
         "search" => parse_search(&mut c, args)?,
         "range" => {
             c.mode = Mode::Range;
@@ -340,6 +390,237 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
     Ok(c)
 }
 
+fn parse_watch(c: &mut Config, args: &[String]) -> Result<(), String> {
+    c.mode = Mode::Watch;
+    let mut p = 1;
+    while p < args.len() {
+        match args[p].as_str() {
+            "--store-dir" => {
+                p += 1;
+                c.store_dir = Some(take(args, &mut p, "--store-dir")?.into());
+            }
+            "--capture" => {
+                p += 1;
+                c.watch_capture = Some(take(args, &mut p, "--capture")?.into());
+            }
+            "--current" => {
+                c.watch_current = true;
+                p += 1;
+            }
+            "--latest" => {
+                c.watch_latest = true;
+                p += 1;
+            }
+            "--stop" => {
+                c.watch_stop = true;
+                p += 1;
+            }
+            "--analyzer-file" | "--set-analyzer-file" => {
+                p += 1;
+                c.watch_analyzer_file = Some(take(args, &mut p, "--analyzer-file")?.into());
+            }
+            "--analyzer-code" | "--set-analyzer-code" => {
+                p += 1;
+                c.watch_analyzer_code = Some(take(args, &mut p, "--analyzer-code")?.into());
+            }
+            "--clear-analyzer" => {
+                c.watch_clear_analyzer = true;
+                p += 1;
+            }
+            "--sample-every" => {
+                p += 1;
+                c.watch_sample_every_set = true;
+                c.watch_sample_every_ms = parse_watch_duration(
+                    take(args, &mut p, "--sample-every")?,
+                    100,
+                    86_400_000,
+                    "--sample-every",
+                )?;
+            }
+            "--attempt-timeout" => {
+                p += 1;
+                c.watch_attempt_timeout_ms = parse_watch_duration(
+                    take(args, &mut p, "--attempt-timeout")?,
+                    1_000,
+                    600_000,
+                    "--attempt-timeout",
+                )?;
+            }
+            "--deadline" => {
+                p += 1;
+                c.watch_deadline_ms = Some(parse_watch_duration(
+                    take(args, &mut p, "--deadline")?,
+                    1_000,
+                    30 * 86_400_000,
+                    "--deadline",
+                )?);
+            }
+            "--review-after" => {
+                p += 1;
+                c.watch_review_after_ms = Some(parse_watch_duration(
+                    take(args, &mut p, "--review-after")?,
+                    1_000,
+                    86_400_000,
+                    "--review-after",
+                )?);
+            }
+            "--inactive-after" => {
+                p += 1;
+                c.watch_inactive_after_set = true;
+                c.watch_inactive_after_ms = parse_watch_optional_duration(
+                    take(args, &mut p, "--inactive-after")?,
+                    "--inactive-after",
+                )?;
+            }
+            "--unchanged-after" => {
+                p += 1;
+                c.watch_unchanged_after_set = true;
+                c.watch_unchanged_after_ms = parse_watch_optional_duration(
+                    take(args, &mut p, "--unchanged-after")?,
+                    "--unchanged-after",
+                )?;
+            }
+            "--no-progress-after" => {
+                p += 1;
+                c.watch_no_progress_after_set = true;
+                c.watch_no_progress_after_ms = parse_watch_optional_duration(
+                    take(args, &mut p, "--no-progress-after")?,
+                    "--no-progress-after",
+                )?;
+            }
+            "--pending-exit" => {
+                p += 1;
+                c.watch_pending_exit = take(args, &mut p, "--pending-exit")?
+                    .parse()
+                    .map_err(|_| "--pending-exit must be 1..255 except 2")?;
+            }
+            "--attention" => {
+                p += 1;
+                c.watch_attention_set = true;
+                c.watch_attention = match take(args, &mut p, "--attention")? {
+                    "return" => WatchAttention::Return,
+                    "cache" => WatchAttention::Cache,
+                    _ => return Err("--attention must be return or cache".into()),
+                };
+            }
+            "--intent" => {
+                p += 1;
+                c.intent = Some(take(args, &mut p, "--intent")?.into());
+            }
+            "--" => {
+                p += 1;
+                if p >= args.len() {
+                    return Err("watch requires PROGRAM after --".into());
+                }
+                c.cmd = args[p..].to_vec();
+                p = args.len();
+            }
+            value if !value.starts_with('-') && c.target.is_none() => {
+                c.target = Some(value.into());
+                p += 1;
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let analyzer_count = usize::from(c.watch_analyzer_file.is_some())
+        + usize::from(c.watch_analyzer_code.is_some())
+        + usize::from(c.watch_clear_analyzer);
+    if analyzer_count > 1 {
+        return Err("choose one analyzer update".into());
+    }
+    if c.watch_pending_exit <= 0 || c.watch_pending_exit == 2 || c.watch_pending_exit > 255 {
+        return Err("--pending-exit must be 1..255 except 2".into());
+    }
+    let creating = c.watch_capture.is_some() || c.watch_current || !c.cmd.is_empty();
+    if creating {
+        let sources = usize::from(c.watch_capture.is_some())
+            + usize::from(c.watch_current)
+            + usize::from(!c.cmd.is_empty());
+        if c.target.is_some() || sources != 1 {
+            return Err("choose exactly one --current, --capture RESULT, or probe PROGRAM".into());
+        }
+        if c.watch_deadline_ms.is_none() {
+            return Err("creating a watch requires --deadline".into());
+        }
+        if c.watch_latest || c.watch_stop || c.watch_clear_analyzer {
+            return Err("--latest/--stop/--clear-analyzer require WATCH_ID".into());
+        }
+        normalize_optional_intent(c)?;
+    } else {
+        if c.target.is_none() {
+            return Err("watch requires WATCH_ID, --capture RESULT, or PROGRAM".into());
+        }
+        let lifecycle_controls = usize::from(c.watch_latest) + usize::from(c.watch_stop);
+        let mutating = analyzer_count == 1 || watch_configuration_update(c);
+        if lifecycle_controls > 1 || (lifecycle_controls == 1 && mutating) {
+            return Err("--latest/--stop cannot be combined with watch updates".into());
+        }
+        if c.watch_deadline_ms.is_some() || c.intent.is_some() {
+            return Err("stored watch configuration cannot be changed on resume".into());
+        }
+        if (lifecycle_controls > 0 || mutating) && c.watch_review_after_ms.is_some() {
+            return Err("--review-after is valid only when owning/resuming a watch".into());
+        }
+        if c.watch_attempt_timeout_ms != 20_000 || c.watch_pending_exit != 75 {
+            return Err("stored watch configuration cannot be changed on resume".into());
+        }
+    }
+    if c.watch_no_progress_after_ms.is_some()
+        && c.watch_analyzer_file.is_none()
+        && c.watch_analyzer_code.is_none()
+        && creating
+    {
+        return Err("--no-progress-after requires an analyzer".into());
+    }
+    Ok(())
+}
+
+fn watch_configuration_update(c: &Config) -> bool {
+    c.watch_sample_every_set
+        || c.watch_inactive_after_set
+        || c.watch_unchanged_after_set
+        || c.watch_no_progress_after_set
+        || c.watch_attention_set
+}
+
+fn parse_watch_optional_duration(value: &str, option: &str) -> Result<Option<u64>, String> {
+    if value == "off" {
+        Ok(None)
+    } else {
+        parse_watch_duration(value, 1_000, 30 * 86_400_000, option).map(Some)
+    }
+}
+
+fn parse_watch_duration(
+    value: &str,
+    minimum: u64,
+    maximum: u64,
+    option: &str,
+) -> Result<u64, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| format!("{option} requires an integer duration"))?;
+    let multiplier = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return Err(format!("{option} must use ms, s, m, h, or d")),
+    };
+    let milliseconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{option} is too large"))?;
+    if !(minimum..=maximum).contains(&milliseconds) {
+        return Err(format!("{option} is outside its supported range"));
+    }
+    Ok(milliseconds)
+}
+
 fn parse_help_request(args: &[String]) -> Result<Option<Option<String>>, String> {
     let help_flag = |value: &str| matches!(value, "--help" | "-h");
     let boundary = args
@@ -435,7 +716,7 @@ fn parse_python_exec(c: &mut Config, args: &[String]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    require_intent(c)?;
+    normalize_optional_intent(c)?;
     match (c.exec_code.is_some(), c.exec_file.is_some()) {
         (true, false) | (false, true) => {}
         _ => return Err("choose exactly one --code CODE or --file PATH".into()),
@@ -968,6 +1249,109 @@ mod tests {
     }
 
     #[test]
+    fn watch_creation_and_controls_are_unambiguous() {
+        let probe = parse_args(&a(&[
+            "watch",
+            "--deadline",
+            "2h",
+            "--sample-every",
+            "30s",
+            "--",
+            "check-job",
+            "123",
+        ]))
+        .unwrap();
+        assert_eq!(probe.mode, Mode::Watch);
+        assert_eq!(probe.cmd, a(&["check-job", "123"]));
+        assert_eq!(probe.watch_deadline_ms, Some(7_200_000));
+        assert!(probe.intent.is_none());
+
+        let capture = parse_args(&a(&[
+            "watch",
+            "--capture",
+            "abc",
+            "--deadline",
+            "1h",
+            "--attention",
+            "cache",
+        ]))
+        .unwrap();
+        assert_eq!(capture.watch_capture.as_deref(), Some("abc"));
+        assert_eq!(capture.watch_attention, WatchAttention::Cache);
+
+        let current = parse_args(&a(&[
+            "watch",
+            "--current",
+            "--deadline",
+            "1h",
+            "--unchanged-after",
+            "10m",
+        ]))
+        .unwrap();
+        assert!(current.watch_current);
+
+        let latest = parse_args(&a(&["watch", "watch-123", "--latest"])).unwrap();
+        assert!(latest.watch_latest);
+        assert!(parse_args(&a(&["watch", "watch-123", "--latest", "--stop"])).is_err());
+        assert!(parse_args(&a(&["watch", "--deadline", "2h"])).is_err());
+        assert!(parse_args(&a(&["watch", "--capture", "abc", "--", "probe"])).is_err());
+        assert!(
+            parse_args(&a(&[
+                "watch",
+                "--current",
+                "--capture",
+                "abc",
+                "--deadline",
+                "1h",
+            ]))
+            .is_err()
+        );
+        let update = parse_args(&a(&[
+            "watch",
+            "watch-123",
+            "--sample-every",
+            "1s",
+            "--inactive-after",
+            "off",
+            "--unchanged-after",
+            "5m",
+            "--attention",
+            "return",
+            "--set-analyzer-code",
+            "print('{}')",
+        ]))
+        .unwrap();
+        assert!(update.watch_sample_every_set);
+        assert_eq!(update.watch_sample_every_ms, 1_000);
+        assert!(update.watch_inactive_after_set);
+        assert_eq!(update.watch_inactive_after_ms, None);
+        assert_eq!(update.watch_unchanged_after_ms, Some(300_000));
+        assert!(update.watch_attention_set);
+        assert!(
+            parse_args(&a(&[
+                "watch",
+                "watch-123",
+                "--latest",
+                "--sample-every",
+                "1s",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(&a(&[
+                "watch",
+                "--deadline",
+                "1h",
+                "--no-progress-after",
+                "5m",
+                "--",
+                "probe",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn python_exec_requires_result_intent_and_one_program_source() {
         let config = parse_args(&a(&[
             "exec",
@@ -981,7 +1365,7 @@ mod tests {
         assert_eq!(config.mode, Mode::Exec);
         assert_eq!(config.target.as_deref(), Some("--last"));
         assert_eq!(config.exec_code.as_deref(), Some("print(MSG_EXIT)"));
-        assert!(parse_args(&a(&["exec", "--last", "--code", "pass"])).is_err());
+        assert!(parse_args(&a(&["exec", "--last", "--code", "pass"])).is_ok());
         assert!(parse_args(&a(&["exec", "--intent", "x", "--code", "pass"])).is_err());
         assert!(
             parse_args(&a(&[

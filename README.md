@@ -124,7 +124,7 @@ Most users can keep the recommended defaults. Open this section when you want st
 | `--agent-dir PATH` | Installs against a path other than `~/agent`. |
 | `--skip-tools` | Skips installation or refresh of released native PIRA tools. |
 | `--tools-install-dir PATH` | Overrides the per-user tools directory (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows). |
-| `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.6.0`; repeat for multiple tools. Unspecified tools use the latest release. |
+| `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.7.0`; repeat for multiple tools. Unspecified tools use the latest release. |
 | `--verify` | Checks the current setup without writing. |
 | `--dry-run` | Prints planned changes without applying them. |
 
@@ -139,7 +139,7 @@ cd ~/agent
 python3 assets/scripts/setup_pira_tools.py          # install or refresh
 python3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 python3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-python3 assets/scripts/setup_pira_tools.py --version ctx=1.6.0 --version nav=0.11.0
+python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version nav=0.12.0
 ```
 
 On Windows PowerShell:
@@ -149,14 +149,14 @@ cd $HOME\agent
 py -3 assets/scripts/setup_pira_tools.py          # install or refresh
 py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-py -3 assets/scripts/setup_pira_tools.py --version ctx=1.6.0 --version nav=0.11.0
+py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version nav=0.12.0
 ```
 
 The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, or `nav=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 ### Maintainer release procedure
 
-PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all three tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
+PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all three tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -426,11 +426,11 @@ ast-outline demonstrates compact declarations and name-based retrieval; Grove de
 
 Repository code is read and parsed but never edited, built, imported, or executed. Directory discovery honors ignore and hidden rules and does not follow symlinked directories; explicit search operands reject symlink components, and local dependency targets cannot escape the selected root. Source files, syntax, patterns, protocol messages, server output, results, and rendered bytes are bounded.
 
-Source and hover text is framed as untrusted data, and unsafe terminal controls are escaped. A conservative English-keyword heuristic adds one short warning when rendered content resembles prompt injection; it never redacts, reorders, or expands source and is not a general multilingual classifier. The LSP client rejects `workspace/applyEdit`. A selected or `PATH`-discovered language server is still an external executable and may create its own caches, so its executable configuration remains part of the caller's trust boundary. PIRA imposes no timeout; the caller controls cancellation.
+Source and hover text is framed as untrusted data, and unsafe terminal controls are escaped. A conservative English-keyword heuristic adds one short warning when rendered content resembles prompt injection; it never redacts, reorders, or expands source and is not a general multilingual classifier. The LSP client rejects `workspace/applyEdit`. A selected or `PATH`-discovered language server is still an external executable and may create its own caches, so its executable configuration remains part of the caller's trust boundary. Each LSP request is bounded to two minutes and timed-out server process trees are terminated; callers may still cancel earlier.
 
 #### Validation
 
-The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files are rejected by `--native` and routed to an LSP when available. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips plus 74/74 curated essential target checks. Current validation also includes 36 functional black-box tests, 12 inert security tests, 31 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 28 code/document formats. These are implementation tests, not an agentic evaluation.
+The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files are rejected by `--native` and routed to an LSP when available. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips plus 74/74 curated essential target checks. Current validation also includes 36 functional black-box tests, 12 inert security tests, 37 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 28 code/document formats. These are implementation tests, not an agentic evaluation.
 
 #### Performance
 

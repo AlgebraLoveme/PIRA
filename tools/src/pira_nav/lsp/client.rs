@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -22,6 +23,10 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_MESSAGES_PER_REQUEST: usize = 10_000;
 const MAX_SERVER_STDERR_BYTES: usize = 16 * 1024;
+const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const LSP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+type WriteRequest = (Vec<u8>, mpsc::SyncSender<Result<(), String>>);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ServerCapabilities {
@@ -45,8 +50,10 @@ struct DocumentPosition<'a> {
 
 pub(super) struct LspClient {
     child: Child,
-    input: BufWriter<ChildStdin>,
-    output: BufReader<ChildStdout>,
+    input: Option<mpsc::Sender<WriteRequest>>,
+    output: mpsc::Receiver<Result<Value, String>>,
+    input_thread: Option<JoinHandle<()>>,
+    output_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_thread: Option<JoinHandle<()>>,
     next_id: u64,
@@ -55,23 +62,34 @@ pub(super) struct LspClient {
     settings: Option<Value>,
     retain_documents: bool,
     open_documents: BTreeMap<String, Vec<usize>>,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+    unusable: bool,
+    request_timeout: Duration,
 }
 
 impl LspClient {
     pub(super) fn start(config: &LspConfig, retain_documents: bool) -> Result<Self, String> {
-        let mut child = Command::new(&config.executable)
+        let mut command = Command::new(&config.executable);
+        command
             .args(&config.arguments)
             .current_dir(&config.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                format!(
-                    "cannot start LSP server {}: {error}",
-                    config.executable.display()
-                )
-            })?;
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "cannot start LSP server {}: {error}",
+                config.executable.display()
+            )
+        })?;
+        #[cfg(windows)]
+        let job = create_kill_job(&child).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("cannot isolate LSP server process tree: {error}")
+        })?;
         let input = child
             .stdin
             .take()
@@ -99,10 +117,38 @@ impl LspClient {
                 }
             }
         });
+        let (input_sender, input_receiver) = mpsc::channel::<WriteRequest>();
+        let input_thread = thread::spawn(move || {
+            let mut input = BufWriter::new(input);
+            for (bytes, reply) in input_receiver {
+                let result = input
+                    .write_all(&bytes)
+                    .and_then(|_| input.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        let (output_sender, output_receiver) = mpsc::channel();
+        let output_thread = thread::spawn(move || {
+            let mut output = BufReader::new(output);
+            loop {
+                let message = read_message(&mut output);
+                let failed = message.is_err();
+                if output_sender.send(message).is_err() || failed {
+                    break;
+                }
+            }
+        });
         let mut client = Self {
             child,
-            input: BufWriter::new(input),
-            output: BufReader::new(output),
+            input: Some(input_sender),
+            output: output_receiver,
+            input_thread: Some(input_thread),
+            output_thread: Some(output_thread),
             stderr: captured,
             stderr_thread: Some(stderr_thread),
             next_id: 1,
@@ -111,6 +157,10 @@ impl LspClient {
             settings: config.settings.clone(),
             retain_documents,
             open_documents: BTreeMap::new(),
+            #[cfg(windows)]
+            job,
+            unusable: false,
+            request_timeout: LSP_REQUEST_TIMEOUT,
         };
         let root_uri = file_uri(&config.root)?;
         let root_name = config
@@ -510,8 +560,9 @@ impl LspClient {
             "method": method,
             "params": params
         }))?;
+        let deadline = Instant::now() + self.request_timeout;
         for _ in 0..MAX_MESSAGES_PER_REQUEST {
-            let message = self.read()?;
+            let message = self.read(deadline)?;
             if message.get("id").and_then(Value::as_u64) == Some(id)
                 && message.get("method").is_none()
             {
@@ -593,6 +644,9 @@ impl LspClient {
     }
 
     fn send(&mut self, message: &Value) -> Result<(), String> {
+        if self.unusable {
+            return Err("LSP client is unavailable after a previous I/O failure".into());
+        }
         let payload = serde_json::to_vec(message)
             .map_err(|error| format!("cannot encode LSP message: {error}"))?;
         if payload.len() > MAX_MESSAGE_BYTES {
@@ -601,68 +655,75 @@ impl LspClient {
                 MAX_MESSAGE_BYTES / (1024 * 1024)
             ));
         }
-        write!(self.input, "Content-Length: {}\r\n\r\n", payload.len())
-            .and_then(|_| self.input.write_all(&payload))
-            .and_then(|_| self.input.flush())
-            .map_err(|error| self.io_error("write", error))
+        let mut framed = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
+        framed.extend_from_slice(&payload);
+        let (reply, result) = mpsc::sync_channel(1);
+        self.input
+            .as_ref()
+            .ok_or_else(|| "LSP writer is closed".to_string())?
+            .send((framed, reply))
+            .map_err(|_| "LSP writer stopped unexpectedly".to_string())?;
+        match result.recv_timeout(LSP_WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(self.io_error("write", io::Error::other(error))),
+            Err(_) => {
+                self.unusable = true;
+                self.terminate_tree();
+                Err(format!(
+                    "LSP write timed out after {}s{}",
+                    LSP_WRITE_TIMEOUT.as_secs(),
+                    self.stderr_excerpt()
+                ))
+            }
+        }
     }
 
-    fn read(&mut self) -> Result<Value, String> {
-        let mut content_length = None;
-        let mut header_bytes = 0usize;
-        loop {
-            let mut line = Vec::new();
-            let count = self
-                .output
-                .read_until(b'\n', &mut line)
-                .map_err(|error| self.io_error("read", error))?;
-            if count == 0 {
-                return Err(self.io_error("read", io::Error::from(io::ErrorKind::UnexpectedEof)));
+    fn read(&mut self, deadline: Instant) -> Result<Value, String> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.output.recv_timeout(remaining) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(self.io_error("read", io::Error::other(error))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(self.io_error("read", io::Error::from(io::ErrorKind::UnexpectedEof)))
             }
-            header_bytes = header_bytes.saturating_add(count);
-            if line.len() > MAX_HEADER_LINE_BYTES || header_bytes > MAX_HEADER_BYTES {
-                return Err("LSP response headers exceed the safety limit".into());
-            }
-            if line == b"\r\n" || line == b"\n" {
-                break;
-            }
-            let text = std::str::from_utf8(&line)
-                .map_err(|_| "LSP response header is not valid UTF-8".to_string())?;
-            let (name, value) = text
-                .split_once(':')
-                .ok_or_else(|| "malformed LSP response header".to_string())?;
-            if name.eq_ignore_ascii_case("content-length") {
-                if content_length.is_some() {
-                    return Err("duplicate LSP Content-Length header".into());
-                }
-                let length = value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "invalid LSP Content-Length header".to_string())?;
-                if length > MAX_MESSAGE_BYTES {
-                    return Err(format!(
-                        "LSP response exceeds the {} MiB safety limit",
-                        MAX_MESSAGE_BYTES / (1024 * 1024)
-                    ));
-                }
-                content_length = Some(length);
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.unusable = true;
+                self.terminate_tree();
+                Err(format!(
+                    "LSP request timed out after {}s{}",
+                    self.request_timeout.as_secs_f64(),
+                    self.stderr_excerpt()
+                ))
             }
         }
-        let length =
-            content_length.ok_or_else(|| "LSP response omitted Content-Length".to_string())?;
-        let mut payload = vec![0u8; length];
-        self.output
-            .read_exact(&mut payload)
-            .map_err(|error| self.io_error("read", error))?;
-        let value: Value = serde_json::from_slice(&payload)
-            .map_err(|error| format!("invalid JSON from LSP server: {error}"))?;
-        if !value.is_object() {
-            return Err("LSP message must be a JSON object".into());
+    }
+
+    fn terminate_tree(&mut self) {
+        #[cfg(unix)]
+        {
+            let group = self.child.id().min(i32::MAX as u32) as i32;
+            // SAFETY: the LSP server is made leader of its own process group before spawn.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
         }
-        Ok(value)
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            // SAFETY: `job` is a live handle owned by this client.
+            unsafe {
+                TerminateJobObject(self.job, 1);
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = self.child.kill();
+        }
     }
 
     fn io_error(&mut self, operation: &str, error: io::Error) -> String {
+        self.unusable = true;
+        self.terminate_tree();
         let status = self
             .child
             .try_wait()
@@ -673,7 +734,62 @@ impl LspClient {
         let stderr = self.stderr_excerpt();
         format!("cannot {operation} LSP message: {error}{status}{stderr}")
     }
+}
 
+fn read_message(output: &mut BufReader<ChildStdout>) -> Result<Value, String> {
+    let mut content_length = None;
+    let mut header_bytes = 0usize;
+    loop {
+        let mut line = Vec::new();
+        let count = output
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("cannot read LSP message: {error}"))?;
+        if count == 0 {
+            return Err("cannot read LSP message: unexpected end of file".into());
+        }
+        header_bytes = header_bytes.saturating_add(count);
+        if line.len() > MAX_HEADER_LINE_BYTES || header_bytes > MAX_HEADER_BYTES {
+            return Err("LSP response headers exceed the safety limit".into());
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| "LSP response header is not valid UTF-8".to_string())?;
+        let (name, value) = text
+            .split_once(':')
+            .ok_or_else(|| "malformed LSP response header".to_string())?;
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err("duplicate LSP Content-Length header".into());
+            }
+            let length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "invalid LSP Content-Length header".to_string())?;
+            if length > MAX_MESSAGE_BYTES {
+                return Err(format!(
+                    "LSP response exceeds the {} MiB safety limit",
+                    MAX_MESSAGE_BYTES / (1024 * 1024)
+                ));
+            }
+            content_length = Some(length);
+        }
+    }
+    let length = content_length.ok_or_else(|| "LSP response omitted Content-Length".to_string())?;
+    let mut payload = vec![0u8; length];
+    output
+        .read_exact(&mut payload)
+        .map_err(|error| format!("cannot read LSP message: {error}"))?;
+    let value: Value = serde_json::from_slice(&payload)
+        .map_err(|error| format!("invalid JSON from LSP server: {error}"))?;
+    if !value.is_object() {
+        return Err("LSP message must be a JSON object".into());
+    }
+    Ok(value)
+}
+
+impl LspClient {
     fn stderr_excerpt(&self) -> String {
         let Ok(bytes) = self.stderr.lock() else {
             return String::new();
@@ -688,20 +804,23 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        for (uri, _) in std::mem::take(&mut self.open_documents) {
-            let _ = self.notify(
-                "textDocument/didClose",
-                json!({"textDocument": {"uri": uri}}),
-            );
+        if !self.unusable {
+            for (uri, _) in std::mem::take(&mut self.open_documents) {
+                let _ = self.notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": uri}}),
+                );
+            }
+            let id = self.next_id;
+            let _ = self.send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "shutdown",
+                "params": null
+            }));
+            let _ = self.notify("exit", Value::Null);
         }
-        let id = self.next_id;
-        let _ = self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "shutdown",
-            "params": null
-        }));
-        let _ = self.notify("exit", Value::Null);
+        self.input.take();
         for _ in 0..100 {
             if self.child.try_wait().ok().flatten().is_some() {
                 break;
@@ -709,12 +828,76 @@ impl Drop for LspClient {
             thread::sleep(std::time::Duration::from_millis(1));
         }
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            self.terminate_tree();
         }
         let _ = self.child.wait();
+        if let Some(thread) = self.input_thread.take() {
+            let _ = thread.join();
+        }
+        let (_replacement, disconnected) = mpsc::channel();
+        self.output = disconnected;
+        if let Some(thread) = self.output_thread.take() {
+            let _ = thread.join();
+        }
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
         }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            // SAFETY: `job` is owned by this client and closed exactly once.
+            unsafe {
+                CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn create_kill_job(child: &Child) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    // SAFETY: APIs receive initialized values of documented sizes; failure paths close `job`.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            let error = io::Error::last_os_error().to_string();
+            CloseHandle(job);
+            return Err(error);
+        }
+        if AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
+            let error = io::Error::last_os_error().to_string();
+            CloseHandle(job);
+            return Err(error);
+        }
+        Ok(job)
     }
 }
 
@@ -735,9 +918,16 @@ fn provider_enabled(value: Option<&Value>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
     use serde_json::json;
 
-    use super::configuration_section;
+    use super::{LspClient, LspConfig, configuration_section};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn configuration_sections_support_whole_and_dotted_settings() {
@@ -754,5 +944,58 @@ mod tests {
             configuration_section(Some(&settings), "python.missing"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_lsp_request_is_time_bounded() {
+        let directory = std::env::temp_dir().join(format!(
+            "pira-nav-lsp-timeout-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let server = directory.join("server.py");
+        fs::write(
+            &server,
+            r#"#!/usr/bin/env python3
+import json, sys, time
+def read():
+    n = 0
+    while True:
+        line = sys.stdin.buffer.readline()
+        if line in (b'\r\n', b'\n', b''): break
+        if line.lower().startswith(b'content-length:'): n = int(line.split(b':', 1)[1])
+    return json.loads(sys.stdin.buffer.read(n))
+def send(v):
+    b = json.dumps(v).encode()
+    sys.stdout.buffer.write(b'Content-Length: ' + str(len(b)).encode() + b'\r\n\r\n' + b)
+    sys.stdout.buffer.flush()
+m = read()
+send({'jsonrpc':'2.0','id':m['id'],'result':{'capabilities':{}}})
+read()
+m = read()
+time.sleep(10)
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = LspConfig::new(
+            PathBuf::from(&server),
+            Vec::new(),
+            directory.clone(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut client = LspClient::start(&config, false).unwrap();
+        client.request_timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let error = client.request("test/stall", json!({})).unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(client);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

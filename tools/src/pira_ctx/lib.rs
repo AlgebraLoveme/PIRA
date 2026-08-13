@@ -9,6 +9,7 @@ mod storage;
 mod summarize;
 mod transform;
 mod util;
+mod watch;
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
@@ -75,6 +76,7 @@ fn real_main() -> Result<i32, String> {
         Mode::Verify => run_verify(&config),
         Mode::Prune => run_prune(&config),
         Mode::Forget => run_forget(&config),
+        Mode::Watch => watch::run(&config),
     }
 }
 
@@ -89,7 +91,7 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
             .map(|(name, source)| format!("{name}={}", source.metadata.result_id)),
     );
     let ranking = ranking_terms(&analysis_config);
-    let mut capture = match capture_program(&analysis_config, &prepared.command)? {
+    let mut capture = match capture_program(&analysis_config, &prepared.command, false)? {
         Ok(capture) => capture,
         Err(code) => {
             record_event(&analysis_config, code, 0, None);
@@ -142,7 +144,7 @@ fn run_exact(config: &Config) -> Result<i32, String> {
         return run_streaming_exact(config);
     }
     let ranking = ranking_terms(config);
-    let mut capture = match capture_program(config, &config.cmd)? {
+    let mut capture = match capture_program(config, &config.cmd, false)? {
         Ok(capture) => capture,
         Err(code) => {
             record_event(config, code, 0, None);
@@ -295,7 +297,7 @@ fn run_auto(config: &Config) -> Result<i32, String> {
         return run_exact(config);
     }
     let ranking = ranking_terms(config);
-    let mut capture = match capture_program(config, &config.cmd)? {
+    let mut capture = match capture_program(config, &config.cmd, false)? {
         Ok(capture) => capture,
         Err(code) => {
             record_event(config, code, 0, None);
@@ -341,7 +343,7 @@ fn inspect_capture_for_context(capture: &CaptureResult) -> Result<security::Cont
 
 fn run_check(config: &Config) -> Result<i32, String> {
     let ranking = ranking_terms(config);
-    let mut capture = match capture_program(config, &config.cmd)? {
+    let mut capture = match capture_program(config, &config.cmd, true)? {
         Ok(capture) => capture,
         Err(code) => {
             record_event(config, code, 0, None);
@@ -414,7 +416,7 @@ fn retain_text_shape(bytes: u64, lines: usize, repetitive: bool) -> bool {
 
 fn run_capture(config: &Config) -> Result<i32, String> {
     let ranking = ranking_terms(config);
-    let mut capture = match capture_program(config, &config.cmd)? {
+    let mut capture = match capture_program(config, &config.cmd, true)? {
         Ok(capture) => capture,
         Err(code) => {
             record_event(config, code, 0, None);
@@ -487,9 +489,10 @@ fn score_capture(
 fn capture_program(
     config: &Config,
     command: &[String],
+    announce_live: bool,
 ) -> Result<Result<CaptureResult, i32>, String> {
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
-    capture::capture_command(command, Some(&store_dir))
+    capture::capture_command(command, Some(&store_dir), announce_live)
 }
 
 fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Metadata>) {
@@ -1162,15 +1165,17 @@ fn run_list(config: &Config) -> Result<i32, String> {
     } else {
         None
     };
-    let entries = storage::scan_store(&store_dir, filter.as_deref())?;
+    let mut entries = storage::scan_store(&store_dir, filter.as_deref())?;
+    entries.extend(watch::list_entries(&store_dir, filter.as_deref())?);
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.start_ms));
     let omitted = entries.len().saturating_sub(config.limit);
-    util::stdout_line("id | state | timestamp | exit | bytes | lines | command")?;
+    util::stdout_line("id | kind | state | timestamp | exit | bytes | lines | command")?;
     for entry in entries.into_iter().take(config.limit) {
         print_listed_entry(&entry)?;
     }
     if omitted > 0 {
         util::stdout_line(&format!(
-            "... {omitted} captures omitted; rerun with --limit N (maximum 100)"
+            "... {omitted} entries omitted; rerun with --limit N (maximum 100)"
         ))?;
     }
     Ok(0)
@@ -1179,9 +1184,10 @@ fn run_list(config: &Config) -> Result<i32, String> {
 fn print_listed_entry(entry: &ListedEntry) -> Result<(), String> {
     let command = table_field(&entry.command, 256);
     util::stdout_line(&format!(
-        "{} | {} | {} | {} | {} | {} | {}",
+        "{} | {} | {} | {} | {} | {} | {} | {}",
         entry.id,
-        if entry.running { "running" } else { "complete" },
+        entry.kind,
+        entry.state,
         entry.timestamp,
         if entry.running {
             "-".to_string()
@@ -1481,6 +1487,10 @@ fn run_forget(config: &Config) -> Result<i32, String> {
         util::stdout_line(&format!("forgot {count} event files"))?;
         return Ok(0);
     }
+    if let Some(path) = watch::forget(&dir, target)? {
+        util::stdout_line(&format!("forgot {}", path.display()))?;
+        return Ok(0);
+    }
     let path = storage::resolve_result(&dir, target)?;
     let capture = storage::read_result_path(&path)?;
     capture.verify()?;
@@ -1555,7 +1565,7 @@ fn run_batch(config: &Config) -> Result<i32, String> {
             };
             let worker_dir = dir.clone();
             handles.push(std::thread::spawn(move || {
-                let result = capture::capture_command(&argv, Some(&worker_dir));
+                let result = capture::capture_command(&argv, Some(&worker_dir), false);
                 (index, intent, argv, result)
             }));
         }

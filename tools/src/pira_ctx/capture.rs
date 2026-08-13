@@ -80,6 +80,7 @@ impl RetentionBudget {
 pub fn capture_command(
     cmd: &[String],
     live_store_dir: Option<&Path>,
+    announce_live: bool,
 ) -> Result<Result<CaptureResult, i32>, String> {
     if cmd.is_empty() {
         return Err(crate::cli::USAGE.to_string());
@@ -110,18 +111,49 @@ pub fn capture_command(
     });
     let stdout_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stdout", start_ms)));
     let stderr_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stderr", start_ms)));
+    let (initial_live_id, live_owner) = if announce_live {
+        let store_dir = live_store_dir.ok_or("live announcement requires capture storage")?;
+        let (stdout_path, stderr_path) = live_spool_paths(&stdout_spool, &stderr_spool)?;
+        let checkpoint = crate::storage::LiveCheckpoint {
+            command: cmd,
+            cwd: &cwd,
+            start_ms,
+            duration_ms: 0,
+            stdout_path: &stdout_path,
+            stderr_path: &stderr_path,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            total_lines: 0,
+            timeline: &[],
+            timeline_truncated: false,
+        };
+        let (id, owner) = crate::storage::begin_live_capture(store_dir, &checkpoint)?;
+        (Some(id), Some(owner))
+    } else {
+        (None, None)
+    };
     let mut child = match spawn_command(cmd) {
         Ok(child) => child,
         Err(error) if error.starts_with("__EXIT127__ ") => {
+            remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
             eprintln!("pira_ctx: {}", error.trim_start_matches("__EXIT127__ "));
             return Ok(Err(127));
         }
         Err(error) if error.starts_with("__EXIT126__ ") => {
+            remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
             eprintln!("pira_ctx: {}", error.trim_start_matches("__EXIT126__ "));
             return Ok(Err(126));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
+            return Err(error);
+        }
     };
+    if let Some(result_id) = initial_live_id.as_deref() {
+        eprintln!("PIRA live | result={result_id}");
+    }
     let child_stdout = child
         .stdout
         .take()
@@ -181,8 +213,8 @@ pub fn capture_command(
         let stderr_spool = Arc::clone(&stderr_spool);
         let collected = Arc::clone(&collected);
         thread::spawn(move || {
-            let mut live_id = None;
-            let mut generation = 0_u64;
+            let mut live_id = initial_live_id;
+            let mut generation = u64::from(live_id.is_some());
             let mut last_progress = None;
             loop {
                 match checkpoint_receiver.recv_timeout(checkpoint_interval) {
@@ -263,6 +295,7 @@ pub fn capture_command(
                     &store_dir,
                     live_id.as_deref(),
                     generation,
+                    announce_live,
                     &checkpoint,
                 ) {
                     Ok(id) => live_id = Some(id),
@@ -305,8 +338,15 @@ pub fn capture_command(
         cwd,
         live_id,
         live_store_dir: live_store_dir.map(Path::to_path_buf),
+        _live_owner: live_owner,
     };
     Ok(Ok(capture))
+}
+
+fn remove_initial_checkpoint(store_dir: Option<&Path>, result_id: Option<&str>) {
+    if let (Some(store_dir), Some(result_id)) = (store_dir, result_id) {
+        crate::storage::remove_live_checkpoint(store_dir, result_id);
+    }
 }
 
 fn join_reader(

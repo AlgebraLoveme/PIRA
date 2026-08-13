@@ -890,7 +890,7 @@ fn resolve_rust(
     if matches!(first, "std" | "core" | "alloc") {
         return (None, format!("external:{first}"), "external");
     }
-    let base;
+    let mut base;
     let mut segments = Vec::new();
     match first {
         "crate" => {
@@ -903,7 +903,18 @@ fn resolve_rust(
         }
         "super" => {
             base = path.parent().unwrap_or(cwd).to_path_buf();
-            segments.extend(parts);
+            let mut remaining = parts.peekable();
+            while remaining.peek() == Some(&"super") {
+                remaining.next();
+                let Some(parent) = base.parent() else {
+                    return (None, "outside-workspace".into(), "blocked");
+                };
+                if !parent.starts_with(source_root) {
+                    return (None, "outside-workspace".into(), "blocked");
+                }
+                base = parent.to_path_buf();
+            }
+            segments.extend(remaining);
         }
         "" => return (None, "external:unknown".into(), "unresolved"),
         local => {
@@ -956,5 +967,46 @@ fn find_rust_source_root(path: &Path, cwd: &Path) -> PathBuf {
             return cwd.to_path_buf();
         };
         current = parent;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::resolve_rust;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn resolves_multiple_leading_rust_super_components() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-nav-rust-super-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("lib.rs"), "mod c; mod a;").unwrap();
+        fs::write(root.join("c.rs"), "pub struct Thing;").unwrap();
+        let source = root.join("a/b.rs");
+        fs::write(&source, "use super::super::c::Thing;").unwrap();
+
+        let (target, _, resolution) = resolve_rust(&source, "super::super::c::Thing", &root, &root);
+        assert_eq!(resolution, "structural");
+        assert_eq!(target, Some(root.join("c.rs")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn blocks_rust_super_components_above_source_root() {
+        let root = PathBuf::from("/workspace/src");
+        let source = root.join("a.rs");
+        let (target, label, resolution) =
+            resolve_rust(&source, "super::super::outside", &root, &root);
+        assert!(target.is_none());
+        assert_eq!(label, "outside-workspace");
+        assert_eq!(resolution, "blocked");
     }
 }

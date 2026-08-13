@@ -8,6 +8,8 @@ use crate::model::{ParseBackend, Symbol};
 use crate::util::{hash16, one_line, percent_encode, read_source, source_slice};
 
 const MAX_SYNTAX_DEPTH: usize = 256;
+pub const MAX_CODE_SYMBOLS: usize = 20_000;
+const MAX_CODE_SYMBOL_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct ParsedFile {
     pub path: PathBuf,
@@ -91,7 +93,7 @@ fn parse_source_symbols_state(
     if defects > 0 {
         return Ok((Vec::new(), defects, false));
     }
-    let (mut symbols, symbols_truncated) = collect_symbols(&tree, language, source);
+    let (mut symbols, mut symbols_truncated) = collect_symbols(&tree, language, source);
     symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     symbols.dedup_by(|left, right| {
         left.start_byte == right.start_byte
@@ -99,6 +101,24 @@ fn parse_source_symbols_state(
             && left.kind == right.kind
             && left.qualified_name == right.qualified_name
     });
+    let mut text_bytes = 0usize;
+    let keep = symbols
+        .iter()
+        .take(MAX_CODE_SYMBOLS)
+        .take_while(|symbol| {
+            let next = text_bytes
+                .saturating_add(symbol.qualified_name.len())
+                .saturating_add(symbol.signature.len());
+            if next > MAX_CODE_SYMBOL_TEXT_BYTES {
+                false
+            } else {
+                text_bytes = next;
+                true
+            }
+        })
+        .count();
+    symbols_truncated |= keep < symbols.len();
+    symbols.truncate(keep);
     Ok((symbols, defects, symbols_truncated))
 }
 
@@ -141,7 +161,7 @@ fn collect_symbols(tree: &Tree, language: Language, source: &str) -> (Vec<Symbol
         let collected = document::collect(tree, language, source);
         return (collected.symbols, collected.truncated);
     }
-    let mut symbols = Vec::new();
+    let mut symbols = SymbolCollector::default();
     match language {
         Language::Python => walk_python(tree.root_node(), source, None, false, 0, &mut symbols),
         Language::Rust => walk_rust(tree.root_node(), source, None, 0, &mut symbols),
@@ -174,7 +194,32 @@ fn collect_symbols(tree: &Tree, language: Language, source: &str) -> (Vec<Symbol
             unreachable!()
         }
     }
-    (symbols, false)
+    (symbols.symbols, symbols.truncated)
+}
+
+#[derive(Default)]
+struct SymbolCollector {
+    symbols: Vec<Symbol>,
+    text_bytes: usize,
+    truncated: bool,
+}
+
+impl SymbolCollector {
+    fn push(&mut self, symbol: Symbol) {
+        if self.truncated {
+            return;
+        }
+        let text_bytes = self
+            .text_bytes
+            .saturating_add(symbol.qualified_name.len())
+            .saturating_add(symbol.signature.len());
+        if self.symbols.len() >= MAX_CODE_SYMBOLS || text_bytes > MAX_CODE_SYMBOL_TEXT_BYTES {
+            self.truncated = true;
+            return;
+        }
+        self.text_bytes = text_bytes;
+        self.symbols.push(symbol);
+    }
 }
 
 fn push_symbol(
@@ -184,7 +229,7 @@ fn push_symbol(
     qualification: (Option<&str>, &str),
     kind: &'static str,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) -> String {
     let name = one_line(&source_slice(
         source,
@@ -201,7 +246,7 @@ fn push_symbol_name(
     qualification: (Option<&str>, &str),
     kind: &'static str,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) -> String {
     let name = one_line(name);
     let qualified = qualify(qualification.0, &name, qualification.1);
@@ -225,7 +270,7 @@ fn walk_java(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "field_declaration" && parent.is_some() {
         let mut cursor = node.walk();
@@ -290,7 +335,7 @@ fn walk_c_family(
     parent: Option<&str>,
     depth: usize,
     cpp: bool,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let container_kind = match node.kind() {
         "namespace_definition" if cpp => Some("namespace"),
@@ -417,7 +462,7 @@ fn walk_bash(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "function_definition"
         && let Some(name_node) = node.child_by_field_name("name")
@@ -448,7 +493,7 @@ fn walk_go(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "type_spec"
         && let Some(name_node) = node.child_by_field_name("name")
@@ -558,7 +603,7 @@ fn walk_ecmascript(
     parent: Option<&str>,
     depth: usize,
     typescript: bool,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let container_kind = match node.kind() {
         "class_declaration" | "abstract_class_declaration" => Some("class"),
@@ -698,7 +743,7 @@ fn walk_ecmascript(
     });
 }
 
-fn walk_csharp_root(node: Node<'_>, source: &str, output: &mut Vec<Symbol>) {
+fn walk_csharp_root(node: Node<'_>, source: &str, output: &mut SymbolCollector) {
     let mut namespace = None;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -731,7 +776,7 @@ fn walk_csharp(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let container_kind = match node.kind() {
         "namespace_declaration" => Some("namespace"),
@@ -849,7 +894,7 @@ fn walk_powershell(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let declaration = match node.kind() {
         "class_statement" => Some(("simple_name", "class", ".")),
@@ -879,7 +924,7 @@ fn walk_powershell(
     });
 }
 
-fn walk_php_root(root: Node<'_>, source: &str, output: &mut Vec<Symbol>) {
+fn walk_php_root(root: Node<'_>, source: &str, output: &mut SymbolCollector) {
     let mut namespace = None;
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -905,7 +950,7 @@ fn walk_php(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let declaration = match node.kind() {
         "class_declaration" => Some(("class", "\\")),
@@ -948,7 +993,7 @@ fn walk_kotlin(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let (name, kind, separator) = match node.kind() {
         "class_declaration" => {
@@ -1019,7 +1064,7 @@ fn walk_lua(
     parent: Option<&str>,
     depth: usize,
     top_level: bool,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "function_declaration"
         && let Some(name) = node.child_by_field_name("name")
@@ -1091,7 +1136,7 @@ fn walk_hcl(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "block" {
         let mut cursor = node.walk();
@@ -1136,7 +1181,7 @@ fn walk_r(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "binary_operator"
         && let Some(operator) = node.child_by_field_name("operator")
@@ -1186,7 +1231,7 @@ fn walk_ruby(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if matches!(node.kind(), "module" | "class")
         && let Some(name) = node.child_by_field_name("name")
@@ -1241,7 +1286,7 @@ fn walk_swift(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let declaration = match node.kind() {
         "protocol_declaration" => Some(("protocol", node.child_by_field_name("name"))),
@@ -1349,7 +1394,7 @@ fn walk_scala(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let kind = match node.kind() {
         "class_definition" => "class",
@@ -1432,7 +1477,7 @@ fn walk_dart(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let kind = match node.kind() {
         "class_declaration" => "class",
@@ -1526,7 +1571,7 @@ fn walk_elixir(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "call"
         && let Some(target) = node.child_by_field_name("target")
@@ -1605,7 +1650,7 @@ fn walk_julia(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "module_definition"
         && let Some(name) = node.child_by_field_name("name")
@@ -1830,7 +1875,7 @@ fn walk_python(
     parent: Option<&str>,
     parent_is_class: bool,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if parent.is_none() && node.kind() == "assignment" {
         if let Some(left) = node.child_by_field_name("left") {
@@ -1884,7 +1929,7 @@ fn add_python_bindings(
     target: Node<'_>,
     source: &str,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if target.kind() == "identifier" {
         push_symbol(
@@ -1913,7 +1958,7 @@ fn add_python_definition(
     parent: Option<&str>,
     parent_is_class: bool,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -1961,7 +2006,7 @@ fn walk_rust(
     source: &str,
     parent: Option<&str>,
     depth: usize,
-    output: &mut Vec<Symbol>,
+    output: &mut SymbolCollector,
 ) {
     if node.kind() == "impl_item" {
         let type_name = node
@@ -2122,5 +2167,25 @@ mod rust_navigation_tests {
         assert_eq!(rust_impl_owner("SourcePositions<'a>"), "SourcePositions");
         assert_eq!(rust_impl_owner("crate::Cache<K, Vec<V>>"), "crate::Cache");
         assert_eq!(rust_impl_owner("Plain"), "Plain");
+    }
+}
+
+#[cfg(test)]
+mod symbol_limit_tests {
+    use std::path::Path;
+
+    use super::{MAX_CODE_SYMBOLS, parse_source_symbols_state};
+    use crate::language::Language;
+
+    #[test]
+    fn code_symbol_collection_is_bounded_and_reports_truncation() {
+        let source = (0..MAX_CODE_SYMBOLS + 10)
+            .map(|index| format!("fn f{index}() {{}}\n"))
+            .collect::<String>();
+        let (symbols, defects, truncated) =
+            parse_source_symbols_state(Path::new("many.rs"), Language::Rust, &source).unwrap();
+        assert_eq!(defects, 0);
+        assert_eq!(symbols.len(), MAX_CODE_SYMBOLS);
+        assert!(truncated);
     }
 }

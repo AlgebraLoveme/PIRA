@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 
@@ -42,6 +41,9 @@ const MAX_REPORTED_FAILURES: usize = 20;
 const MAX_FAILURE_SUBJECT_BYTES: usize = 512;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
 const PARSE_BATCH_FILES: usize = 16;
+// Parsed files retain source, syntax-derived symbols, and sometimes LSP data until a batch is
+// reduced. Limit each parallel batch by both file count and known input bytes.
+const PARSE_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_SYMBOL_ITEMS: usize = 100_000;
 const MAX_SYMBOL_QUERIES: usize = 32;
 const MAX_SYMBOL_PATHS: usize = 64;
@@ -107,6 +109,14 @@ impl FailureCollector {
 
     fn omitted(&self) -> usize {
         self.total.saturating_sub(self.shown.len())
+    }
+
+    fn record_omitted(&mut self, count: usize, code: i32) {
+        if count == 0 {
+            return;
+        }
+        self.total = self.total.saturating_add(count);
+        self.first_code.get_or_insert(code);
     }
 
     fn first_code(&self) -> i32 {
@@ -1188,8 +1198,12 @@ fn command_map(
         explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
         max_depth,
     );
-    let shape = collect_map_shape(&root, max_depth);
+    let shape = collect_map_shape(&root, &discovery.all_files);
     let mut failures = FailureCollector::default();
+    for error in &discovery.walk_errors {
+        failures.record("repository traversal".into(), 2, error.clone());
+    }
+    failures.record_omitted(discovery.walk_errors_total - discovery.walk_errors.len(), 2);
     let fixture_skipped = discovery
         .files
         .iter()
@@ -1197,7 +1211,7 @@ fn command_map(
         .count();
     let mut summaries = Vec::with_capacity(discovery.files.len());
     let mut resolver = structural_resolver(lsp, &root)?;
-    for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
+    for batch in parse_batches(&discovery.files) {
         let parsed = batch
             .par_iter()
             .map(|(path, language)| {
@@ -1270,6 +1284,14 @@ fn command_map(
             output,
             " parsed={} failed={} complete=0",
             parsed_count, failures.total
+        )
+        .map_err(output_error)?;
+    }
+    if discovery.walk_errors_total > discovery.walk_errors.len() {
+        write!(
+            output,
+            " traversal_errors_omitted={}",
+            discovery.walk_errors_total - discovery.walk_errors.len()
         )
         .map_err(output_error)?;
     }
@@ -1666,13 +1688,17 @@ fn command_symbols(
     };
     let mut resolver = structural_resolver(lsp, lsp_root)?;
     let mut failures = FailureCollector::default();
+    for error in &discovery.walk_errors {
+        failures.record("repository traversal".into(), 2, error.clone());
+    }
+    failures.record_omitted(discovery.walk_errors_total - discovery.walk_errors.len(), 2);
     let mut parsed_count = 0usize;
     let mut lsp_count = 0usize;
     let mut truncated_files = 0usize;
     let mut buckets = (0..options.queries.len())
         .map(|_| SymbolBucket::new(options.max_items))
         .collect::<Vec<_>>();
-    for batch in discovery.files.chunks(PARSE_BATCH_FILES) {
+    for batch in parse_batches(&discovery.files) {
         let parsed = batch
             .par_iter()
             .map(|(path, language)| parse_file(path, *language))
@@ -1790,6 +1816,14 @@ fn command_symbols(
             output,
             " parsed={} failed={} complete=0",
             parsed_count, failures.total
+        )
+        .map_err(output_error)?;
+    }
+    if discovery.walk_errors_total > 0 && parsed_count == discovery.files.len() {
+        write!(
+            output,
+            " traversal_errors={} complete=0",
+            discovery.walk_errors_total
         )
         .map_err(output_error)?;
     }
@@ -2176,6 +2210,27 @@ struct FileSummary {
     symbols_truncated: bool,
 }
 
+fn parse_batches(files: &[(PathBuf, Language)]) -> Vec<&[(PathBuf, Language)]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < files.len() {
+        let mut end = start;
+        let mut bytes = 0u64;
+        while end < files.len() && end - start < PARSE_BATCH_FILES {
+            let next =
+                std::fs::metadata(&files[end].0).map_or(PARSE_BATCH_BYTES, |item| item.len());
+            if end > start && bytes.saturating_add(next) > PARSE_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(next);
+            end += 1;
+        }
+        batches.push(&files[start..end]);
+        start = end;
+    }
+    batches
+}
+
 struct MapShape {
     files: usize,
     languages: Vec<String>,
@@ -2184,29 +2239,12 @@ struct MapShape {
     landmarks: Vec<(PathBuf, &'static str)>,
 }
 
-fn collect_map_shape(root: &Path, max_depth: Option<usize>) -> MapShape {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .ignore(true)
-        .follow_links(false);
-    builder.max_depth(max_depth);
-    let mut files = Vec::new();
-    for entry in builder.build().filter_map(Result::ok) {
-        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            files.push(entry.into_path());
-        }
-    }
-    files.sort();
+fn collect_map_shape(root: &Path, files: &[PathBuf]) -> MapShape {
     let mut language_counts = BTreeMap::<&'static str, usize>::new();
     let mut document_counts = BTreeMap::<&'static str, usize>::new();
     let mut directory_counts = BTreeMap::<String, usize>::new();
     let mut landmarks = Vec::new();
-    for path in &files {
+    for path in files {
         if let Ok(language) = Language::infer(path) {
             let counts = if language.is_document() {
                 &mut document_counts
@@ -2571,9 +2609,18 @@ fn command_dependents(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let extracted = extract_dependencies(&discovery.files, &options.root, Some(&target), |edge| {
-        (edge.target.as_deref() == Some(target.as_path())).then_some(edge)
-    });
+    let mut extracted =
+        extract_dependencies(&discovery.files, &options.root, Some(&target), |edge| {
+            (edge.target.as_deref() == Some(target.as_path())).then_some(edge)
+        });
+    for error in &discovery.walk_errors {
+        extracted
+            .failures
+            .record("repository traversal".into(), 2, error.clone());
+    }
+    extracted
+        .failures
+        .record_omitted(discovery.walk_errors_total - discovery.walk_errors.len(), 2);
     let mut edges = extracted.edges;
     edges.sort_by(|left, right| {
         left.source
@@ -2925,13 +2972,21 @@ fn command_deps(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let extracted = extract_dependencies(&discovery.files, &options.root, None, |edge| {
+    let mut extracted = extract_dependencies(&discovery.files, &options.root, None, |edge| {
         edge.target.map(|target| LocalDependencyEdge {
             source: edge.source,
             target,
             line: edge.line,
         })
     });
+    for error in &discovery.walk_errors {
+        extracted
+            .failures
+            .record("repository traversal".into(), 2, error.clone());
+    }
+    extracted
+        .failures
+        .record_omitted(discovery.walk_errors_total - discovery.walk_errors.len(), 2);
     let DependencyExtraction {
         scanned,
         parsed_imports,

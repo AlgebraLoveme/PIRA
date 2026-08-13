@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -117,7 +118,13 @@ fn build_config(
 }
 
 fn read_json(path: &Path, option: &str) -> Result<Value, CommandError> {
-    let metadata = fs::metadata(path).map_err(|error| {
+    let file = File::open(path).map_err(|error| {
+        (
+            2,
+            format!("cannot open {option} file {}: {error}", path.display()),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
         (
             2,
             format!("cannot inspect {option} file {}: {error}", path.display()),
@@ -135,12 +142,21 @@ fn read_json(path: &Path, option: &str) -> Result<Value, CommandError> {
             format!("{option} file exceeds 64 KiB: {}", path.display()),
         ));
     }
-    let bytes = fs::read(path).map_err(|error| {
-        (
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_LSP_CONFIG_BYTES) as usize);
+    file.take(MAX_LSP_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            (
+                2,
+                format!("cannot read {option} file {}: {error}", path.display()),
+            )
+        })?;
+    if bytes.len() as u64 > MAX_LSP_CONFIG_BYTES {
+        return Err((
             2,
-            format!("cannot read {option} file {}: {error}", path.display()),
-        )
-    })?;
+            format!("{option} file exceeds 64 KiB: {}", path.display()),
+        ));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         (
             2,
@@ -308,4 +324,27 @@ fn supports_lsp(command: &str) -> bool {
             | "subtypes"
             | "query"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::read_json;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn lsp_json_read_is_bounded_by_the_open_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "pira-nav-lsp-config-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, vec![b' '; 64 * 1024 + 1]).unwrap();
+        let error = read_json(&path, "--lsp-init").unwrap_err();
+        assert!(error.1.contains("exceeds 64 KiB"));
+        fs::remove_file(path).unwrap();
+    }
 }

@@ -183,6 +183,7 @@ pub struct CaptureResult {
     pub cwd: String,
     pub live_id: Option<String>,
     pub live_store_dir: Option<PathBuf>,
+    pub(crate) _live_owner: Option<crate::storage::LiveOwnerLease>,
 }
 
 impl Drop for CaptureResult {
@@ -278,6 +279,8 @@ pub struct Metadata {
     #[serde(default)]
     pub workspace_hash: String,
     #[serde(default)]
+    pub scope_hash: String,
+    #[serde(default)]
     pub stdout_sha256: String,
     #[serde(default)]
     pub stderr_sha256: String,
@@ -301,12 +304,24 @@ pub struct ListedEntry {
     pub command: String,
     pub path: PathBuf,
     pub workspace_hash: String,
+    #[serde(default = "capture_kind")]
+    pub kind: String,
+    #[serde(default = "complete_state")]
+    pub state: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn capture_kind() -> String {
+    "capture".into()
+}
+
+fn complete_state() -> String {
+    "complete".into()
 }
 
 impl ListedEntry {
@@ -322,6 +337,8 @@ impl ListedEntry {
             command: util::redacted_argv_display(&metadata.command_argv),
             path,
             workspace_hash: metadata.workspace_hash.clone(),
+            kind: "capture".into(),
+            state: "complete".into(),
             running: false,
         }
     }
@@ -517,6 +534,15 @@ impl StreamReaders {
         let reader = self.parts_mut(stream);
         let length = reader.length().min(maximum);
         reader.read_range(0, length)
+    }
+
+    pub(crate) fn read_section_range(
+        &mut self,
+        stream: StreamKind,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, String> {
+        self.parts_mut(stream).read_range(offset, length)
     }
 
     fn parts_mut(&mut self, stream: StreamKind) -> &mut SectionReader {

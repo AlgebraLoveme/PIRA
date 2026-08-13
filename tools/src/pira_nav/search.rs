@@ -146,12 +146,20 @@ pub fn run(
         return Err(input_error(message));
     }
     let engine = build_engine(&options)?;
-    let paths = roots
-        .iter()
-        .flat_map(|root| discover_text_files(root, language))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut path_set = BTreeSet::new();
+    let mut walk_errors = Vec::new();
+    let mut walk_errors_total = 0usize;
+    for root in &roots {
+        let discovered = discover_text_files(root, language);
+        path_set.extend(discovered.paths);
+        walk_errors_total = walk_errors_total.saturating_add(discovered.errors_total);
+        for error in discovered.errors {
+            if walk_errors.len() < 20 {
+                walk_errors.push(error);
+            }
+        }
+    }
+    let paths = path_set.into_iter().collect::<Vec<_>>();
     let results = paths
         .par_iter()
         .map(|path| match read_text(path) {
@@ -205,7 +213,7 @@ pub fn run(
         Mode::Count => write!(output, " matching_lines={matching_lines} mode=count"),
     }
     .map_err(output_error)?;
-    if missing_roots > 0 || !skips.is_empty() {
+    if missing_roots > 0 || !skips.is_empty() || walk_errors_total > 0 {
         write!(output, " complete=0").map_err(output_error)?;
         if missing_roots > 0 {
             write!(output, " missing_roots={missing_roots}").map_err(output_error)?;
@@ -215,8 +223,27 @@ pub fn run(
                 write!(output, " {name}={count}").map_err(output_error)?;
             }
         }
+        if walk_errors_total > 0 {
+            write!(output, " traversal_errors={walk_errors_total}").map_err(output_error)?;
+        }
     }
     writeln!(output).map_err(output_error)?;
+    for error in &walk_errors {
+        writeln!(
+            output,
+            "error kind=traversal message={}",
+            crate::util::quote_metadata(error)
+        )
+        .map_err(output_error)?;
+    }
+    if walk_errors_total > walk_errors.len() {
+        writeln!(
+            output,
+            "errors_omitted={}",
+            walk_errors_total - walk_errors.len()
+        )
+        .map_err(output_error)?;
+    }
 
     let shown_per_query = match options.mode {
         Mode::Files => render_files(&scans, &options, cwd, output)?,
@@ -537,12 +564,23 @@ fn invalid_regex(error: regex::Error) -> (i32, String) {
     )
 }
 
-fn discover_text_files(root: &Path, language: Option<Language>) -> Vec<PathBuf> {
+struct TextDiscovery {
+    paths: Vec<PathBuf>,
+    errors: Vec<String>,
+    errors_total: usize,
+}
+
+fn discover_text_files(root: &Path, language: Option<Language>) -> TextDiscovery {
     if root.is_file() {
-        return if language.is_none_or(|item| item.matches_path(root)) {
+        let paths = if language.is_none_or(|item| item.matches_path(root)) {
             vec![root.to_path_buf()]
         } else {
             Vec::new()
+        };
+        return TextDiscovery {
+            paths,
+            errors: Vec::new(),
+            errors_total: 0,
         };
     }
     let mut builder = WalkBuilder::new(root);
@@ -555,24 +593,37 @@ fn discover_text_files(root: &Path, language: Option<Language>) -> Vec<PathBuf> 
         .parents(true)
         .ignore(true)
         .follow_links(false);
-    let mut paths = builder
-        .build()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                return None;
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    let mut errors_total = 0usize;
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors_total += 1;
+                if errors.len() < 20 {
+                    errors.push(error.to_string());
+                }
+                continue;
             }
-            let path = entry.into_path();
-            if language.is_none_or(|item| item.matches_path(&path)) {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+        };
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.into_path();
+        if language.is_none_or(|item| item.matches_path(&path)) {
+            paths.push(path);
+        }
+    }
     paths.sort();
-    paths
+    TextDiscovery {
+        paths,
+        errors,
+        errors_total,
+    }
 }
 
 fn read_text(path: &Path) -> Result<TextFile, SkipKind> {

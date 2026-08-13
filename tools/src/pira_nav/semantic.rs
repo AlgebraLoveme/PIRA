@@ -59,7 +59,7 @@ fn parse_semantic_target(
             return Err((2, "semantic target line and column must be positive".into()));
         }
         let path = absolute_lexical(Path::new(path), cwd);
-        ensure_target_root(&path, lsp.root(cwd), cwd)?;
+        let path = ensure_target_root(&path, lsp.root(cwd), cwd)?;
         ensure_semantic_file(&path, cwd)?;
         let language = language_for(&path, explicit)?;
         reject_document_semantics(language)?;
@@ -102,9 +102,9 @@ fn parse_semantic_target(
         (path, None, None, name, None)
     };
     ensure_semantic_file(&path, cwd)?;
+    let path = ensure_target_root(&path, lsp.root(cwd), cwd)?;
     let language = language_for(&path, explicit)?;
     reject_document_semantics(language)?;
-    ensure_target_root(&path, lsp.root(cwd), cwd)?;
     if expected_language.is_some_and(|expected| expected != language) {
         return Err((2, "selector language does not match the target file".into()));
     }
@@ -211,9 +211,27 @@ fn reject_document_semantics(language: Language) -> Result<(), (i32, String)> {
     Ok(())
 }
 
-fn ensure_target_root(path: &Path, root: &Path, cwd: &Path) -> Result<(), (i32, String)> {
-    if path.starts_with(root) {
-        return Ok(());
+fn ensure_target_root(path: &Path, root: &Path, cwd: &Path) -> Result<PathBuf, (i32, String)> {
+    let canonical_root = std::fs::canonicalize(root).map_err(|error| {
+        (
+            2,
+            format!(
+                "cannot resolve selected LSP root {}: {error}",
+                display_path(root, cwd)
+            ),
+        )
+    })?;
+    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
+        (
+            2,
+            format!(
+                "cannot resolve semantic target {}: {error}",
+                display_path(path, cwd)
+            ),
+        )
+    })?;
+    if canonical_path.starts_with(&canonical_root) {
+        return Ok(canonical_path);
     }
     Err((
         2,
@@ -333,15 +351,24 @@ fn semantic_service(
     cwd: &Path,
     command: &str,
 ) -> Result<LspService, (i32, String)> {
-    let root = options.root(cwd);
+    let configured_root = options.root(cwd);
+    let root = std::fs::canonicalize(configured_root).map_err(|error| {
+        (
+            2,
+            format!(
+                "cannot resolve selected LSP root {}: {error}",
+                display_path(configured_root, cwd)
+            ),
+        )
+    })?;
     for target in requests.iter().map(|request| &request.target) {
-        if !target.path.starts_with(root) {
+        if !target.path.starts_with(&root) {
             return Err((
                 2,
                 format!(
                     "semantic target {} is outside the selected LSP root {}",
                     display_path(&target.path, cwd),
-                    display_path(root, cwd)
+                    display_path(configured_root, cwd)
                 ),
             ));
         }
@@ -1485,7 +1512,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{RequestDefaults, SemanticCommand, parse_semantic_target, prepare_requests};
+    use super::{
+        RequestDefaults, SemanticCommand, ensure_target_root, parse_semantic_target,
+        prepare_requests,
+    };
 
     #[test]
     fn repeated_targets_share_one_source_allocation() {
@@ -1545,5 +1575,26 @@ mod tests {
         assert_eq!(prepared.failures.len(), 1);
 
         fs::remove_file(path).expect("remove temporary source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_root_rejects_symlink_target_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("pira-nav-semantic-root-{unique}"));
+        let outside = std::env::temp_dir().join(format!("pira-nav-semantic-outside-{unique}.py"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "secret = True\n").unwrap();
+        let link = root.join("linked.py");
+        symlink(&outside, &link).unwrap();
+        let error = ensure_target_root(&link, &root, &root).unwrap_err();
+        assert!(error.1.contains("outside the selected LSP root"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 }
