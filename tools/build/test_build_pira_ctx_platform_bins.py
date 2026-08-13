@@ -12,6 +12,8 @@ from tools.build import build_pira_ctx_platform_bins as builder
 
 class RustToolsTests(unittest.TestCase):
     def test_preserves_rustup_multicall_symlink_name(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows does not provide POSIX symlink executable lookup semantics")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / "rustup-init"
