@@ -148,7 +148,7 @@ jobs:
           pattern: pira_*-bundle
           path: ${{ runner.temp }}/pira-build-artifacts
 
-      - name: Prepare direct release assets
+      - name: Prepare compressed release assets
         id: release
         shell: bash
         env:

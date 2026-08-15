@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import re
@@ -20,6 +21,7 @@ PLATFORMS = (
     "windows-x64",
 )
 MAX_BINARY_BYTES = 128 * 1024 * 1024
+GZIP_LEVEL = 9
 
 
 class PackageError(RuntimeError):
@@ -120,13 +122,15 @@ def package_tool(archive_path: Path, output_dir: Path, tool: str) -> dict[str, o
             if actual != expected:
                 raise PackageError(f"{tool} checksum mismatch for {platform_key}")
             suffix = ".exe" if platform_key.startswith("windows-") else ""
-            asset_name = f"{tool}-{manifest['tool_version']}-{platform_key}{suffix}"
+            binary_name = f"{tool}-{manifest['tool_version']}-{platform_key}{suffix}"
+            asset_name = f"{binary_name}.gz"
             destination = output_dir / asset_name
-            destination.write_bytes(data)
-            if not suffix:
-                destination.chmod(0o755)
+            destination.write_bytes(gzip.compress(data, compresslevel=GZIP_LEVEL, mtime=0))
             release_records[platform_key] = {
                 "asset": asset_name,
+                "compression": "gzip",
+                "asset_sha256": sha256_file(destination),
+                "asset_size": destination.stat().st_size,
                 "sha256": actual,
                 "size": len(data),
             }
@@ -160,7 +164,7 @@ def package_release(
             verified_archive(artifacts_dir, tool), output_dir, tool
         )
     index = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": repository,
         "tag": tag,
         "source_sha": source_sha.lower(),

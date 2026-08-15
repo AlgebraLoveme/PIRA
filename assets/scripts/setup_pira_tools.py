@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,8 @@ LATEST_RELEASE_BASE = (
 RELEASES_API = f"https://api.github.com/repos/{RELEASE_REPOSITORY}/releases"
 MAX_INDEX_BYTES = 1024 * 1024
 MAX_BINARY_BYTES = 128 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+PROGRESS_INTERVAL_SECONDS = 5.0
 LEGACY_MANAGED_HASHES = {
     "pira_codenav": {
         "c2cba4a149da97ef68a233b7ddb37b70e13efb097f14d1045b48320645cb52dc",
@@ -55,6 +59,9 @@ class ToolSelection:
     record: dict[str, object]
     destination: Path
     expected_hash: str
+    asset_hash: str
+    asset_size: int
+    compression: str | None
     existing_hash: str | None
     action: str
 
@@ -114,6 +121,89 @@ def request_bytes(
     return data
 
 
+def request_to_path(
+    url: str,
+    destination: Path,
+    *,
+    limit: int,
+    expected_size: int,
+    expected_hash: str,
+) -> None:
+    if expected_size <= 0 or expected_size > limit:
+        raise RuntimeError(f"invalid expected release asset size: {expected_size}")
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "PIRA-setup",
+        },
+    )
+    digest = hashlib.sha256()
+    received = 0
+    last_progress = time.monotonic()
+    created = False
+    try:
+        with urlopen(request, timeout=30) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None:
+                try:
+                    recorded_length = int(length)
+                except ValueError as error:
+                    raise RuntimeError(
+                        "release asset has an invalid Content-Length"
+                    ) from error
+                if recorded_length > limit:
+                    raise RuntimeError(
+                        f"release asset exceeds the {limit}-byte safety limit"
+                    )
+                if recorded_length != expected_size:
+                    raise RuntimeError(
+                        "release asset Content-Length mismatch: "
+                        f"expected {expected_size}, got {recorded_length}"
+                    )
+            with destination.open("xb") as output:
+                created = True
+                while chunk := response.read(DOWNLOAD_CHUNK_BYTES):
+                    received += len(chunk)
+                    if received > limit:
+                        raise RuntimeError(
+                            f"release asset exceeds the {limit}-byte safety limit"
+                        )
+                    output.write(chunk)
+                    digest.update(chunk)
+                    now = time.monotonic()
+                    if now - last_progress >= PROGRESS_INTERVAL_SECONDS:
+                        percent = 100.0 * received / expected_size
+                        print(
+                            f"Downloading {destination.name}: "
+                            f"{received / (1024 * 1024):.1f}/"
+                            f"{expected_size / (1024 * 1024):.1f} MiB "
+                            f"({min(percent, 100.0):.0f}%)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        last_progress = now
+    except (HTTPError, URLError, TimeoutError) as error:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise RuntimeError(f"cannot download {url}: {error}") from error
+    except Exception:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
+    if received != expected_size:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"release asset size mismatch: expected {expected_size}, got {received}"
+        )
+    actual = digest.hexdigest()
+    if actual != expected_hash:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"release asset checksum mismatch: expected {expected_hash}, got {actual}"
+        )
+
+
 def release_index(tag: str | None = None) -> dict[str, object]:
     requested_tag = tag
     if requested_tag is not None and not re.fullmatch(
@@ -133,7 +223,7 @@ def release_index(tag: str | None = None) -> dict[str, object]:
         raise RuntimeError(f"invalid PIRA release index: {error}") from error
     if (
         not isinstance(index, dict)
-        or index.get("schema_version") != 1
+        or index.get("schema_version") not in {1, 2}
         or index.get("repository") != RELEASE_REPOSITORY
         or not isinstance(index.get("tools"), dict)
     ):
@@ -180,7 +270,10 @@ def release_tags_for_versions(
         return {}
     suffix = ".exe" if platform_key.startswith("windows-") else ""
     expected_assets = {
-        tool_name: f"{tool_name}-{version}-{platform_key}{suffix}"
+        tool_name: {
+            f"{tool_name}-{version}-{platform_key}{suffix}",
+            f"{tool_name}-{version}-{platform_key}{suffix}.gz",
+        }
         for tool_name, version in versions.items()
     }
     found: dict[str, str] = {}
@@ -214,8 +307,8 @@ def release_tags_for_versions(
                 for asset in assets
                 if isinstance(asset, dict) and isinstance(asset.get("name"), str)
             }
-            for tool_name, expected_asset in expected_assets.items():
-                if tool_name not in found and expected_asset in names:
+            for tool_name, candidates in expected_assets.items():
+                if tool_name not in found and candidates.intersection(names):
                     found[tool_name] = tag
             if len(found) == len(expected_assets):
                 return found
@@ -240,22 +333,54 @@ def release_asset_url(tag: str, asset: str) -> str:
 
 
 def download_binary(tag: str, selection: ToolSelection, directory: Path) -> Path:
-    data = request_bytes(
-        release_asset_url(tag, selection.asset), limit=MAX_BINARY_BYTES
+    asset_path = directory / selection.asset
+    request_to_path(
+        release_asset_url(tag, selection.asset),
+        asset_path,
+        limit=MAX_BINARY_BYTES,
+        expected_size=selection.asset_size,
+        expected_hash=selection.asset_hash,
     )
-    if len(data) != selection.record["size"]:
-        raise RuntimeError(
-            f"downloaded {selection.name} size mismatch: "
-            f"expected {selection.record['size']}, got {len(data)}"
-        )
-    actual = hashlib.sha256(data).hexdigest()
-    if actual != selection.expected_hash:
-        raise RuntimeError(
-            f"downloaded {selection.name} checksum mismatch: "
-            f"expected {selection.expected_hash}, got {actual}"
-        )
-    path = directory / selection.asset
-    path.write_bytes(data)
+    path = asset_path
+    if selection.compression == "gzip":
+        path = directory / selection.asset.removesuffix(".gz")
+        digest = hashlib.sha256()
+        size = 0
+        created = False
+        try:
+            with gzip.open(asset_path, "rb") as source, path.open("xb") as output:
+                created = True
+                while chunk := source.read(DOWNLOAD_CHUNK_BYTES):
+                    size += len(chunk)
+                    if size > selection.record["size"]:
+                        raise RuntimeError(
+                            f"expanded {selection.name} exceeds its declared size"
+                        )
+                    output.write(chunk)
+                    digest.update(chunk)
+        except (OSError, EOFError) as error:
+            if created:
+                path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"cannot decompress release asset {selection.asset}: {error}"
+            ) from error
+        except Exception:
+            if created:
+                path.unlink(missing_ok=True)
+            raise
+        if size != selection.record["size"]:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"expanded {selection.name} size mismatch: "
+                f"expected {selection.record['size']}, got {size}"
+            )
+        actual = digest.hexdigest()
+        if actual != selection.expected_hash:
+            path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"expanded {selection.name} checksum mismatch: "
+                f"expected {selection.expected_hash}, got {actual}"
+            )
     if os.name != "nt":
         path.chmod(0o755)
     return path
@@ -484,13 +609,36 @@ def tool_selection(
     expected = record.get("sha256")
     size = record.get("size")
     suffix = ".exe" if platform_key.startswith("windows-") else ""
-    expected_asset = f"{tool_name}-{version}-{platform_key}{suffix}"
+    binary_asset = f"{tool_name}-{version}-{platform_key}{suffix}"
+    compression = record.get("compression")
+    if compression is None:
+        expected_asset = binary_asset
+    elif compression == "gzip":
+        expected_asset = f"{binary_asset}.gz"
+    else:
+        raise RuntimeError(f"unsupported release compression for {tool_name}")
     if asset != expected_asset:
         raise RuntimeError(f"invalid release asset name for {tool_name}: {asset}")
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
         raise RuntimeError(f"invalid release checksum for {tool_name}")
     if not isinstance(size, int) or size <= 0 or size > MAX_BINARY_BYTES:
         raise RuntimeError(f"invalid release size for {tool_name}")
+    if compression == "gzip":
+        asset_hash = record.get("asset_sha256")
+        asset_size = record.get("asset_size")
+        if not isinstance(asset_hash, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", asset_hash
+        ):
+            raise RuntimeError(f"invalid compressed asset checksum for {tool_name}")
+        if (
+            not isinstance(asset_size, int)
+            or asset_size <= 0
+            or asset_size > MAX_BINARY_BYTES
+        ):
+            raise RuntimeError(f"invalid compressed asset size for {tool_name}")
+    else:
+        asset_hash = expected
+        asset_size = size
     destination = executable_path(install_dir, tool_name)
     existing_hash = (
         sha256(destination)
@@ -510,6 +658,9 @@ def tool_selection(
         record=record,
         destination=destination,
         expected_hash=expected.lower(),
+        asset_hash=asset_hash.lower(),
+        asset_size=asset_size,
+        compression=compression,
         existing_hash=existing_hash,
         action=action,
     )

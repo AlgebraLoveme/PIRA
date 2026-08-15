@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import io
 import json
 import tarfile
@@ -44,7 +45,7 @@ class PackageGitHubReleaseTests(unittest.TestCase):
             f"{digest}  {archive_path.name}\n", encoding="utf-8"
         )
 
-    def test_packages_direct_assets_and_release_index(self) -> None:
+    def test_packages_compressed_assets_and_release_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             versions = {"pira_ctx": "1.6.0", "pira_dec": "0.5.1", "pira_nav": "0.11.0"}
@@ -59,6 +60,7 @@ class PackageGitHubReleaseTests(unittest.TestCase):
                 source_sha="a" * 40,
             )
             index = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(index["schema_version"], 2)
             self.assertEqual(index["repository"], "AlgebraLoveme/PIRA")
             self.assertEqual(index["source_sha"], "a" * 40)
             self.assertEqual(set(index["tools"]), set(release.TOOLS))
@@ -68,7 +70,13 @@ class PackageGitHubReleaseTests(unittest.TestCase):
                 for platform_key, record in index["tools"][tool]["binaries"].items():
                     asset = output / record["asset"]
                     self.assertTrue(asset.is_file())
-                    self.assertEqual(release.sha256_file(asset), record["sha256"])
+                    self.assertTrue(asset.name.endswith(".gz"))
+                    self.assertEqual(record["compression"], "gzip")
+                    self.assertEqual(release.sha256_file(asset), record["asset_sha256"])
+                    self.assertEqual(asset.stat().st_size, record["asset_size"])
+                    data = gzip.decompress(asset.read_bytes())
+                    self.assertEqual(hashlib.sha256(data).hexdigest(), record["sha256"])
+                    self.assertEqual(len(data), record["size"])
 
     def test_rejects_changed_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

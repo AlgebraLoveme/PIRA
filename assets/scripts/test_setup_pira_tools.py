@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -20,13 +22,17 @@ SPEC.loader.exec_module(setup)
 class SetupPiraToolsTests(unittest.TestCase):
     def index(self) -> dict[str, object]:
         data = b"binary"
+        compressed = gzip.compress(data, mtime=0)
         record = {
-            "asset": "pira_ctx-1.6.0-linux-x64",
+            "asset": "pira_ctx-1.6.0-linux-x64.gz",
+            "compression": "gzip",
+            "asset_sha256": hashlib.sha256(compressed).hexdigest(),
+            "asset_size": len(compressed),
             "sha256": hashlib.sha256(data).hexdigest(),
             "size": len(data),
         }
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": setup.RELEASE_REPOSITORY,
             "tag": "pira-tools-20260808-42",
             "source_sha": "a" * 40,
@@ -63,7 +69,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             {
                 "tag_name": "pira-tools-20260808-42",
                 "draft": False,
-                "assets": [{"name": "pira_ctx-1.6.0-linux-x64"}],
+                "assets": [{"name": "pira_ctx-1.6.0-linux-x64.gz"}],
             }
         ]
         with patch.object(
@@ -88,10 +94,83 @@ class SetupPiraToolsTests(unittest.TestCase):
             selection = setup.tool_selection(
                 index, "pira_ctx", "linux-x64", directory / "install"
             )
-            with patch.object(setup, "request_bytes", return_value=b"binary") as request:
+            compressed = gzip.compress(b"binary", mtime=0)
+
+            def download(_url: str, destination: Path, **_kwargs: object) -> None:
+                destination.write_bytes(compressed)
+
+            with patch.object(setup, "request_to_path", side_effect=download) as request:
                 path = setup.download_binary(str(index["tag"]), selection, directory)
             self.assertEqual(path.read_bytes(), b"binary")
             self.assertIn("/pira-tools-20260808-42/", request.call_args.args[0])
+
+    def test_streamed_download_verifies_asset_and_preserves_existing_file(self) -> None:
+        data = b"compressed asset"
+
+        def response() -> io.BytesIO:
+            value = io.BytesIO(data)
+            value.headers = {"Content-Length": str(len(data))}  # type: ignore[attr-defined]
+            return value
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "asset.gz"
+            with patch.object(setup, "urlopen", return_value=response()):
+                setup.request_to_path(
+                    "https://example.invalid/asset.gz",
+                    destination,
+                    limit=1024,
+                    expected_size=len(data),
+                    expected_hash=hashlib.sha256(data).hexdigest(),
+                )
+            self.assertEqual(destination.read_bytes(), data)
+
+            destination.write_bytes(b"keep")
+            with patch.object(setup, "urlopen", return_value=response()):
+                with self.assertRaises(FileExistsError):
+                    setup.request_to_path(
+                        "https://example.invalid/asset.gz",
+                        destination,
+                        limit=1024,
+                        expected_size=len(data),
+                        expected_hash=hashlib.sha256(data).hexdigest(),
+                    )
+            self.assertEqual(destination.read_bytes(), b"keep")
+
+    def test_decompression_rejects_content_larger_than_declared(self) -> None:
+        index = self.index()
+        record = index["tools"]["pira_ctx"]["binaries"]["linux-x64"]
+        record["size"] = len(b"binary") - 1
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            selection = setup.tool_selection(
+                index, "pira_ctx", "linux-x64", directory / "install"
+            )
+
+            def download(_url: str, destination: Path, **_kwargs: object) -> None:
+                destination.write_bytes(gzip.compress(b"binary", mtime=0))
+
+            with patch.object(setup, "request_to_path", side_effect=download):
+                with self.assertRaisesRegex(RuntimeError, "declared size"):
+                    setup.download_binary(str(index["tag"]), selection, directory)
+            self.assertFalse((directory / "pira_ctx-1.6.0-linux-x64").exists())
+
+    def test_legacy_uncompressed_release_record_remains_supported(self) -> None:
+        index = self.index()
+        index["schema_version"] = 1
+        record = index["tools"]["pira_ctx"]["binaries"]["linux-x64"]
+        record.clear()
+        record.update(
+            {
+                "asset": "pira_ctx-1.6.0-linux-x64",
+                "sha256": hashlib.sha256(b"binary").hexdigest(),
+                "size": len(b"binary"),
+            }
+        )
+        selection = setup.tool_selection(
+            index, "pira_ctx", "linux-x64", Path("install")
+        )
+        self.assertIsNone(selection.compression)
+        self.assertEqual(selection.asset_hash, selection.expected_hash)
 
     def test_selection_rejects_unexpected_asset_name(self) -> None:
         index = self.index()
