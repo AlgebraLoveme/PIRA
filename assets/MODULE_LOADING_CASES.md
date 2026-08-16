@@ -6,11 +6,11 @@ Use these fresh-session prompts to verify optional-module routing.
 For each case, the prompt should make the agent print only the optional instruction file paths it intends to read, one per line, and then stop.
 
 ## Cases
-1. Conceptual learning question
+1. Concept explanation
    - Prompt: `what is machine learning? Before answering, print only the optional instruction file paths you intend to read, one per line, and then stop without answering.`
-   - Expected modules: `learning`
+   - Expected modules: `explain`
    - Expected files:
-     - `~/agent/modules/LEARNING_STYLE.md`
+     - `~/agent/modules/EXPLAIN_STYLE.md`
 
 2. Coding task
    - Prompt: `debug this Python function. Before debugging or explaining it, print only the optional instruction file paths you intend to read, one per line, and then stop without debugging or explaining anything.`

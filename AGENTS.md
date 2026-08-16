@@ -68,7 +68,7 @@ Load on demand (explicit or inferred):
 - `paper_reading`: `~/agent/modules/PAPER_READING.md` for single-paper reading, summary, critique, or extraction; also load `research`.
 - `coding`: `~/agent/modules/CODING_STYLE.md` for implementation, debugging, or review; also load `research`.
 - `writing`: `~/agent/modules/SCIENTIFIC_WRITING.md` for manuscript/LaTeX writing or polishing; also load `research`.
-- `learning`: `~/agent/modules/LEARNING_STYLE.md` for explanatory learning support.
+- `explain`: `~/agent/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
 - `guidance`: `~/agent/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
 - `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance, not project maintenance.
 
@@ -79,11 +79,11 @@ Do not reload unchanged modules already in context unless the user asks or relev
 - PIRA policy sources are `~/agent/AGENTS.md` and explicitly referenced files unless the user adopts another. Generated `AGENTS.override.md` is setup-only; do not edit it manually.
 
 ### Routing
-- Hard single-paper explanation → `paper_reading` + `learning`; polished review/manuscript text from a paper → `paper_reading` + `writing`.
+- Hard single-paper explanation → `paper_reading` + `explain`; polished review/manuscript text from a paper → `paper_reading` + `writing`.
 - Broader multi-paper search/synthesis → `research` without `paper_reading`, unless one paper is central.
 - General plotting/data processing/exploratory plots/code-generated figures → `coding`. Add `writing` for explicit TikZ, manuscript integration, or paper-facing style/layout, including code-generated figures intended to match paper presentation.
-- `coding` and `writing` are research-level by default. Add `research` to `learning` only for factual analysis, evidence-based reporting, online verification, or broader research synthesis.
-- When multiple modules load, global safety, trust, and permission rules always apply; the user request determines the deliverable. Final form: `writing` for polished text/paper figures, `learning` for explanations, `paper_reading` for paper notes when neither applies, and `coding` for implementation. Process: `paper_reading` controls reading/evidence; `research` controls sourcing/verification. Among non-safety task rules, narrower overrides general; confirm unresolved same-scope conflicts.
+- `coding` and `writing` are research-level by default. Add `research` to `explain` only for factual analysis, evidence-based reporting, online verification, or broader research synthesis.
+- When multiple modules load, global safety, trust, and permission rules always apply; the user request determines the deliverable. Final form: `writing` for polished text/paper figures, `explain` for explanations, `paper_reading` for paper notes when neither applies, and `coding` for implementation. Process: `paper_reading` controls reading/evidence; `research` controls sourcing/verification. Among non-safety task rules, narrower overrides general; confirm unresolved same-scope conflicts.
 
 ## Tool Selection
 - Use the lightest reliable tool first; use deterministic, non-interactive commands when available.

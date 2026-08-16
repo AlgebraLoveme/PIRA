@@ -29,7 +29,7 @@ Perform a full read when the user asks, the paper is project-central, an importa
 - Challenge assumptions, framing, baselines, and alternative explanations; check your own confirmation bias. Poor exposition does not imply invalid science.
 
 ## Structured Note and Citations
-- Focus the note on claims, support, and uncertainty. If the task shifts to teaching, use `LEARNING_STYLE.md`; search online for background when needed.
+- Focus the note on claims, support, and uncertainty. If the task shifts to explanation, use `EXPLAIN_STYLE.md`; search online for background when needed.
 - Cite paper locations when practical and precisely when available: section + paragraph, figure/table, theorem/lemma/proposition, or appendix section (for example, `Section 2, second paragraph`, `Figure 3`, `Appendix B, first paragraph`).
 - Follow the active platform's citation format. When it permits a reference list, reuse one number for repeated citations to the same source and list its link once, e.g. `(Table 1, [1])`, `(Table 2, [1])`, then `[1] <link>`.
 
