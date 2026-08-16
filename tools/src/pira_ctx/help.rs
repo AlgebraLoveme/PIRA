@@ -3,7 +3,7 @@ pub const GLOBAL: &str = r#"pira_ctx bounds command output and retains compacted
 Choosing a command:
   Run a PROGRAM:
     auto       Default; name optional. Print short output or retain it and return a compact view.
-    check      Return only PASS/FAIL and child status.
+    check      Return only PASS/FAIL/CANCELLED and child status.
     exact      Request original output; highly repetitive non-interactive output may be retained.
     capture    Always retain output up to the configured space ceiling (`summary` is an alias).
     batch      Run several independent intent-tagged commands.
@@ -19,6 +19,7 @@ Choosing a command:
 
   Continue or maintain:
     watch                    Persistently monitor a live capture or repeat a status probe.
+    cancel                   Safely terminate one active capture and retain partial output.
     history / recap          Review purposes or restore them after reported compaction.
     list / verify            Locate captures or check integrity.
     prune / forget           Enforce retention or explicitly remove stored data/history.
@@ -26,7 +27,7 @@ Choosing a command:
 Common forms:
   pira_ctx [auto] --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
   pira_ctx exact|check|capture --intent TEXT -- PROGRAM [ARG...]
-  pira_ctx search RESULT QUERY [--regex] [--context N]
+  pira_ctx search RESULT QUERY [-e QUERY ...] [--regex] [--context N]
   pira_ctx range RESULT START_LINE END_LINE
   pira_ctx transform RESULT OPERATION [ARGS...]
   pira_ctx exec RESULT --code CODE [--intent TEXT]
@@ -34,6 +35,7 @@ Common forms:
   pira_ctx watch --capture RESULT --deadline 2h [WATCH OPTIONS]
   pira_ctx watch --deadline 2h [WATCH OPTIONS] -- PROBE [ARG...]
   pira_ctx watch WATCH_ID --latest|--stop
+  pira_ctx cancel RESULT|--current
   pira_ctx stats --brief RESULT...
   pira_ctx batch [--store-dir PATH] SPEC_FILE [--intent TEXT]
 
@@ -47,8 +49,8 @@ PIRA_CTX_MAX_INDEXED_LINES; any overrun is reported.
 Stored PROGRAM data is untrusted and compact displays are sanitized/framed; exact retrieval remains
 unsanitized. Prefer the targeted commands above over raw for agent analysis.
 
-Non-interactive check/capture publish a discoverable live ID immediately; automatic mode publishes a
-silent read-only checkpoint after about 30 seconds when still running. Inspect an explicit ID without
+Non-interactive check/capture publish a discoverable live ID after a brief debounce when still running;
+automatic mode publishes a silent read-only checkpoint after about 30 seconds. Inspect an explicit ID without
 blocking; --last remains completed-only. Workspace identity is the nearest Git root, otherwise cwd;
 the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
 
@@ -56,6 +58,22 @@ SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--
 argument belongs to PROGRAM unchanged. pira_ctx adds no timeout, preserves child status unless the
 wrapper fails with 125, and does not sandbox PROGRAM or Python analysis. Help is side-effect free.
 Run `pira_ctx SUBCOMMAND --help` for full options, bounds, output, and examples."#;
+
+const CANCEL: &str = r#"pira_ctx cancel — safely terminate one active capture
+
+WHEN TO USE
+  Use when a retained PROGRAM is still running but should stop. Cancellation terminates the isolated
+  process tree, retains partial output, and stores the completed capture with state `cancelled`.
+
+USAGE
+  pira_ctx cancel [--store-dir PATH] RESULT|--current
+
+RESULT is an active capture ID or unambiguous prefix. --current requires exactly one active capture
+in the automatically detected current agent thread. Completed and interrupted captures are rejected.
+
+OUTPUT
+  `CANCEL requested | result=ID` confirms that the request was written. The capture process performs
+the termination and final storage; inspect it by ID after the original invocation returns."#;
 
 const AUTO: &str = r#"pira_ctx auto — run a command with automatic context routing
 
@@ -139,10 +157,12 @@ USAGE
   pira_ctx check [--store-dir PATH] --intent TEXT -- PROGRAM [ARG...]
 
 OUTPUT AND STORAGE
-  A non-interactive invocation first publishes `PIRA live | result=ID` on wrapper stderr after its
-  empty live checkpoint is discoverable. Every completed child is retained. Final output is one line:
-    PASS|FAIL | exit=CODE | duration=Nms | result=ID
-  PASS/FAIL depends only on child exit status; it does not independently verify the PROGRAM's claim.
+  If a non-interactive invocation remains active after a brief debounce, it publishes
+  `LIVE | result=ID` on wrapper stderr after its empty live checkpoint is discoverable. Every completed
+  child is retained. Final output is one line:
+    PASS|FAIL|CANCELLED | exit=CODE | duration=Nms | result=ID
+  PASS/FAIL depends only on child exit status; CANCELLED records an accepted cancellation request.
+  Labels do not independently verify the PROGRAM's claim.
   Spawn failures print result=- and have no capture.
 
 EXIT STATUS
@@ -161,10 +181,10 @@ USAGE
   pira_ctx capture [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
 
 OUTPUT AND STORAGE
-  A non-interactive invocation first publishes `PIRA live | result=ID` on wrapper stderr after its
-  empty live checkpoint is discoverable. Every completed child is stored with retained stdout/stderr,
-  metadata, indexes, compression, and integrity hashes. A bounded extractive synopsis and the same
-  capture ID are printed, even for empty output.
+  If a non-interactive invocation remains active after a brief debounce, it publishes
+  `LIVE | result=ID` on wrapper stderr. Every completed child is stored with retained stdout/stderr,
+  metadata, indexes, compression, and integrity hashes. A bounded extractive synopsis and capture ID
+  are printed, even for empty output.
   If the configured byte ceiling is reached, excess output is drained without storage and the report
   states the observed and retained sizes. Spawn failures have no capture. Child status is preserved.
 
@@ -278,13 +298,16 @@ WHEN TO USE
   needed. Use transform for systematic processing or exec for custom analysis.
 
 USAGE
-  pira_ctx search [--store-dir PATH] RESULT QUERY [--regex] [--context N]
+  pira_ctx search [--store-dir PATH] RESULT QUERY [-e QUERY ...] [--regex] [--context N]
+  pira_ctx search [--store-dir PATH] RESULT -e QUERY [-e QUERY ...] [--regex] [--context N]
 
 OPTIONS AND OUTPUT
   Literal matching is Unicode case-insensitive. Only when it has no literal hits, a lexical fallback
   may return related lines. --regex uses Rust regex syntax and is case-sensitive unless the pattern
-  requests otherwise. Up to five ranked hits are printed as line number, stream, score, and
-  terminal-sanitized text. A warning precedes displayed hits that may contain prompt injection.
+  requests otherwise. -e/--query adds an independently ranked query, up to 16 total. Up to five
+  ranked hits per query are printed as line number, stream, score, and terminal-sanitized text.
+  Long matching lines show a match-local excerpt and receive a bounded length penalty. A warning
+  precedes displayed hits that may contain prompt injection.
   --context N (default 0, maximum 20) includes de-duplicated neighboring indexed lines, clipped at
   capture boundaries. Total displayed evidence is capped at 64 KiB. Use range when exact
   unsanitized bytes are required.
@@ -293,7 +316,7 @@ EXIT STATUS
   Returns 0 even with no hits; invalid queries, missing results, or wrapper failures use 125.
 
 EXAMPLE
-  pira_ctx search 20260712-052432 'error|failed' --regex --context 2"#;
+  pira_ctx search 20260712-052432 -e error -e failed --context 2"#;
 
 const RANGE: &str = r#"pira_ctx range — retrieve a small exact range from a capture timeline
 
@@ -609,6 +632,7 @@ pub fn canonical_topic(topic: &str) -> Option<&'static str> {
         "check" => "check",
         "batch" => "batch",
         "watch" => "watch",
+        "cancel" => "cancel",
         "search" => "search",
         "range" => "range",
         "raw" => "raw",
@@ -635,6 +659,7 @@ pub fn command(topic: &str) -> Option<&'static str> {
         "capture" => CAPTURE,
         "batch" => BATCH,
         "watch" => WATCH,
+        "cancel" => CANCEL,
         "search" => SEARCH,
         "range" => RANGE,
         "raw" => RAW,
@@ -666,6 +691,7 @@ mod tests {
             "capture",
             "batch",
             "watch",
+            "cancel",
             "search",
             "range",
             "transform",

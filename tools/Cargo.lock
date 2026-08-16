@@ -293,7 +293,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "pira_ctx"
-version = "1.7.1"
+version = "1.8.0"
 dependencies = [
  "fs2",
  "jiff",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "pira_dec"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "jiff",
  "regex",

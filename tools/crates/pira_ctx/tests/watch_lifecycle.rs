@@ -202,7 +202,7 @@ fn capture_announces_a_discoverable_id_before_completion() {
         .unwrap();
     let id = announcement
         .trim()
-        .strip_prefix("PIRA live | result=")
+        .strip_prefix("LIVE | result=")
         .expect("capture live ID announcement");
     assert!(
         sandbox
@@ -273,10 +273,7 @@ fn current_selects_exactly_one_live_capture_in_detected_thread() {
     BufReader::new(capture.stderr.take().unwrap())
         .read_line(&mut announcement)
         .unwrap();
-    let capture_id = announcement
-        .trim()
-        .strip_prefix("PIRA live | result=")
-        .unwrap();
+    let capture_id = announcement.trim().strip_prefix("LIVE | result=").unwrap();
 
     let mut watch = Command::new(binary())
         .env("PIRA_CTX_THREAD_ID", &thread_id)
@@ -359,7 +356,7 @@ fn current_rejects_multiple_live_captures_and_names_candidates() {
         ids.push(
             announcement
                 .trim()
-                .strip_prefix("PIRA live | result=")
+                .strip_prefix("LIVE | result=")
                 .unwrap()
                 .to_string(),
         );

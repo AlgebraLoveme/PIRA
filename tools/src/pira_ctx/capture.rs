@@ -10,12 +10,15 @@ use std::time::{Duration, Instant, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::model::{CaptureResult, CapturedStream, LineMeta, StreamKind};
-use crate::{spawn_command, util};
+use crate::util;
+use crate::watch::process::ProcessTree;
 
 const DEFAULT_MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_INDEXED_LINES: usize = 1_000_000;
 const HARD_MAX_INDEXED_LINES: usize = 2_000_000;
 const DEFAULT_LIVE_CHECKPOINT_MS: u64 = 30_000;
+const LIVE_ANNOUNCEMENT_DELAY_MS: u128 = 250;
+const CAPTURE_CONTROL_POLL_MS: u64 = 25;
 const MEMORY_SPOOL_BYTES: usize = 64 * 1024;
 
 #[cfg(unix)]
@@ -134,8 +137,8 @@ pub fn capture_command(
     } else {
         (None, None)
     };
-    let mut child = match spawn_command(cmd) {
-        Ok(child) => child,
+    let mut tree = match ProcessTree::spawn_capture(cmd) {
+        Ok(tree) => tree,
         Err(error) if error.starts_with("__EXIT127__ ") => {
             remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
             eprintln!("pira_ctx: {}", error.trim_start_matches("__EXIT127__ "));
@@ -151,14 +154,13 @@ pub fn capture_command(
             return Err(error);
         }
     };
-    if let Some(result_id) = initial_live_id.as_deref() {
-        eprintln!("PIRA live | result={result_id}");
-    }
-    let child_stdout = child
+    let child_stdout = tree
+        .child
         .stdout
         .take()
         .ok_or_else(|| "failed to capture stdout".to_string())?;
-    let child_stderr = child
+    let child_stderr = tree
+        .child
         .stderr
         .take()
         .ok_or_else(|| "failed to capture stderr".to_string())?;
@@ -205,6 +207,7 @@ pub fn capture_command(
         100,
     ));
     let (checkpoint_stop, checkpoint_receiver) = mpsc::channel();
+    let shared_live_id = Arc::new(Mutex::new(initial_live_id.clone()));
     let checkpoint_handle = live_store_dir.map(|store_dir| {
         let store_dir = store_dir.to_path_buf();
         let command = cmd.to_vec();
@@ -212,8 +215,9 @@ pub fn capture_command(
         let stdout_spool = Arc::clone(&stdout_spool);
         let stderr_spool = Arc::clone(&stderr_spool);
         let collected = Arc::clone(&collected);
+        let shared_live_id = Arc::clone(&shared_live_id);
         thread::spawn(move || {
-            let mut live_id = initial_live_id;
+            let mut live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
             let mut generation = u64::from(live_id.is_some());
             let mut last_progress = None;
             loop {
@@ -298,14 +302,43 @@ pub fn capture_command(
                     announce_live,
                     &checkpoint,
                 ) {
-                    Ok(id) => live_id = Some(id),
+                    Ok(id) => {
+                        if let Ok(mut shared) = shared_live_id.lock() {
+                            *shared = Some(id.clone());
+                        }
+                        live_id = Some(id);
+                    }
                     Err(_) => break,
                 }
             }
             live_id
         })
     });
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let mut live_announced = false;
+    let mut cancelled = false;
+    let status = loop {
+        if announce_live
+            && !live_announced
+            && elapsed.elapsed().as_millis() >= LIVE_ANNOUNCEMENT_DELAY_MS
+            && let Some(result_id) = initial_live_id.as_deref()
+        {
+            eprintln!("LIVE | result={result_id}");
+            live_announced = true;
+        }
+        let active_live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
+        if let (Some(store_dir), Some(result_id)) = (live_store_dir, active_live_id.as_deref())
+            && crate::storage::cancellation_requested(store_dir, result_id)
+        {
+            cancelled = true;
+            tree.terminate_tree();
+            break tree.child.wait().map_err(|error| error.to_string())?;
+        }
+        if let Some(status) = tree.child.try_wait().map_err(|error| error.to_string())? {
+            tree.terminate_tree();
+            break status;
+        }
+        thread::sleep(Duration::from_millis(CAPTURE_CONTROL_POLL_MS));
+    };
     let _ = checkpoint_stop.send(());
     let live_id = checkpoint_handle
         .and_then(|handle| handle.join().ok())
@@ -331,6 +364,7 @@ pub fn capture_command(
         stderr_lines: collected.stderr,
         timeline_truncated: collected.truncated || retention_truncated,
         retention_truncated,
+        cancelled,
         exit_code,
         start_ms,
         end_ms,

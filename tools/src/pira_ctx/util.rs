@@ -306,6 +306,39 @@ pub fn clip_display(value: &str) -> String {
     )
 }
 
+pub fn clip_match_display(value: &str, match_start: usize, match_end: usize) -> String {
+    if value.len() <= DISPLAY_CLIP_BYTES {
+        return value.to_string();
+    }
+    let match_start = match_start.min(value.len());
+    let match_end = match_end.max(match_start).min(value.len());
+    let mut start = match_start.saturating_sub(400);
+    while !value.is_char_boundary(start) {
+        start = start.saturating_sub(1);
+    }
+    let mut end = match_end.saturating_add(500).min(value.len());
+    while end < value.len() && !value.is_char_boundary(end) {
+        end += 1;
+    }
+    if end.saturating_sub(start) > 1_000 {
+        end = start.saturating_add(1_000).min(value.len());
+        while !value.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+    }
+    let prefix = if start > 0 {
+        format!("… {start} bytes omitted … ")
+    } else {
+        String::new()
+    };
+    let suffix = if end < value.len() {
+        format!(" … {} bytes omitted …", value.len() - end)
+    } else {
+        String::new()
+    };
+    format!("{prefix}{}{suffix}", &value[start..end])
+}
+
 pub fn single_line_clip(value: &str, maximum_bytes: usize) -> String {
     let clean = sanitize_terminal(value)
         .chars()
@@ -365,5 +398,14 @@ mod tests {
     #[test]
     fn unicode_search_is_case_insensitive() {
         assert!(unicode_contains_ci("CAFÉ diagnostic", "café"));
+    }
+
+    #[test]
+    fn long_line_excerpt_keeps_the_match_local() {
+        let value = format!("{}NEEDLE{}", "a".repeat(5_000), "z".repeat(5_000));
+        let excerpt = clip_match_display(&value, 5_000, 5_006);
+        assert!(excerpt.contains("NEEDLE"));
+        assert!(excerpt.len() < 1_100);
+        assert!(excerpt.contains("bytes omitted"));
     }
 }

@@ -31,6 +31,8 @@ FIELDS
   --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
   --decision N      One-based index selecting one listed choice.
   --maker VALUE     Decision authority: human or agent; human overrides agent if repeated.
+  --supersedes ID   Exact existing decision replaced by this decision; at most once.
+  --related ID      Exact existing related decision; repeatable.
 
 OPTIONS
   --store-dir PATH  Override the durable per-user store.
@@ -82,6 +84,7 @@ FIELDS
   choice     Every considered alternative.
   decision   Selected choice text only.
   maker      human or agent.
+  relation   Superseded and related decision IDs.
   timestamp  RFC 3339 UTC timestamp.
 
 TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since includes records at or after its
@@ -138,6 +141,7 @@ pub enum SearchField {
     Choice,
     Decision,
     Maker,
+    Relation,
     Timestamp,
 }
 
@@ -149,9 +153,10 @@ impl SearchField {
             "choice" => Ok(Self::Choice),
             "decision" => Ok(Self::Decision),
             "maker" => Ok(Self::Maker),
+            "relation" => Ok(Self::Relation),
             "timestamp" => Ok(Self::Timestamp),
             _ => Err(format!(
-                "unknown search field {value:?}; expected id, context, choice, decision, maker, or timestamp"
+                "unknown search field {value:?}; expected id, context, choice, decision, maker, relation, or timestamp"
             )),
         }
     }
@@ -254,6 +259,8 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
     let mut choices = Vec::new();
     let mut decision = None;
     let mut maker = None;
+    let mut supersedes = None;
+    let mut related = Vec::new();
     let mut store_dir = None;
     let mut index = 0;
     while index < args.len() {
@@ -279,6 +286,12 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
                     Maker::Agent
                 });
             }
+            "--supersedes" => set_once(
+                &mut supersedes,
+                value(args, &mut index, "--supersedes")?,
+                "--supersedes",
+            )?,
+            "--related" => related.push(value(args, &mut index, "--related")?),
             "--store-dir" => {
                 let path = PathBuf::from(value(args, &mut index, "--store-dir")?);
                 set_once(&mut store_dir, path, "--store-dir")?;
@@ -293,6 +306,8 @@ fn parse_add(args: &[String]) -> Result<Config, String> {
             choices,
             decision: decision.ok_or_else(|| "add requires --decision".to_string())?,
             maker: maker.ok_or_else(|| "add requires --maker".to_string())?,
+            supersedes,
+            related,
         }),
         store_dir,
     })
@@ -559,6 +574,35 @@ mod tests {
         assert_eq!(draft.choices.len(), 2);
         assert_eq!(draft.decision, 2);
         assert_eq!(draft.maker, Maker::Human);
+    }
+
+    #[test]
+    fn parses_immutable_relationships() {
+        let supersedes = "D-20260716-063012-a3f921c84d77e102";
+        let related = "D-20260715-063012-a3f921c84d77e102";
+        let config = parse_args(&args(&[
+            "add",
+            "--context",
+            "Choose storage",
+            "--choice",
+            "Files",
+            "--choice",
+            "Database",
+            "--decision",
+            "1",
+            "--maker",
+            "human",
+            "--supersedes",
+            supersedes,
+            "--related",
+            related,
+        ]))
+        .unwrap();
+        let Command::Add(draft) = config.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(draft.supersedes.as_deref(), Some(supersedes));
+        assert_eq!(draft.related, vec![related]);
     }
 
     #[test]

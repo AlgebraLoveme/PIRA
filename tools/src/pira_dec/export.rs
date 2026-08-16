@@ -376,7 +376,22 @@ fn render_record(output: &mut String, record: &DecisionRecord) -> Result<(), Str
         }
         output.push_str("</li>");
     }
-    output.push_str("</ol></section><footer class=\"record-footer\"><code>");
+    output.push_str("</ol></section>");
+    if record.supersedes.is_some() || !record.related.is_empty() {
+        output.push_str("<section class=\"section\"><h2>Relationships</h2><ul>");
+        if let Some(id) = &record.supersedes {
+            output.push_str("<li>Supersedes <code>");
+            escape(output, id);
+            output.push_str("</code></li>");
+        }
+        for id in &record.related {
+            output.push_str("<li>Related <code>");
+            escape(output, id);
+            output.push_str("</code></li>");
+        }
+        output.push_str("</ul></section>");
+    }
+    output.push_str("<footer class=\"record-footer\"><code>");
     escape(output, &record.id);
     output.push_str("</code><a href=\"#");
     escape(output, &record.id);
@@ -424,6 +439,8 @@ mod tests {
             ],
             decision: 2,
             maker: Maker::Human,
+            supersedes: None,
+            related: Vec::new(),
         }
     }
 

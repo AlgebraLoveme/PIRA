@@ -7,6 +7,8 @@ pub const MAX_KEYWORDS: usize = 16;
 pub const MAX_KEYWORD_BYTES: usize = 256;
 pub const MAX_SEARCH_CONTEXT: usize = 20;
 pub const MAX_QUERY_BYTES: usize = 4096;
+pub const MAX_SEARCH_QUERIES: usize = 16;
+pub const MAX_TOTAL_SEARCH_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_TRANSFORM_PATTERNS: usize = 16;
 pub const MAX_HISTORY_RESULTS: usize = 100;
 pub const MAX_HISTORY_WINDOW: usize = 8_000;
@@ -19,6 +21,7 @@ pub enum Mode {
     Check,
     Capture,
     Watch,
+    Cancel,
     Search,
     Range,
     Raw,
@@ -105,6 +108,7 @@ pub struct Config {
     pub stats_targets: Vec<String>,
     pub stats_brief: bool,
     pub query: Option<String>,
+    pub search_queries: Vec<String>,
     pub regex: bool,
     pub history_scope: HistoryScope,
     pub history_details: bool,
@@ -164,6 +168,7 @@ impl Default for Config {
             stats_targets: vec![],
             stats_brief: false,
             query: None,
+            search_queries: vec![],
             regex: false,
             history_scope: HistoryScope::Current,
             history_details: false,
@@ -241,6 +246,14 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
             require_intent(&mut c)?;
         }
         "watch" => parse_watch(&mut c, args)?,
+        "cancel" => {
+            c.mode = Mode::Cancel;
+            let mut p = parse_store(&mut c, args, 1)?;
+            c.target = Some(take(args, &mut p, "RESULT|--current")?.into());
+            if p != args.len() {
+                return Err(USAGE.into());
+            }
+        }
         "search" => parse_search(&mut c, args)?,
         "range" => {
             c.mode = Mode::Range;
@@ -898,9 +911,18 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Search;
     let mut p = parse_store(c, args, 1)?;
     c.target = Some(take(args, &mut p, "RESULT")?.into());
-    c.query = Some(take(args, &mut p, "QUERY")?.into());
+    if args
+        .get(p)
+        .is_some_and(|value| !matches!(value.as_str(), "-e" | "--query"))
+    {
+        c.search_queries.push(take(args, &mut p, "QUERY")?.into());
+    }
     while p < args.len() {
         match args[p].as_str() {
+            "-e" | "--query" => {
+                p += 1;
+                c.search_queries.push(take(args, &mut p, "QUERY")?.into());
+            }
             "--regex" => {
                 c.regex = true;
                 p += 1
@@ -912,10 +934,19 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    let query = c.query.as_deref().unwrap_or_default();
-    if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control) {
+    if c.search_queries.is_empty() || c.search_queries.len() > MAX_SEARCH_QUERIES {
+        return Err(format!("search requires 1..={MAX_SEARCH_QUERIES} queries"));
+    }
+    if c.search_queries.iter().any(|query| {
+        query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control)
+    }) {
         return Err(format!(
             "search query must be non-empty, single-line, and at most {MAX_QUERY_BYTES} UTF-8 bytes"
+        ));
+    }
+    if c.search_queries.iter().map(String::len).sum::<usize>() > MAX_TOTAL_SEARCH_QUERY_BYTES {
+        return Err(format!(
+            "search queries exceed the {MAX_TOTAL_SEARCH_QUERY_BYTES}-byte combined limit"
         ));
     }
     if c.context > MAX_SEARCH_CONTEXT {

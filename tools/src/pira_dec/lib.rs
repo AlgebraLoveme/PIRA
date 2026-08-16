@@ -389,6 +389,13 @@ fn record_matches(
         SearchField::Choice => record.choices.iter().any(|choice| regex.is_match(choice)),
         SearchField::Decision => regex.is_match(record.selected_text()?),
         SearchField::Maker => regex.is_match(record.maker.as_str()),
+        SearchField::Relation => {
+            record
+                .supersedes
+                .as_deref()
+                .is_some_and(|id| regex.is_match(id))
+                || record.related.iter().any(|id| regex.is_match(id))
+        }
         SearchField::Timestamp => regex.is_match(&util::format_rfc3339(record.timestamp_ms)?),
     })
 }
@@ -402,6 +409,12 @@ fn print_human_record(record: &DecisionRecord) -> Result<(), String> {
         record.timestamp_ms
     ));
     output.push_str(&format!("Maker: {}\n", record.maker.as_str()));
+    if let Some(id) = &record.supersedes {
+        output.push_str(&format!("Supersedes: {id}\n"));
+    }
+    if !record.related.is_empty() {
+        output.push_str(&format!("Related: {}\n", record.related.join(", ")));
+    }
     output.push_str("Context:\n");
     output.push_str(&record.context);
     output.push_str("\nChoices:\n");
@@ -446,6 +459,8 @@ mod tests {
             choices: vec!["SQLite".into(), "JSON".into()],
             decision: 1,
             maker: Maker::Agent,
+            supersedes: None,
+            related: Vec::new(),
         }
     }
 

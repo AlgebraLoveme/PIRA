@@ -1,4 +1,5 @@
-use std::process::{Child, Command};
+use std::io;
+use std::process::{Child, Command, Stdio};
 
 /// A child isolated so its descendants can be terminated as one attempt.
 pub struct ProcessTree {
@@ -14,6 +15,30 @@ impl ProcessTree {
         let child = command
             .spawn()
             .map_err(|error| format!("start {label}: {error}"))?;
+        Self::isolate(child, label)
+    }
+
+    pub fn spawn_capture(cmd: &[String]) -> Result<Self, String> {
+        let mut command = Command::new(&cmd[0]);
+        command
+            .args(&cmd[1..])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure(&mut command);
+        let child = command.spawn().map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!("__EXIT127__ command not found: {}", cmd[0])
+            } else if error.kind() == io::ErrorKind::PermissionDenied {
+                format!("__EXIT126__ permission denied/not executable: {}", cmd[0])
+            } else {
+                format!("failed to spawn {}: {error}", cmd[0])
+            }
+        })?;
+        Self::isolate(child, "capture")
+    }
+
+    fn isolate(child: Child, _label: &str) -> Result<Self, String> {
         #[cfg(windows)]
         let job = match create_kill_job(&child) {
             Ok(job) => job,
@@ -21,7 +46,7 @@ impl ProcessTree {
                 let mut child = child;
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("isolate {label} process tree: {error}"));
+                return Err(format!("isolate {_label} process tree: {error}"));
             }
         };
         Ok(Self {

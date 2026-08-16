@@ -95,6 +95,7 @@ pub fn add(store_option: Option<&Path>, draft: DecisionDraft) -> Result<Decision
     let draft = draft.normalized()?;
     let layout = Layout::current(store_option)?;
     layout.prepare_for_write()?;
+    validate_relationship_targets(&layout, &draft)?;
     loop {
         let timestamp_ms = util::now_ms()?;
         let id = util::decision_id(timestamp_ms)?;
@@ -146,6 +147,24 @@ pub fn add(store_option: Option<&Path>, draft: DecisionDraft) -> Result<Decision
         drop(lock);
         return Ok(record);
     }
+}
+
+fn validate_relationship_targets(layout: &Layout, draft: &DecisionDraft) -> Result<(), String> {
+    for id in draft.supersedes.iter().chain(draft.related.iter()) {
+        model::validate_id_syntax(id)?;
+        let path = match resolve(layout, id, true)? {
+            Resolution::Found(path) => path,
+            Resolution::Missing => return Err(format!("related decision {id} does not exist")),
+            Resolution::Ambiguous => {
+                return Err(format!("related decision ID {id} is ambiguous"));
+            }
+        };
+        read_record(&path).map_err(|error| match error {
+            ReadFailure::Vanished => format!("related decision {id} vanished"),
+            ReadFailure::Invalid(error) => format!("related decision {id} is invalid: {error}"),
+        })?;
+    }
+    Ok(())
 }
 
 pub fn record_paths(layout: &Layout) -> Result<Vec<PathBuf>, String> {

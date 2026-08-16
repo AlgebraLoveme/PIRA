@@ -9,6 +9,7 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 const MAX_CHOICES: usize = 32;
 const MAX_CHOICE_BYTES: usize = 4 * 1024;
+const MAX_RELATED_DECISIONS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Maker {
@@ -54,6 +55,8 @@ pub struct DecisionDraft {
     pub choices: Vec<String>,
     pub decision: u32,
     pub maker: Maker,
+    pub supersedes: Option<String>,
+    pub related: Vec<String>,
 }
 
 impl DecisionDraft {
@@ -64,7 +67,14 @@ impl DecisionDraft {
             .into_iter()
             .map(|choice| choice.trim().to_string())
             .collect();
+        self.supersedes = self.supersedes.map(|id| id.trim().to_string());
+        self.related = self
+            .related
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .collect();
         validate_fields(&self.context, &self.choices, self.decision)?;
+        validate_relationships(self.supersedes.as_deref(), &self.related)?;
         Ok(self)
     }
 }
@@ -77,6 +87,8 @@ pub struct DecisionRecord {
     pub choices: Vec<String>,
     pub decision: u32,
     pub maker: Maker,
+    pub supersedes: Option<String>,
+    pub related: Vec<String>,
 }
 
 impl DecisionRecord {
@@ -92,6 +104,8 @@ impl DecisionRecord {
             choices: draft.choices.clone(),
             decision: draft.decision,
             maker: draft.maker,
+            supersedes: draft.supersedes.clone(),
+            related: draft.related.clone(),
         };
         record.validate()?;
         Ok(record)
@@ -112,6 +126,7 @@ impl DecisionRecord {
         validate_id(&self.id, self.timestamp_ms)?;
         util::validate_timestamp(self.timestamp_ms)?;
         validate_fields(&self.context, &self.choices, self.decision)?;
+        validate_relationships(self.supersedes.as_deref(), &self.related)?;
         if self.context.trim() != self.context {
             return Err("context is not stored in normalized form".into());
         }
@@ -131,6 +146,8 @@ impl DecisionRecord {
             decision: self.decision,
             decision_text: self.selected_text()?.to_string(),
             maker: self.maker.as_str().to_string(),
+            supersedes: self.supersedes.clone(),
+            related: self.related.clone(),
         })
     }
 }
@@ -145,6 +162,30 @@ pub struct DecisionView {
     pub decision: u32,
     pub decision_text: String,
     pub maker: String,
+    pub supersedes: Option<String>,
+    pub related: Vec<String>,
+}
+
+fn validate_relationships(supersedes: Option<&str>, related: &[String]) -> Result<(), String> {
+    if let Some(id) = supersedes {
+        validate_id_syntax(id)?;
+    }
+    if related.len() > MAX_RELATED_DECISIONS {
+        return Err(format!(
+            "expected at most {MAX_RELATED_DECISIONS} related decisions"
+        ));
+    }
+    let mut unique = HashSet::with_capacity(related.len());
+    for id in related {
+        validate_id_syntax(id)?;
+        if Some(id.as_str()) == supersedes {
+            return Err("a decision cannot be both superseded and related".into());
+        }
+        if !unique.insert(id) {
+            return Err("related decision IDs must be unique".into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_fields(context: &str, choices: &[String], decision: u32) -> Result<(), String> {
@@ -213,6 +254,12 @@ pub fn encode(record: &DecisionRecord) -> Result<Vec<u8>, String> {
     }
     put_tlv(&mut body, 5, &record.decision.to_le_bytes())?;
     put_tlv(&mut body, 6, &[record.maker.byte()])?;
+    if let Some(id) = &record.supersedes {
+        put_tlv(&mut body, 7, id.as_bytes())?;
+    }
+    for id in &record.related {
+        put_tlv(&mut body, 8, id.as_bytes())?;
+    }
     let body_len = u32::try_from(body.len()).map_err(|_| "decision body is too large")?;
     let total = 8 + 4 + body.len() + 32;
     if total > MAX_RECORD_BYTES {
@@ -255,6 +302,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
     let mut choices = Vec::new();
     let mut decision = None;
     let mut makers = Vec::new();
+    let mut supersedes = None;
+    let mut related = Vec::new();
     let mut position = 0;
     let mut previous_tag = 0;
     while position < body.len() {
@@ -288,7 +337,11 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
                 decision = Some(u32::from_le_bytes(value.try_into().unwrap()));
             }
             6 if value.len() == 1 => makers.push(Maker::from_byte(value[0])?),
-            1..=6 => return Err("duplicate or malformed singleton decision field".into()),
+            7 if supersedes.is_none() => {
+                supersedes = Some(parse_string(value, MAX_ID_BYTES, "supersedes")?);
+            }
+            8 => related.push(parse_string(value, MAX_ID_BYTES, "related")?),
+            1..=8 => return Err("duplicate or malformed singleton decision field".into()),
             _ => return Err("unknown decision TLV tag".into()),
         }
     }
@@ -306,6 +359,8 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
         choices,
         decision: decision.ok_or_else(|| "missing selected decision".to_string())?,
         maker,
+        supersedes,
+        related,
     };
     record.validate()?;
     Ok(record)
@@ -340,12 +395,22 @@ mod tests {
             choices: vec!["Use SQL.".into(), "Use checked files.".into()],
             decision: 2,
             maker: Maker::Human,
+            supersedes: None,
+            related: Vec::new(),
         }
     }
 
     #[test]
     fn record_round_trips() {
         let record = sample();
+        assert_eq!(decode(&encode(&record).unwrap()).unwrap(), record);
+    }
+
+    #[test]
+    fn relationship_fields_round_trip() {
+        let mut record = sample();
+        record.supersedes = Some("D-20260716-063012-a3f921c84d77e102".into());
+        record.related = vec!["D-20260715-063012-a3f921c84d77e102".into()];
         assert_eq!(decode(&encode(&record).unwrap()).unwrap(), record);
     }
 

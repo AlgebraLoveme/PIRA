@@ -327,6 +327,7 @@ pub fn write_live_checkpoint(
         observed_stderr_bytes: snapshot.stderr_bytes,
         observed_total_bytes: total_bytes,
         retention_truncated: false,
+        cancelled: false,
         stdout_lines: snapshot.stdout_lines,
         stderr_lines: snapshot.stderr_lines,
         total_lines: snapshot.total_lines,
@@ -430,9 +431,32 @@ fn live_manifest_path(store_dir: &Path, result_id: &str) -> PathBuf {
         .join(format!("{result_id}.live.json"))
 }
 
+fn cancel_request_path(store_dir: &Path, result_id: &str) -> PathBuf {
+    store_dir.join("live").join(format!("{result_id}.cancel"))
+}
+
+pub fn request_cancel(store_dir: &Path, target: &str) -> Result<String, String> {
+    let path = resolve_result(store_dir, target)?;
+    let stored = read_result_path(&path)?;
+    if !stored.is_running() || !live_result_is_active(store_dir, &stored) {
+        return Err(format!(
+            "capture {} is not running",
+            stored.metadata.result_id
+        ));
+    }
+    let result_id = stored.metadata.result_id.clone();
+    write_private_file_relaxed(&cancel_request_path(store_dir, &result_id), b"cancel\n")?;
+    Ok(result_id)
+}
+
+pub fn cancellation_requested(store_dir: &Path, result_id: &str) -> bool {
+    cancel_request_path(store_dir, result_id).is_file()
+}
+
 pub fn remove_live_checkpoint(store_dir: &Path, result_id: &str) {
     let _ = fs::remove_file(live_manifest_path(store_dir, result_id));
     let _ = fs::remove_file(live_owner_path(store_dir, result_id));
+    let _ = fs::remove_file(cancel_request_path(store_dir, result_id));
 }
 
 struct HashSink(Sha256);
@@ -542,6 +566,7 @@ pub fn store_capture(
         observed_stderr_bytes: capture.stderr.observed_length,
         observed_total_bytes: capture.observed_bytes(),
         retention_truncated: capture.retention_truncated,
+        cancelled: capture.cancelled,
         stdout_lines: capture.stdout_lines,
         stderr_lines: capture.stderr_lines,
         total_lines: capture.total_lines,

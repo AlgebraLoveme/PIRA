@@ -13,7 +13,7 @@ mod watch;
 
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Instant, SystemTime};
 
 use cli::{Config, HistoryScope, Mode, RawStream};
@@ -62,6 +62,7 @@ fn real_main() -> Result<i32, String> {
         Mode::Check => run_check(&config),
         Mode::Auto => run_auto(&config),
         Mode::Capture => run_capture(&config),
+        Mode::Cancel => run_cancel(&config),
         Mode::Search => run_search(&config),
         Mode::Range => run_range(&config),
         Mode::Raw => run_raw(&config),
@@ -374,7 +375,11 @@ fn run_check(config: &Config) -> Result<i32, String> {
     );
     util::stdout_line(&format!(
         "{} | exit={} | duration={}ms | result={}{}",
-        check_label(capture.exit_code),
+        if capture.cancelled {
+            "CANCELLED"
+        } else {
+            check_label(capture.exit_code)
+        },
         capture.exit_code,
         capture.duration_ms,
         stored.metadata.result_id,
@@ -425,6 +430,22 @@ fn run_capture(config: &Config) -> Result<i32, String> {
     };
     score_capture(config, &mut capture, &ranking)?;
     store_and_summarize(config, &capture, false)
+}
+
+fn run_cancel(config: &Config) -> Result<i32, String> {
+    let store_dir = effective_store_dir(config.store_dir.as_ref())?;
+    let target = config
+        .target
+        .as_deref()
+        .ok_or_else(|| cli::USAGE.to_string())?;
+    let resolved = if target == "--current" {
+        storage::resolve_current_live_capture(&store_dir)?
+    } else {
+        target.to_string()
+    };
+    let result_id = storage::request_cancel(&store_dir, &resolved)?;
+    util::stdout_line(&format!("CANCEL requested | result={result_id}"))?;
+    Ok(0)
 }
 
 fn replay_capture(capture: &CaptureResult) -> Result<(), String> {
@@ -568,8 +589,13 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             .chain(rendered_json.iter().map(|(text, _)| text.as_str())),
     );
     output.line(&format!(
-        "Result: {} | exit={} | {} B/{} lines | omitted={} B/{} lines",
+        "Result: {} | {}exit={} | {} B/{} lines | omitted={} B/{} lines",
         metadata.result_id,
+        if capture.cancelled {
+            "state=cancelled | "
+        } else {
+            ""
+        },
         capture.exit_code,
         capture.total_bytes(),
         capture.total_lines,
@@ -634,13 +660,19 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             output.line(&format!("  {count}x {example}"))?;
         }
     }
-    if !metadata.suggested_keywords.is_empty() {
+    let recovery_needed = omitted_lines > 0
+        || omitted_bytes > 0
+        || capture.timeline_truncated
+        || capture.retention_truncated;
+    if recovery_needed && !metadata.suggested_keywords.is_empty() {
         output.line(&format!("Search terms: {displayed_keywords}"))?;
     }
-    output.line(&format!(
-        "Retrieve: pira_ctx search {} <query>",
-        metadata.result_id
-    ))?;
+    if recovery_needed {
+        output.line(&format!(
+            "Retrieve: pira_ctx search {} <query>",
+            metadata.result_id
+        ))?;
+    }
     Ok(())
 }
 
@@ -733,8 +765,9 @@ fn print_compact_summary(metadata: &Metadata, capture: &CaptureResult) -> Result
         }
     }
     output.line(&format!(
-        "Captured: {} (exit {}){}",
+        "Captured: {} ({}exit {}){}",
         metadata.result_id,
+        if capture.cancelled { "cancelled; " } else { "" },
         capture.exit_code,
         if capture.total_lines == 0 {
             "; no output"
@@ -776,105 +809,127 @@ fn prepare_program_display(raw: &str) -> (String, security::ContentRisk) {
 
 fn run_search(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
-    let query = config
-        .query
-        .as_ref()
-        .ok_or_else(|| cli::USAGE.to_string())?;
-    let regex = if config.regex {
-        Some(regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?)
-    } else {
-        None
-    };
     let mut reader = store.reader()?;
-    let mut hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-    let mut hit_count = 0_usize;
-    let query_terms = lexical_terms(query);
-    let query_lower = query.to_lowercase();
-    let mut lexical_hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-    let mut lexical_count = 0_usize;
-    for (index, line) in store.metadata.line_timeline.iter().enumerate() {
-        let text = reader.read_search_line(line)?;
-        let matched = regex.as_ref().map_or_else(
-            || text.to_lowercase().contains(&query_lower),
-            |regex| regex.is_match(&text),
-        );
-        if matched {
-            hit_count += 1;
-            offer_search_hit(
-                &mut hits,
-                (index, line.score + if config.regex { 70 } else { 80 }),
-                &store.metadata.line_timeline,
-            );
-        } else if !config.regex {
-            let score = lexical_score(&text, &query_terms);
-            if score > 0 {
-                lexical_count += 1;
+    let mut output = util::BoundedStdout::new(64 * 1024);
+    if store.metadata.timeline_truncated {
+        output.line("Index: truncated; search covered only the indexed retained prefix")?;
+    }
+    for (query_index, query) in config.search_queries.iter().enumerate() {
+        let matcher = if config.regex {
+            regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?
+        } else {
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| format!("invalid literal query: {error}"))?
+        };
+        let query_terms = lexical_terms(query);
+        let mut hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
+        let mut hit_count = 0_usize;
+        let mut lexical_hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
+        let mut lexical_count = 0_usize;
+        for (index, line) in store.metadata.line_timeline.iter().enumerate() {
+            let text = reader.read_search_line(line)?;
+            let length_penalty = (line.length / 4096).min(200) as i64;
+            if matcher.is_match(&text) {
+                hit_count += 1;
                 offer_search_hit(
-                    &mut lexical_hits,
-                    (index, line.score + score),
+                    &mut hits,
+                    (
+                        index,
+                        line.score + if config.regex { 70 } else { 80 } - length_penalty,
+                    ),
                     &store.metadata.line_timeline,
                 );
+            } else if !config.regex {
+                let score = lexical_score(&text, &query_terms);
+                if score > 0 {
+                    lexical_count += 1;
+                    offer_search_hit(
+                        &mut lexical_hits,
+                        (index, line.score + score - length_penalty),
+                        &store.metadata.line_timeline,
+                    );
+                }
             }
         }
-    }
-    let lexical = hit_count == 0 && lexical_count > 0;
-    if lexical {
-        hits = lexical_hits;
-        hit_count = lexical_count;
-    }
-    util::stdout_line(&format!(
-        "{}{} hits",
-        hit_count,
-        if lexical { " lexical" } else { "" }
-    ))?;
-    if store.metadata.timeline_truncated {
-        util::stdout_line("Index: truncated; search covered only the indexed retained prefix")?;
-    }
-    let mut selected = Vec::new();
-    if config.context == 0 {
-        selected.extend(hits.into_iter().take(MAX_SEARCH_RESULTS));
-    } else {
-        let mut seen = std::collections::HashSet::new();
+        let lexical = hit_count == 0 && lexical_count > 0;
+        if lexical {
+            hits = lexical_hits;
+            hit_count = lexical_count;
+        }
+        if config.search_queries.len() == 1 {
+            output.line(&format!(
+                "{}{} hits",
+                hit_count,
+                if lexical { " lexical" } else { "" }
+            ))?;
+        } else {
+            output.line(&format!(
+                "Query {} {:?}: {}{} hits",
+                query_index + 1,
+                query,
+                hit_count,
+                if lexical { " lexical" } else { "" }
+            ))?;
+        }
+        let mut selected = std::collections::BTreeMap::new();
         for (index, score) in hits.into_iter().take(MAX_SEARCH_RESULTS) {
             let start = index.saturating_sub(config.context);
             let end = index
                 .saturating_add(config.context)
                 .min(store.metadata.line_timeline.len().saturating_sub(1));
             for nearby in start..=end {
-                if seen.insert(nearby) {
-                    selected.push((
-                        nearby,
-                        if nearby == index {
-                            score
-                        } else {
-                            store.metadata.line_timeline[nearby].score
-                        },
-                    ));
-                }
+                let is_hit = nearby == index;
+                let nearby_score = if is_hit {
+                    score
+                } else {
+                    store.metadata.line_timeline[nearby].score
+                };
+                selected
+                    .entry(nearby)
+                    .and_modify(|entry: &mut (i64, bool)| {
+                        if is_hit {
+                            *entry = (nearby_score, true);
+                        }
+                    })
+                    .or_insert((nearby_score, is_hit));
             }
         }
-        selected.sort_by_key(|(index, _)| *index);
-    }
-    let mut rendered = Vec::with_capacity(selected.len());
-    for (index, score) in selected {
-        let line = &store.metadata.line_timeline[index];
-        let raw = reader.read_security_line(line)?;
-        let (text, risk) = prepare_program_display(&raw);
-        rendered.push((line, score, text, risk));
-    }
-    let mut output = util::BoundedStdout::new(64 * 1024);
-    print_content_warnings(
-        &mut output,
-        rendered
-            .iter()
-            .map(|(line, _, _, risk)| (Some(line.line), *risk))
-            .chain(std::iter::once((
-                None,
-                security::inspect_combined(rendered.iter().map(|(_, _, text, _)| text.as_str())),
-            ))),
-    )?;
-    for (line, score, text, _) in rendered {
-        output.line(&format_scored_line(line, score, &text))?;
+        let mut rendered = Vec::with_capacity(selected.len());
+        for (index, (score, is_hit)) in selected {
+            let line = &store.metadata.line_timeline[index];
+            let raw = if is_hit {
+                reader.read_search_line(line)?
+            } else {
+                reader.read_security_line(line)?
+            };
+            let risk = security::inspect(&raw);
+            let text = if is_hit && !lexical {
+                matcher.find(&raw).map_or_else(
+                    || prepare_program_display(&raw).0,
+                    |matched| util::clip_match_display(&raw, matched.start(), matched.end()),
+                )
+            } else {
+                prepare_program_display(&raw).0
+            };
+            rendered.push((line, score, text, risk));
+        }
+        print_content_warnings(
+            &mut output,
+            rendered
+                .iter()
+                .map(|(line, _, _, risk)| (Some(line.line), *risk))
+                .chain(std::iter::once((
+                    None,
+                    security::inspect_combined(
+                        rendered.iter().map(|(_, _, text, _)| text.as_str()),
+                    ),
+                ))),
+        )?;
+        for (line, score, text, _) in rendered {
+            output.line(&format_scored_line(line, score, &text))?;
+        }
     }
     Ok(0)
 }
@@ -1648,24 +1703,6 @@ fn format_scored_line(line: &model::LineMeta, score: i64, text: &str) -> String 
 
 fn table_field(value: &str, maximum_bytes: usize) -> String {
     util::single_line_clip(&util::sanitize_terminal(value), maximum_bytes).replace('|', "\\|")
-}
-
-pub(crate) fn spawn_command(cmd: &[String]) -> Result<std::process::Child, String> {
-    Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                format!("__EXIT127__ command not found: {}", cmd[0])
-            } else if error.kind() == io::ErrorKind::PermissionDenied {
-                format!("__EXIT126__ permission denied/not executable: {}", cmd[0])
-            } else {
-                format!("failed to spawn {}: {error}", cmd[0])
-            }
-        })
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 mod analyzer;
-mod process;
+pub(crate) mod process;
 mod render;
 mod sample;
 mod state;

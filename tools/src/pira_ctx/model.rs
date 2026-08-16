@@ -176,6 +176,7 @@ pub struct CaptureResult {
     pub stderr_lines: usize,
     pub timeline_truncated: bool,
     pub retention_truncated: bool,
+    pub cancelled: bool,
     pub exit_code: i32,
     pub start_ms: u128,
     pub end_ms: u128,
@@ -246,6 +247,8 @@ pub struct Metadata {
     pub observed_total_bytes: u64,
     #[serde(default)]
     pub retention_truncated: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     #[serde(default)]
     pub stdout_lines: usize,
     #[serde(default)]
@@ -338,7 +341,11 @@ impl ListedEntry {
             path,
             workspace_hash: metadata.workspace_hash.clone(),
             kind: "capture".into(),
-            state: "complete".into(),
+            state: if metadata.cancelled {
+                "cancelled".into()
+            } else {
+                "complete".into()
+            },
             running: false,
         }
     }
