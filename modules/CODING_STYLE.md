@@ -12,7 +12,7 @@ Executed checks bound claims that code works; report exact gaps. Other coding ta
 3. Make the minimal safe change: correct, boring, readable over clever/speculative; deletion over addition when possible; the fewest-file, shortest working diff.
 4. Run the smallest relevant checks; report gaps.
 
-Before non-trivial refactoring, protect moved behavior with the smallest check. Refactor only to improve in-scope readability or required extensibility, reduce current-change risk, remove duplication, clarify a boundary, or materially ease testing. **Optimize** must prefer behavior-preserving, proportionate readability and extensibility refactoring; any behavior change requires explicit user authorization. Optimize performance only with profiling, measurement, or clear workload evidence; stop when evidence is unconvincing. Briefly comment non-obvious tradeoffs.
+Before non-trivial refactoring, protect moved behavior with the smallest check. Refactor only to improve in-scope readability or required extensibility, reduce current-change risk, remove duplication, clarify a boundary, or materially ease testing. **Optimize** must prefer behavior-preserving, proportionate readability and extensibility refactoring; any behavior change requires explicit user authorization. Do not make complex changes for marginal gains unless the user explicitly requests them. Optimize performance only with profiling, measurement, or clear workload evidence; stop when evidence is unconvincing. Briefly comment non-obvious tradeoffs.
 
 ## Change Discipline
 - Use this global style unless trusted repository-local instructions specify otherwise; explicit user instructions override both.
