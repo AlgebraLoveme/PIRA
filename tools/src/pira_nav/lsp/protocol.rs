@@ -445,7 +445,7 @@ pub(super) fn parse_document_symbols(
         if entry.get("location").is_some() {
             push_flat_symbol(entry, uri, language, &positions, &mut symbols)?;
         } else {
-            push_document_symbol(entry, None, 0, language, &positions, &mut symbols)?;
+            push_document_symbol(entry, None, 0, 0, language, &positions, &mut symbols)?;
         }
     }
     symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.depth));
@@ -462,14 +462,31 @@ fn push_document_symbol(
     value: &Value,
     parent: Option<&str>,
     depth: usize,
+    nesting: usize,
     language: Language,
     positions: &SourcePositions<'_>,
     output: &mut Vec<Symbol>,
 ) -> Result<(), String> {
-    if depth > MAX_SYMBOL_DEPTH || output.len() >= MAX_SYMBOLS {
+    if nesting > MAX_SYMBOL_DEPTH || output.len() >= MAX_SYMBOLS {
         return Err("LSP document symbols exceed structural safety limits".into());
     }
     let name = symbol_name(value)?;
+    if language == Language::Lean && name == "<section>" {
+        if let Some(children) = value.get("children").and_then(Value::as_array) {
+            for child in children {
+                push_document_symbol(
+                    child,
+                    parent,
+                    depth,
+                    nesting + 1,
+                    language,
+                    positions,
+                    output,
+                )?;
+            }
+        }
+        return Ok(());
+    }
     let qualified = qualify_lsp(parent, &name, language);
     let (start_byte, end_byte, start_row, start_column, end_row, end_column) =
         positions.range(required(value, "range")?)?;
@@ -494,6 +511,7 @@ fn push_document_symbol(
                 child,
                 Some(&qualified),
                 depth + 1,
+                nesting + 1,
                 language,
                 positions,
                 output,
@@ -778,6 +796,7 @@ pub(super) fn language_id(language: Language) -> &'static str {
         Language::Bash => "shellscript",
         Language::Cuda => "cuda-cpp",
         Language::Hcl => "terraform",
+        Language::Lean => "lean4",
         _ => language.name(),
     }
 }
@@ -805,7 +824,8 @@ pub(super) fn file_uri(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PositionEncoding, SourcePositions, file_uri};
+    use super::{PositionEncoding, SourcePositions, file_uri, parse_document_symbols};
+    use crate::language::Language;
 
     #[test]
     fn utf16_positions_map_to_utf8_byte_columns() {
@@ -828,5 +848,40 @@ mod tests {
     fn file_uri_escapes_spaces_and_unicode() {
         let uri = file_uri(std::path::Path::new("/tmp/naïve file.rs")).unwrap();
         assert_eq!(uri, "file:///tmp/na%C3%AFve%20file.rs");
+    }
+
+    #[test]
+    fn lean_lsp_sections_are_transparent_navigation_scopes() {
+        let source = "namespace Algebraic\ntheorem foo : True := by trivial\nend Algebraic\n";
+        let result = serde_json::json!([{
+            "name": "<section>",
+            "kind": 3,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 13}},
+            "children": [{
+                "name": "Algebraic",
+                "kind": 3,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 13}},
+                "children": [{
+                    "name": "foo",
+                    "kind": 6,
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 31}}
+                }]
+            }]
+        }]);
+        let symbols = parse_document_symbols(
+            &result,
+            "file:///tmp/Test.lean",
+            source,
+            Language::Lean,
+            PositionEncoding::Utf16,
+        )
+        .unwrap();
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.qualified_name.as_str(), symbol.depth))
+                .collect::<Vec<_>>(),
+            vec![("Algebraic", 0), ("Algebraic.foo", 1)]
+        );
     }
 }

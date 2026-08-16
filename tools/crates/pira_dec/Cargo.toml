@@ -1,6 +1,6 @@
 [package]
 name = "pira_dec"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Structured medium-level decision memory for PIRA agents"

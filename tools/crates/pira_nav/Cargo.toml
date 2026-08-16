@@ -1,6 +1,6 @@
 [package]
 name = "pira_nav"
-version = "0.12.0"
+version = "0.14.0"
 edition = "2024"
 description = "Read-only repository navigation for PIRA agents"
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ tree-sitter-hcl = "1.1.0"
 tree-sitter-julia = "0.23.1"
 tree-sitter-json = "0.24.8"
 tree-sitter-kotlin-sg = "0.4.1"
+tree-sitter-lean = { git = "https://github.com/Julian/tree-sitter-lean", rev = "86c2bcb379fe0b2ad13d8b3411400deff75b2785" }
 tree-sitter-lua = "0.5.0"
 tree-sitter-php = "0.24.2"
 tree-sitter-powershell = "0.26.4"

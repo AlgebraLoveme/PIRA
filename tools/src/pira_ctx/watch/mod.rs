@@ -766,10 +766,21 @@ fn report(w: &WatchState, code: i32) -> Result<i32, String> {
     let mut out = util::BoundedStdout::new(MAX_REPORT_BYTES);
     out.line("PIRA watch")?;
     out.line(&format!("Result: {}", w.id))?;
-    out.line(&format!(
-        "Monitor: {:?} | Job: {:?} | Attempt: {:?}",
-        w.monitor, w.job, w.attempt
-    ))?;
+    let final_probe = terminal(w) && w.source_kind == SourceKind::Probe;
+    if final_probe {
+        let outcome = w.detail.strip_prefix("probe ").unwrap_or(&w.detail);
+        out.line(&format!(
+            "Monitor: {:?} | Job: {:?} | Probe: {outcome}",
+            w.monitor, w.job
+        ))?;
+    } else if terminal(w) {
+        out.line(&format!("Monitor: {:?} | Job: {:?}", w.monitor, w.job))?;
+    } else {
+        out.line(&format!(
+            "Monitor: {:?} | Job: {:?} | Attempt: {:?}",
+            w.monitor, w.job, w.attempt
+        ))?;
+    }
     out.line(&format!(
         "Samples: {} | Latest age: {}ms",
         w.attempts,
@@ -813,7 +824,9 @@ fn report(w: &WatchState, code: i32) -> Result<i32, String> {
         out.line("Latest visible stderr:")?;
         out.line(&w.visible_stderr)?
     }
-    out.line(&format!("Detail: {}", w.detail))?;
+    if !final_probe {
+        out.line(&format!("Detail: {}", w.detail))?;
+    }
     Ok(code)
 }
 fn age(value: Option<u128>) -> String {

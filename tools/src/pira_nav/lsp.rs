@@ -289,6 +289,7 @@ fn discover_executable(language: Language) -> Option<(PathBuf, Vec<String>)> {
         Language::Kotlin => &[("kotlin-language-server", &[])],
         Language::Lua => &[("lua-language-server", &[])],
         Language::Hcl => &[("terraform-ls", &["serve"])],
+        Language::Lean => &[("lake", &["serve"]), ("lean", &["--server"])],
         Language::Ruby => &[("solargraph", &["stdio"])],
         Language::Swift => &[("sourcekit-lsp", &[])],
         Language::Scala => &[("metals", &[])],

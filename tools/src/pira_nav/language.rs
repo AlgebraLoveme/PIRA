@@ -30,6 +30,7 @@ pub enum Language {
     Dart,
     Elixir,
     Julia,
+    Lean,
     Json,
     Jsonc,
     Yaml,
@@ -38,7 +39,7 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Python,
         Self::Rust,
         Self::Java,
@@ -62,6 +63,7 @@ impl Language {
         Self::Dart,
         Self::Elixir,
         Self::Julia,
+        Self::Lean,
         Self::Json,
         Self::Jsonc,
         Self::Yaml,
@@ -94,6 +96,7 @@ impl Language {
             Self::Dart => "dart",
             Self::Elixir => "elixir",
             Self::Julia => "julia",
+            Self::Lean => "lean",
             Self::Json => "json",
             Self::Jsonc => "jsonc",
             Self::Yaml => "yaml",
@@ -127,6 +130,7 @@ impl Language {
             "dart" => Some(Self::Dart),
             "elixir" | "ex" | "exs" => Some(Self::Elixir),
             "julia" | "jl" => Some(Self::Julia),
+            "lean" | "lean4" => Some(Self::Lean),
             "json" => Some(Self::Json),
             "jsonc" => Some(Self::Jsonc),
             "yaml" | "yml" => Some(Self::Yaml),
@@ -169,6 +173,7 @@ impl Language {
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
             Self::Elixir => tree_sitter_elixir::LANGUAGE.into(),
             Self::Julia => tree_sitter_julia::LANGUAGE.into(),
+            Self::Lean => tree_sitter_lean::LANGUAGE.into(),
             Self::Json | Self::Jsonc => tree_sitter_json::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
@@ -216,6 +221,7 @@ impl Language {
                 "dart" => Ok(Self::Dart),
                 "ex" | "exs" => Ok(Self::Elixir),
                 "jl" => Ok(Self::Julia),
+                "lean" => Ok(Self::Lean),
                 "json" => Ok(Self::Json),
                 "jsonc" => Ok(Self::Jsonc),
                 "yaml" | "yml" => Ok(Self::Yaml),
@@ -292,5 +298,20 @@ impl Language {
             self,
             Self::Json | Self::Jsonc | Self::Yaml | Self::Toml | Self::Markdown
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::Language;
+
+    #[test]
+    fn lean4_names_and_files_resolve_to_the_canonical_language() {
+        assert_eq!(Language::parse_name("lean"), Some(Language::Lean));
+        assert_eq!(Language::parse_name("lean4"), Some(Language::Lean));
+        assert_eq!(Language::infer(Path::new("Proof.lean")), Ok(Language::Lean));
+        assert_eq!(Language::Lean.name(), "lean");
     }
 }

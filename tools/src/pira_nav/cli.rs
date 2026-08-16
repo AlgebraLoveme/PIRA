@@ -18,7 +18,7 @@ use crate::document::MAX_DOCUMENT_SYMBOLS;
 use crate::language::Language;
 use crate::lsp_options::{self, LspOptions};
 use crate::model::{ImportEdge, ParseBackend, Symbol};
-use crate::parse::{ParsedFile, parse_file, parse_syntax};
+use crate::parse::{ParsedFile, parse_file};
 use crate::search;
 use crate::security::possible_prompt_injection;
 use crate::semantic;
@@ -2462,8 +2462,7 @@ fn command_imports(
         let result = (|| {
             validate_regular_file(&path, cwd, "imports")?;
             let language = language_for(&path, explicit)?;
-            let parsed = parse_syntax(&path, language).map_err(input_error)?;
-            let edges = deps::imports(&parsed, cwd);
+            let edges = deps::imports_from_path(&path, language, cwd).map_err(input_error)?;
             let shown = edges.len().min(options.max_items);
             let local = edges.iter().filter(|edge| edge.target.is_some()).count();
             let external = edges
@@ -2866,9 +2865,8 @@ where
             },
             |mut output, (path, language)| {
                 output.scanned += 1;
-                match parse_syntax(path, *language) {
-                    Ok(parsed) => {
-                        let imports = deps::imports(&parsed, root);
+                match deps::imports_from_path(path, *language, root) {
+                    Ok(imports) => {
                         output.parsed_imports += imports.len();
                         for edge in imports {
                             if edge.target.is_some() {

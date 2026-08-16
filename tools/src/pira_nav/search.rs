@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
@@ -18,14 +18,18 @@ use crate::util::{
 
 const MAX_PATTERNS: usize = 32;
 const MAX_PATHS: usize = 64;
+const MAX_GLOBS: usize = 64;
 const MAX_PATTERN_BYTES: usize = 4 * 1024;
 const MAX_TOTAL_PATTERN_BYTES: usize = 32 * 1024;
+const MAX_TOTAL_GLOB_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT: usize = 1_000;
 const MAX_ITEMS: usize = 10_000;
 const DEFAULT_ITEMS: usize = 48;
 const DEFAULT_MAX_PER_QUERY: usize = 8;
 const DEFAULT_BYTES: usize = 8 * 1024;
 const RETAINED_HITS_PER_FILE: usize = 256;
+const MAX_MISSING_ROOTS_SHOWN: usize = 8;
+const MAX_SNIPPET_LINE_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
@@ -37,6 +41,7 @@ enum Mode {
 struct Options {
     paths: Vec<String>,
     patterns: Vec<String>,
+    globs: Vec<String>,
     regex: bool,
     ignore_case: bool,
     word: bool,
@@ -108,7 +113,7 @@ pub fn run(
         .map(|path| absolute_lexical(Path::new(path), cwd))
         .collect::<Vec<_>>();
     let mut roots = Vec::with_capacity(requested_roots.len());
-    let mut missing_roots = 0;
+    let mut missing_roots = Vec::new();
     for root in &requested_roots {
         if path_contains_symlink(root) {
             return Err(input_error(format!(
@@ -126,7 +131,7 @@ pub fn run(
                     PathExpectation::FileOrDirectory,
                 )));
             }
-            missing_roots += 1;
+            missing_roots.push(root.clone());
             continue;
         }
         roots.push(root.clone());
@@ -150,7 +155,7 @@ pub fn run(
     let mut walk_errors = Vec::new();
     let mut walk_errors_total = 0usize;
     for root in &roots {
-        let discovered = discover_text_files(root, language);
+        let discovered = discover_text_files(root, language, &options.globs)?;
         path_set.extend(discovered.paths);
         walk_errors_total = walk_errors_total.saturating_add(discovered.errors_total);
         for error in discovered.errors {
@@ -207,16 +212,19 @@ pub fn run(
         matched_files,
     )
     .map_err(output_error)?;
+    if !options.globs.is_empty() {
+        write!(output, " globs={}", options.globs.len()).map_err(output_error)?;
+    }
     match options.mode {
         Mode::Snippets => write!(output, " matching_lines={matching_lines} mode=snippets"),
         Mode::Files => write!(output, " mode=files"),
         Mode::Count => write!(output, " matching_lines={matching_lines} mode=count"),
     }
     .map_err(output_error)?;
-    if missing_roots > 0 || !skips.is_empty() || walk_errors_total > 0 {
+    if !missing_roots.is_empty() || !skips.is_empty() || walk_errors_total > 0 {
         write!(output, " complete=0").map_err(output_error)?;
-        if missing_roots > 0 {
-            write!(output, " missing_roots={missing_roots}").map_err(output_error)?;
+        if !missing_roots.is_empty() {
+            write!(output, " missing_roots={}", missing_roots.len()).map_err(output_error)?;
         }
         for (name, count) in skip_counts(&skips) {
             if count > 0 {
@@ -228,6 +236,22 @@ pub fn run(
         }
     }
     writeln!(output).map_err(output_error)?;
+    for root in missing_roots.iter().take(MAX_MISSING_ROOTS_SHOWN) {
+        writeln!(
+            output,
+            "missing_root path={}",
+            quote_metadata(&display_path(root, cwd))
+        )
+        .map_err(output_error)?;
+    }
+    if missing_roots.len() > MAX_MISSING_ROOTS_SHOWN {
+        writeln!(
+            output,
+            "missing_roots_omitted={}",
+            missing_roots.len() - MAX_MISSING_ROOTS_SHOWN
+        )
+        .map_err(output_error)?;
+    }
     for error in &walk_errors {
         writeln!(
             output,
@@ -271,6 +295,7 @@ fn path_contains_symlink(path: &Path) -> bool {
 fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
     let mut positional = Vec::new();
     let mut patterns = Vec::new();
+    let mut globs = Vec::new();
     let mut regex = false;
     let mut fixed_strings = false;
     let mut ignore_case = false;
@@ -298,6 +323,17 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
             }
             value if value.starts_with("--pattern=") => {
                 patterns.push(value[10..].to_string());
+                index += 1;
+            }
+            "--glob" | "-g" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| (2, "--glob requires a value".into()))?;
+                globs.push(value.clone());
+                index += 2;
+            }
+            value if value.starts_with("--glob=") => {
+                globs.push(value[7..].to_string());
                 index += 1;
             }
             "--regex" => {
@@ -469,9 +505,11 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
         return Err((2, format!("search accepts at most {MAX_PATHS} paths")));
     }
     validate_patterns(&patterns)?;
+    validate_globs(&globs)?;
     Ok(Options {
         paths,
         patterns,
+        globs,
         regex,
         ignore_case,
         word,
@@ -483,6 +521,28 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
         max_bytes,
         owners,
     })
+}
+
+fn validate_globs(globs: &[String]) -> Result<(), (i32, String)> {
+    if globs.len() > MAX_GLOBS {
+        return Err((2, format!("search accepts at most {MAX_GLOBS} globs")));
+    }
+    if globs
+        .iter()
+        .any(|value| value.is_empty() || value.len() > MAX_PATTERN_BYTES)
+    {
+        return Err((
+            2,
+            "each search glob must contain 1..4096 UTF-8 bytes".into(),
+        ));
+    }
+    if globs.iter().map(String::len).sum::<usize>() > MAX_TOTAL_GLOB_BYTES {
+        return Err((
+            2,
+            "combined search globs may not exceed 32768 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_context(value: Option<&String>, option: &str) -> Result<usize, (i32, String)> {
@@ -570,18 +630,38 @@ struct TextDiscovery {
     errors_total: usize,
 }
 
-fn discover_text_files(root: &Path, language: Option<Language>) -> TextDiscovery {
+fn discover_text_files(
+    root: &Path,
+    language: Option<Language>,
+    globs: &[String],
+) -> Result<TextDiscovery, (i32, String)> {
+    let override_root = if root.is_file() {
+        root.parent().unwrap_or(root)
+    } else {
+        root
+    };
+    let mut override_builder = OverrideBuilder::new(override_root);
+    for glob in globs {
+        override_builder
+            .add(glob)
+            .map_err(|error| input_error(format!("invalid search glob {glob:?}: {error}")))?;
+    }
+    let overrides = override_builder
+        .build()
+        .map_err(|error| input_error(format!("invalid search glob: {error}")))?;
     if root.is_file() {
-        let paths = if language.is_none_or(|item| item.matches_path(root)) {
+        let paths = if language.is_none_or(|item| item.matches_path(root))
+            && !overrides.matched(root, false).is_ignore()
+        {
             vec![root.to_path_buf()]
         } else {
             Vec::new()
         };
-        return TextDiscovery {
+        return Ok(TextDiscovery {
             paths,
             errors: Vec::new(),
             errors_total: 0,
-        };
+        });
     }
     let mut builder = WalkBuilder::new(root);
     builder
@@ -614,16 +694,18 @@ fn discover_text_files(root: &Path, language: Option<Language>) -> TextDiscovery
             continue;
         }
         let path = entry.into_path();
-        if language.is_none_or(|item| item.matches_path(&path)) {
+        if !overrides.matched(&path, false).is_ignore()
+            && language.is_none_or(|item| item.matches_path(&path))
+        {
             paths.push(path);
         }
     }
     paths.sort();
-    TextDiscovery {
+    Ok(TextDiscovery {
         paths,
         errors,
         errors_total,
-    }
+    })
 }
 
 fn read_text(path: &Path) -> Result<TextFile, SkipKind> {
@@ -984,6 +1066,7 @@ fn render_snippets(
             .iter()
             .map(|(_, hit)| hit)
             .filter(|hit| hit.line_bytes > options.max_bytes)
+            .take(remaining_items)
         {
             writeln!(
                 output,
@@ -1026,13 +1109,6 @@ fn render_snippets(
             if remaining_items == 0 {
                 break;
             }
-            let source_bytes = lines[start..end]
-                .iter()
-                .map(|line| line.len() + 1)
-                .sum::<usize>();
-            if source_bytes > remaining_bytes {
-                continue;
-            }
             let hit_rows = hits
                 .iter()
                 .map(|(_, hit)| hit.row)
@@ -1042,7 +1118,30 @@ fn render_snippets(
                 use std::fmt::Write as _;
                 let row = start + offset;
                 let marker = if hit_rows.contains(&row) { '>' } else { ' ' };
-                let _ = writeln!(rendered, "{marker}{:>5} | {line}", row + 1);
+                let focus = hits
+                    .iter()
+                    .filter(|(_, hit)| hit.row == row)
+                    .map(|(_, hit)| hit.column)
+                    .min();
+                let (excerpt, excerpt_start, excerpt_end) = line_excerpt(line, focus);
+                let _ = write!(rendered, "{marker}{:>5} | ", row + 1);
+                if excerpt_start > 0 {
+                    rendered.push_str("... ");
+                }
+                rendered.push_str(excerpt);
+                if excerpt_end < line.len() {
+                    rendered.push_str(" ...");
+                }
+                if excerpt.len() < line.len() {
+                    let _ = write!(
+                        rendered,
+                        " [clipped line_bytes={} shown_bytes={}..{}]",
+                        line.len(),
+                        excerpt_start,
+                        excerpt_end
+                    );
+                }
+                rendered.push('\n');
             }
             let hit_label = hits
                 .iter()
@@ -1123,6 +1222,22 @@ fn render_snippets(
         writeln!(output, "matches_omitted={omitted}").map_err(output_error)?;
     }
     Ok(shown_per_query)
+}
+
+fn line_excerpt(line: &str, focus: Option<usize>) -> (&str, usize, usize) {
+    if line.len() <= MAX_SNIPPET_LINE_BYTES {
+        return (line, 0, line.len());
+    }
+    let focus = focus.unwrap_or(0).min(line.len());
+    let mut start = focus.saturating_sub(MAX_SNIPPET_LINE_BYTES / 3);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + MAX_SNIPPET_LINE_BYTES).min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&line[start..end], start, end)
 }
 
 fn shown_query_files(scans: &[&Scan], query_count: usize) -> Vec<usize> {
@@ -1294,7 +1409,36 @@ fn skip_counts(skips: &[Skip]) -> [(&'static str, usize); 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, Options, build_engine, parse_options};
+    use super::{Mode, Options, build_engine, parse_options, run};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Sandbox(PathBuf);
+
+    impl Sandbox {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "pira-nav-search-{label}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(fs::canonicalize(path).unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn options(args: &[&str]) -> Result<Options, (i32, String)> {
         parse_options(
@@ -1321,6 +1465,57 @@ mod tests {
     }
 
     #[test]
+    fn repeatable_globs_filter_paths_and_missing_roots_are_named() {
+        let sandbox = Sandbox::new("globs");
+        fs::write(sandbox.path().join("keep.rs"), "Needle\n").unwrap();
+        fs::write(sandbox.path().join("drop.py"), "Needle\n").unwrap();
+        fs::write(sandbox.path().join("ignored.rs"), "Needle\n").unwrap();
+        fs::write(sandbox.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::create_dir(sandbox.path().join("vendor")).unwrap();
+        fs::write(sandbox.path().join("vendor/drop.rs"), "Needle\n").unwrap();
+        let args = [
+            "Needle",
+            ".",
+            "missing-a",
+            "missing-b",
+            "-g",
+            "*.rs",
+            "--glob=!vendor/**",
+            "--files-with-matches",
+        ]
+        .map(str::to_string);
+        let mut output = Vec::new();
+        run(&args, None, sandbox.path(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("matched_files=1 globs=2"));
+        assert!(output.contains("missing_roots=2"));
+        assert!(output.contains("missing_root path=\"missing-a\""));
+        assert!(output.contains("missing_root path=\"missing-b\""));
+        assert!(output.contains("file=\"keep.rs\""));
+        assert!(!output.contains("drop.py"));
+        assert!(!output.contains("ignored.rs"));
+        assert!(!output.contains("vendor/drop.rs"));
+    }
+
+    #[test]
+    fn long_matching_line_is_clipped_around_the_match() {
+        let sandbox = Sandbox::new("long-line");
+        let line = format!("{}Needle{}", "a".repeat(1_500), "z".repeat(500));
+        fs::write(sandbox.path().join("long.rs"), format!("{line}\n")).unwrap();
+        let args = ["Needle", "long.rs", "-C", "0"].map(str::to_string);
+        let mut output = Vec::new();
+        run(&args, None, sandbox.path(), &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Needle"));
+        assert!(output.contains("clipped line_bytes=2006 shown_bytes="));
+        assert!(
+            output.len() < 1_500,
+            "unexpectedly large output: {}",
+            output.len()
+        );
+    }
+
+    #[test]
     fn symmetric_and_directional_context_are_mutually_exclusive() {
         for args in [
             ["Needle", "--context", "2", "--after-context", "8"],
@@ -1337,6 +1532,7 @@ mod tests {
         let options = Options {
             paths: vec![".".into()],
             patterns: vec!["Parser".into()],
+            globs: Vec::new(),
             regex: false,
             ignore_case: false,
             word: true,

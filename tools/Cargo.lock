@@ -293,7 +293,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "pira_ctx"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "fs2",
  "jiff",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "pira_dec"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "jiff",
  "regex",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "pira_nav"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "ignore",
  "libc",
@@ -342,6 +342,7 @@ dependencies = [
  "tree-sitter-json",
  "tree-sitter-julia",
  "tree-sitter-kotlin-sg",
+ "tree-sitter-lean",
  "tree-sitter-lua",
  "tree-sitter-php",
  "tree-sitter-powershell",
@@ -716,6 +717,15 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-lean"
+version = "0.2.0"
+source = "git+https://github.com/Julian/tree-sitter-lean?rev=86c2bcb379fe0b2ad13d8b3411400deff75b2785#86c2bcb379fe0b2ad13d8b3411400deff75b2785"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "tree-sitter-lua"

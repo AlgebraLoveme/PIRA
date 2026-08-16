@@ -84,12 +84,16 @@ fn parse_source_symbols_state(
     let tree = parser
         .parse(input.as_bytes(), None)
         .ok_or_else(|| format!("{} parser returned no tree", language.name()))?;
-    let defects = inspect_tree(tree.root_node()).map_err(|depth| {
-        format!(
-            "syntax tree nesting exceeds supported depth of {MAX_SYNTAX_DEPTH} in {} (observed at least {depth})",
-            path.display()
-        )
-    })?;
+    let defects = match inspect_tree(tree.root_node()) {
+        Ok(defects) => defects,
+        Err(_) if language == Language::Lean => return Ok((Vec::new(), 1, false)),
+        Err(depth) => {
+            return Err(format!(
+                "syntax tree nesting exceeds supported depth of {MAX_SYNTAX_DEPTH} in {} (observed at least {depth})",
+                path.display()
+            ));
+        }
+    };
     if defects > 0 {
         return Ok((Vec::new(), defects, false));
     }
@@ -190,6 +194,7 @@ fn collect_symbols(tree: &Tree, language: Language, source: &str) -> (Vec<Symbol
         Language::Dart => walk_dart(tree.root_node(), source, None, 0, &mut symbols),
         Language::Elixir => walk_elixir(tree.root_node(), source, None, 0, &mut symbols),
         Language::Julia => walk_julia(tree.root_node(), source, None, 0, &mut symbols),
+        Language::Lean => walk_lean(tree.root_node(), source, &mut symbols),
         Language::Json | Language::Jsonc | Language::Yaml | Language::Toml | Language::Markdown => {
             unreachable!()
         }
@@ -1645,6 +1650,242 @@ fn elixir_head_name(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+#[derive(Debug)]
+enum LeanScopeContext {
+    Namespace(Option<String>),
+    Section,
+}
+
+#[derive(Debug)]
+struct LeanScope {
+    context: LeanScopeContext,
+    symbol_index: Option<usize>,
+    visible: bool,
+}
+
+#[derive(Debug, Default)]
+struct LeanScopes {
+    stack: Vec<LeanScope>,
+    namespace: Option<String>,
+    visible_depth: usize,
+}
+
+impl LeanScopes {
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    fn depth(&self) -> usize {
+        self.visible_depth
+    }
+
+    fn push_namespace(&mut self, namespace: String, symbol_index: Option<usize>) {
+        let previous = self.namespace.replace(namespace);
+        self.stack.push(LeanScope {
+            context: LeanScopeContext::Namespace(previous),
+            symbol_index,
+            visible: true,
+        });
+        self.visible_depth = self.visible_depth.saturating_add(1);
+    }
+
+    fn push_section(&mut self, symbol_index: Option<usize>, visible: bool) {
+        self.stack.push(LeanScope {
+            context: LeanScopeContext::Section,
+            symbol_index,
+            visible,
+        });
+        self.visible_depth = self.visible_depth.saturating_add(usize::from(visible));
+    }
+
+    fn close(
+        &mut self,
+        output: &mut SymbolCollector,
+        end_byte: usize,
+        end_point: Point,
+        all: bool,
+    ) {
+        while let Some(scope) = self.stack.pop() {
+            if let Some(index) = scope.symbol_index
+                && let Some(symbol) = output.symbols.get_mut(index)
+            {
+                symbol.end_byte = end_byte;
+                symbol.end_row = end_point.row;
+                symbol.end_column = end_point.column;
+            }
+            self.visible_depth = self
+                .visible_depth
+                .saturating_sub(usize::from(scope.visible));
+            if let LeanScopeContext::Namespace(previous) = scope.context {
+                self.namespace = previous;
+            }
+            if !all {
+                break;
+            }
+        }
+    }
+}
+
+fn walk_lean(root: Node<'_>, source: &str, output: &mut SymbolCollector) {
+    let mut scopes = LeanScopes::default();
+    walk_lean_commands(root, source, &mut scopes, output);
+    scopes.close(output, root.end_byte(), root.end_position(), true);
+}
+
+fn walk_lean_commands(
+    node: Node<'_>,
+    source: &str,
+    scopes: &mut LeanScopes,
+    output: &mut SymbolCollector,
+) {
+    match node.kind() {
+        "namespace" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            let parent = scopes.namespace();
+            let before = output.symbols.len();
+            let qualified = push_symbol(
+                node,
+                name,
+                source,
+                (parent, "."),
+                "namespace",
+                scopes.depth(),
+                output,
+            );
+            scopes.push_namespace(qualified, (output.symbols.len() > before).then_some(before));
+            return;
+        }
+        "section" => {
+            let name = node.child_by_field_name("name");
+            let symbol_index = name.and_then(|name| {
+                let before = output.symbols.len();
+                push_symbol(
+                    node,
+                    name,
+                    source,
+                    (scopes.namespace(), "."),
+                    "section",
+                    scopes.depth(),
+                    output,
+                );
+                (output.symbols.len() > before).then_some(before)
+            });
+            scopes.push_section(symbol_index, name.is_some());
+            return;
+        }
+        "end" => {
+            scopes.close(output, node.end_byte(), node.end_position(), false);
+            return;
+        }
+        "declaration" => {
+            if let Some(declaration) = lean_declaration_child(node) {
+                collect_lean_declaration(
+                    node,
+                    declaration,
+                    source,
+                    scopes.namespace(),
+                    scopes.depth(),
+                    output,
+                );
+            }
+            return;
+        }
+        _ => {}
+    }
+    walk_named_children(node, |child| {
+        walk_lean_commands(child, source, scopes, output)
+    });
+}
+
+fn lean_declaration_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| lean_declaration_base_kind(child.kind()).is_some())
+}
+
+fn collect_lean_declaration(
+    range_node: Node<'_>,
+    declaration: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    depth: usize,
+    output: &mut SymbolCollector,
+) {
+    let Some(name) = declaration.child_by_field_name("name") else {
+        return;
+    };
+    let kind = match declaration.kind() {
+        "structure" if lean_prefix_has_keyword(declaration, name, source, "class") => "class",
+        "inductive" if lean_prefix_has_keyword(declaration, name, source, "class") => {
+            "class-inductive"
+        }
+        other => lean_declaration_base_kind(other).expect("declaration kind was prefiltered"),
+    };
+    let qualified = push_symbol(range_node, name, source, (parent, "."), kind, depth, output);
+    collect_lean_members(
+        declaration,
+        source,
+        &qualified,
+        depth.saturating_add(1),
+        output,
+    );
+}
+
+fn collect_lean_members(
+    node: Node<'_>,
+    source: &str,
+    parent: &str,
+    depth: usize,
+    output: &mut SymbolCollector,
+) {
+    if output.truncated {
+        return;
+    }
+    let kind = match node.kind() {
+        "field" => Some("field"),
+        "ctor" | "ctor_alt" => Some("constructor"),
+        "where_aux_def" => Some("definition"),
+        _ => None,
+    };
+    if let Some(kind) = kind
+        && let Some(name) = node.child_by_field_name("name")
+    {
+        push_symbol(node, name, source, (Some(parent), "."), kind, depth, output);
+        return;
+    }
+    walk_named_children(node, |child| {
+        collect_lean_members(child, source, parent, depth, output)
+    });
+}
+
+fn lean_declaration_base_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "def" => Some("definition"),
+        "theorem" => Some("theorem"),
+        "abbrev" => Some("abbrev"),
+        "instance" => Some("instance"),
+        "axiom" => Some("axiom"),
+        "opaque" => Some("opaque"),
+        "constant" => Some("constant"),
+        "structure" => Some("structure"),
+        "inductive" => Some("inductive"),
+        _ => None,
+    }
+}
+
+fn lean_prefix_has_keyword(
+    declaration: Node<'_>,
+    name: Node<'_>,
+    source: &str,
+    keyword: &str,
+) -> bool {
+    source_slice(source, declaration.start_byte(), name.start_byte())
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .any(|token| token == keyword)
+}
+
 fn walk_julia(
     node: Node<'_>,
     source: &str,
@@ -2167,6 +2408,29 @@ mod rust_navigation_tests {
         assert_eq!(rust_impl_owner("SourcePositions<'a>"), "SourcePositions");
         assert_eq!(rust_impl_owner("crate::Cache<K, Vec<V>>"), "crate::Cache");
         assert_eq!(rust_impl_owner("Plain"), "Plain");
+    }
+}
+
+#[cfg(test)]
+mod lean_navigation_tests {
+    use std::path::Path;
+
+    use super::parse_source_symbols;
+    use crate::language::Language;
+
+    #[test]
+    fn anonymous_sections_do_not_create_invisible_outline_depth() {
+        let source = "namespace Demo\nsection\ndef value : Nat := 1\nend\nend Demo\n";
+        let (symbols, defects) =
+            parse_source_symbols(Path::new("Demo.lean"), Language::Lean, source).unwrap();
+        assert_eq!(defects, 0);
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| (symbol.qualified_name.as_str(), symbol.depth))
+                .collect::<Vec<_>>(),
+            vec![("Demo", 0), ("Demo.value", 1)]
+        );
     }
 }
 

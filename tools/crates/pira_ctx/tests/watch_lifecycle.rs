@@ -44,6 +44,20 @@ fn run(store: &Path, arguments: &[&str]) -> Output {
     Command::new(binary()).args(argv).output().unwrap()
 }
 
+#[test]
+fn completed_probe_reports_final_exit_instead_of_an_idle_attempt() {
+    let sandbox = Sandbox::new("watch-complete-probe");
+    let output = run(
+        sandbox.path(),
+        &["watch", "--deadline", "2s", "--", "sh", "-c", "exit 0"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(report.contains("Monitor: Complete | Job: Succeeded | Probe: exit 0"));
+    assert!(!report.contains("Attempt: Idle"));
+    assert!(!report.contains("Detail: probe exit 0"));
+}
+
 fn start_pending_watch(store: &Path, extra: &[&str]) -> (Child, String) {
     let mut arguments = vec!["watch", "--store-dir", store.to_str().unwrap()];
     arguments.extend_from_slice(extra);

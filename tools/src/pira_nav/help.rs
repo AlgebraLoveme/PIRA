@@ -88,10 +88,9 @@ USAGE
   pira_nav search PATTERN [PATH...] [OPTIONS]
   pira_nav search -e PATTERN [-e PATTERN]... [PATH...] [OPTIONS]
 
-PATH defaults to `.`; up to 64 overlapping paths are deduplicated. Directories cover ordinary
-unignored UTF-8 text, including unsupported languages; explicit files bypass ignore discovery. With
-several paths, missing peers mark output incomplete while valid peers are searched; one missing target
-is an error. Binary, non-UTF-8, oversized, and unreadable files are aggregate incomplete counts.
+PATH defaults to `.`; up to 64 overlapping paths are deduplicated. Directories search unignored UTF-8
+text; explicit files bypass ignore discovery but obey `--glob`. Missing peers mark output incomplete;
+one missing target errors. Skipped binary/non-UTF-8/oversized/unreadable files are counted.
 
 OPTIONS
   -e, --pattern PATTERN     Add a pattern (1..32 total).
@@ -100,6 +99,7 @@ OPTIONS
   --regex                   Use bounded Rust-regex syntax.
   -i, --ignore-case         Match without case distinctions.
   -w, --word                Require Unicode half-word boundaries.
+  -g, --glob GLOB           Restrict paths with a gitignore glob; repeatable; ! excludes.
   -l, --files-with-matches  Print matching paths and query coverage only.
   -c, --count               Print exact matching-line counts per file/query.
   -B, --before-context N    Lines before each snippet match (maximum 1000).
@@ -110,10 +110,10 @@ OPTIONS
   --max-bytes N             Maximum rendered source-block bytes (default 8192).
   --owners                  Annotate snippet matches with enclosing clean declarations when available.
 
-Combine -B and -A for asymmetric context; either conflicts with -C. One scan serves all patterns.
-Each ranks independently, preferring declaration-like production hits;
-batches remain query-balanced with exact shown/omitted counts. Zero matches is success. Source is
-framed as untrusted data; an overlong matching line is identified but not truncated.
+Combine -B and -A for asymmetric context; either conflicts with -C. One balanced scan ranks each
+pattern independently with exact omission counts. Zero matches succeeds. Source is untrusted data;
+lines over 512 bytes are clipped around the first selected match with byte-range metadata. A line
+larger than the full byte budget is metadata-only.
 
 EXAMPLES
   pira_nav search Parser src

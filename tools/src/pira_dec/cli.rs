@@ -89,7 +89,8 @@ bound; --until excludes records at or after its bound. Use either a field/regex 
 or both. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
 newest first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records,
 reports them as warnings, and may omit a record published concurrently. Use --json for structured
-matches and skipped-record details.
+matches and skipped-record details. A human-readable search with no matches prints an explicit
+`decisions_matched=0` status and exits 1.
 
 EXAMPLES
   pira_dec search --since 7d --limit 20

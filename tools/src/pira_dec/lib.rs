@@ -265,6 +265,17 @@ fn run_search(
         };
         print_json(&output)?;
     } else {
+        if !found {
+            util::stdout_line(&format!(
+                "decisions_matched=0 complete={}{}",
+                usize::from(skipped.is_empty()),
+                if skipped.is_empty() {
+                    String::new()
+                } else {
+                    format!(" skipped={}", skipped.len())
+                }
+            ))?;
+        }
         for record in matches {
             util::stdout_line(&format!(
                 "{} | {} | {} | {}",

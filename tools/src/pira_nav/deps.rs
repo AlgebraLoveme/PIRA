@@ -1,14 +1,31 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tree_sitter::Node;
 
 use crate::language::Language;
 use crate::model::ImportEdge;
-use crate::parse::ParsedSyntax;
-use crate::util::{absolute_lexical, display_path, one_line, source_slice};
+use crate::parse::{ParsedSyntax, parse_syntax};
+use crate::util::{absolute_lexical, display_path, one_line, read_source, source_slice};
 
-pub fn imports(parsed: &ParsedSyntax, cwd: &Path) -> Vec<ImportEdge> {
+/// Extract imports from a source file.
+///
+/// Most languages use their native syntax tree. Lean is intentionally dispatched to its
+/// source-level module-header scanner: imports can only occur in the header, while parsing the
+/// complete body is both unnecessary and vulnerable to syntax extensions introduced by imports.
+pub fn imports_from_path(
+    path: &Path,
+    language: Language,
+    cwd: &Path,
+) -> Result<Vec<ImportEdge>, String> {
+    if language == Language::Lean {
+        return lean_imports_from_source(path, &read_source(path)?, cwd);
+    }
+    let parsed = parse_syntax(path, language)?;
+    imports_from_syntax(&parsed, cwd)
+}
+
+fn imports_from_syntax(parsed: &ParsedSyntax, cwd: &Path) -> Result<Vec<ImportEdge>, String> {
     let mut output = Vec::new();
     match parsed.language {
         Language::Python => collect_python(parsed.tree.root_node(), parsed, cwd, &mut output),
@@ -46,6 +63,9 @@ pub fn imports(parsed: &ParsedSyntax, cwd: &Path) -> Vec<ImportEdge> {
         Language::Dart => collect_dart(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::Elixir => collect_elixir(parsed.tree.root_node(), parsed, cwd, &mut output),
         Language::Julia => collect_julia(parsed.tree.root_node(), parsed, cwd, &mut output),
+        Language::Lean => {
+            return Err("Lean imports require the source-level header scanner".into());
+        }
         Language::Json | Language::Jsonc | Language::Yaml | Language::Toml | Language::Markdown => {
         }
     }
@@ -54,7 +74,7 @@ pub fn imports(parsed: &ParsedSyntax, cwd: &Path) -> Vec<ImportEdge> {
             .cmp(&right.line)
             .then_with(|| left.text.cmp(&right.text))
     });
-    output
+    Ok(output)
 }
 
 fn collect_java(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
@@ -544,6 +564,259 @@ fn collect_julia(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut
     recurse(node, |child| collect_julia(child, parsed, cwd, output));
 }
 
+#[derive(Clone, Copy)]
+struct LeanHeaderToken {
+    start: usize,
+    end: usize,
+    line: usize,
+}
+
+struct LeanHeaderScanner<'a> {
+    source: &'a str,
+    offset: usize,
+    line: usize,
+}
+
+impl<'a> LeanHeaderScanner<'a> {
+    fn new(source: &'a str) -> Self {
+        Self {
+            source,
+            offset: 0,
+            line: 1,
+        }
+    }
+
+    fn checkpoint(&self) -> (usize, usize) {
+        (self.offset, self.line)
+    }
+
+    fn restore(&mut self, checkpoint: (usize, usize)) {
+        (self.offset, self.line) = checkpoint;
+    }
+
+    fn token_text(&self, token: LeanHeaderToken) -> &'a str {
+        &self.source[token.start..token.end]
+    }
+
+    fn next_token(&mut self) -> Result<Option<LeanHeaderToken>, String> {
+        self.skip_trivia()?;
+        if self.offset == self.source.len() {
+            return Ok(None);
+        }
+        let start = self.offset;
+        let line = self.line;
+        let mut quoted = false;
+        while self.offset < self.source.len() {
+            if !quoted
+                && (self.current_char().is_some_and(char::is_whitespace)
+                    || self.remaining().starts_with("--")
+                    || self.remaining().starts_with("/-"))
+            {
+                break;
+            }
+            let character = self.current_char().expect("offset is within source");
+            quoted = match character {
+                '«' if !quoted => true,
+                '»' if quoted => false,
+                _ => quoted,
+            };
+            self.advance_char(character);
+        }
+        if quoted {
+            return Err(format!(
+                "unterminated quoted identifier in Lean module header at line {line}"
+            ));
+        }
+        Ok(Some(LeanHeaderToken {
+            start,
+            end: self.offset,
+            line,
+        }))
+    }
+
+    fn skip_trivia(&mut self) -> Result<(), String> {
+        loop {
+            while let Some(character) = self.current_char().filter(|value| value.is_whitespace()) {
+                self.advance_char(character);
+            }
+            if self.remaining().starts_with("--") {
+                while let Some(character) = self.current_char() {
+                    self.advance_char(character);
+                    if character == '\n' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if self.remaining().starts_with("/-") {
+                let comment_line = self.line;
+                self.offset += 2;
+                let mut depth = 1usize;
+                while self.offset < self.source.len() {
+                    if self.remaining().starts_with("/-") {
+                        depth = depth.saturating_add(1);
+                        self.offset += 2;
+                    } else if self.remaining().starts_with("-/") {
+                        depth -= 1;
+                        self.offset += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        let character = self.current_char().expect("offset is within source");
+                        self.advance_char(character);
+                    }
+                }
+                if depth != 0 {
+                    return Err(format!(
+                        "unterminated block comment in Lean module header at line {comment_line}"
+                    ));
+                }
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    fn current_char(&self) -> Option<char> {
+        self.remaining().chars().next()
+    }
+
+    fn remaining(&self) -> &'a str {
+        &self.source[self.offset..]
+    }
+
+    fn advance_char(&mut self, character: char) {
+        self.offset += character.len_utf8();
+        self.line += usize::from(character == '\n');
+    }
+}
+
+fn lean_imports_from_source(
+    path: &Path,
+    source: &str,
+    cwd: &Path,
+) -> Result<Vec<ImportEdge>, String> {
+    let mut scanner = LeanHeaderScanner::new(source);
+    consume_lean_header_keyword(&mut scanner, "module")?;
+    consume_lean_header_keyword(&mut scanner, "prelude")?;
+
+    let mut output = Vec::new();
+    loop {
+        let checkpoint = scanner.checkpoint();
+        let Some(first) = scanner.next_token()? else {
+            break;
+        };
+        let start = first.start;
+        let line = first.line;
+        let mut keyword = scanner.token_text(first);
+        if keyword == "public" {
+            let Some(token) = scanner.next_token()? else {
+                scanner.restore(checkpoint);
+                break;
+            };
+            keyword = scanner.token_text(token);
+        }
+        if keyword == "meta" {
+            let Some(token) = scanner.next_token()? else {
+                scanner.restore(checkpoint);
+                break;
+            };
+            keyword = scanner.token_text(token);
+        }
+        if keyword != "import" {
+            scanner.restore(checkpoint);
+            break;
+        }
+
+        let Some(mut module_token) = scanner.next_token()? else {
+            return Err(format!("Lean import at line {line} has no module name"));
+        };
+        if scanner.token_text(module_token) == "all" {
+            module_token = scanner
+                .next_token()?
+                .ok_or_else(|| format!("Lean import at line {line} has no module name"))?;
+        }
+        let module = scanner.token_text(module_token);
+        let relative = lean_module_path(module)
+            .ok_or_else(|| format!("invalid Lean module name {module:?} at line {line}"))?;
+        let targets = ancestor_source_targets(path, cwd, &relative, &[""]);
+        let (target, target_label, resolution) = resolved_or_ambiguous(targets, module, cwd);
+        output.push(ImportEdge {
+            source: path.to_path_buf(),
+            line,
+            text: one_line(&source[start..module_token.end]),
+            target,
+            target_label,
+            resolution,
+        });
+    }
+    Ok(output)
+}
+
+fn consume_lean_header_keyword(
+    scanner: &mut LeanHeaderScanner<'_>,
+    expected: &str,
+) -> Result<(), String> {
+    let checkpoint = scanner.checkpoint();
+    if scanner
+        .next_token()?
+        .is_some_and(|token| scanner.token_text(token) == expected)
+    {
+        return Ok(());
+    }
+    scanner.restore(checkpoint);
+    Ok(())
+}
+
+fn lean_module_path(module: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    let mut segment = String::new();
+    let mut quoted = false;
+    for character in module.chars() {
+        match character {
+            '«' => {
+                if quoted {
+                    return None;
+                }
+                quoted = true;
+            }
+            '»' => {
+                if !quoted {
+                    return None;
+                }
+                quoted = false;
+            }
+            '.' if !quoted => {
+                if !push_lean_module_segment(&mut relative, &mut segment) {
+                    return None;
+                }
+            }
+            '/' | '\\' | '\0' => return None,
+            _ => segment.push(character),
+        }
+    }
+    if quoted || !push_lean_module_segment(&mut relative, &mut segment) {
+        return None;
+    }
+    let mut file_name = relative.file_name()?.to_os_string();
+    file_name.push(".lean");
+    relative.set_file_name(file_name);
+    Some(relative)
+}
+
+fn push_lean_module_segment(relative: &mut PathBuf, segment: &mut String) -> bool {
+    if segment.is_empty() || segment == "." || segment == ".." {
+        return false;
+    }
+    let mut components = Path::new(segment.as_str()).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return false;
+    }
+    relative.push(std::mem::take(segment));
+    true
+}
+
 fn resolve_relative_source(path: &Path, module: &str, default_extension: &str) -> Option<PathBuf> {
     let base = path.parent()?.join(module);
     if base.is_file() {
@@ -976,7 +1249,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::resolve_rust;
+    use super::{imports_from_path, lean_module_path, resolve_rust};
+    use crate::language::Language;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1008,5 +1282,108 @@ mod tests {
         assert!(target.is_none());
         assert_eq!(label, "outside-workspace");
         assert_eq!(resolution, "blocked");
+    }
+
+    #[test]
+    fn lean_imports_ignore_dynamic_and_deep_body_syntax() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-nav-lean-imports-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("Demo")).unwrap();
+        fs::write(root.join("Demo/Base.lean"), "def base : Nat := 1\n").unwrap();
+        let source = root.join("Deep.lean");
+        fs::write(
+            &source,
+            format!(
+                "import Demo.Base\n\nsyntax \"pira_custom\" : term\ndef deep : Nat := {}0{}\n",
+                "(".repeat(300),
+                ")".repeat(300)
+            ),
+        )
+        .unwrap();
+
+        let edges = imports_from_path(&source, Language::Lean, &root).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, Some(root.join("Demo/Base.lean")));
+        assert_eq!(edges[0].resolution, "structural");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lean_header_scanner_handles_comments_modifiers_and_quoted_names() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-nav-lean-header-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("Demo")).unwrap();
+        fs::write(root.join("Demo/Base.lean"), "def base : Nat := 1\n").unwrap();
+        fs::write(
+            root.join("Demo/Quoted Name.lean"),
+            "def quoted : Nat := 2\n",
+        )
+        .unwrap();
+        let source = root.join("Header.lean");
+        fs::write(
+            &source,
+            "/- outer /- import Ignored.Nested -/ comment -/\n\
+             module -- module annotation\n\
+             prelude\n\
+             public meta import all Demo.Base -- retained comment\n\
+             import Demo.«Quoted Name»\n\
+             /-! import Ignored.Doc -/\n\
+             deprecated_module \"import Ignored.Deprecation instead\" (since := \"2026-01-01\")\n\
+             def body : String := \"import Ignored.String\"\n",
+        )
+        .unwrap();
+
+        let edges = imports_from_path(&source, Language::Lean, &root).unwrap();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].line, 4);
+        assert_eq!(edges[0].text, "public meta import all Demo.Base");
+        assert_eq!(edges[0].target, Some(root.join("Demo/Base.lean")));
+        assert_eq!(edges[1].line, 5);
+        assert_eq!(edges[1].text, "import Demo.«Quoted Name»");
+        assert_eq!(edges[1].target, Some(root.join("Demo/Quoted Name.lean")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lean_header_scanner_rejects_incomplete_header_trivia() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-nav-lean-malformed-header-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("Malformed.lean");
+        fs::write(&source, "/- import Demo.Base\n").unwrap();
+
+        let error = imports_from_path(&source, Language::Lean, &root).unwrap_err();
+        assert!(error.contains("unterminated block comment"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lean_module_paths_are_relative_and_quote_aware() {
+        assert_eq!(
+            lean_module_path("Demo.«Quoted.Name»"),
+            Some(PathBuf::from("Demo/Quoted.Name.lean"))
+        );
+        for invalid in [
+            "",
+            ".Demo",
+            "Demo.",
+            "Demo..Base",
+            "Demo/Injected",
+            "Demo\\Injected",
+            "Demo.«Unclosed",
+            "Demo.Unopened»",
+            "Demo.««Nested»»",
+        ] {
+            assert_eq!(lean_module_path(invalid), None, "accepted {invalid:?}");
+        }
     }
 }
