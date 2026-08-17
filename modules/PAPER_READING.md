@@ -1,65 +1,46 @@
 # PAPER_READING
 
-## Goal and Strategy
-- Read one research paper efficiently; default to the minimum decision-useful extraction.
-- First identify the goal: relevance/triage, main idea/background, method, evidence quality, limitations, citation support, implementation, critique, reproduction, or review. Goal determines depth; if unclear from context, confirm before reading.
-- Escalate to one full read only under the Progressive Depth conditions below. Always end with a depth-scaled structured note.
+## Requests
+- **Triage a paper for relevance**
+  - **Done when:** the user can decide whether to read, cite, or use the paper based on its problem, main claim, strongest visible support, consequential limitation, and fit to the stated goal.
+  - **Workflow:** target decision → title, abstract, introduction, conclusion, and key figures or tables → claim, support, and risk → relevance verdict.
+- **Understand a contribution or method**
+  - **Done when:** the user can reconstruct the problem, operative idea, claimed capability, supporting evidence, and important boundary without reproducing the paper's exposition.
+  - **Workflow:** question → problem and contribution → operative mechanism or inference chain → decisive evidence → assumptions and boundary. Read method, proof, or appendix detail only where the mechanism remains incomplete.
+- **Evaluate evidence or critique a paper**
+  - **Done when:** each material claim is tied to the evidence that does or does not support it, and the resulting judgment accounts for assumptions, uncertainty, comparison fairness, and plausible alternative explanations.
+  - **Workflow:** claim inventory → evidence locations → design, assumptions, baselines, and uncertainty → alternative explanations → calibrated trust judgment.
+- **Verify a claim or citation**
+  - **Done when:** the target statement has a clear support verdict grounded in the cited paper's exact result and scope.
+  - **Workflow:** target statement → exact passage, result, or theorem → surrounding method and scope → supported, partially supported, or unsupported. Distinguish mere topic relevance from actual entailment.
+- **Extract implementation or reproduction details**
+  - **Done when:** the user has a dependency-ordered implementation path and can distinguish the reported procedure, required inference, optional recommendation, and consequential unresolved choices.
+  - **Workflow:** target behavior → method, appendix, supplement, and artifact → reported inputs and preprocessing → model or procedure → parameters and training → evaluation → blocking or result-sensitive gaps → separately labeled inferences or recommendations.
+  - Default to two parts: the reported procedure in dependency order, then unresolved decisions. Mark any inference needed to make the procedure executable at the point where it occurs; do not silently resolve it. Add engineering recommendations only when requested. Prioritize missing details that prevent execution or can materially change the result; omit ordinary unspecified defaults unless they are outcome-sensitive.
 
-## Context-Efficient Reading
-- Do not read the whole paper by default. Start with title, abstract, introduction, figures/tables, and conclusion.
-- Skip references by default. Read methods, appendices, proofs, supplement, or artifact details only when relevant to the goal.
-- Inspect references only for reference checking or a clearly important citation; search that citation rather than reading the full list.
+Use the applicable request workflow plus the shared rules below.
 
-## Progressive Depth
-1. **Triage:** problem, main claim, potential importance.
-2. **Core understanding:** method, supporting evidence, important assumptions/limits.
-3. **Full read:** one front-to-back pass, still skipping references, only when full understanding, close critique, or implementation/reproduction detail is needed.
+## Reading Method
+- Start with the smallest sections that can answer the question. Default to title, abstract, introduction, conclusion, and task-relevant figures or tables; inspect methods, proofs, appendices, supplements, and artifacts only as needed.
+- Use three depth levels: triage scan, targeted reading, and one deliberate full pass. Escalate only when the user asks, the paper is central to an important decision, abstract-level claims remain consequentially uncertain, or close critique, implementation, or reproduction requires broader context.
+- Ask one clarification only when different reading goals would materially change what must be inspected. Otherwise infer the goal, state any consequential assumption, and proceed.
+- Skip references by default. Follow only citations needed to resolve the task; broader literature synthesis requires an explicit request.
+- Keep compact notes in your own words. If the contribution or decisive inference cannot be restated simply, inspect the missing evidence rather than padding the explanation.
 
-Perform a full read when the user asks, the paper is project-central, an important decision rests on a strong abstract-level story, the paper appears contradictory/suspicious/unusually influential, or method detail is needed for implementation/critique. Keep it one deliberate pass, not uncontrolled detail chasing.
+## Evidence and Critique
+- Treat figures, tables, theorem statements, proofs, and key experimental results as evidence, not decoration. Check whether they support the headline claim at its stated scope.
+- For empirical work, inspect the study design, data, baselines, ablations or sensitivity analyses, uncertainty, evaluation metric, and comparison fairness when relevant. For theoretical work, inspect assumptions, theorem statements, proof dependencies, and guarantee scope.
+- Separate what the paper directly shows, what the authors infer, and what you infer. Label uncertainty and tentative critique; poor exposition alone does not imply invalid science.
+- Challenge framing, assumptions, baselines, and alternative explanations without manufacturing objections. Check whether the evidence would support a narrower claim when it does not support the headline version.
+- When the paper, supplement, artifact, or revisions conflict, preserve source and version provenance and do not silently choose among them. State what evidence could resolve the conflict; matching a reported output alone does not establish which procedure produced it.
+- Cite paper locations as precisely as available, using section and paragraph, figure or table, theorem or proposition, appendix, or artifact location. Follow `RESEARCH_POLICY.md` for external sourcing and citation format.
 
-## Evidence and Claims
-- Treat figures, tables, theorems, and key experimental results as primary evidence; verify that they support the headline claim.
-- Empirical paper: inspect baselines, ablations, uncertainty, and comparison fairness.
-- Theory paper: inspect assumptions, theorem statements, and guarantee scope.
-- Separate what the paper directly shows, what authors infer, and what you infer; never merge them silently.
-- Take short notes in your own words: core claim, method sketch, strongest evidence, main assumptions, key limitation/doubt. Inability to restate the contribution simply signals incomplete understanding.
-
-## References and Critique
-- Follow only task-useful references: one foundational precursor, one strongest baseline/comparator, and one important follow-up/response. Do not turn one-paper reading into an unbounded survey unless asked.
-- Challenge assumptions, framing, baselines, and alternative explanations; check your own confirmation bias. Poor exposition does not imply invalid science.
-
-## Structured Note and Citations
-- Focus the note on claims, support, and uncertainty. If the task shifts to explanation, use `EXPLAIN_STYLE.md`; search online for background when needed.
-- Cite paper locations when practical and precisely when available: section + paragraph, figure/table, theorem/lemma/proposition, or appendix section (for example, `Section 2, second paragraph`, `Figure 3`, `Appendix B, first paragraph`).
-- Follow the active platform's citation format. When it permits a reference list, reuse one number for repeated citations to the same source and list its link once, e.g. `(Table 1, [1])`, `(Table 2, [1])`, then `[1] <link>`.
-
-## Default Output
-1. Problem.
-2. Main claim/contribution.
-3. Method.
-4. Evidence.
-5. Assumptions/limitations.
-6. Reliable transferable takeaways when feasible: reusable method insights, engineering tricks, design choices, or evaluation practices.
-7. Overall trust/usefulness.
-8. Next step, if any.
-
-Include relevance to the user's goal only when clear and decision-useful. Transferable takeaways are optional by default but strongly encouraged when reliably inferable from read sections.
-
-## Full-Read Output
-1. One-paragraph summary.
-2. Problem setting.
-3. Key idea.
-4. Method.
-5. Evidence.
-6. Strengths.
-7. Weaknesses.
-8. Assumptions.
-9. Transferable takeaways.
-10. Open questions.
-11. User relevance, only when clear/useful.
-
-Transferable takeaways are mandatory after a full read; if none are meaningful, say so explicitly.
+## Output
+- Lead with the answer, relevance verdict, support verdict, or trust judgment requested. Use only the request-specific structure needed to make that conclusion auditable.
+- Include problem, method, evidence, limitations, transferable insights, or next steps only when they affect the user's question. Do not emit a fixed paper-summary template.
+- Present each material fact or source conflict once. For multiple sources, annotate the dependency-ordered procedure inline or use a compact comparison, rather than repeating both, unless each view answers a distinct user need.
+- State reading-depth or access limitations only when they constrain the conclusion. Never imply that an uninspected method, appendix, supplement, artifact, or reference was checked.
 
 ## Guardrails
-- Do not overread by default, overstate what the paper proves, or rely only on abstract/conclusion when the decision matters.
-- Do not present tentative critique as fact or expose reading-process metadata unless directly useful.
+- Do not overread by default, overstate what the paper proves, or rely only on its abstract or conclusion when the decision depends on underlying evidence.
+- Do not present author interpretation or tentative critique as demonstrated fact.
