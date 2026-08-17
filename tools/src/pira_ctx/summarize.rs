@@ -1457,9 +1457,7 @@ mod tests {
 
     #[test]
     fn summary_boilerplate_and_command_boundaries_are_separated() {
-        assert!(is_summary_boilerplate(
-            "--- begin untrusted repository source ---"
-        ));
+        assert!(is_summary_boilerplate("--- begin ---"));
         assert!(is_summary_boilerplate("# pira_nav outline file=\"x.py\""));
         assert!(is_summary_boilerplate("21 |"));
         assert!(is_summary_boilerplate("----------------"));
@@ -1472,9 +1470,7 @@ mod tests {
         ));
         assert!(is_command_boundary("# pira_nav search path=\".\""));
         assert!(!is_command_boundary("ordinary program output"));
-        assert!(is_rendering_scaffolding(
-            "--- begin untrusted repository source ---"
-        ));
+        assert!(is_rendering_scaffolding("--- begin ---"));
         assert!(!is_rendering_scaffolding("error: compilation failed"));
     }
 

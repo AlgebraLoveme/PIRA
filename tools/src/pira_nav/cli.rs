@@ -3447,7 +3447,7 @@ fn render_source(
     if !rendered.ends_with('\n') {
         writeln!(output).map_err(output_error)?;
     }
-    writeln!(output, "--- end source ---").map_err(output_error)?;
+    writeln!(output, "--- end ---").map_err(output_error)?;
     Ok(())
 }
 
@@ -3617,7 +3617,7 @@ fn render_text_range(
     if !rendered.ends_with('\n') {
         writeln!(output).map_err(output_error)?;
     }
-    writeln!(output, "--- end source ---").map_err(output_error)?;
+    writeln!(output, "--- end ---").map_err(output_error)?;
     Ok(())
 }
 
@@ -3655,15 +3655,10 @@ fn path_suffix_identifies_language(path: &Path, language: Language) -> bool {
 }
 
 fn render_source_boundary(output: &mut dyn Write, escaped_controls: usize) -> CommandResult {
-    if escaped_controls == 0 {
-        writeln!(output, "--- begin untrusted repository source ---").map_err(output_error)
-    } else {
-        writeln!(
-            output,
-            "--- begin untrusted repository source controls_escaped={escaped_controls} ---"
-        )
-        .map_err(output_error)
+    if escaped_controls > 0 {
+        writeln!(output, "controls_escaped={escaped_controls}").map_err(output_error)?;
     }
+    writeln!(output, "--- begin ---").map_err(output_error)
 }
 
 struct MapOptions {
