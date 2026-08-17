@@ -46,3 +46,4 @@ Before non-trivial refactoring, protect moved behavior with the smallest check. 
 - Non-trivial new logic needs the smallest runnable check that fails if it breaks; trivial one-liners need no tests.
 - Tests must be readable, independent, fast, and focused on observable behavior rather than implementation shape.
 - Run user-specified tests first; otherwise use minimal fast checks such as syntax, grammar, static sanity, or a focused smoke test.
+- Once relevant checks pass and the implementation appears production-quality against the user's stated goals, such as extensibility, reliability, security, or performance, ask whether they want an independent agent to perform a third-party adversarial review. Do not ask while known production-quality gaps remain.
