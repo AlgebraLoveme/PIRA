@@ -1,85 +1,49 @@
 # SCIENTIFIC_WRITING
 
-## Role and Scope
-- Default: polish user drafts; draft from scratch only on explicit request.
-- Text rules cover manuscripts, polishing, rebuttals, response letters, and explanatory or public-facing technical writing.
-- Figure rules apply only to explicit paper-facing styling/layout/integration; TikZ rules only to explicit TikZ tasks.
+## Requests
+- **Polish or proofread existing text**
+  - **Done when:** the requested text is clearer and more concise while preserving its technical meaning, author voice, relative emphasis, uncertainty, notation, citations, and requested scope.
+  - **Workflow:** infer the passage's purpose and audience from available context → identify the highest-value issues → make the smallest sufficient edits → audit grammatical agreement and every changed claim, qualifier, symbol, and citation.
+  - A conservative proofread changes only genuine errors or clear friction. Do not rewrite an already effective sentence merely to impose a preferred style. Preserve paragraph order and relative emphasis unless coherence clearly improves. Section-level compaction or reordering must not silently remove claims, concessions, limitations, or decision-relevant reviewer praise; surface any meaning-sensitive deletion or emphasis shift separately.
+- **Draft or restructure scientific text**
+  - **Done when:** the piece serves its section-level purpose, every substantive claim is supported by supplied evidence or clearly marked as needing support, and the reader can follow the claim-evidence progression.
+  - **Workflow:** deliverable, audience, and constraints → claim/evidence inventory → purpose-driven order → draft → claim, notation, and citation audit.
+  - Match structure to function rather than a universal template. Add future-work statements only when requested or already present in the source. If essential evidence or intent is missing, expose the smallest consequential gap instead of filling it with plausible prose.
+- **Write a rebuttal or response letter**
+  - **Done when:** each concern receives a direct, factual, reviewer-usable answer that distinguishes existing evidence, clarification, manuscript changes, commitments, and remaining limitations.
+  - **Workflow:** concern → direct answer → decisive evidence or reasoning → concrete change or limitation. Acknowledge praise only when it helps orient the response; avoid generic gratitude, defensiveness, vague reassurance, and unsupported promises.
+- **Write explanatory or public-facing technical prose**
+  - **Done when:** the target reader can identify the practical problem, operative idea, evidence, scope, and relevant limitation or next action without domain-specific clutter.
+  - **Workflow:** reader question → necessary context → core mechanism or argument → concrete evidence → limitation or action only when useful.
+  - Organize around reader questions, not a feature inventory. Give each section a distinct purpose and remove sections that only repeat surrounding material or offer generic advice. Define only needed jargon; use measurements and examples when they materially ground the claim. Identify the speaker whenever perspective or quotation status could be ambiguous.
 
-## General Writing
-- Preserve technical meaning, author intent, core claims, and uncertainty calibration unless correctness or explicit request requires change.
-- Improve clarity, flow, and academic concision; remove redundancy without losing important information.
-- Establish target readers early; add sufficient motivation/background for audiences less familiar with the domain.
-- Keep terminology, notation, symbols, equations, definitions, headings, and citation style consistent; change them only for consistency, clarity, or correctness.
-- LaTeX prose: `\cref` for cross-references, `\citet` for textual citations, `\citep` for parenthetical citations; avoid generic `\cite` unless document style requires it.
-- Expand acronyms on first use in each section when needed; then use consistently.
-- Keep prose concise and reader-friendly: shorter sentences when helpful, natural logical connectors, examples only when materially clarifying.
-- Avoid academic-prose semicolons unless clearly necessary; prefer sentence splits/light rewording. Preserve semicolons in math, code, or notation syntax.
-- Unless absolutely necessary, avoid em dashes (`---` or `—`) and formulaic “is not X, but Y” constructions; prefer commas, parentheses, sentence splits, or direct affirmative phrasing.
-- Flag logic, evidence, or exposition gaps; propose minimal fixes.
-- Final text must not contain ambiguous notation, undefined symbols, unexplained task-specific terms, or obvious audience mismatch.
+Use the applicable request workflow plus the shared rules below.
 
-## Drafting
-- Match section flow to function, e.g. motivation → method → evidence → takeaway.
-- Default to present tense, active voice, and clear `we`, unless venue or user draft requires otherwise.
-- Never introduce unsupported claims, evidence, or citations.
-- Add future-work statements only when requested or already present.
-- Ensure a clear reader-oriented purpose, coherent flow, and sufficient audience context.
+## Shared Method
+- Infer venue, audience, and desired intervention from the request and surrounding document. Ask one clarification only when the answer would materially change claims, structure, or voice; otherwise state a reasonable assumption and proceed.
+- Prefer direct claims, coherent paragraph progression, and concrete logical connections. Remove filler, repetition, and metacommentary, but retain decision-relevant concessions, limitations, and evidence.
+- Preserve established terminology, notation, equation and definition semantics, citation style, headings, and document conventions. For LaTeX prose, default to `\cref` for cross-references, `\citet` for textual citations, and `\citep` for parenthetical citations; when the existing source or venue uses another convention, follow it consistently instead.
+- Default to present tense, active voice, and clear `we`; follow an established alternative voice or venue requirement when present.
+- When drafting or materially polishing academic prose, avoid semicolons, em dashes, parenthetical asides, formulaic contrast constructions, and long or compound sentences unless they are the clearest way to preserve precision or flow. Prefer sentence splits, short direct affirmative phrasing, commas, or explicit connectors. Preserve semicolons required by math, code, or notation syntax. In conservative proofreading, retain an intentional existing construction when it is clear and consistent with the author's voice.
+- Expand an acronym on first use in each section when needed, then use it consistently. Define unavoidable task-specific terms near first use and keep terminology consistent.
+- Flag logic, evidence, or exposition gaps and propose the smallest adequate fix. Final prose must not contain ambiguous notation, undefined symbols, unexplained task-specific terms, or an obvious audience mismatch.
+- Match form to information: prose for an argument, a table for compact comparison, and a visual for spatial or process structure. Do not duplicate the same content across forms without a reader need.
 
-## Explanatory and Public-Facing Writing
-- Organize around reader questions rather than a feature inventory. A useful default is problem → requirements → solution → evidence → limitations → next step; adapt or omit stages that do not serve the piece.
-- For performance or behavior claims, prefer exact measurements and concrete examples when available. State the setting and scope, and distinguish controlled evidence from personal experience.
-- Identify the speaker whenever perspective may be ambiguous. Label edited, reformatted, or summarized remarks explicitly; do not imply that edited wording is verbatim.
-- Give each section a distinct reader-facing purpose. Remove sections that only repeat surrounding ideas or offer generic advice.
-- Match form to information: visuals for spatial or process structure, tables for compact comparisons, concise prose otherwise. Put secondary technical detail behind optional disclosure when the medium supports it.
-- End public-facing pieces with one clear next action when an action would help the reader.
-
-## Polishing
-- Preserve author voice unless a stronger rewrite is requested.
-- During compaction, preserve key claims, concessions, limitations, reviewer praise, and other decision-relevant content unless explicitly removed by the user.
-- Moderate sentence restructuring is allowed; preserve paragraph order, relative emphasis, and section flow unless coherence clearly improves.
-- If an edit may shift meaning, provide safer and improved alternatives; recommend one.
-- A cleaner rewrite must not drift in meaning, remove decision-relevant nuance, or weaken intended emphasis.
-- Rebuttals/response letters: optimize for directness, factual grounding, and reviewer usability; answer concern first; map concern → response; distinguish clarification/paper changes from remaining limitations; use concrete commitments instead of vague reassurance; remain respectful/non-defensive; do not overstate novelty, evidence, or implementation status.
+## Evidence and Precision
+- Never introduce unsupported claims, results, citations, novelty, validation status, or implementation status. Distinguish evidence from interpretation and future work from completed work.
+- Preserve uncertainty calibration. Replace an overclaim with the strongest supported statement and flag the issue when the correction is consequential.
+- Treat modal verbs, negation, quantifiers, comparative or equality language, singular/plural distinctions, causal direction, and temporal or completion status as meaning-bearing technical content rather than surface style.
+- A human reference, venue example, or style sample guides expression; it does not authorize transferring its claims, omissions, terminology, or confidence into the user's source. Reconcile any conflict in favor of the user's stated intent and evidence, or surface it when consequential.
+- When a cleaner section would omit or demote technically valid material, preserve it unless the user requested compaction/restructuring or the surrounding document clearly provides a safer destination. Identify any non-obvious omission.
+- For performance or behavior claims, retain the setting, comparison basis, metric, and scope needed to interpret the number.
+- Edited, reformatted, or summarized remarks must not be presented as verbatim quotations.
 
 ## Default Output
-1. Requested deliverable.
-2. Brief changelog: key edits and reasons.
-
-Add open questions/risky assumptions only when needed. For non-trivial meaning-shift risk, include paired alternatives and recommend one. Add no confidence tags unless requested. Keep the changelog brief unless more detail is requested.
+- Return the requested deliverable only. Add a brief changelog only when requested, when edits are structurally substantial, or when the user needs to review non-obvious meaning-sensitive changes.
+- Add open questions or risky assumptions only when they block a trustworthy final version. For a consequential ambiguity, provide at most two alternatives and recommend one.
+- Do not add confidence tags, generic writing advice, or an offer for further work unless requested.
 
 ## Hard Constraints
-- Never silently change core technical claims.
-- Never alter equation/definition semantics.
-- Never present pending validation as complete.
-
-## General Paper Figures
-
-### Working
-- Apply only to explicit paper-facing or manuscript-integrated refinement—not general plotting code, analysis plots, or exploratory plots.
-- Match the paper's established template unless a new style is requested.
-- Favor paper-integrated appearance: compact footprint, less whitespace, subdued text hierarchy, restrained visual weight.
-- For visual/layout-sensitive work, rendered appearance is the primary acceptance criterion; inspect every preview under the `AGENTS.md` plotting checks, not only compilation/code.
-- Use color semantically: one color consistently represents one condition/model. Choose clear reusable palettes; avoid weak low-contrast colors for important curves.
-- Numerically overlapping important content: use alpha or other lightweight styling for separability without noise.
-- Keep legends, annotations, ticks, and tick labels concise, attributable, and clean.
-- Compile: fast draft each pass; single-pass by default; full compile on final pass; multi-pass only when references/layout require it.
-
-### Completion
-- Gate: no overlap/clipping; readable labels; consistent fonts/line styles; balanced spacing/alignment; correct caption/label; consistency with nearby figures.
-- Any failure requires revision and re-rendering; never present as final while a gate item fails.
-- Iterate until pass or 10 passes. At the cap, give exactly one primary fix plan with estimated effort and wait for approval.
-
-## TikZ Paper Figures
-
-### Working
-- Use TikZ mainly for conceptual scientific figures; default output is the full `figure` + `caption` + `label` block.
-- Keep layouts clean; avoid negative `\vspace` and aggressive squeezing unless explicitly requested.
-- Reuse existing template/header commands/styles first. Search only the current repository; use semantic style aliases rather than raw inline styling unless necessary.
-- Use named macros, coordinates, or semantic nodes for major repeated/structural geometry; avoid scattered hardcoded layout numbers unless abstraction would not help.
-- Missing styles/macros: propose at most two options (minimal, richer), confirm with the user, and edit headers only after approval.
-- Give new commands/styles clear semantic names; do not force personal prefixes.
-- Two consecutive misses of intended style/structure require explicit acknowledgment and a strategy change.
-- A user-provided manual drawing/adjustment is the primary visual source of truth. Bias toward cleanup, cropping, placement, notation alignment, and manuscript integration unless replacement is explicitly requested.
-
-### Completion
-- The task remains incomplete when structure is correct but visual style, spacing, or figure-language fit still misses the target paper/reference.
+- Never silently change a core technical claim or equation/definition semantics.
+- Never remove decision-relevant evidence, concessions, or limitations merely for smoother prose.
+- Never present pending validation, intended revisions, or future work as completed.
