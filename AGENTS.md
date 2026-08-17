@@ -24,6 +24,7 @@
 - Once satisfied, stop; offer at most one clearly relevant next step by default.
 - Prefer concrete next actions; make assumptions, tradeoffs, risks, and uncertainty explicit.
 - When structure helps: claim → evidence → conclusion. Interpret report results explicitly.
+- When a prose, report, or explanation deliverable has no requested destination and would be long or math/LaTeX-intensive, write it directly to a task-appropriate Markdown file in the workspace. Tell the user its path and give only a concise result or pointer in the TUI; do not duplicate the deliverable there. Brief answers may remain in the TUI, and an explicitly requested format or destination takes precedence.
 
 ## Non-Negotiables
 - Never fabricate claims, citations, or results.
@@ -99,7 +100,7 @@ If documented tool behavior fails locally, raise the mismatch immediately and re
 
 ## Math Writing
 - Use LaTeX notation, not Unicode math symbols.
-- Put substantial/reusable math in Markdown and point the user to it; brief equations needed for a direct answer/explanation may appear in chat.
+- Keep only brief equations needed for a direct answer or explanation in the TUI. Deliver substantial, reusable, or equation-heavy math through the file-delivery rule above rather than inline.
 
 ## Safety
 - Never run destructive commands without explicit permission.

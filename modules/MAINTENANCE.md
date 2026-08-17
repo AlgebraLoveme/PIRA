@@ -1,26 +1,26 @@
 # MAINTENANCE
 
-Use this module only for maintenance of PIRA's own configuration, modules, and rules, not for ordinary project work.
+Use only for PIRA configuration, module, and rule maintenance—not ordinary project work.
 
 ## Maintenance Rules
-- Keep memory-system defaults in the `Memory System` section of `~/agent/AGENTS.md`; use this module only to maintain them, not to define ordinary memory handling locally.
-- When files are removed from the active scheme in the future, add them to `~/agent/assets/LEGACY_LIST.md`.
-- Overwrite with current policy text only: no timestamps, question IDs, changelogs, or override chains.
-- After every maintenance write, check and immediately raise cross-file conflicts. For agent configuration/instruction updates, also remove introduced/obsolete redundancy without rewriting unrelated meaning; audit tracked touched files for unexpected personal information and each rule's intended scope. Generalize only deliberately, with explicit scope matching the user's intent.
-- When a new experimental rule conflicts with an older established rule, preserve the older default unless the user explicitly approves a scope or routing change.
-- Put rules in the proper place: default/session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
-- Keep module-loading and routing policy only in `~/agent/AGENTS.md`.
-- Keep README public-phase only: document public behavior, releases, artifacts, usage, and reproducible public validation; exclude local development candidates, pending work, private validation state, and rollout plans.
-- After commit and push, clean temporary backup files created for the change if they are no longer needed.
+- Keep memory defaults in `Memory System` in `~/agent/AGENTS.md`; this module maintains them but does not define ordinary memory handling.
+- Add files removed from the active scheme to `~/agent/assets/LEGACY_LIST.md`.
+- Overwrite with current policy only: no timestamps, question IDs, changelogs, or override chains.
+- After every maintenance write, immediately check and raise cross-file conflicts. For instruction or agent-configuration updates, remove introduced or obsolete redundancy without changing unrelated meaning; audit tracked touched files for unexpected personal information and every rule's intended scope. Generalize only deliberately and within the user's intended scope.
+- When an experimental rule conflicts with an established rule, preserve the established default unless the user explicitly approves a scope or routing change.
+- Place default or session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
+- Keep module loading and routing only in `~/agent/AGENTS.md`.
+- Keep README public-phase only: public behavior, releases, artifacts, usage, and reproducible public validation—not local development candidates, pending work, private validation state, or rollout plans.
+- After commit and push, remove obsolete temporary backups created for the change.
 
-## Meaning-Preserving Telegraphic Compression
+## Meaning-Preserving Telegraphic Compression (MPTC)
 
-Use **Meaning-Preserving Telegraphic Compression (MPTC)** when shortening PIRA instructions:
+Use MPTC when shortening PIRA instructions:
 
-- Preserve each rule's actor, modality, trigger, action, object, scope, ordering, exceptions, and prohibitions. Compression must neither weaken nor strengthen, broaden nor narrow the rule.
-- Remove filler, repeated context, and details already fully covered by tool help. Merge only genuinely parallel rules.
-- Preserve normative strength exactly: `must`, `should`, `use`, `prefer`, `may`, `never`, and `only` are not interchangeable. Never turn a requirement into `prefer`, `avoid`, or an implicit fragment.
-- Use fragments and symbols only for low-risk routing or sequencing with an obvious actor and trigger: `→` = next step, `⇒` = consequence, and `+` = both. Do not use symbols to encode permission, prohibition, safety, exceptions, or normative strength.
+- Preserve every rule's actor, modality, trigger, action, object, scope, ordering, exceptions, and prohibitions. Never weaken, strengthen, broaden, or narrow it.
+- Remove filler, repeated context, and details fully covered by tool help. Merge only genuinely parallel rules.
+- Preserve normative strength exactly: `must`, `should`, `use`, `prefer`, `may`, `never`, and `only` are not interchangeable. Never reduce a requirement to `prefer`, `avoid`, or an implicit fragment.
+- Use fragments and symbols only for low-risk routing or sequencing with an obvious actor and trigger: `→` means next step, `⇒` consequence, and `+` both. Never use symbols for permission, prohibition, safety, exceptions, or normative strength.
 - Keep grammatical sentences for permission, safety, trust boundaries, destructive actions, negation, and exceptions. Clarity outranks compression.
-- Validate every original rule one-to-one against `actor | modality | trigger | action | object | scope | order | exception | prohibition`. If any field is lost, changed, or reasonably debatable, expand the compressed rule.
-- Measure and report compression only after fidelity validation passes; identify the metric used and label token savings as estimates unless measured with the target tokenizer.
+- Validate every original rule one-to-one against `actor | modality | trigger | action | object | scope | order | exception | prohibition`; expand if any field is lost, changed, or reasonably debatable.
+- Measure and report compression only after fidelity validation passes. State the metric and label token savings as estimates unless measured with the target tokenizer.
