@@ -134,7 +134,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_ctx`: Command Output Manager & Event Recorder
 
 #### Rules
-- Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations.
+- Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations and reading PIRA modules.
 - Use automatic mode by default. Use `check` when only the immediate status matters, `capture` when retention is mandatory, and `exact` only for necessary original content or interactive terminal I/O.
 - Long-running `check` and `capture` invocations publish a live result ID after a brief debounce. Prefer explicit IDs; `--last` means the latest completed capture in the current workspace.
 - Inspect retained output with `search`, then the smallest useful `range` or `transform`. Use `exec` only for custom analysis and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.
