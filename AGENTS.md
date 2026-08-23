@@ -71,7 +71,7 @@ Load on demand (explicit or inferred):
 - `paper_reading`: `~/agent/modules/PAPER_READING.md` for single-paper reading, summary, critique, or extraction; also load `research`.
 - `coding`: `~/agent/modules/CODING_STYLE.md` for implementation, debugging, or review; also load `research`.
 - `writing`: `~/agent/modules/SCIENTIFIC_WRITING.md` for scientific or technical prose, including polishing, drafting, rebuttals, and public-facing research writing; also load `research`.
-- `paper_figure`: `~/agent/modules/PAPER_FIGURE_STYLE.md` for explicit paper-facing figure creation, styling, layout, integration, or TikZ; also load `research`.
+- `public_figure`: `~/agent/modules/PUBLIC_FIGURE_STYLE.md` for figure creation, styling, layout, integration, or release when the figure is intended for an external audience or public artifact, including papers, preprints, posters, talks, blogs, websites, documentation, READMEs, reports, repositories, and release assets; also load `research`.
 - `explain`: `~/agent/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
 - `guidance`: `~/agent/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
 - `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance, not project maintenance.
@@ -85,9 +85,9 @@ Do not reload unchanged modules already in context unless the user asks or relev
 ### Routing
 - Hard single-paper explanation → `paper_reading` + `explain`; polished review/manuscript text from a paper → `paper_reading` + `writing`.
 - Broader multi-paper search/synthesis → `research` without `paper_reading`, unless one paper is central.
-- General plotting, data processing, exploratory plots, and code-generated figures → `coding`. Add `paper_figure` only for explicit manuscript integration or paper-facing style/layout; TikZ uses `paper_figure`, plus `coding` only when surrounding code or data processing is also in scope.
-- `coding`, `writing`, and `paper_figure` are research-level by default. Add `research` to `explain` only for factual analysis, evidence-based reporting, online verification, or broader research synthesis.
-- When multiple modules load, global safety, trust, and permission rules always apply; the user request determines the deliverable. Final form: `writing` for polished prose, `paper_figure` for paper figures, `explain` for explanations, `paper_reading` for paper notes when none of those applies, and `coding` for implementation. Process: `paper_reading` controls reading/evidence; `research` controls sourcing/verification. Among non-safety task rules, narrower overrides general; confirm unresolved same-scope conflicts.
+- General plotting, data processing, and exploratory or internal figures → `coding`. Add `public_figure` whenever a figure will be published, embedded in public-facing material, or released as a public repository asset. A code-generated public figure uses `coding` + `public_figure`; TikZ uses `public_figure`, plus `coding` only when surrounding code or data processing is also in scope.
+- `coding`, `writing`, and `public_figure` are research-level by default. Add `research` to `explain` only for factual analysis, evidence-based reporting, online verification, or broader research synthesis.
+- When multiple modules load, global safety, trust, and permission rules always apply; the user request determines the deliverable. Final form: `writing` for polished prose, `public_figure` for public figures, `explain` for explanations, `paper_reading` for paper notes when none of those applies, and `coding` for implementation. Process: `paper_reading` controls reading/evidence; `research` controls sourcing/verification. Among non-safety task rules, narrower overrides general; confirm unresolved same-scope conflicts.
 
 ## Tool Selection
 - Use the lightest reliable tool first; use deterministic, non-interactive commands when available.
