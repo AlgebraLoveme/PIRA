@@ -124,7 +124,7 @@ Most users can keep the recommended defaults. Open this section when you want st
 | `--agent-dir PATH` | Installs against a path other than `~/agent`. |
 | `--skip-tools` | Skips installation or refresh of released native PIRA tools. |
 | `--tools-install-dir PATH` | Overrides the per-user tools directory (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows). |
-| `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.7.0`; repeat for multiple tools. Unspecified tools use the latest release. |
+| `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.7.0` or `svg=0.1.0`; repeat for multiple tools. Unspecified tools use the latest release. |
 | `--verify` | Checks the current setup without writing. |
 | `--dry-run` | Prints planned changes without applying them. |
 
@@ -139,7 +139,7 @@ cd ~/agent
 python3 assets/scripts/setup_pira_tools.py          # install or refresh
 python3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 python3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version nav=0.12.0
+python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
 ```
 
 On Windows PowerShell:
@@ -149,14 +149,14 @@ cd $HOME\agent
 py -3 assets/scripts/setup_pira_tools.py          # install or refresh
 py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version nav=0.12.0
+py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
 ```
 
-The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, or `nav=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
+The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, or `svg=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 ### Maintainer release procedure
 
-PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all three tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
+PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all four tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -215,17 +215,18 @@ Information moves upward only when its lasting value increases. Activity stays i
 
 ## PIRA Internal Tools
 
-PIRA includes three small tools that help agents work with less noise and better continuity. Most users never need to run them manually; built-in command help provides exact syntax.
+PIRA includes four small native tools for agent continuity, repository work, and figure validation. Built-in command help provides exact syntax.
 
 | Tool | What problem it solves |
 |---|---|
 | `pira_ctx` | Keeps large command output available without flooding the active conversation. |
 | `pira_dec` | Records important choices in a consistent, searchable form. |
 | `pira_nav` | Provides portable lexical, structural, dependency, and optional IDE-semantic repository navigation. |
+| `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
 
 ### Agent-level evaluation
 
-Isolated agentic benchmarks tested whether PIRA's internal tools help fresh agents complete real tasks, not merely whether individual binaries are fast in microbenchmarks.
+Isolated agentic benchmarks tested whether the three agent-operation tools (`pira_ctx`, `pira_dec`, and `pira_nav`) help fresh agents complete real tasks, not merely whether individual binaries are fast in microbenchmarks. `pira_svg_check` is validated separately with synthetic SVG cases and release-platform builds.
 
 <details>
 <summary>Method, results, and interpretation</summary>
@@ -458,6 +459,10 @@ Validation used pinned real fixtures with retained upstream provenance, hashes, 
 
 </details>
 
+### `pira_svg_check`: conservative SVG text-legibility warnings
+
+Run `pira_svg_check FIGURE.svg` on a finalized SVG. It warns about low contrast, clipped or masked text, text overlap, and visible strokes crossing text; findings are review prompts and return exit code `0`, while analysis errors return `2`. Opaque label backgrounds are supported, and only semantic `<text>` can be analyzed reliably, so a clear report never replaces inspection at the final display size. See [`tools/crates/pira_svg_check/README.md`](tools/crates/pira_svg_check/README.md) for options and limits.
+
 ## Optional Codex audio notifications
 
 <details>
@@ -547,9 +552,10 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/build/build_pira_ctx_platform_bins.py` — shared pinned, reproducibility-checking release builder configured for `pira_ctx`
 - `tools/build/build_pira_dec_platform_bins.py` — package-isolated release entry point for `pira_dec`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
-- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all three tools, builds every platform twice, and publishes direct GitHub Release assets
+- `tools/build/build_pira_svg_check_platform_bins.py` — package-isolated release entry point for `pira_svg_check`
+- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all four tools, builds every platform twice, and publishes direct GitHub Release assets
 - `tools/build/package_github_release.py` — validates build archives and produces the versioned release assets and checksum index consumed by setup
-- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, and `tools/src/pira_nav/` — public Rust implementations
+- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, and `tools/src/pira_svg_check/` — public Rust implementations
 - GitHub Releases — published platform executables; generated binaries are not stored on a second branch or in the source tree
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 

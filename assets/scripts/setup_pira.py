@@ -499,7 +499,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--tools-version",
         action="append",
         default=None,
-        help="Pin a native tool as ctx=VERSION, dec=VERSION, or nav=VERSION; repeatable.",
+        help=(
+            "Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or "
+            "svg=VERSION; repeatable."
+        ),
     )
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
     parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")

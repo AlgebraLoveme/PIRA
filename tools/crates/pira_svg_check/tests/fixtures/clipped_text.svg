@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="100" viewBox="0 0 240 100">
+  <defs>
+    <clipPath id="small-clip"><rect x="58" y="30" width="50" height="35"/></clipPath>
+  </defs>
+  <rect width="240" height="100" fill="white"/>
+  <text id="label" x="60" y="58" font-family="sans-serif" font-size="24" fill="black" clip-path="url(#small-clip)">Clipped label</text>
+</svg>
