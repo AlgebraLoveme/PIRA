@@ -91,7 +91,7 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 
 ### Claude Code (experimental)
 
-Claude Code reads `CLAUDE.md`, not `AGENTS.md`. PIRA follows Claude Code's documented compatibility pattern: the user-level `~/.claude/CLAUDE.md` contains one managed import of the canonical `~/agent/AGENTS.md`. It does not copy the policy into a second tree or install duplicate skills.
+Claude Code reads `CLAUDE.md`, not `AGENTS.md`. PIRA follows Claude Code's documented compatibility pattern: the user-level `~/.claude/CLAUDE.md` contains one managed import of the canonical `~/agent/AGENTS.md`, followed by two short Claude-specific reminders for module loading and Bash routing. It does not copy the policy into a second tree or install duplicate skills.
 
 Run these commands after the checkout is available at `~/agent`, which is also where the imported modules live. If another directory already occupies `~/agent`, setup intentionally stops rather than replacing it; resolve that conflict explicitly before continuing. Then preview, install, and verify with:
 
@@ -111,7 +111,7 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --cla
 powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --claude-code --verify
 ```
 
-The Claude Code mode preserves content outside the PIRA-managed block, backs up `CLAUDE.md` before changing it, and uses the same three PIRA tools as Codex. It does not change Claude Code permission settings or install Codex audio hooks.
+The Claude Code mode preserves content outside the PIRA-managed block, backs up `CLAUDE.md` before changing it, and uses the same three PIRA tools as Codex. The small bridge repeats only the two entry rules that Claude Code must apply before the imported policy can govern tool use; it does not duplicate PIRA's modules. Setup does not change Claude Code permission settings or install Codex audio hooks.
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
 

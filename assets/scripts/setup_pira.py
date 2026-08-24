@@ -430,11 +430,22 @@ def claude_import_path(path: Path) -> str:
 
 def claude_managed_block(agent_dir: Path) -> str:
     agents_path = claude_import_path(agent_dir / "AGENTS.md")
-    return f"{CLAUDE_BLOCK_START}\n@{agents_path}\n{CLAUDE_BLOCK_END}"
+    return (
+        f"{CLAUDE_BLOCK_START}\n"
+        f"@{agents_path}\n\n"
+        "## Claude Code bridge\n"
+        "- IMPORTANT: Before using task tools, classify the request using the imported Module Loading "
+        "and Routing rules, then load all required modules via `pira_ctx exact`. Do not substitute "
+        "direct Read for PIRA module loading.\n"
+        "- IMPORTANT: Never invoke Bash directly. Every Bash command must begin with `pira_ctx`, "
+        "`pira_dec`, or `pira_nav`. Use Claude Read/Glob/Grep for ordinary file inspection instead of "
+        "shell find/cat/grep.\n"
+        f"{CLAUDE_BLOCK_END}"
+    )
 
 
 def update_claude_md(state: SetupState, claude_md_path: Path) -> None:
-    """Install one managed import while preserving all user-owned content."""
+    """Install the managed Claude bridge while preserving all user-owned content."""
     existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md") if claude_md_path.exists() else ""
     start_count = existing.count(CLAUDE_BLOCK_START)
     end_count = existing.count(CLAUDE_BLOCK_END)

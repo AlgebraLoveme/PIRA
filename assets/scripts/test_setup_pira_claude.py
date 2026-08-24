@@ -27,22 +27,26 @@ class SetupPiraClaudeTests(unittest.TestCase):
             yes=True,
         )
 
-    def test_adds_one_absolute_agents_import(self) -> None:
+    def test_adds_one_agents_import_and_thin_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             claude_md = root / ".claude" / "CLAUDE.md"
             state = self.state(root)
 
             setup.update_claude_md(state, claude_md)
+            installed = claude_md.read_text(encoding="utf-8")
 
             self.assertEqual(
-                claude_md.read_text(encoding="utf-8"),
+                installed,
                 setup.claude_managed_block(state.agent_dir) + "\n",
             )
             self.assertIn(
                 "@" + setup.claude_import_path(state.agent_dir / "AGENTS.md"),
-                claude_md.read_text(encoding="utf-8"),
+                installed,
             )
+            self.assertEqual(installed.count("@"), 1)
+            self.assertIn("load all required modules via `pira_ctx exact`", installed)
+            self.assertIn("Never invoke Bash directly", installed)
 
     def test_preserves_user_content_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -118,7 +122,7 @@ class SetupPiraClaudeTests(unittest.TestCase):
             self.assertEqual(claude_md.read_bytes(), original)
             self.assertEqual(list(root.glob("CLAUDE.md.bak.*")), [])
 
-    def test_cli_installs_only_the_managed_import(self) -> None:
+    def test_cli_installs_only_the_managed_bridge(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             claude_md = Path(temporary) / ".claude" / "CLAUDE.md"
             agent_dir = Path(temporary) / "agent"
