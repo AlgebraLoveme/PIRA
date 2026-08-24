@@ -182,8 +182,8 @@ brackets, `>`, or other metacharacters.
 OPTIONS
 {STRUCTURAL_OPTIONS}
   --window N
-  --head N                  Print the first N lines of one bare FILE; N may be 0.
-  --tail N                  Print the last N lines of one bare FILE; N may be 0.
+  --head N                  Print the first N lines of the preceding bare FILE; N may be 0.
+  --tail N                  Print the last N lines of the preceding bare FILE; N may be 0.
   --glance
   --max-items N
   --max-bytes N
@@ -197,6 +197,7 @@ EXAMPLES
   pira_nav show README.md LICENSE
   pira_nav show README.md --head 20
   pira_nav show README.md --tail 20
+  pira_nav show README.md LICENSE --head 20
   pira_nav show src/parser.rs:120-160
   pira_nav show generated.json:1-20 --glance"#),
         "imports" => r#"pira_nav imports — syntax-level file imports

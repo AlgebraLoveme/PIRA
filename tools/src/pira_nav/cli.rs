@@ -512,29 +512,28 @@ fn command_show(
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_show_options(args)?;
-    if options.head.is_some() || options.tail.is_some() {
-        let (option, lines) = options
-            .head
-            .map(|lines| ("--head", lines))
-            .or_else(|| options.tail.map(|lines| ("--tail", lines)))
-            .expect("head or tail was present");
-        if options.targets.len() != 1 {
-            return usage(format!(
-                "show {option} accepts exactly one bare FILE; use explicit FILE:START-END targets for a batch"
-            ));
-        }
+    if options.targets.len() == 1 && options.targets[0].file_slice.is_some() {
         if options.max_items.is_some() {
             return usage("show --max-items does not apply to a single --head/--tail target");
         }
         let target = &options.targets[0];
-        let path = plain_show_path(target, cwd)
-            .ok_or_else(|| (2, show_file_slice_target_error(target, option, lines)))?;
-        validate_show_file_target(target, &path, cwd)?;
+        let file_slice = target.file_slice.expect("file slice was present");
+        let path = plain_show_path(&target.value, cwd).ok_or_else(|| {
+            let (option, lines) = file_slice.option_and_lines();
+            (
+                2,
+                show_file_slice_target_error(&target.value, option, lines),
+            )
+        })?;
+        validate_show_file_target(&target.value, &path, cwd)?;
         let mut item = Vec::new();
-        if let Some(lines) = options.head {
-            render_file_head(&path, lines, cwd, options.glance, &mut item)?;
-        } else if let Some(lines) = options.tail {
-            render_file_tail(&path, lines, cwd, options.glance, &mut item)?;
+        match file_slice {
+            ShowFileSlice::Head(lines) => {
+                render_file_head(&path, lines, cwd, options.glance, &mut item)?
+            }
+            ShowFileSlice::Tail(lines) => {
+                render_file_tail(&path, lines, cwd, options.glance, &mut item)?
+            }
         }
         if let Some(max_bytes) = options.max_bytes
             && item.len() > max_bytes
@@ -558,7 +557,7 @@ fn command_show(
             return usage("show --max-items does not apply to a single --window target");
         }
         let target = &options.targets[0];
-        let (path_text, line, _) = parse_location(target).ok_or_else(|| {
+        let (path_text, line, _) = parse_location(&target.value).ok_or_else(|| {
             (
                 2,
                 "show --window requires a FILE:LINE[:COLUMN] target".into(),
@@ -587,12 +586,12 @@ fn command_show(
         return Ok(());
     }
     if options.targets.len() == 1
-        && let Some(path) = plain_show_path(&options.targets[0], cwd)
+        && let Some(path) = plain_show_path(&options.targets[0].value, cwd)
     {
         if options.max_items.is_some() {
             return usage("show --max-items does not apply to a single FILE target");
         }
-        validate_show_file_target(&options.targets[0], &path, cwd)?;
+        validate_show_file_target(&options.targets[0].value, &path, cwd)?;
         let mut item = Vec::new();
         render_entire_file(&path, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
@@ -612,7 +611,7 @@ fn command_show(
     let mut parsed_files = ParsedFileCache::new();
     let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1
-        && let Some((path_text, start, end)) = parse_line_range(&options.targets[0])
+        && let Some((path_text, start, end)) = parse_line_range(&options.targets[0].value)
     {
         let path = absolute_lexical(Path::new(path_text), cwd);
         let mut item = Vec::new();
@@ -633,7 +632,7 @@ fn command_show(
     }
     if options.targets.len() == 1 && options.max_bytes.is_none() {
         let (key, symbol_index) = resolve_show_target(
-            &options.targets[0],
+            &options.targets[0].value,
             explicit,
             cwd,
             &mut parsed_files,
@@ -663,22 +662,52 @@ fn command_show(
     let mut resolved = 0;
     let mut considered = 0;
     let mut payload_bytes = 0;
+    #[derive(Clone, Hash, Eq, PartialEq)]
+    enum ShowIdentity {
+        Entire(PathBuf),
+        Lines(PathBuf, usize, usize),
+        Head(PathBuf, usize),
+        Tail(PathBuf, usize),
+        Symbol(PathBuf, usize, usize),
+    }
+
     for target in &options.targets {
         if considered >= max_items {
             break;
         }
-        if let Some(path) = plain_show_path(target, cwd) {
-            let identity = (path.clone(), 0, usize::MAX, true);
+        if let Some(file_slice) = target.file_slice {
+            let (option, lines) = file_slice.option_and_lines();
+            let Some(path) = plain_show_path(&target.value, cwd) else {
+                failures.record(
+                    target.value.clone(),
+                    2,
+                    show_file_slice_target_error(&target.value, option, lines),
+                );
+                continue;
+            };
+            let identity = match file_slice {
+                ShowFileSlice::Head(lines) => ShowIdentity::Head(path.clone(), lines),
+                ShowFileSlice::Tail(lines) => ShowIdentity::Tail(path.clone(), lines),
+            };
             if !identities.insert(identity.clone()) {
                 duplicates += 1;
                 continue;
             }
             let mut item = Vec::new();
-            let result = validate_show_file_target(target, &path, cwd)
-                .and_then(|()| render_entire_file(&path, cwd, options.glance, &mut item));
+            let result =
+                validate_show_file_target(&target.value, &path, cwd).and_then(
+                    |()| match file_slice {
+                        ShowFileSlice::Head(lines) => {
+                            render_file_head(&path, lines, cwd, options.glance, &mut item)
+                        }
+                        ShowFileSlice::Tail(lines) => {
+                            render_file_tail(&path, lines, cwd, options.glance, &mut item)
+                        }
+                    },
+                );
             if let Err((code, message)) = result {
                 identities.remove(&identity);
-                failures.record(target.clone(), code, message);
+                failures.record(target.value.clone(), code, message);
                 continue;
             }
             resolved += 1;
@@ -691,9 +720,33 @@ fn command_show(
             rendered.push(item);
             continue;
         }
-        if let Some((path_text, start, end)) = parse_line_range(target) {
+        if let Some(path) = plain_show_path(&target.value, cwd) {
+            let identity = ShowIdentity::Entire(path.clone());
+            if !identities.insert(identity.clone()) {
+                duplicates += 1;
+                continue;
+            }
+            let mut item = Vec::new();
+            let result = validate_show_file_target(&target.value, &path, cwd)
+                .and_then(|()| render_entire_file(&path, cwd, options.glance, &mut item));
+            if let Err((code, message)) = result {
+                identities.remove(&identity);
+                failures.record(target.value.clone(), code, message);
+                continue;
+            }
+            resolved += 1;
+            considered += 1;
+            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+                byte_limited += 1;
+                continue;
+            }
+            payload_bytes += item.len();
+            rendered.push(item);
+            continue;
+        }
+        if let Some((path_text, start, end)) = parse_line_range(&target.value) {
             let path = absolute_lexical(Path::new(path_text), cwd);
-            let identity = (path.clone(), start, end, true);
+            let identity = ShowIdentity::Lines(path.clone(), start, end);
             if !identities.insert(identity.clone()) {
                 duplicates += 1;
                 continue;
@@ -703,7 +756,7 @@ fn command_show(
                 render_line_range(&path, start, end, cwd, options.glance, &mut item)
             {
                 identities.remove(&identity);
-                failures.record(target.clone(), code, message);
+                failures.record(target.value.clone(), code, message);
                 continue;
             }
             resolved += 1;
@@ -716,26 +769,27 @@ fn command_show(
             rendered.push(item);
             continue;
         }
-        let (key, symbol_index) =
-            match resolve_show_target(target, explicit, cwd, &mut parsed_files, &mut resolver) {
-                Ok(resolved) => resolved,
-                Err((code, message)) => {
-                    failures.record(target.clone(), code, message);
-                    continue;
-                }
-            };
+        let (key, symbol_index) = match resolve_show_target(
+            &target.value,
+            explicit,
+            cwd,
+            &mut parsed_files,
+            &mut resolver,
+        ) {
+            Ok(resolved) => resolved,
+            Err((code, message)) => {
+                failures.record(target.value.clone(), code, message);
+                continue;
+            }
+        };
         resolved += 1;
         let parsed = parsed_files
             .get(&key)
             .and_then(|result| result.as_ref().ok())
             .expect("resolved show target has a cached parse");
         let symbol = &parsed.symbols[symbol_index];
-        let identity = (
-            parsed.path.clone(),
-            symbol.start_byte,
-            symbol.end_byte,
-            false,
-        );
+        let identity =
+            ShowIdentity::Symbol(parsed.path.clone(), symbol.start_byte, symbol.end_byte);
         if !identities.insert(identity) {
             duplicates += 1;
             continue;
@@ -801,13 +855,31 @@ fn command_show(
 }
 
 struct ShowOptions {
-    targets: Vec<String>,
+    targets: Vec<ShowTarget>,
     max_items: Option<usize>,
     max_bytes: Option<usize>,
     window: Option<usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
     glance: bool,
+}
+
+struct ShowTarget {
+    value: String,
+    file_slice: Option<ShowFileSlice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShowFileSlice {
+    Head(usize),
+    Tail(usize),
+}
+
+impl ShowFileSlice {
+    fn option_and_lines(self) -> (&'static str, usize) {
+        match self {
+            Self::Head(lines) => ("--head", lines),
+            Self::Tail(lines) => ("--tail", lines),
+        }
+    }
 }
 
 fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
@@ -815,14 +887,15 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
     let mut max_items = None;
     let mut max_bytes = None;
     let mut window = None;
-    let mut head = None;
-    let mut tail = None;
     let mut glance = false;
     let mut index = 0;
     while index < args.len() {
         let option = args[index].as_str();
         if option == "--" {
-            targets.extend(args[index + 1..].iter().cloned());
+            targets.extend(args[index + 1..].iter().cloned().map(|value| ShowTarget {
+                value,
+                file_slice: None,
+            }));
             break;
         } else if option == "--glance" {
             if glance {
@@ -850,15 +923,23 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 let parsed = value
                     .parse::<usize>()
                     .map_err(|_| (2, format!("{option} requires a non-negative integer")))?;
-                let slot = if option == "--head" {
-                    &mut head
-                } else {
-                    &mut tail
-                };
-                if slot.is_some() {
-                    return Err((2, format!("{option} may be specified only once")));
+                let target = targets.last_mut().ok_or_else(|| {
+                    (
+                        2,
+                        format!("{option} must follow the bare FILE it applies to"),
+                    )
+                })?;
+                if target.file_slice.is_some() {
+                    return Err((
+                        2,
+                        "--head and --tail may be specified at most once per bare FILE".into(),
+                    ));
                 }
-                *slot = Some(parsed);
+                target.file_slice = Some(if option == "--head" {
+                    ShowFileSlice::Head(parsed)
+                } else {
+                    ShowFileSlice::Tail(parsed)
+                });
             } else {
                 let parsed = positive_usize(value, option)?;
                 if option == "--max-items" {
@@ -876,7 +957,10 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 ),
             ));
         } else {
-            targets.push(args[index].clone());
+            targets.push(ShowTarget {
+                value: args[index].clone(),
+                file_slice: None,
+            });
             index += 1;
         }
     }
@@ -886,10 +970,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
             "show requires at least one file, selector, file:line[:column], or file::symbol".into(),
         ));
     }
-    if head.is_some() && tail.is_some() {
-        return Err((2, "--head and --tail are mutually exclusive".into()));
-    }
-    if window.is_some() && (head.is_some() || tail.is_some()) {
+    if window.is_some() && targets.iter().any(|target| target.file_slice.is_some()) {
         return Err((
             2,
             "--window cannot be combined with --head or --tail".into(),
@@ -900,8 +981,6 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
         max_items,
         max_bytes,
         window,
-        head,
-        tail,
         glance,
     })
 }
@@ -3848,15 +3927,19 @@ fn fail<T: AsRef<str>>(code: i32, message: T) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        DependencyTraversal, GLANCE_LINE_PREFIX_BYTES, alternate_dependencies, help_requested,
-        outline_display_name, parse_dependency_options, parse_import_options, parse_location,
-        parse_map_options, parse_selector, parse_show_options, parse_symbol_options, render_glance,
-        select_line_range, show_file_slice_target_error, source_line_count,
+        DependencyTraversal, GLANCE_LINE_PREFIX_BYTES, ShowFileSlice, alternate_dependencies,
+        command_show, help_requested, outline_display_name, parse_dependency_options,
+        parse_import_options, parse_location, parse_map_options, parse_selector,
+        parse_show_options, parse_symbol_options, render_glance, select_line_range,
+        show_file_slice_target_error, source_line_count,
     };
     use crate::language::Language;
+    use crate::lsp_options::LspOptions;
     use crate::model::Symbol;
     use crate::util::escape_untrusted_text;
 
@@ -3923,12 +4006,11 @@ mod tests {
     fn show_head_and_tail_are_explicit_and_exclusive() {
         let head = parse_show_options(&["README.md".into(), "--head".into(), "10".into()])
             .expect("valid head options");
-        assert_eq!(head.head, Some(10));
-        assert_eq!(head.tail, None);
+        assert_eq!(head.targets[0].file_slice, Some(ShowFileSlice::Head(10)));
 
         let zero = parse_show_options(&["README.md".into(), "--tail".into(), "0".into()])
             .expect("zero-line tail options");
-        assert_eq!(zero.tail, Some(0));
+        assert_eq!(zero.targets[0].file_slice, Some(ShowFileSlice::Tail(0)));
 
         let error = parse_show_options(&[
             "README.md".into(),
@@ -3940,10 +4022,102 @@ mod tests {
         .err()
         .expect("head and tail must conflict");
         assert_eq!(error.0, 2);
-        assert!(error.1.contains("mutually exclusive"));
+        assert!(error.1.contains("at most once per bare FILE"));
+
+        let batch = parse_show_options(&[
+            "setup.py".into(),
+            "README.md::Build local CUDA kernels".into(),
+            "compactlogic/cuda/developer.md".into(),
+            "--head".into(),
+            "80".into(),
+        ])
+        .expect("head applies only to the preceding batch target");
+        assert_eq!(batch.targets.len(), 3);
+        assert_eq!(batch.targets[0].file_slice, None);
+        assert_eq!(batch.targets[1].file_slice, None);
+        assert_eq!(batch.targets[2].file_slice, Some(ShowFileSlice::Head(80)));
+
+        let multiple = parse_show_options(&[
+            "first.txt".into(),
+            "--head".into(),
+            "2".into(),
+            "second.txt".into(),
+            "--tail".into(),
+            "3".into(),
+        ])
+        .expect("different files may each have a slice");
+        assert_eq!(multiple.targets[0].file_slice, Some(ShowFileSlice::Head(2)));
+        assert_eq!(multiple.targets[1].file_slice, Some(ShowFileSlice::Tail(3)));
 
         let suggestion = show_file_slice_target_error("README.md:10-20", "--head", 5);
         assert!(suggestion.contains("pira_nav show README.md --head 5"));
+    }
+
+    #[test]
+    fn show_head_applies_only_to_the_preceding_file_in_a_mixed_batch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pira-nav-show-slices-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create test directory");
+        fs::write(root.join("full.txt"), "full-first\nfull-second\n").expect("write full file");
+        fs::write(
+            root.join("guide.md"),
+            "# Guide\n\n## Section\nsection-body\n\n## Other\nother-body\n",
+        )
+        .expect("write Markdown file");
+        fs::write(
+            root.join("limited.txt"),
+            "limited-first\nlimited-second\nlimited-third\n",
+        )
+        .expect("write limited file");
+
+        let args = [
+            "full.txt".into(),
+            "guide.md::Guide > Section".into(),
+            "limited.txt".into(),
+            "--head".into(),
+            "2".into(),
+        ];
+        let mut output = Vec::new();
+        let result = command_show(&args, None, &root, &LspOptions::default(), &mut output);
+        let sliced_args = [
+            "full.txt".into(),
+            "--head".into(),
+            "1".into(),
+            "limited.txt".into(),
+            "--tail".into(),
+            "1".into(),
+        ];
+        let mut sliced_output = Vec::new();
+        let sliced_result = command_show(
+            &sliced_args,
+            None,
+            &root,
+            &LspOptions::default(),
+            &mut sliced_output,
+        );
+        fs::remove_dir_all(&root).expect("remove test directory");
+        result.expect("mixed show batch succeeds");
+        sliced_result.expect("multiple file slices succeed");
+        let output = String::from_utf8(output).expect("UTF-8 show output");
+        let sliced_output = String::from_utf8(sliced_output).expect("UTF-8 sliced output");
+
+        assert!(output.starts_with("# pira_nav show targets=3 shown=3\n"));
+        assert!(output.contains("# pira_nav show file=\"full.txt\" range=L1-L2"));
+        assert!(output.contains("item=\"Guide > Section\""));
+        assert!(output.contains("section-body"));
+        assert!(!output.contains("other-body"));
+        assert!(output.contains("# pira_nav show file=\"limited.txt\" range=L1-L2"));
+        assert!(output.contains("limited-second"));
+        assert!(!output.contains("limited-third"));
+        assert!(sliced_output.starts_with("# pira_nav show targets=2 shown=2\n"));
+        assert!(sliced_output.contains("# pira_nav show file=\"full.txt\" range=L1-L1"));
+        assert!(sliced_output.contains("# pira_nav show file=\"limited.txt\" range=L3-L3"));
     }
 
     #[test]
@@ -4014,7 +4188,9 @@ mod tests {
 
         let show =
             parse_show_options(&["--".into(), "-notes.md".into()]).expect("show option boundary");
-        assert_eq!(show.targets, ["-notes.md"]);
+        assert_eq!(show.targets.len(), 1);
+        assert_eq!(show.targets[0].value, "-notes.md");
+        assert_eq!(show.targets[0].file_slice, None);
 
         let symbols = parse_symbol_options(&["--query=Parser".into(), ".".into()])
             .expect("symbols query assignment");
