@@ -91,7 +91,7 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 
 ### Claude Code (experimental)
 
-Claude Code reads `CLAUDE.md`, not `AGENTS.md`. PIRA follows Claude Code's documented compatibility pattern: the user-level `~/.claude/CLAUDE.md` contains one managed import of the canonical `~/agent/AGENTS.md`, followed by two short Claude-specific reminders for module loading and Bash routing. It does not copy the policy into a second tree or install duplicate skills.
+Claude Code reads `CLAUDE.md`, not `AGENTS.md`. PIRA follows Claude Code's documented compatibility pattern: the user-level `~/.claude/CLAUDE.md` contains one managed import of the canonical `~/agent/AGENTS.md`, followed by two short Claude-specific reminders for module loading and shell/exec routing. It does not copy the policy into a second tree or install duplicate skills.
 
 Run these commands after the checkout is available at `~/agent`, which is also where the imported modules live. If another directory already occupies `~/agent`, setup intentionally stops rather than replacing it; resolve that conflict explicitly before continuing. Then preview, install, and verify with:
 

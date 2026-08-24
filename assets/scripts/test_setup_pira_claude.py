@@ -46,7 +46,8 @@ class SetupPiraClaudeTests(unittest.TestCase):
             )
             self.assertEqual(installed.count("@"), 1)
             self.assertIn("load all required modules via `pira_ctx exact`", installed)
-            self.assertIn("Never invoke Bash directly", installed)
+            self.assertIn("Route every shell/exec command through `pira_ctx`", installed)
+            self.assertIn("except direct `pira_dec` or `pira_nav` invocations", installed)
 
     def test_preserves_user_content_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -93,6 +94,11 @@ class SetupPiraClaudeTests(unittest.TestCase):
             + setup.CLAUDE_BLOCK_END
             + "\n"
             + setup.CLAUDE_BLOCK_START,
+            setup.CLAUDE_BLOCK_END
+            + "\n"
+            + setup.CLAUDE_BLOCK_START
+            + "\n"
+            + setup.CLAUDE_BLOCK_END,
             setup.CLAUDE_BLOCK_END + "\n" + setup.CLAUDE_BLOCK_START,
         ]
         for content in cases:

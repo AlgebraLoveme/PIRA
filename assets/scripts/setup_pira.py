@@ -437,9 +437,9 @@ def claude_managed_block(agent_dir: Path) -> str:
         "- IMPORTANT: Before using task tools, classify the request using the imported Module Loading "
         "and Routing rules, then load all required modules via `pira_ctx exact`. Do not substitute "
         "direct Read for PIRA module loading.\n"
-        "- IMPORTANT: Never invoke Bash directly. Every Bash command must begin with `pira_ctx`, "
-        "`pira_dec`, or `pira_nav`. Use Claude Read/Glob/Grep for ordinary file inspection instead of "
-        "shell find/cat/grep.\n"
+        "- IMPORTANT: Route every shell/exec command through `pira_ctx`, except direct `pira_dec` or "
+        "`pira_nav` invocations. Use Claude Read/Glob/Grep or `pira_nav` for ordinary read-only "
+        "inspection instead of raw shell find/cat/grep.\n"
         f"{CLAUDE_BLOCK_END}"
     )
 
