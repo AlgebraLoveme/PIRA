@@ -22,6 +22,8 @@ from typing import Iterable, Literal
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
+CLAUDE_BLOCK_START = "<!-- PIRA:BEGIN (managed by setup_pira.py; do not edit inside) -->"
+CLAUDE_BLOCK_END = "<!-- PIRA:END -->"
 USER_PLACEHOLDER_TEXT = """# USER
 
 ## Knowledge Domains
@@ -125,8 +127,15 @@ def confirm_or_skip(state: SetupState, question: str, default: bool = False) -> 
     return prompt_yes_no(question, default=default)
 
 
+def read_utf8_text(path: Path, description: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{description} is not valid UTF-8: {display_path(path)}") from exc
+
+
 def write_text(state: SetupState, path: Path, content: str, description: str, *, backup: bool = True) -> None:
-    old = path.read_text(encoding="utf-8") if path.exists() else None
+    old = read_utf8_text(path, description) if path.exists() else None
     if old == content:
         print(f"OK: {description} already up to date ({display_path(path)})")
         return
@@ -409,6 +418,65 @@ def remove_duplicate_global_agents(state: SetupState, global_path: Path, pira_pa
     state.note_change(f"removed duplicate {global_label} symlink")
 
 
+def claude_import_path(path: Path) -> str:
+    """Return a stable path accepted by CLAUDE.md imports."""
+    expanded = path.expanduser().absolute()
+    home = Path.home().absolute()
+    try:
+        return "~/" + expanded.relative_to(home).as_posix()
+    except ValueError:
+        return expanded.as_posix()
+
+
+def claude_managed_block(agent_dir: Path) -> str:
+    agents_path = claude_import_path(agent_dir / "AGENTS.md")
+    return f"{CLAUDE_BLOCK_START}\n@{agents_path}\n{CLAUDE_BLOCK_END}"
+
+
+def update_claude_md(state: SetupState, claude_md_path: Path) -> None:
+    """Install one managed import while preserving all user-owned content."""
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md") if claude_md_path.exists() else ""
+    start_count = existing.count(CLAUDE_BLOCK_START)
+    end_count = existing.count(CLAUDE_BLOCK_END)
+    if start_count != end_count or start_count > 1:
+        raise RuntimeError(
+            f"Refusing to edit malformed PIRA markers in {display_path(claude_md_path)} "
+            f"(start={start_count}, end={end_count})"
+        )
+
+    block = claude_managed_block(state.agent_dir)
+    if start_count == 1:
+        start = existing.index(CLAUDE_BLOCK_START)
+        end_start = existing.find(CLAUDE_BLOCK_END)
+        if end_start < start:
+            raise RuntimeError(f"Refusing to edit reversed PIRA markers in {display_path(claude_md_path)}")
+        end = end_start + len(CLAUDE_BLOCK_END)
+        updated = existing[:start] + block + existing[end:]
+    else:
+        separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
+        updated = existing + separator + block + "\n"
+    write_text(state, claude_md_path, updated, "Claude Code CLAUDE.md")
+
+
+def verify_claude(state: SetupState, claude_md_path: Path) -> None:
+    def add(name: str, passed: bool, detail: str) -> None:
+        state.verification.append((name, passed, detail))
+        print(f"{'PASS' if passed else 'FAIL'}: {name} — {detail}")
+
+    if not claude_md_path.exists():
+        add("Claude Code CLAUDE.md exists", False, display_path(claude_md_path))
+        return
+    text = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    expected = claude_managed_block(state.agent_dir)
+    add(
+        "Claude Code PIRA import",
+        text.count(CLAUDE_BLOCK_START) == 1
+        and text.count(CLAUDE_BLOCK_END) == 1
+        and expected in text,
+        f"{display_path(claude_md_path)} -> {claude_import_path(state.agent_dir / 'AGENTS.md')}",
+    )
+
+
 def configure_audio(
     state: SetupState,
     audio: Literal["ask", "yes", "no"],
@@ -492,6 +560,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
+    parser.add_argument("--claude-code", action="store_true", help="Configure Claude Code instead of Codex.")
+    parser.add_argument("--claude-md", default="~/.claude/CLAUDE.md", help="Claude Code user instruction file.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
@@ -542,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes)
     config_path = expand_path(args.codex_config)
+    claude_md_path = expand_path(args.claude_md)
     audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
 
     print("PIRA setup")
@@ -550,13 +621,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry run:    {state.dry_run}")
 
     try:
+        if args.claude_code and args.execution_mode != "ask":
+            raise RuntimeError("--execution-mode configures Codex only; Claude Code permission settings are left unchanged")
+        if args.claude_code and args.audio == "yes":
+            raise RuntimeError("Claude Code setup does not install Codex audio notifications")
         if not args.verify:
             ensure_agent_dir(state, force_agent_link=args.force_agent_link)
             ensure_user_md(state, args.user_mode)
             remove_legacy_files(state, args.legacy)
-            if not args.skip_codex:
-                configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
-            configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
+            if args.claude_code:
+                update_claude_md(state, claude_md_path)
+            else:
+                if not args.skip_codex:
+                    configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
+                configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
             if not args.skip_tools:
                 configure_tools(
                     state,
@@ -567,7 +645,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
-            verify(state, config_path, skip_codex=args.skip_codex)
+            verify(state, config_path, skip_codex=args.skip_codex or args.claude_code)
+            if args.claude_code:
+                verify_claude(state, claude_md_path)
             if args.verify and not args.skip_tools:
                 configure_tools(
                     state,
