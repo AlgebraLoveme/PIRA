@@ -428,8 +428,20 @@ def claude_import_path(path: Path) -> str:
         return expanded.as_posix()
 
 
+def claude_bridge_is_windows() -> bool:
+    """The Claude bridge adds Windows shell-routing guidance only on Windows hosts."""
+    return os.name == "nt"
+
+
 def claude_managed_block(agent_dir: Path) -> str:
     agents_path = claude_import_path(agent_dir / "AGENTS.md")
+    windows_line = (
+        "- IMPORTANT (Windows): Invoke PIRA tools from the POSIX Bash tool, not PowerShell — "
+        "PowerShell PATH lacks `cat`/`grep`, and `bash` there may resolve to WSL. Inside "
+        "`pira_ctx`, express pipelines or compound commands as `bash -c '...'`.\n"
+        if claude_bridge_is_windows()
+        else ""
+    )
     return (
         f"{CLAUDE_BLOCK_START}\n"
         f"@{agents_path}\n\n"
@@ -440,6 +452,7 @@ def claude_managed_block(agent_dir: Path) -> str:
         "- IMPORTANT: Route every shell/exec command through `pira_ctx`, except direct `pira_dec` or "
         "`pira_nav` invocations. Use Claude Read/Glob/Grep or `pira_nav` for ordinary read-only "
         "inspection instead of raw shell find/cat/grep.\n"
+        f"{windows_line}"
         f"{CLAUDE_BLOCK_END}"
     )
 

@@ -49,6 +49,14 @@ class SetupPiraClaudeTests(unittest.TestCase):
             self.assertIn("Route every shell/exec command through `pira_ctx`", installed)
             self.assertIn("except direct `pira_dec` or `pira_nav` invocations", installed)
 
+    def test_windows_bridge_line_only_on_windows(self) -> None:
+        with patch.object(setup, "claude_bridge_is_windows", return_value=True):
+            windows_block = setup.claude_managed_block(Path("/tmp/agent"))
+        with patch.object(setup, "claude_bridge_is_windows", return_value=False):
+            posix_block = setup.claude_managed_block(Path("/tmp/agent"))
+        self.assertIn("POSIX Bash tool", windows_block)
+        self.assertNotIn("POSIX Bash tool", posix_block)
+
     def test_preserves_user_content_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
