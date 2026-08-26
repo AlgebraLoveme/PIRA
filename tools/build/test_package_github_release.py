@@ -48,7 +48,12 @@ class PackageGitHubReleaseTests(unittest.TestCase):
     def test_packages_compressed_assets_and_release_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            versions = {"pira_ctx": "1.6.0", "pira_dec": "0.5.1", "pira_nav": "0.11.0"}
+            versions = {
+                "pira_ctx": "1.6.0",
+                "pira_dec": "0.5.1",
+                "pira_nav": "0.11.0",
+                "pira_svg_check": "0.1.0",
+            }
             for tool, version in versions.items():
                 self.make_bundle(root, tool, version)
             output = root / "release"
@@ -64,7 +69,10 @@ class PackageGitHubReleaseTests(unittest.TestCase):
             self.assertEqual(index["repository"], "AlgebraLoveme/PIRA")
             self.assertEqual(index["source_sha"], "a" * 40)
             self.assertEqual(set(index["tools"]), set(release.TOOLS))
-            self.assertEqual(len(list(output.iterdir())), 16)
+            self.assertEqual(
+                len(list(output.iterdir())),
+                1 + len(release.TOOLS) * len(release.PLATFORMS),
+            )
             for tool, version in versions.items():
                 self.assertEqual(index["tools"][tool]["version"], version)
                 for platform_key, record in index["tools"][tool]["binaries"].items():

@@ -11,6 +11,15 @@ from tools.build import build_pira_ctx_platform_bins as builder
 
 
 class RustToolsTests(unittest.TestCase):
+    def test_configures_pira_svg_check_workspace_tool(self) -> None:
+        builder.configure_tool("pira_svg_check")
+        self.assertEqual(builder.TOOL_NAME, "pira_svg_check")
+        self.assertEqual(builder.TARGETS["windows-x64"].exe_name, "pira_svg_check.exe")
+
+    def test_rejects_unsafe_workspace_tool_name(self) -> None:
+        with self.assertRaises(builder.BuildError):
+            builder.configure_tool("../pira_svg_check")
+
     def test_preserves_rustup_multicall_symlink_name(self) -> None:
         if os.name == "nt":
             self.skipTest("Windows does not provide POSIX symlink executable lookup semantics")

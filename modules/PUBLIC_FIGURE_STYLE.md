@@ -46,6 +46,11 @@ Use the applicable workflow plus the shared rules below.
 - After two consecutive misses of the intended visual structure, explicitly change strategy instead of continuing local tweaks.
 - Iterate until the gate passes or 10 render-refine passes. At the cap, give exactly one primary fix plan with estimated effort and await approval before continuing.
 
+### PIRA SVG check
+- For a public SVG containing semantic `<text>`, run `pira_svg_check FIGURE.svg` after the final render and before release. Use `--json` for machine-readable output and repeat `--font-dir DIR` when the final fonts are not otherwise available to the renderer.
+- Treat findings as conservative review warnings, not rejection criteria. Inspect every cited label in the final-use render and fix confirmed low contrast, clipping or masking, text overlap, or stroke intrusion. An opaque background behind text is acceptable when the text remains readily legible and foreground content does not obstruct it.
+- A clear result does not replace the visual completion gate: path-converted text is not discoverable as text, and complex filters, `foreignObject`, text paths, unusual blending, browser-specific layout, or transparent-canvas assumptions can still require manual review. Tool analysis errors must be resolved or reported rather than treated as a clear result.
+
 ## Color
 - Reuse the publication's palette when present. Otherwise choose by purpose, keep mappings consistent, and verify contrast, color-vision deficiency, and grayscale at final size. Add a non-color cue for important distinctions.
 - Use these colors for categorical marks and concept or workflow diagrams. Ordered data require a perceptually uniform sequential, diverging, or cyclic map matched to meaning.

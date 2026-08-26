@@ -246,7 +246,12 @@ def release_index(tag: str | None = None) -> dict[str, object]:
 
 
 def parse_versions(values: list[str] | None) -> dict[str, str]:
-    aliases = {"ctx": "pira_ctx", "dec": "pira_dec", "nav": "pira_nav"}
+    aliases = {
+        "ctx": "pira_ctx",
+        "dec": "pira_dec",
+        "nav": "pira_nav",
+        "svg": "pira_svg_check",
+    }
     versions: dict[str, str] = {}
     for value in values or []:
         if "=" not in value:
@@ -543,7 +548,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         action="append",
         help=(
-            "Pin one tool as ctx=VERSION, dec=VERSION, or nav=VERSION; repeatable. "
+            "Pin one tool as ctx=VERSION, dec=VERSION, nav=VERSION, or svg=VERSION; "
+            "repeatable. "
             "Unspecified tools use latest. Exact history begins with cloud releases."
         ),
     )

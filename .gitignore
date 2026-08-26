@@ -33,6 +33,7 @@ tools/build/*
 !tools/build/build_pira_ctx_platform_bins.py
 !tools/build/build_pira_dec_platform_bins.py
 !tools/build/build_pira_nav_platform_bins.py
+!tools/build/build_pira_svg_check_platform_bins.py
 !tools/build/test_build_pira_ctx_platform_bins.py
 !tools/build/package_github_release.py
 !tools/build/test_package_github_release.py

@@ -1,0 +1,26 @@
+[package]
+name = "pira_svg_check"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Conservative warning-only text legibility guard for SVG figures"
+license = "Apache-2.0"
+repository = "https://github.com/AlgebraLoveme/PIRA"
+
+[dependencies]
+quick-xml = "0.38"
+resvg = { version = "0.48.1", default-features = false, features = [
+    "memmap-fonts",
+    "raster-images",
+    "system-fonts",
+    "text",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+path = "../../src/pira_svg_check/lib.rs"
+
+[[bin]]
+name = "pira_svg_check"
+path = "../../src/pira_svg_check/main.rs"

@@ -60,8 +60,47 @@ class SetupPiraToolsTests(unittest.TestCase):
 
     def test_parses_per_tool_versions(self) -> None:
         self.assertEqual(
-            setup.parse_versions(["ctx=1.6.0", "pira_nav=0.11.0"]),
-            {"pira_ctx": "1.6.0", "pira_nav": "0.11.0"},
+            setup.parse_versions(
+                ["ctx=1.6.0", "pira_nav=0.11.0", "svg=0.1.0"]
+            ),
+            {
+                "pira_ctx": "1.6.0",
+                "pira_nav": "0.11.0",
+                "pira_svg_check": "0.1.0",
+            },
+        )
+
+    def test_selector_accepts_pira_svg_check_and_rejects_unsafe_names(self) -> None:
+        selector = setup.load_selector()
+        self.assertEqual(selector.validate_tool_name("pira_svg_check"), "pira_svg_check")
+        with self.assertRaises(selector.SelectionError):
+            selector.validate_tool_name("../pira_svg_check")
+
+    def test_selector_installs_pira_svg_check_atomically(self) -> None:
+        selector = setup.load_selector()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "downloaded-pira-svg-check"
+            source.write_bytes(b"pira-svg-check-binary")
+            record = {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            installed = selector.install_binary(
+                source,
+                record,
+                root / "bin",
+                tool_name="pira_svg_check",
+            )
+            self.assertEqual(installed.name, "pira_svg_check")
+            self.assertEqual(installed.read_bytes(), source.read_bytes())
+
+    def test_default_selection_includes_released_pira_svg_check(self) -> None:
+        index = self.index()
+        index["tools"]["pira_svg_check"] = {
+            "version": "0.1.0",
+            "binaries": {},
+        }
+        self.assertEqual(
+            setup.selected_tools(index, None),
+            ["pira_ctx", "pira_svg_check"],
         )
 
     def test_finds_release_containing_exact_version_asset(self) -> None:

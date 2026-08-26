@@ -48,6 +48,9 @@ jobs:
           - tool: pira_nav
             script: tools/build/build_pira_nav_platform_bins.py
             needs_zig: true
+          - tool: pira_svg_check
+            script: tools/build/build_pira_svg_check_platform_bins.py
+            needs_zig: false
 
     env:
       TOOL: ${{ matrix.tool }}
@@ -145,7 +148,7 @@ jobs:
       - name: Download verified build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: pira_*-bundle
+          pattern: "*-bundle"
           path: ${{ runner.temp }}/pira-build-artifacts
 
       - name: Prepare compressed release assets
