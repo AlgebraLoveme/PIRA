@@ -29,6 +29,21 @@ fn line_through_word_warns_even_when_text_is_topmost() {
 }
 
 #[test]
+fn closed_panel_boundary_crossing_text_edge_warns() {
+    assert!(warning_codes("boundary_through_text.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn open_line_crossing_text_edge_warns() {
+    assert!(warning_codes("line_at_text_edge.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
+fn padded_stroked_panel_does_not_warn() {
+    assert!(!warning_codes("padded_stroked_panel.svg").contains(&"stroke-intrusion".to_string()));
+}
+
+#[test]
 fn opaque_backing_hides_line() {
     assert!(!warning_codes("backed_label.svg").contains(&"stroke-intrusion".to_string()));
 }

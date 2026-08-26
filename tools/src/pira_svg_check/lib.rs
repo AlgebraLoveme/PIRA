@@ -396,17 +396,8 @@ fn crosses_text_block(points: &[(u32, u32)], glyphs: Bounds, ratio: f64) -> bool
     let max_y = points.iter().map(|point| point.1).max().unwrap_or(0);
     let span_x = max_x.saturating_sub(min_x) + 1;
     let span_y = max_y.saturating_sub(min_y) + 1;
-    let central_y0 = f64::from(glyphs.y0) + f64::from(glyphs.height()) * 0.2;
-    let central_y1 = f64::from(glyphs.y1) - f64::from(glyphs.height()) * 0.2;
-    let central_x0 = f64::from(glyphs.x0) + f64::from(glyphs.width()) * 0.2;
-    let central_x1 = f64::from(glyphs.x1) - f64::from(glyphs.width()) * 0.2;
-    let horizontal = f64::from(span_x) >= f64::from(glyphs.width()) * ratio
-        && f64::from(max_y) >= central_y0
-        && f64::from(min_y) <= central_y1;
-    let vertical = f64::from(span_y) >= f64::from(glyphs.height()) * ratio
-        && f64::from(max_x) >= central_x0
-        && f64::from(min_x) <= central_x1;
-    horizontal || vertical
+    f64::from(span_x) >= f64::from(glyphs.width()) * ratio
+        || f64::from(span_y) >= f64::from(glyphs.height()) * ratio
 }
 
 fn text_overlap_warnings(regions: &[TextRegion]) -> Vec<GuardWarning> {
