@@ -196,7 +196,7 @@ pira_dec help [COMMAND]
 #### Rules
 - `search`, `symbols`, and `map` default omitted path to cwd; `dependents`/`deps` default omitted `--root` to cwd.
 - For commands with positional paths or targets, use `--` to end option parsing before values that begin with `-`. `query` instead pairs each semantic operation option directly with its target.
-- `show` accepts bare files for full content, `FILE:START-END`, `FILE:LINE[:COLUMN]`, `FILE::ITEM`, or a `pira://` selector, including mixed batches. A postfix `--head N` or `--tail N` bounds only the preceding bare file and may be repeated for different files in one batch. `ITEM` may be a full qualified name or a unique qualified-name suffix. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
+- `show` accepts bare files for full content, `FILE:START-END`, `FILE:LINE[:COLUMN]`, `FILE::ITEM`, or a `pira://` selector, including mixed batches. A postfix `--head N` or `--tail N` bounds only the preceding bare file and may be repeated for different files in one batch. `ITEM` may be a full qualified name or a unique qualified-name suffix. Canonical hierarchy uses `::` across code, structured-document keys, and Markdown headings; append `[N]` for an index and use JSON-style bracket quoting for arbitrary segments, for example `["a.b"]`. Legacy language-native, dot-key, and `Parent > Child` selectors remain accepted aliases, but agents must emit canonical selectors. Shell-quote metacharacter-containing targets.
 - `show` is exact by default. For orientation across ultra-long lines, use `--glance` to show line numbers and at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata; do not use it when exact source is required.
 - Markdown outlines display local heading titles under indented ancestors; matching and `show` still use qualified heading paths when a suffix is ambiguous.
 - Semantic commands accept one-based UTF-8-byte `FILE:LINE:COLUMN`, `FILE::QUALIFIED-NAME`, or a `pira://` selector and require an LSP.
@@ -233,6 +233,6 @@ pira_nav help COMMAND...
 - Bounded file orientation: `pira_nav show README.md --head 40`.
 - Mixed full-file batch: `pira_nav show README.md LICENSE`.
 - Code item: `pira_nav show src/foo.rs::Foo::bar`.
-- Structured-document key: `pira_nav show config.yaml::foo.bar`.
-- Markdown subsection: `pira_nav show 'README.md::Usage > Linux'`.
+- Structured-document key: `pira_nav show config.yaml::foo::bar`.
+- Markdown subsection: `pira_nav show README.md::Usage::Linux`.
 - Shared-LSP mixed query: `pira_nav query --definition src/foo.py::bar --references src/foo.py::bar`.

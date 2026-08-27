@@ -175,9 +175,10 @@ apart from terminal-control escaping and is framed as untrusted data. --glance i
 orientation view: it prefixes every physical line with its line number and shows at most the first
 160 source bytes, clipping only at UTF-8 boundaries and visibly marking omitted bytes.
 
-Structured-document names use dot-separated keys, [N] array indices, and JSON-quoted brackets for
-special keys, for example ["a.b"]. Markdown names use `Parent > Child`. Shell-quote targets containing
-brackets, `>`, or other metacharacters.
+Qualified names use `::` between hierarchy segments in every code and document format. Array indices
+use [N]. Segments containing punctuation, whitespace, or `::` use JSON-style bracket quoting, for
+example ["a.b"]. Legacy language-native, dot-key, and `Parent > Child` names remain accepted aliases.
+Shell-quote targets containing brackets or other metacharacters.
 
 OPTIONS
 {STRUCTURAL_OPTIONS}
@@ -190,9 +191,10 @@ OPTIONS
 
 EXAMPLES
   pira_nav show src/parser.rs::Parser::parse
-  pira_nav show 'package.json::scripts.build'
-  pira_nav show 'workflow.yaml::jobs.test.steps[2]'
-  pira_nav show 'README.md::Install > Linux'
+  pira_nav show package.json::scripts::build
+  pira_nav show workflow.yaml::jobs::test::steps[2]
+  pira_nav show README.md::Install::Linux
+  pira_nav show 'README.md::["Install > Linux"]'
   pira_nav show README.md
   pira_nav show README.md LICENSE
   pira_nav show README.md --head 20

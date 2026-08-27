@@ -4,7 +4,7 @@ use tree_sitter::{Node, Point, Tree};
 
 use crate::document;
 use crate::language::Language;
-use crate::model::{ParseBackend, Symbol};
+use crate::model::{ParseBackend, Symbol, SymbolPath};
 use crate::util::{hash16, one_line, percent_encode, read_source, source_slice};
 
 const MAX_SYNTAX_DEPTH: usize = 256;
@@ -217,6 +217,7 @@ impl SymbolCollector {
         let text_bytes = self
             .text_bytes
             .saturating_add(symbol.qualified_name.len())
+            .saturating_add(symbol.legacy_qualified_name.len())
             .saturating_add(symbol.signature.len());
         if self.symbols.len() >= MAX_CODE_SYMBOLS || text_bytes > MAX_CODE_SYMBOL_TEXT_BYTES {
             self.truncated = true;
@@ -254,10 +255,13 @@ fn push_symbol_name(
     output: &mut SymbolCollector,
 ) -> String {
     let name = one_line(name);
-    let qualified = qualify(qualification.0, &name, qualification.1);
+    let (path, qualified, legacy_qualified_name) =
+        qualified_names(qualification.0, &name, qualification.1, output);
     output.push(Symbol {
         kind,
+        path,
         qualified_name: qualified.clone(),
+        legacy_qualified_name,
         signature: signature(node, source, node.start_byte()),
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -940,8 +944,7 @@ fn walk_php_root(root: Node<'_>, source: &str, output: &mut SymbolCollector) {
         let Some(name) = child.child_by_field_name("name") else {
             continue;
         };
-        let namespace_name = one_line(&source_slice(source, name.start_byte(), name.end_byte()));
-        push_symbol(child, name, source, (None, "\\"), "namespace", 0, output);
+        let namespace_name = push_symbol(child, name, source, (None, "\\"), "namespace", 0, output);
         if let Some(body) = child.child_by_field_name("body") {
             walk_php(body, source, Some(&namespace_name), 1, output);
         } else {
@@ -2205,7 +2208,7 @@ fn add_python_definition(
         return;
     };
     let name = source_slice(source, name_node.start_byte(), name_node.end_byte()).into_owned();
-    let qualified = qualify(parent, &name, ".");
+    let (path, qualified, legacy_qualified_name) = qualified_names(parent, &name, ".", output);
     let kind = if node.kind() == "class_definition" {
         "class"
     } else if parent_is_class {
@@ -2217,7 +2220,9 @@ fn add_python_definition(
         range_start.unwrap_or_else(|| (node.start_byte(), node.start_position()));
     output.push(Symbol {
         kind,
+        path,
         qualified_name: qualified.clone(),
+        legacy_qualified_name,
         signature: signature(node, source, start_byte),
         start_byte,
         end_byte: node.end_byte(),
@@ -2283,11 +2288,14 @@ fn walk_rust(
         if let Some(name_node) = name_node {
             let name =
                 source_slice(source, name_node.start_byte(), name_node.end_byte()).into_owned();
-            let qualified = qualify(parent, &name, "::");
+            let (path, qualified, legacy_qualified_name) =
+                qualified_names(parent, &name, "::", output);
             let (start_byte, start_position) = rust_attached_start(node, source);
             output.push(Symbol {
                 kind,
+                path,
                 qualified_name: qualified.clone(),
+                legacy_qualified_name,
                 // Attached docs/attributes belong to `show`, not the compact signature.
                 signature: signature(node, source, node.start_byte()),
                 start_byte,
@@ -2376,10 +2384,49 @@ fn named_child_with_kind<'tree>(node: &Node<'tree>, kinds: &[&str]) -> Option<No
 }
 
 fn qualify(parent: Option<&str>, name: &str, separator: &str) -> String {
-    match parent {
-        Some(parent) if !parent.is_empty() => format!("{parent}{separator}{name}"),
-        _ => name.to_owned(),
-    }
+    qualified_path(parent, name, separator).canonical()
+}
+
+fn qualified_names(
+    parent: Option<&str>,
+    name: &str,
+    separator: &str,
+    output: &SymbolCollector,
+) -> (SymbolPath, String, String) {
+    let path = qualified_path(parent, name, separator);
+    let qualified = path.canonical();
+    let legacy_qualified_name = match parent.filter(|parent| !parent.is_empty()) {
+        Some(parent) => {
+            let legacy_parent = output
+                .symbols
+                .iter()
+                .rev()
+                .find(|symbol| symbol.qualified_name == parent)
+                .map(|symbol| symbol.legacy_qualified_name.clone())
+                .or_else(|| {
+                    SymbolPath::parse_canonical(parent).map(|path| path.legacy_code(separator))
+                })
+                .unwrap_or_else(|| parent.to_owned());
+            format!("{legacy_parent}{separator}{name}")
+        }
+        None => name.to_owned(),
+    };
+    (path, qualified, legacy_qualified_name)
+}
+
+fn qualified_path(parent: Option<&str>, name: &str, separator: &str) -> SymbolPath {
+    let parent = parent.map_or_else(SymbolPath::default, |parent| {
+        SymbolPath::parse_canonical(parent).expect("internal parent symbol path must be canonical")
+    });
+    let names = if separator.is_empty() {
+        vec![name.to_owned()]
+    } else {
+        name.split(separator)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    parent.extend_names(names)
 }
 
 #[cfg(test)]
@@ -2429,7 +2476,7 @@ mod lean_navigation_tests {
                 .iter()
                 .map(|symbol| (symbol.qualified_name.as_str(), symbol.depth))
                 .collect::<Vec<_>>(),
-            vec![("Demo", 0), ("Demo.value", 1)]
+            vec![("Demo", 0), ("Demo::value", 1)]
         );
     }
 }
