@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::language::Language;
-use crate::model::Symbol;
+use crate::model::{Symbol, SymbolPath};
 use crate::util::{one_line, percent_decode, sanitize_metadata};
 
 const MAX_SYMBOLS: usize = 100_000;
@@ -460,7 +460,7 @@ pub(super) fn parse_document_symbols(
 
 fn push_document_symbol(
     value: &Value,
-    parent: Option<&str>,
+    parent: Option<&LspScope>,
     depth: usize,
     nesting: usize,
     language: Language,
@@ -492,7 +492,9 @@ fn push_document_symbol(
         positions.range(required(value, "range")?)?;
     output.push(Symbol {
         kind: symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0)),
-        qualified_name: qualified.clone(),
+        path: qualified.path.clone(),
+        qualified_name: qualified.path.canonical(),
+        legacy_qualified_name: qualified.legacy.clone(),
         signature: bounded_text(
             value.get("detail").and_then(Value::as_str).unwrap_or(&name),
             4 * 1024,
@@ -537,12 +539,15 @@ fn push_flat_symbol(
     }
     let name = symbol_name(value)?;
     let container = value.get("containerName").and_then(Value::as_str);
-    let qualified = qualify_lsp(container, &name, language);
+    let container = container.map(|name| qualify_lsp(None, name, language));
+    let qualified = qualify_lsp(container.as_ref(), &name, language);
     let (start_byte, end_byte, start_row, start_column, end_row, end_column) =
         positions.range(required(location, "range")?)?;
     output.push(Symbol {
         kind: symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0)),
-        qualified_name: qualified,
+        path: qualified.path.clone(),
+        qualified_name: qualified.path.canonical(),
+        legacy_qualified_name: qualified.legacy,
         signature: bounded_text(&name, 4 * 1024),
         start_byte,
         end_byte,
@@ -744,18 +749,40 @@ pub(super) fn bounded_text(value: &str, max_bytes: usize) -> String {
     text
 }
 
-fn qualify_lsp(parent: Option<&str>, name: &str, language: Language) -> String {
-    let Some(parent) = parent.filter(|parent| !parent.is_empty()) else {
-        return name.to_string();
+struct LspScope {
+    path: SymbolPath,
+    legacy: String,
+}
+
+fn qualify_lsp(parent: Option<&LspScope>, name: &str, language: Language) -> LspScope {
+    let separator = qualification_separator(language);
+    let split = |value: &str| {
+        value
+            .split(separator)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
     };
-    if name == parent
+    let Some(parent) = parent.filter(|parent| !parent.legacy.is_empty()) else {
+        return LspScope {
+            path: SymbolPath::from_names(split(name)),
+            legacy: name.to_owned(),
+        };
+    };
+    if name == parent.legacy
         || name
-            .strip_prefix(parent)
+            .strip_prefix(&parent.legacy)
             .is_some_and(|suffix| suffix.starts_with(['.', ':', '\\']))
     {
-        return name.to_string();
+        return LspScope {
+            path: SymbolPath::from_names(split(name)),
+            legacy: name.to_owned(),
+        };
     }
-    format!("{parent}{}{name}", qualification_separator(language))
+    LspScope {
+        path: parent.path.extend_names(split(name)),
+        legacy: format!("{}{separator}{name}", parent.legacy),
+    }
 }
 
 fn qualification_separator(language: Language) -> &'static str {
@@ -881,7 +908,7 @@ mod tests {
                 .iter()
                 .map(|symbol| (symbol.qualified_name.as_str(), symbol.depth))
                 .collect::<Vec<_>>(),
-            vec![("Algebraic", 0), ("Algebraic.foo", 1)]
+            vec![("Algebraic", 0), ("Algebraic::foo", 1)]
         );
     }
 }

@@ -1046,7 +1046,7 @@ fn resolve_show_target(
             .iter()
             .position(|symbol| {
                 symbol.kind == selector.kind
-                    && symbol.qualified_name == selector.qualified
+                    && symbol.name_matches(&selector.qualified)
                     && hash16(
                         parsed
                             .source
@@ -1069,14 +1069,14 @@ fn resolve_show_target(
             .symbols
             .iter()
             .enumerate()
-            .filter(|(_, symbol)| symbol.qualified_name == qualified)
+            .filter(|(_, symbol)| symbol.name_matches(&qualified))
             .collect::<Vec<_>>();
         let matches = if exact.is_empty() {
             parsed
                 .symbols
                 .iter()
                 .enumerate()
-                .filter(|(_, symbol)| qualified_suffix_matches(&symbol.qualified_name, &qualified))
+                .filter(|(_, symbol)| symbol.name_suffix_matches(&qualified))
                 .collect::<Vec<_>>()
         } else {
             exact
@@ -1241,16 +1241,6 @@ fn validate_directory(path: &Path, cwd: &Path, command: &str, subject: &str) -> 
             ),
         )),
     }
-}
-
-fn qualified_suffix_matches(candidate: &str, query: &str) -> bool {
-    candidate == query
-        || candidate.strip_suffix(query).is_some_and(|prefix| {
-            prefix.ends_with('.')
-                || prefix.ends_with("::")
-                || prefix.ends_with('\\')
-                || prefix.ends_with(" > ")
-        })
 }
 
 fn command_map(
@@ -3351,10 +3341,10 @@ fn render_outline(
     let exact_matches = matches
         .iter()
         .map(|term| {
-            parsed
-                .symbols
-                .iter()
-                .any(|symbol| symbol.qualified_name.to_lowercase() == *term)
+            parsed.symbols.iter().any(|symbol| {
+                symbol.qualified_name.to_lowercase() == *term
+                    || symbol.legacy_qualified_name.to_lowercase() == *term
+            })
         })
         .collect::<Vec<_>>();
     let selected = parsed
@@ -3458,12 +3448,16 @@ fn outline_symbol_matches(symbol: &Symbol, matches: &[String], exact_matches: &[
         return true;
     }
     let name = symbol.qualified_name.to_lowercase();
+    let legacy_name = symbol.legacy_qualified_name.to_lowercase();
     let signature = symbol.signature.to_lowercase();
     matches.iter().zip(exact_matches).any(|(term, exact)| {
         if *exact {
-            name == *term
+            name == *term || legacy_name == *term
         } else {
-            symbol.kind.contains(term) || name.contains(term) || signature.contains(term)
+            symbol.kind.contains(term)
+                || name.contains(term)
+                || legacy_name.contains(term)
+                || signature.contains(term)
         }
     })
 }
@@ -3940,7 +3934,7 @@ mod tests {
     };
     use crate::language::Language;
     use crate::lsp_options::LspOptions;
-    use crate::model::Symbol;
+    use crate::model::{Symbol, SymbolPath};
     use crate::util::escape_untrusted_text;
 
     #[test]
@@ -4109,7 +4103,7 @@ mod tests {
 
         assert!(output.starts_with("# pira_nav show targets=3 shown=3\n"));
         assert!(output.contains("# pira_nav show file=\"full.txt\" range=L1-L2"));
-        assert!(output.contains("item=\"Guide > Section\""));
+        assert!(output.contains("item=\"Guide::Section\""));
         assert!(output.contains("section-body"));
         assert!(!output.contains("other-body"));
         assert!(output.contains("# pira_nav show file=\"limited.txt\" range=L1-L2"));
@@ -4157,7 +4151,9 @@ mod tests {
     fn markdown_outline_uses_local_titles_without_changing_other_names() {
         let symbol = Symbol {
             kind: "heading2",
-            qualified_name: "Workbook > Research state".into(),
+            path: SymbolPath::from_names(["Workbook".into(), "Research state".into()]),
+            qualified_name: "Workbook::[\"Research state\"]".into(),
+            legacy_qualified_name: "Workbook > Research state".into(),
             signature: "Research state".into(),
             start_byte: 0,
             end_byte: 1,
@@ -4173,7 +4169,7 @@ mod tests {
         );
         assert_eq!(
             outline_display_name(Language::Rust, &symbol),
-            "Workbook > Research state"
+            "Workbook::[\"Research state\"]"
         );
     }
 

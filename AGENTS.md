@@ -196,23 +196,23 @@ pira_dec help [COMMAND]
 #### Rules
 - `search`, `symbols`, and `map` default omitted path to cwd; `dependents`/`deps` default omitted `--root` to cwd.
 - For commands with positional paths or targets, use `--` to end option parsing before values that begin with `-`. `query` instead pairs each semantic operation option directly with its target.
-- `show` accepts bare files for full content, `FILE:START-END`, `FILE:LINE[:COLUMN]`, `FILE::ITEM`, or a `pira://` selector, including mixed batches. A postfix `--head N` or `--tail N` bounds only the preceding bare file and may be repeated for different files in one batch. `ITEM` may be a full qualified name or a unique qualified-name suffix. Code nesting uses `::`; document-key nesting `.`; Markdown heading nesting ` > `. Shell-quote metacharacter-containing targets.
+- Use `show` with a bare `FILE`, `FILE:START-END`, `FILE:LINE[:COLUMN]`, fully qualified `FILE::ITEM`, or a freshness-checked selector returned by `outline --selectors`; batch independent targets. In every code and document format, separate `ITEM` hierarchy segments with `::`, append `[N]` for indices, and JSON-quote arbitrary segments in brackets, for example `["a.b"]`. Shell-quote metacharacter-containing targets. A postfix `--head N` or `--tail N` bounds only the preceding bare file.
 - `show` is exact by default. For orientation across ultra-long lines, use `--glance` to show line numbers and at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata; do not use it when exact source is required.
-- Markdown outlines display local heading titles under indented ancestors; matching and `show` still use qualified heading paths when a suffix is ambiguous.
-- Semantic commands accept one-based UTF-8-byte `FILE:LINE:COLUMN`, `FILE::QUALIFIED-NAME`, or a `pira://` selector and require an LSP.
+- Markdown outlines display local heading titles under indented ancestors; construct fully qualified `show` targets from the displayed hierarchy.
+- Semantic commands require an LSP. Use one-based UTF-8-byte `FILE:LINE:COLUMN` for a known source position, fully qualified `FILE::ITEM` for a named symbol, and an `outline --selectors` result when freshness-checked identity matters.
 - Start with the operation directly answering the question. Use `map` only for topology discovery; when text/name/file/target is known, start with `search`, `symbols`, `outline`, or `show`.
 - Search defaults to literal. Use `--regex` for regex, `-i` for case-insensitive matching, repeatable `-g GLOB` for gitignore-style path filtering (`!` excludes), `-C N` for symmetric context, `-B N`/`-A N` for before/after context, `--files-with-matches` for paths only, and `--count` for matching-line counts.
-- First pass: use default context/output bounds. Reuse verified paths, targets, and evidence; answer once they support every answer part. Increase only an omission-reported bound, or broaden/repeat for a named unresolved gap. For `map`, use `--max-depth N` (or `--depth N`) when directory traversal itself must be bounded.
-- Combine related same-scope search terms in one invocation with repeated `-e PATTERN` so each keeps independent ranking and accounting; use regex alternation only when the alternatives are conceptually one query. Batch confirmed independent targets in one `show`/semantic command. Use `query` for mixed semantic operations; split only when later targets depend on earlier evidence.
+- First pass: use default context/output bounds. Reuse verified paths, targets, and evidence; answer once they support every answer part. Increase only an omission-reported bound, or broaden/repeat for a named unresolved gap. For `map`, use `--max-depth N` when directory traversal itself must be bounded.
+- Combine related same-scope search terms in one invocation with repeated `-e PATTERN` so each keeps independent ranking and accounting; use one regex pattern only when it expresses one conceptual query. Batch confirmed independent targets in one `show`/semantic command. Use `query` for mixed semantic operations; split only when later targets depend on earlier evidence.
 - Lexical matches do not establish semantic identity. When identity matters, use LSP semantic commands; report unavailable LSP rather than substituting text matches.
 - Semantic operations: `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, `supertypes`, `subtypes`, `hover`.
 - Let structural commands choose backend automatically. Use `--native` only to require a clean bundled parse and `--lsp` only to override language-server discovery.
-- Use a system search tool only outside `pira_nav` support: binary/non-UTF-8 data, multiline/PCRE-only matching, archives, broad ignored-tree overrides, or symlink traversal. Keep output bounded.
+- Do not use `pira_nav` for binary/non-UTF-8 data, multiline or PCRE-only matching, archives, broad ignored-tree overrides, or symlink traversal.
 - Preserve punctuation when the task requests an exact source expression.
 
 #### Forms
 ```text
-pira_nav map [PATH] [--max-depth N|--depth N] [OPTION...]
+pira_nav map [PATH] [--max-depth N] [OPTION...]
 pira_nav search PATTERN [PATH...] [OPTION...]
 pira_nav symbols QUERY [PATH...] [OPTION...]
 pira_nav outline FILE... [OPTION...]
@@ -233,6 +233,6 @@ pira_nav help COMMAND...
 - Bounded file orientation: `pira_nav show README.md --head 40`.
 - Mixed full-file batch: `pira_nav show README.md LICENSE`.
 - Code item: `pira_nav show src/foo.rs::Foo::bar`.
-- Structured-document key: `pira_nav show config.yaml::foo.bar`.
-- Markdown subsection: `pira_nav show 'README.md::Usage > Linux'`.
+- Structured-document key: `pira_nav show config.yaml::foo::bar`.
+- Markdown subsection: `pira_nav show README.md::Usage::Linux`.
 - Shared-LSP mixed query: `pira_nav query --definition src/foo.py::bar --references src/foo.py::bar`.

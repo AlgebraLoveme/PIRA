@@ -123,7 +123,7 @@ fn parse_semantic_target(
         .symbols
         .iter()
         .filter(|symbol| {
-            (symbol.qualified_name == name || qualified_suffix(&symbol.qualified_name, &name))
+            (symbol.name_matches(&name) || symbol.name_suffix_matches(&name))
                 && expected_kind
                     .as_ref()
                     .is_none_or(|kind| symbol.kind == *kind)
@@ -244,11 +244,7 @@ fn ensure_target_root(path: &Path, root: &Path, cwd: &Path) -> Result<PathBuf, (
 }
 
 fn symbol_name_position(source: &str, symbol: &crate::model::Symbol) -> (usize, usize) {
-    let simple_name = symbol
-        .qualified_name
-        .rsplit(['.', ':', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(&symbol.qualified_name);
+    let simple_name = symbol.path.last_name().unwrap_or(&symbol.qualified_name);
     let Some(relative) = source
         .get(symbol.start_byte..symbol.end_byte)
         .and_then(|item| item.find(simple_name))
@@ -337,12 +333,6 @@ fn parse_selector_target(value: &str, cwd: &Path) -> Result<SelectorTarget, (i32
         name,
         Some(hash.to_string()),
     ))
-}
-
-fn qualified_suffix(qualified: &str, query: &str) -> bool {
-    [".", "::", "\\"]
-        .iter()
-        .any(|separator| qualified.ends_with(&format!("{separator}{query}")))
 }
 
 fn semantic_service(

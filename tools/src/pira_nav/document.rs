@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use tree_sitter::{Node, Tree};
 
 use crate::language::Language;
-use crate::model::Symbol;
+use crate::model::{Symbol, SymbolPath};
 use crate::util::{one_line, source_slice};
 
 pub const MAX_DOCUMENT_SYMBOLS: usize = 20_000;
@@ -24,10 +24,11 @@ pub fn parse_input(language: Language, source: &str) -> Cow<'_, str> {
 
 pub fn collect(tree: &Tree, language: Language, source: &str) -> DocumentSymbols {
     let mut collector = Collector::new(source);
+    let root = SymbolPath::default();
     match language {
         Language::Json | Language::Jsonc => {
             for child in named_children(tree.root_node()) {
-                walk_json_value(child, "", 0, &mut collector);
+                walk_json_value(child, &root, 0, &mut collector);
             }
         }
         Language::Yaml => walk_yaml_stream(tree.root_node(), &mut collector),
@@ -63,7 +64,9 @@ pub fn collect_markdown(source: &str) -> DocumentSymbols {
             hierarchy.pop();
         }
         hierarchy.push((heading.level, heading.title.clone()));
-        let qualified_name = hierarchy
+        let path = SymbolPath::from_names(hierarchy.iter().map(|(_, title)| title.clone()));
+        let qualified_name = path.canonical();
+        let legacy_qualified_name = hierarchy
             .iter()
             .map(|(_, title)| title.as_str())
             .collect::<Vec<_>>()
@@ -83,7 +86,9 @@ pub fn collect_markdown(source: &str) -> DocumentSymbols {
                 5 => "heading5",
                 _ => "heading6",
             },
+            path,
             qualified_name,
+            legacy_qualified_name,
             signature: heading.title.clone(),
             start_byte: heading.start_byte,
             end_byte,
@@ -265,14 +270,18 @@ impl<'a> Collector<'a> {
         }
     }
 
-    fn push(&mut self, node: Node<'_>, path: String, kind: &'static str, depth: usize) {
+    fn push(&mut self, node: Node<'_>, path: SymbolPath, kind: &'static str, depth: usize) {
         if self.symbols.len() >= MAX_DOCUMENT_SYMBOLS {
             self.truncated = true;
             return;
         }
+        let qualified_name = path.canonical();
+        let legacy_qualified_name = path.legacy_document();
         self.symbols.push(Symbol {
             kind,
-            qualified_name: path,
+            path,
+            qualified_name,
+            legacy_qualified_name,
             signature: document_signature(node, self.source),
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
@@ -285,7 +294,7 @@ impl<'a> Collector<'a> {
     }
 }
 
-fn walk_json_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Collector<'_>) {
+fn walk_json_value(node: Node<'_>, parent: &SymbolPath, depth: usize, output: &mut Collector<'_>) {
     if output.truncated {
         return;
     }
@@ -301,7 +310,7 @@ fn walk_json_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Coll
                 let Some(key) = json_string(key_node, output.source) else {
                     continue;
                 };
-                let path = append_key(parent, &key);
+                let path = parent.child_name(key);
                 output.push(pair, path.clone(), "key", depth);
                 walk_json_value(value, &path, depth + 1, output);
             }
@@ -311,7 +320,7 @@ fn walk_json_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Coll
                 .filter(|child| child.kind() != "comment")
                 .enumerate()
             {
-                let path = append_index(parent, index);
+                let path = parent.child_index(index);
                 output.push(value, path.clone(), "item", depth);
                 walk_json_value(value, &path, depth + 1, output);
             }
@@ -326,14 +335,14 @@ fn walk_yaml_stream(root: Node<'_>, output: &mut Collector<'_>) {
         .collect::<Vec<_>>();
     let multiple = documents.len() > 1;
     for (index, document) in documents.into_iter().enumerate() {
-        let path = multiple.then(|| format!("document[{index}]"));
+        let path = multiple.then(|| SymbolPath::from_names(["document".into()]).child_index(index));
         if let Some(path) = &path {
             output.push(document, path.clone(), "document", 0);
         }
         if let Some(value) = yaml_payload(document) {
             walk_yaml_value(
                 value,
-                path.as_deref().unwrap_or(""),
+                path.as_ref().unwrap_or(&SymbolPath::default()),
                 usize::from(multiple),
                 output,
             );
@@ -342,7 +351,7 @@ fn walk_yaml_stream(root: Node<'_>, output: &mut Collector<'_>) {
     collect_yaml_references(root, output);
 }
 
-fn walk_yaml_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Collector<'_>) {
+fn walk_yaml_value(node: Node<'_>, parent: &SymbolPath, depth: usize, output: &mut Collector<'_>) {
     if output.truncated {
         return;
     }
@@ -365,7 +374,7 @@ fn walk_yaml_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Coll
                 } else {
                     item
                 };
-                let path = append_index(parent, index);
+                let path = parent.child_index(index);
                 output.push(item, path.clone(), "item", depth);
                 walk_yaml_value(value, &path, depth + 1, output);
             }
@@ -374,14 +383,14 @@ fn walk_yaml_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Coll
     }
 }
 
-fn walk_yaml_pair(pair: Node<'_>, parent: &str, depth: usize, output: &mut Collector<'_>) {
+fn walk_yaml_pair(pair: Node<'_>, parent: &SymbolPath, depth: usize, output: &mut Collector<'_>) {
     let Some(key_node) = pair.child_by_field_name("key") else {
         return;
     };
     let Some(key) = yaml_scalar(key_node, output.source) else {
         return;
     };
-    let path = append_key(parent, &key);
+    let path = parent.child_name(key);
     output.push(pair, path.clone(), "key", depth);
     if let Some(value) = pair.child_by_field_name("value") {
         walk_yaml_value(value, &path, depth + 1, output);
@@ -426,7 +435,12 @@ fn collect_yaml_references(node: Node<'_>, output: &mut Collector<'_>) {
     {
         let raw = source_slice(output.source, name.start_byte(), name.end_byte());
         let prefix = if node.kind() == "anchor" { '&' } else { '*' };
-        output.push(node, format!("{prefix}{raw}"), node.kind(), 0);
+        output.push(
+            node,
+            SymbolPath::from_names([format!("{prefix}{raw}")]),
+            node.kind(),
+            0,
+        );
         return;
     }
     for child in named_children(node) {
@@ -436,9 +450,10 @@ fn collect_yaml_references(node: Node<'_>, output: &mut Collector<'_>) {
 
 fn walk_toml_document(root: Node<'_>, output: &mut Collector<'_>) {
     let mut table_arrays = BTreeMap::<String, usize>::new();
+    let root_path = SymbolPath::default();
     for child in named_children(root) {
         match child.kind() {
-            "pair" => walk_toml_pair(child, "", 0, output),
+            "pair" => walk_toml_pair(child, &root_path, 0, output),
             "table" | "table_array_element" => {
                 let Some(key_node) = named_children(child).find(|node| is_toml_key(*node)) else {
                     continue;
@@ -446,10 +461,10 @@ fn walk_toml_document(root: Node<'_>, output: &mut Collector<'_>) {
                 let Some(segments) = toml_key_segments(key_node, output.source) else {
                     continue;
                 };
-                let base = append_segments("", &segments);
+                let base = root_path.extend_names(segments);
                 let (path, kind) = if child.kind() == "table_array_element" {
-                    let index = table_arrays.entry(base.clone()).or_default();
-                    let path = append_index(&base, *index);
+                    let index = table_arrays.entry(base.canonical()).or_default();
+                    let path = base.child_index(*index);
                     *index += 1;
                     (path, "table-item")
                 } else {
@@ -465,7 +480,7 @@ fn walk_toml_document(root: Node<'_>, output: &mut Collector<'_>) {
     }
 }
 
-fn walk_toml_pair(pair: Node<'_>, parent: &str, depth: usize, output: &mut Collector<'_>) {
+fn walk_toml_pair(pair: Node<'_>, parent: &SymbolPath, depth: usize, output: &mut Collector<'_>) {
     let mut children = named_children(pair);
     let Some(key_node) = children.find(|node| is_toml_key(*node)) else {
         return;
@@ -473,14 +488,14 @@ fn walk_toml_pair(pair: Node<'_>, parent: &str, depth: usize, output: &mut Colle
     let Some(segments) = toml_key_segments(key_node, output.source) else {
         return;
     };
-    let path = append_segments(parent, &segments);
+    let path = parent.extend_names(segments);
     output.push(pair, path.clone(), "key", depth);
     if let Some(value) = named_children(pair).find(|node| !is_toml_key(*node)) {
         walk_toml_value(value, &path, depth + 1, output);
     }
 }
 
-fn walk_toml_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Collector<'_>) {
+fn walk_toml_value(node: Node<'_>, parent: &SymbolPath, depth: usize, output: &mut Collector<'_>) {
     if output.truncated {
         return;
     }
@@ -495,7 +510,7 @@ fn walk_toml_value(node: Node<'_>, parent: &str, depth: usize, output: &mut Coll
                 .filter(|child| child.kind() != "comment")
                 .enumerate()
             {
-                let path = append_index(parent, index);
+                let path = parent.child_index(index);
                 output.push(value, path.clone(), "item", depth);
                 walk_toml_value(value, &path, depth + 1, output);
             }
@@ -546,33 +561,6 @@ fn normalize_quoted_scalar(raw: &str) -> Option<String> {
         return Some(value[1..value.len() - 1].replace("''", "'"));
     }
     Some(value.to_owned())
-}
-
-fn append_segments(parent: &str, segments: &[String]) -> String {
-    segments.iter().fold(parent.to_owned(), |path, segment| {
-        append_key(&path, segment)
-    })
-}
-
-fn append_key(parent: &str, key: &str) -> String {
-    if key
-        .chars()
-        .all(|character| character.is_alphanumeric() || matches!(character, '_' | '-' | '$'))
-        && !key.is_empty()
-    {
-        if parent.is_empty() {
-            key.to_owned()
-        } else {
-            format!("{parent}.{key}")
-        }
-    } else {
-        let quoted = serde_json::to_string(key).expect("serializing a string cannot fail");
-        format!("{parent}[{quoted}]")
-    }
-}
-
-fn append_index(parent: &str, index: usize) -> String {
-    format!("{parent}[{index}]")
 }
 
 fn document_signature(node: Node<'_>, source: &str) -> String {
@@ -679,9 +667,13 @@ mod tests {
 
     #[test]
     fn special_document_keys_have_unambiguous_paths() {
-        assert_eq!(append_key("root", "plain-key"), "root.plain-key");
-        assert_eq!(append_key("root", "a.b"), "root[\"a.b\"]");
-        assert_eq!(append_index("root.items", 2), "root.items[2]");
+        let root = SymbolPath::from_names(["root".into()]);
+        assert_eq!(root.child_name("plain-key").canonical(), "root::plain-key");
+        assert_eq!(root.child_name("a.b").canonical(), "root::[\"a.b\"]");
+        assert_eq!(
+            root.child_name("items").child_index(2).canonical(),
+            "root::items[2]"
+        );
     }
 
     #[test]
@@ -720,10 +712,10 @@ mod tests {
             names,
             [
                 "Guide",
-                "Guide > Install",
-                "Guide > Install > Verify",
-                "Guide > Configuration",
-                "Guide > Inspect",
+                "Guide::Install",
+                "Guide::Install::Verify",
+                "Guide::Configuration",
+                "Guide::Inspect",
             ]
         );
         let install = &parsed.symbols[1];
@@ -743,6 +735,19 @@ mod tests {
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["Visible", "Visible > Shown"]);
+        assert_eq!(names, ["Visible", "Visible::Shown"]);
+    }
+
+    #[test]
+    fn markdown_titles_with_selector_characters_are_quoted_segments() {
+        let parsed = collect_markdown("# Guide #1\n## Install :: advanced > safe\n");
+        assert_eq!(
+            parsed.symbols[1].qualified_name,
+            "[\"Guide #1\"]::[\"Install :: advanced > safe\"]"
+        );
+        assert_eq!(
+            parsed.symbols[1].legacy_qualified_name,
+            "Guide #1 > Install :: advanced > safe"
+        );
     }
 }
