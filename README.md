@@ -111,7 +111,7 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --cla
 powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --claude-code --verify
 ```
 
-The Claude Code mode preserves content outside the PIRA-managed block, backs up `CLAUDE.md` before changing it, and uses the same three PIRA tools as Codex. The small bridge repeats only the two entry rules that Claude Code must apply before the imported policy can govern tool use; it does not duplicate PIRA's modules. Setup does not change Claude Code permission settings or install Codex audio hooks.
+The Claude Code mode preserves content outside the PIRA-managed block, backs up `CLAUDE.md` before changing it, and uses the same four PIRA tools as Codex. The small bridge repeats only the two entry rules that Claude Code must apply before the imported policy can govern tool use; it does not duplicate PIRA's modules. Claude loads PIRA modules with its native Read tool. Unlike the Codex policy, the Claude bridge keeps `pira_ctx` targeted to commands whose output needs retention or retrieval so Claude Code permission rules can inspect ordinary Bash commands directly. Setup does not change Claude Code permission settings, does not require a broad `Bash(pira_ctx:*)` allow rule, and does not install Codex audio hooks.
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
 

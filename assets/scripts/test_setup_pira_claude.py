@@ -45,9 +45,20 @@ class SetupPiraClaudeTests(unittest.TestCase):
                 installed,
             )
             self.assertEqual(installed.count("@"), 1)
-            self.assertIn("load all required modules via `pira_ctx exact`", installed)
-            self.assertIn("Route every shell/exec command through `pira_ctx`", installed)
-            self.assertIn("except direct `pira_dec` or `pira_nav` invocations", installed)
+            self.assertIn("load all required modules exactly with Claude Read", installed)
+            self.assertIn("Do not route PIRA module loading through `pira_ctx`", installed)
+            self.assertIn("use `pira_ctx` only when its output retention", installed)
+            self.assertIn("permission rules can inspect the actual command", installed)
+            self.assertIn("`pira_dec`, `pira_nav`, and `pira_svg_check` directly", installed)
+
+    def test_canonical_module_loading_matches_bridge(self) -> None:
+        agents = (SCRIPT.parents[2] / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "Read on-demand instruction files exactly with an available direct file-reading tool, "
+            "not through `pira_ctx`",
+            agents,
+        )
+        self.assertIn("Loading PIRA modules should not use `pira_ctx`", agents)
 
     def test_windows_bridge_line_only_on_windows(self) -> None:
         with patch.object(setup, "claude_bridge_is_windows", return_value=True):

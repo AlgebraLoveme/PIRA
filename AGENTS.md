@@ -63,7 +63,7 @@ Retrieve only the smallest relevant memory when the task depends on it; never pr
 - Compact only clearly stale/redundant material after an end-to-end read and concurrent-change check. Keep the workbook untracked by Git.
 
 ## Module Loading and Routing
-Read on-demand instruction files exactly through `pira_ctx`; if unavailable, ask for PIRA setup rather than bypassing the instruction.
+Read on-demand instruction files exactly with an available direct file-reading tool, not through `pira_ctx`; if exact reading is unavailable, ask for PIRA setup rather than bypassing the instruction.
 
 Load on demand (explicit or inferred):
 - `user_profile`: `~/agent/USER.md` when user background, learning needs, communication preferences, or acting on the user's behalf may materially affect the response. Skip ordinary factual, coding, or research tasks needing no personalization.
@@ -135,7 +135,7 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_ctx`: Command Output Manager & Event Recorder
 
 #### Rules
-- Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations.
+- Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations. Loading PIRA modules should not use `pira_ctx`.
 - Use automatic mode by default. Use `check` when only the immediate status matters, `capture` when retention is mandatory, and `exact` only for necessary original content or interactive terminal I/O.
 - Long-running `check` and `capture` invocations publish a live result ID after a brief debounce. Prefer explicit IDs; `--last` means the latest completed capture in the current workspace.
 - Inspect retained output with `search`, then the smallest useful `range` or `transform`. Use `exec` only for custom analysis and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.
