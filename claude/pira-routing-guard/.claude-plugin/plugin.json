@@ -1,7 +1,7 @@
 {
   "name": "pira-routing-guard",
   "displayName": "PIRA Routing Guard Pilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Opt-in pilot that requires PIRA turn routing and exact module loading before Claude Code acts.",
   "author": {
     "name": "PIRA contributors"

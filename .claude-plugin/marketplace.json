@@ -1,0 +1,13 @@
+{
+  "name": "pira",
+  "owner": {
+    "name": "PIRA contributors"
+  },
+  "plugins": [
+    {
+      "name": "pira-routing-guard",
+      "source": "./claude/pira-routing-guard",
+      "description": "Requires explicit PIRA routing and exact module loading before top-level Claude Code work."
+    }
+  ]
+}
