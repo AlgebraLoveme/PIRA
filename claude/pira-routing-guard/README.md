@@ -16,4 +16,15 @@ Run the deterministic checks with:
 
 ```text
 python claude/pira-routing-guard/tests/test_pira_routing_guard.py
+python claude/pira-routing-guard/evaluation/test_run_matrix.py
+```
+
+The synthetic Sonnet evaluation matrix is opt-in and keeps raw event streams under a caller-selected
+or platform-temporary artifact directory. It substitutes a tiny synthetic `PIRA_AGENT_DIR`, so routing
+coverage does not disclose a real user profile and does not repeatedly inject the full policy modules.
+Routing-only runs expose just `Skill`, `Bash`, and `Read` and ignore external MCP configuration to reduce
+unrelated context; pass `--tools default` when a broader capability benchmark is intended:
+
+```text
+python claude/pira-routing-guard/evaluation/run_matrix.py --model sonnet --effort low
 ```
