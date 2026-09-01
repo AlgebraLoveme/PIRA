@@ -17,6 +17,7 @@ Run the deterministic checks with:
 ```text
 python claude/pira-routing-guard/tests/test_pira_routing_guard.py
 python claude/pira-routing-guard/evaluation/test_run_matrix.py
+python claude/pira-routing-guard/evaluation/test_run_continuity.py
 ```
 
 The synthetic Sonnet evaluation matrix is opt-in and keeps raw event streams under a caller-selected
@@ -28,3 +29,11 @@ unrelated context; pass `--tools default` when a broader capability benchmark is
 ```text
 python claude/pira-routing-guard/evaluation/run_matrix.py --model sonnet --effort low
 ```
+
+The runner records Claude CLI's `total_cost_usd` field as a local API-equivalent estimate for comparing
+context overhead. It is not authoritative billing and is not an extra charge when Claude Code is using
+included subscription authentication; those runs consume plan usage quota instead.
+
+The separate `run_continuity.py` probe deliberately persists one synthetic session so it can verify a
+fresh Claude Code process with `--resume`. Use it only when writing synthetic session history under the
+active Claude configuration directory is acceptable.

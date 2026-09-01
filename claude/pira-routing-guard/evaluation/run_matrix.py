@@ -258,7 +258,7 @@ def run_case(
         "loaded_modules": parsed["loaded_modules"],
         "task_tools": parsed["task_tools"],
         "permission_denials": result_event.get("permission_denials", []),
-        "cost_usd": result_event.get("total_cost_usd"),
+        "api_equivalent_estimate_usd": result_event.get("total_cost_usd"),
         "duration_seconds": round(elapsed, 3),
         "artifact_dir": str(case_root),
     }
@@ -323,13 +323,13 @@ def main() -> int:
         print(
             f"[{index}/{len(scenarios)}] {status} {result['id']} "
             f"route={result['route_calls']} loaded={result['loaded_modules']} "
-            f"cost={result['cost_usd']}",
+            f"estimate_usd={result['api_equivalent_estimate_usd']}",
             flush=True,
         )
         for failure in result["failures"]:
             print(f"  - {failure}", flush=True)
 
-    total_cost = sum(float(result["cost_usd"] or 0) for result in results)
+    total_estimate = sum(float(result["api_equivalent_estimate_usd"] or 0) for result in results)
     summary = {
         "schema_version": 1,
         "model": args.model,
@@ -339,14 +339,17 @@ def main() -> int:
         "artifact_root": str(artifact_root),
         "total": len(results),
         "passed": sum(bool(result["passed"]) for result in results),
-        "total_cost_usd": round(total_cost, 6),
+        "total_api_equivalent_estimate_usd": round(total_estimate, 6),
         "results": results,
     }
     summary_path = args.summary or artifact_root / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"SUMMARY {summary_path}")
-    print(f"PASS {summary['passed']}/{summary['total']} COST_USD {summary['total_cost_usd']:.6f}")
+    print(
+        f"PASS {summary['passed']}/{summary['total']} "
+        f"API_EQUIVALENT_ESTIMATE_USD {summary['total_api_equivalent_estimate_usd']:.6f}"
+    )
     return 0 if summary["passed"] == summary["total"] else 1
 
 

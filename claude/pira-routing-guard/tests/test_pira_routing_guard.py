@@ -151,6 +151,43 @@ class RoutingGuardTests(unittest.TestCase):
         reason = denied_after_compact["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn(guard.ROUTE_SKILL, reason)
 
+    def test_followup_adds_new_modules_and_session_restart_requires_fresh_route(self) -> None:
+        guard.dispatch(self.event("UserPromptSubmit", prompt="review source code"))
+        self.route("coding")
+
+        guard.dispatch(self.event("UserPromptSubmit", prompt="polish the technical explanation"))
+        self.assertIsNone(
+            guard.dispatch(
+                self.event(
+                    "PreToolUse",
+                    tool_name="Skill",
+                    tool_input={"skill": guard.ROUTE_SKILL, "args": "writing"},
+                    tool_use_id="route-2",
+                )
+            )
+        )
+        injected = guard.load_selected("session-1", "writing")
+        self.assertNotIn("Loaded PIRA module: research", injected)
+        self.assertIn("Loaded PIRA module: writing", injected)
+        guard.dispatch(
+            self.event(
+                "PostToolUse",
+                tool_name="Skill",
+                tool_input={"skill": guard.ROUTE_SKILL, "args": "writing"},
+                tool_use_id="route-2",
+            )
+        )
+        self.assertIsNone(
+            guard.dispatch(self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "draft.md"}))
+        )
+
+        context = guard.dispatch(self.event("SessionStart", source="resume"))
+        self.assertIn(guard.ROUTE_SKILL, json.dumps(context))
+        denied = guard.dispatch(
+            self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "draft.md"})
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_skill_completion_without_loader_does_not_unlock_tools(self) -> None:
         guard.dispatch(self.event("UserPromptSubmit", prompt="implement"))
         self.assertIsNone(
