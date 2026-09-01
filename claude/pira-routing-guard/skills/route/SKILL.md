@@ -9,9 +9,10 @@ description: >-
   coding only when source code, implementation, debugging, or software behavior
   is itself in scope, not merely because an arbitrary file is inspected. Code
   that generates or edits a publication-, paper-, README-, documentation-,
-  slide-, website-, or other public-facing figure uses coding public_figure, not
-  coding alone. Do not add coding when only reviewing an existing SVG or image
-  and no source-code work is requested. Other modules: research for factual
+  slide-, website-, or other public-facing figure uses the two separate arguments
+  `coding public_figure` with a space, never one combined name or coding alone.
+  Do not add coding when only reviewing an existing SVG or image and no
+  source-code work is requested. Other modules: research for factual
   analysis, evidence-based reporting, online verification, or structured
   execution; paper_reading for one paper; writing for polished technical prose;
   public_figure for public-facing figures; guidance for practical or emotional

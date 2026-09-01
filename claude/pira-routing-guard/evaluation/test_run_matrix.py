@@ -17,7 +17,7 @@ class MatrixRunnerTests(unittest.TestCase):
         content = skill.read_text(encoding="utf-8")
         description = content.split("when_to_use:", 1)[0]
         normalized = " ".join(line.strip() for line in description.splitlines())
-        self.assertIn("public-facing figure uses coding public_figure, not coding alone", normalized)
+        self.assertIn("two separate arguments `coding public_figure` with a space", normalized)
 
     def test_route_listing_preserves_precision_rules_within_claude_cap(self) -> None:
         skill = SCRIPT.parents[1] / "skills" / "route" / "SKILL.md"
