@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
@@ -252,7 +253,45 @@ class RoutingGuardTests(unittest.TestCase):
                 )
                 self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_subagent_events_are_not_guarded(self) -> None:
+    def test_subagent_route_is_isolated_and_required(self) -> None:
+        context = guard.dispatch(
+            self.event("SubagentStart", agent_id="subagent-1", agent_type="Explore")
+        )
+        self.assertIn(guard.ROUTE_SKILL, json.dumps(context))
+        denied = guard.dispatch(
+            self.event(
+                "PreToolUse",
+                agent_id="subagent-1",
+                tool_name="Bash",
+                tool_input={"command": "git status"},
+            )
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        decision = guard.dispatch(
+            self.event(
+                "PreToolUse",
+                agent_id="subagent-1",
+                tool_name="Skill",
+                tool_input={"skill": guard.ROUTE_SKILL, "args": "coding"},
+                tool_use_id="sub-route",
+            )
+        )
+        output = decision["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "allow")
+        scoped_arguments = output["updatedInput"]["args"]
+        self.assertIn(guard.SCOPE_PREFIX, scoped_arguments)
+        injected = guard.load_selected("session-1", scoped_arguments)
+        self.assertIn("Loaded PIRA module: coding", injected)
+        guard.dispatch(
+            self.event(
+                "PostToolUse",
+                agent_id="subagent-1",
+                tool_name="Skill",
+                tool_input=output["updatedInput"],
+                tool_use_id="sub-route",
+            )
+        )
         self.assertIsNone(
             guard.dispatch(
                 self.event(
@@ -261,6 +300,73 @@ class RoutingGuardTests(unittest.TestCase):
                     tool_name="Bash",
                     tool_input={"command": "git status"},
                 )
+            )
+        )
+        parent = guard.dispatch(
+            self.event("PreToolUse", tool_name="Bash", tool_input={"command": "git status"})
+        )
+        self.assertEqual(parent["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(guard.dispatch(self.event("SubagentStop", agent_id="subagent-1")))
+
+    def test_concurrent_subagents_keep_routes_and_parent_state_isolated(self) -> None:
+        guard.dispatch(self.event("UserPromptSubmit", prompt="review source"))
+        self.route("coding")
+        parent = guard.SessionState("session-1")
+        parent_before = parent.state_path.read_bytes()
+
+        def route_agent(agent_id: str, arguments: str) -> tuple[str, list[str]]:
+            guard.dispatch(
+                self.event("SubagentStart", agent_id=agent_id, agent_type="general-purpose")
+            )
+            decision = guard.dispatch(
+                self.event(
+                    "PreToolUse",
+                    agent_id=agent_id,
+                    tool_name="Skill",
+                    tool_input={"skill": guard.ROUTE_SKILL, "args": arguments},
+                    tool_use_id=f"route-{agent_id}",
+                )
+            )
+            scoped = decision["hookSpecificOutput"]["updatedInput"]["args"]
+            guard.load_selected("session-1", scoped)
+            guard.dispatch(
+                self.event(
+                    "PostToolUse",
+                    agent_id=agent_id,
+                    tool_name="Skill",
+                    tool_input={"skill": guard.ROUTE_SKILL, "args": scoped},
+                    tool_use_id=f"route-{agent_id}",
+                )
+            )
+            state = guard.SessionState("session-1", agent_id=agent_id).read()
+            return agent_id, state["required"]
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pairs = (("agent-a", "coding"), ("agent-b", "guidance"))
+            results = dict(executor.map(lambda pair: route_agent(*pair), pairs))
+
+        self.assertEqual(results["agent-a"], ["research", "coding"])
+        self.assertEqual(results["agent-b"], ["guidance"])
+        self.assertEqual(parent.state_path.read_bytes(), parent_before)
+
+    def test_unrouted_subagent_stop_retry_is_bounded(self) -> None:
+        guard.dispatch(self.event("SubagentStart", agent_id="subagent-1", agent_type="Explore"))
+        first = guard.dispatch(self.event("SubagentStop", agent_id="subagent-1"))
+        self.assertEqual(first["decision"], "block")
+        self.assertIsNone(guard.dispatch(self.event("SubagentStop", agent_id="subagent-1")))
+
+    def test_corrupt_state_fails_closed_and_route_recovers(self) -> None:
+        session = guard.SessionState("session-1")
+        session.directory.mkdir(parents=True)
+        session.state_path.write_text("{not-json", encoding="utf-8")
+        denied = guard.dispatch(
+            self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "project.py"})
+        )
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.route("coding")
+        self.assertIsNone(
+            guard.dispatch(
+                self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "project.py"})
             )
         )
 

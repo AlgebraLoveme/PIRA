@@ -30,9 +30,9 @@ claude plugin marketplace remove pira
 Removing the `pira` marketplace also removes plugins installed from it. Do not use that second command
 if a future PIRA marketplace contains another plugin you want to keep.
 
-It adds one model-only `pira-routing-guard:route` skill and hooks that require a valid route before top-level task tools or a final answer. While the pilot is loaded, the skill's dynamic-context helper is the direct file-reading mechanism for PIRA routing: it injects selected files exactly from `~/agent`, replacing only the normal model-issued Claude Read step. It neither copies modules into the plugin nor requires Claude Read access outside the project. The plugin stores no prompt or transcript content. Runtime state contains only a hash of the session ID, selected module names, tool-use IDs, and module hashes under the platform temporary directory.
+It adds one model-only `pira-routing-guard:route` skill and hooks that require a valid route before session or subagent task tools and final answers. Subagent state is isolated with a hash derived from Claude's session and agent IDs; validated route arguments receive an internal scope token so the skill loader commits only that agent's state. While the pilot is loaded, the skill's dynamic-context helper is the direct file-reading mechanism for PIRA routing: it injects selected files exactly from `~/agent`, replacing only the normal model-issued Claude Read step. It neither copies modules into the plugin nor requires Claude Read access outside the project. The plugin stores no prompt, transcript content, or raw session/agent IDs. Runtime state contains only scope hashes, selected module names, tool-use IDs, and module hashes under the platform temporary directory.
 
-The guard deliberately ignores subagent hook events in this first pilot. It also fails visibly but open when its Python launcher or script is unavailable, so an experimental installation cannot make Claude Code unusable. The pilot requires skill shell execution; if `disableSkillShellExecution` is enabled, the helper cannot confirm the route. A Stop hook requests at most one automatic retry per turn, preventing a broken pilot from creating an unbounded model loop.
+The guard treats unreadable or corrupt JSON state as not ready and can recover through a fresh route. It still fails visibly but open when its Python launcher or script is unavailable, so an experimental installation cannot make Claude Code unusable. The pilot requires skill shell execution; if `disableSkillShellExecution` is enabled, the helper cannot confirm the route. Stop and SubagentStop hooks request at most one automatic retry per turn, preventing a broken pilot from creating an unbounded model loop.
 
 Run the deterministic checks with:
 
@@ -40,6 +40,7 @@ Run the deterministic checks with:
 python claude/pira-routing-guard/tests/test_pira_routing_guard.py
 python claude/pira-routing-guard/evaluation/test_run_matrix.py
 python claude/pira-routing-guard/evaluation/test_run_continuity.py
+python claude/pira-routing-guard/evaluation/test_run_parity.py
 ```
 
 The synthetic Sonnet evaluation matrix is opt-in and keeps raw event streams under a caller-selected
@@ -50,6 +51,14 @@ unrelated context; pass `--tools default` when a broader capability benchmark is
 
 ```text
 python claude/pira-routing-guard/evaluation/run_matrix.py --model sonnet --effort low
+```
+
+The preregistered paired protocol and isolated Claude/Codex runner are in
+`evaluation/PARITY_PROTOCOL.md` and `evaluation/run_parity.py`. The runner uses synthetic modules,
+records raw JSONL for audit, and keeps Codex command execution read-only:
+
+```text
+python claude/pira-routing-guard/evaluation/run_parity.py --client both --repetitions 2
 ```
 
 The runner records Claude CLI's `total_cost_usd` field as a local API-equivalent estimate for comparing

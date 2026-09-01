@@ -15,6 +15,8 @@ from typing import Any
 
 ROUTE_SKILL = "pira-routing-guard:route"
 MAX_STOP_BLOCKS = 1
+SCOPE_PREFIX = "--pira-scope="
+SCOPE_PATTERN = re.compile(r"[0-9a-f]{64}")
 MODULE_ORDER = (
     "user_profile",
     "research",
@@ -127,12 +129,27 @@ def skill_call(tool_input: dict[str, Any]) -> tuple[str, str]:
     return raw_name, arguments
 
 
+def split_scope(arguments: str) -> tuple[str, str | None, str | None]:
+    tokens = [token for token in arguments.split() if token]
+    scoped = [token[len(SCOPE_PREFIX) :] for token in tokens if token.startswith(SCOPE_PREFIX)]
+    if len(scoped) > 1 or (scoped and not SCOPE_PATTERN.fullmatch(scoped[0])):
+        return arguments, None, "Invalid internal PIRA route scope metadata."
+    clean = " ".join(token for token in tokens if not token.startswith(SCOPE_PREFIX))
+    return clean, scoped[0] if scoped else None, None
+
+
 class SessionState:
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, agent_id: str | None = None, scope_key: str | None = None) -> None:
         root_override = os.environ.get("PIRA_ROUTING_STATE_DIR")
         root = Path(root_override) if root_override else Path(tempfile.gettempdir()) / "pira-claude-routing"
-        session_key = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
-        self.directory = root / session_key
+        if scope_key is not None:
+            if not SCOPE_PATTERN.fullmatch(scope_key):
+                raise ValueError("invalid PIRA route scope")
+            self.scope_key = scope_key
+        else:
+            identity = session_id if agent_id is None else f"{session_id}\0{agent_id}"
+            self.scope_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        self.directory = root / self.scope_key
         self.state_path = self.directory / "route.json"
 
     def read(self) -> dict[str, Any] | None:
@@ -140,6 +157,8 @@ class SessionState:
             return json.loads(self.state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
+        except (json.JSONDecodeError, UnicodeError, OSError):
+            return {"status": "corrupt", "stop_blocks": 0}
 
     def write(self, state: dict[str, Any]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -242,7 +261,11 @@ def handle_pre_tool(data: dict[str, Any], session: SessionState) -> dict[str, An
     if tool_name == "Skill":
         name, arguments = skill_call(tool_input)
         if name == ROUTE_SKILL:
-            required, error = selected_modules(arguments)
+            clean_arguments, supplied_scope, scope_error = split_scope(arguments)
+            if scope_error or supplied_scope is not None:
+                reason = scope_error or "Internal PIRA route scope metadata is reserved."
+                return deny_tool(reason + " " + route_instruction())
+            required, error = selected_modules(clean_arguments)
             if error:
                 return deny_tool(error + " " + route_instruction())
             nonce = secrets.token_hex(12)
@@ -255,6 +278,19 @@ def handle_pre_tool(data: dict[str, Any], session: SessionState) -> dict[str, An
                     "stop_blocks": 0,
                 }
             )
+            if data.get("agent_id"):
+                updated_input = dict(tool_input)
+                updated_input["args"] = " ".join(
+                    part for part in (clean_arguments, f"{SCOPE_PREFIX}{session.scope_key}") if part
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": "Allow the validated PIRA route skill with isolated subagent state.",
+                        "updatedInput": updated_input,
+                    }
+                }
             return None
 
     state = session.read()
@@ -281,11 +317,14 @@ def handle_post_tool(data: dict[str, Any], session: SessionState) -> dict[str, A
 def prepare_selected(
     session_id: str, arguments: str
 ) -> tuple[str, SessionState, dict[str, Any], list[tuple[str, Path]]]:
-    session = SessionState(session_id)
+    clean_arguments, scope_key, scope_error = split_scope(arguments)
+    if scope_error:
+        raise RuntimeError(scope_error)
+    session = SessionState(session_id, scope_key=scope_key) if scope_key else SessionState(session_id)
     state = session.read()
     if not state or state.get("status") != "selected":
         raise RuntimeError("no pending PIRA route selection exists for this session")
-    required, error = selected_modules(arguments)
+    required, error = selected_modules(clean_arguments)
     if error:
         raise RuntimeError(error)
     if required != state.get("required"):
@@ -322,17 +361,22 @@ def load_selected(session_id: str, arguments: str) -> str:
 
 
 def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
-    if data.get("agent_id"):
-        return None
     session_id = data.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise ValueError("hook input is missing session_id")
     event = data.get("hook_event_name")
-    session = SessionState(session_id)
+    agent_id = data.get("agent_id")
+    if agent_id is not None and (not isinstance(agent_id, str) or not agent_id):
+        raise ValueError("hook input contains an invalid agent_id")
+    session = SessionState(session_id, agent_id=agent_id)
     if event == "SessionStart":
         session.clear_loaded()
         session.reset_route()
         return hook_context("SessionStart", route_instruction())
+    if event == "SubagentStart":
+        session.clear_loaded()
+        session.reset_route()
+        return hook_context("SubagentStart", route_instruction())
     if event == "UserPromptSubmit":
         session.reset_route()
         return hook_context("UserPromptSubmit", route_instruction())
@@ -340,7 +384,7 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
         return handle_pre_tool(data, session)
     if event == "PostToolUse":
         return handle_post_tool(data, session)
-    if event == "Stop":
+    if event in {"Stop", "SubagentStop"}:
         state = session.read()
         ready, reason = readiness(session, state)
         if ready or not session.consume_stop_block(state):
