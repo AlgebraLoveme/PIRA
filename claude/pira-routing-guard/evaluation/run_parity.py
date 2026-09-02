@@ -258,7 +258,11 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
         "route_complete_before_work": (
             not loaded
             or (first_work_at is None and final_message_at is None)
-            or (route_complete_at is not None and route_complete_at < first_work_at)
+            or (
+                first_work_at is not None
+                and route_complete_at is not None
+                and route_complete_at < first_work_at
+            )
             or (
                 first_work_at is None
                 and route_complete_at is not None
@@ -277,7 +281,6 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
 
 def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -> list[str]:
     failures: list[str] = []
-    expected_route = sorted(scenario["expected_route"])
     expected_loaded = sorted(scenario["expected_loaded"])
     if exit_code != 0:
         failures.append(f"{client} exit code {exit_code}")
@@ -286,8 +289,11 @@ def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit
     if client == "claude":
         if len(parsed["route_calls"]) != 1:
             failures.append(f"expected one route call, got {parsed['route_calls']}")
-        elif sorted(parsed["route_calls"][0]) != expected_route:
-            failures.append(f"route {parsed['route_calls'][0]} != {scenario['expected_route']}")
+        elif matrix_runner.expanded_route(parsed["route_calls"][0]) != expected_loaded:
+            failures.append(
+                f"expanded route {matrix_runner.expanded_route(parsed['route_calls'][0])} "
+                f"!= {scenario['expected_loaded']}"
+            )
         result = parsed["result_event"]
         if not result or result.get("subtype") != "success" or result.get("is_error"):
             failures.append("Claude result was not successful")

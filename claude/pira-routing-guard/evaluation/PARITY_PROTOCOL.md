@@ -65,6 +65,11 @@ For every stateless case, record:
 7. hook or parser errors;
 8. duration, model turns, and client-reported usage fields when available.
 
+Route arguments are scored after canonical dependency expansion. Explicitly naming
+an implied dependency (for example, `paper_reading research`) is equivalent to
+letting the guard add it, provided the final loaded set is exact. Any unrelated
+extra module, missing module, or `none` combined with another argument fails.
+
 Ordering is evaluated at the model-visible boundary. If one deterministic reader
 invocation accepts several paths, it may load modules and task data in one process
 only when every required module path precedes every task-data path in the declared

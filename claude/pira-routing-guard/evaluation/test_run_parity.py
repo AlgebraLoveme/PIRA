@@ -107,6 +107,22 @@ class ParityRunnerTests(unittest.TestCase):
         self.assertEqual(parsed["loaded_modules"], [])
         self.assertTrue(parsed["route_complete_before_work"])
 
+    def test_parse_codex_allows_routed_direct_answer_without_task_tool(self) -> None:
+        events = [
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "command": "pira_nav show modules/EXPLAIN_STYLE.md",
+                    "aggregated_output": "PIRA_EVAL_MODULE::explain",
+                    "status": "completed",
+                },
+            },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "answer"}},
+        ]
+        parsed = parity.parse_codex("\n".join(json.dumps(event) for event in events))
+        self.assertTrue(parsed["route_complete_before_work"])
+
     def test_evaluate_applies_same_loaded_module_oracle(self) -> None:
         scenario = {
             "expected_route": ["coding"],

@@ -12,12 +12,19 @@ SPEC.loader.exec_module(runner)
 
 
 class MatrixRunnerTests(unittest.TestCase):
+    def test_expanded_route_accepts_explicit_dependencies_but_not_unrelated_modules(self) -> None:
+        self.assertEqual(runner.expanded_route(["paper_reading"]), ["paper_reading", "research"])
+        self.assertEqual(
+            runner.expanded_route(["paper_reading", "research"]), ["paper_reading", "research"]
+        )
+        self.assertIn("guidance", runner.expanded_route(["paper_reading", "guidance"]))
+
     def test_route_listing_leads_with_public_figure_code_combination(self) -> None:
         skill = SCRIPT.parents[1] / "skills" / "route" / "SKILL.md"
         content = skill.read_text(encoding="utf-8")
         description = content.split("when_to_use:", 1)[0]
         normalized = " ".join(line.strip() for line in description.splitlines())
-        self.assertIn("two separate arguments `coding public_figure` with a space", normalized)
+        self.assertIn("two separate arguments `coding public_figure`", normalized)
 
     def test_route_listing_preserves_precision_rules_within_claude_cap(self) -> None:
         skill = SCRIPT.parents[1] / "skills" / "route" / "SKILL.md"
@@ -31,10 +38,11 @@ class MatrixRunnerTests(unittest.TestCase):
         )
         self.assertLessEqual(len(listing), 1536)
         self.assertIn("not merely because an arbitrary file is inspected", listing)
-        self.assertIn("not for an ordinary analysis or evidence conclusion", listing)
-        self.assertIn("only reviewing an existing SVG or image", listing)
-        self.assertIn("Always add user_profile", listing)
-        self.assertIn("evidence-based reporting", listing)
+        self.assertIn("not for ordinary analysis or an evidence conclusion", listing)
+        self.assertIn("Reviewing an existing SVG or image", listing)
+        self.assertIn("Add user_profile", listing)
+        self.assertIn("explicitly evidence-based analysis/reporting", listing)
+        self.assertIn("use paper_reading writing, never writing alone", listing)
 
     def test_parse_and_evaluate_successful_coding_route(self) -> None:
         lines = [

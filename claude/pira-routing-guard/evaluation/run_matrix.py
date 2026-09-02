@@ -27,11 +27,26 @@ MODULE_FILES = {
     "guidance": "modules/GUIDANCE.md",
     "maintenance": "modules/MAINTENANCE.md",
 }
+IMPLIED = {
+    "paper_reading": {"research"},
+    "coding": {"research"},
+    "writing": {"research"},
+    "public_figure": {"research"},
+}
 LOADED_PATTERN = re.compile(r"^### Loaded PIRA module: ([a-z_]+)\r?$", re.MULTILINE)
 
 
 def route_tokens(arguments: str) -> list[str]:
     return [token.replace("-", "_") for token in re.split(r"[\s,]+", arguments.strip().lower()) if token]
+
+
+def expanded_route(route: list[str]) -> list[str]:
+    if route == ["none"]:
+        return []
+    expanded = set(route)
+    for module in tuple(expanded):
+        expanded.update(IMPLIED.get(module, set()))
+    return sorted(expanded)
 
 
 def parse_stream(lines: list[str]) -> dict[str, Any]:
@@ -101,7 +116,6 @@ def parse_stream(lines: list[str]) -> dict[str, Any]:
 
 def evaluate(scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -> tuple[bool, list[str]]:
     failures: list[str] = []
-    expected_route = sorted(scenario["expected_route"])
     expected_loaded = sorted(scenario["expected_loaded"])
     if exit_code != 0:
         failures.append(f"claude exit code {exit_code}")
@@ -109,8 +123,11 @@ def evaluate(scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -
         failures.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
     if len(parsed["route_calls"]) != 1:
         failures.append(f"expected one route call, got {parsed['route_calls']}")
-    elif sorted(parsed["route_calls"][0]) != expected_route:
-        failures.append(f"route {parsed['route_calls'][0]} != {scenario['expected_route']}")
+    elif expanded_route(parsed["route_calls"][0]) != expected_loaded:
+        failures.append(
+            f"expanded route {expanded_route(parsed['route_calls'][0])} "
+            f"!= {scenario['expected_loaded']}"
+        )
     if sorted(parsed["loaded_modules"]) != expected_loaded:
         failures.append(f"loaded {parsed['loaded_modules']} != {scenario['expected_loaded']}")
     if not parsed["route_complete_before_task_tool"]:

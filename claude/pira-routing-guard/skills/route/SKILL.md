@@ -2,26 +2,25 @@
 name: route
 description: >-
   Mandatory PIRA turn router. Before any task tool or answer, select every
-  applicable module. Always add user_profile when the request explicitly asks to
-  use stored preferences/background or to act on the user's behalf. Use explain
-  only when teaching a concept, comparison, outcome, or non-obvious logic is a
-  primary deliverable, not for an ordinary analysis or evidence conclusion. Use
-  coding only when source code, implementation, debugging, or software behavior
-  is itself in scope, not merely because an arbitrary file is inspected. Code
-  that generates or edits a publication-, paper-, README-, documentation-,
+  applicable module. Add user_profile when asked to use stored preferences or
+  background, or act for the user. Use explain when teaching a concept,
+  comparison, outcome, or non-obvious logic is primary, not for ordinary analysis
+  or an evidence conclusion. Use coding only when code, implementation, debugging,
+  or software behavior is in scope, not merely because an arbitrary file is
+  inspected. Code that generates or edits a paper-, README-, documentation-,
   slide-, website-, or other public-facing figure uses the two separate arguments
-  `coding public_figure` with a space, never one combined name or coding alone.
-  Do not add coding when only reviewing an existing SVG or image and no
-  source-code work is requested. Other modules: research for factual
-  analysis, evidence-based reporting, online verification, or structured
-  execution; paper_reading for one paper; writing for polished technical prose;
-  public_figure for public-facing figures; guidance for practical or emotional
-  support; maintenance for PIRA maintenance; none only when no module applies.
+  `coding public_figure`. Reviewing an existing SVG or image without source-code
+  changes uses public_figure, not coding. Other modules: research for factual or
+  explicitly evidence-based analysis/reporting, online verification, or structured
+  execution; paper_reading whenever one paper or excerpt is read or analyzed;
+  writing for polished technical prose; guidance for practical/emotional support;
+  maintenance for PIRA maintenance; none only when no module applies.
 when_to_use: >-
   Dependencies: paper_reading, coding, writing, and public_figure imply research.
-  A hard paper explanation uses paper_reading explain; polished paper prose uses
-  paper_reading writing. Use maintenance without coding for PIRA policy,
-  instruction, or configuration review unless source-code work is also required.
+  A hard paper explanation uses paper_reading explain. If one task reads a paper or
+  excerpt and writes or polishes prose from it, use paper_reading writing, never
+  writing alone. Local or untrusted input does not change routing. PIRA policy/config
+  review uses maintenance without coding unless source code is also in scope.
 user-invocable: false
 argument-hint: "[module ... | none]"
 allowed-tools:
