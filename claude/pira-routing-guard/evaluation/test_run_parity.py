@@ -123,6 +123,32 @@ class ParityRunnerTests(unittest.TestCase):
         parsed = parity.parse_codex("\n".join(json.dumps(event) for event in events))
         self.assertTrue(parsed["route_complete_before_work"])
 
+    def test_parse_codex_rejects_external_skill_access(self) -> None:
+        event = {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "pira_nav show C:/home/.codex/skills/example/SKILL.md",
+                "aggregated_output": "skill data",
+                "status": "completed",
+            },
+        }
+        parsed = parity.parse_codex(json.dumps(event))
+        self.assertEqual(parsed["unexpected_skill_access_count"], 1)
+        scenario = {"expected_loaded": [], "prompt": "test"}
+        failures = parity.evaluate("codex", scenario, parsed | {"final_text": "answer"}, 0)
+        self.assertTrue(any("external skill" in failure for failure in failures))
+
+    def test_skill_disable_config_covers_discovered_skill_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            skill = Path(temporary) / "example" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("example", encoding="utf-8")
+            config = parity.disabled_skills_config([skill])
+            self.assertTrue(config.startswith("skills.config="))
+            self.assertIn("enabled=false", config)
+            self.assertIn(json.dumps(str(skill.resolve())), config)
+
     def test_evaluate_applies_same_loaded_module_oracle(self) -> None:
         scenario = {
             "expected_route": ["coding"],
@@ -154,7 +180,8 @@ class ParityRunnerTests(unittest.TestCase):
         )
         project = Path("project")
         claude = parity.command_for("claude", "claude", project, args)
-        codex = parity.command_for("codex", "codex", project, args)
+        skill = Path("skills") / "example" / "SKILL.md"
+        codex = parity.command_for("codex", "codex", project, args, [skill])
         self.assertIn("--plugin-dir", claude)
         self.assertIn("--setting-sources", claude)
         self.assertIn("--ignore-user-config", codex)
@@ -162,6 +189,7 @@ class ParityRunnerTests(unittest.TestCase):
         self.assertNotIn("--sandbox", codex)
         self.assertTrue(any("pira_eval_read" in argument for argument in codex))
         self.assertTrue(any(":workspace_roots" in argument and '"read"' in argument for argument in codex))
+        self.assertTrue(any(argument.startswith("skills.config=") and "SKILL.md" in argument for argument in codex))
 
 
 if __name__ == "__main__":

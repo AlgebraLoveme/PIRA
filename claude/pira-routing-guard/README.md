@@ -55,7 +55,9 @@ python claude/pira-routing-guard/evaluation/run_matrix.py --model sonnet --effor
 
 The preregistered paired protocol and isolated Claude/Codex runner are in
 `evaluation/PARITY_PROTOCOL.md` and `evaluation/run_parity.py`. The runner uses synthetic modules,
-records raw JSONL for audit, and keeps Codex command execution read-only:
+records raw JSONL for audit, keeps Codex command execution read-only, and disables every locally
+discoverable Codex skill through per-skill CLI overrides. The summary records only the disabled-skill
+count and a path-manifest digest; any observed external `SKILL.md` access fails the case:
 
 ```text
 python claude/pira-routing-guard/evaluation/run_parity.py --client both --repetitions 2

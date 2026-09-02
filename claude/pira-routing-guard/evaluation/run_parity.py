@@ -39,6 +39,7 @@ ROUTE_HEADER = re.compile(r"^### Loaded PIRA module: ([a-z_]+)\r?$", re.MULTILIN
 PERMISSION_FAILURE = re.compile(
     r"(?i)(permission denied|access denied|zugriff verweigert|operation not permitted|sandbox.*denied)"
 )
+SKILL_ACCESS = re.compile(r"(?i)(?:^|[/\\])SKILL\.md(?:$|[\s'\"])")
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -68,6 +69,53 @@ def sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(65536), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def discover_skill_files(project: Path) -> list[Path]:
+    """Find every locally discoverable Codex skill that could contaminate the control."""
+    home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex"))
+    roots = [
+        codex_home / "skills",
+        codex_home / "plugins",
+        home / ".agents" / "skills",
+    ]
+    if os.name != "nt":
+        roots.append(Path("/etc/codex/skills"))
+
+    current = project.resolve()
+    while True:
+        roots.append(current / ".agents" / "skills")
+        if current.parent == current:
+            break
+        current = current.parent
+
+    found: dict[str, Path] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("SKILL.md"):
+            resolved = path.resolve()
+            found[os.path.normcase(str(resolved))] = resolved
+    return [found[key] for key in sorted(found)]
+
+
+def disabled_skills_config(skill_files: list[Path]) -> str:
+    entries = [
+        "{path=" + json.dumps(str(path.resolve()), ensure_ascii=False) + ",enabled=false}"
+        for path in skill_files
+    ]
+    # JSON string syntax is valid TOML basic-string syntax. Passing an array of TOML
+    # inline tables at CLI precedence avoids modifying user configuration.
+    return "skills.config=[" + ",".join(entries) + "]"
+
+
+def skill_manifest_hash(skill_files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in skill_files:
+        digest.update(os.path.normcase(str(path.resolve())).encode("utf-8"))
+        digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -206,6 +254,7 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
     permission_denials: list[str] = []
     turn_failed = False
     usage: dict[str, Any] = {}
+    unexpected_skill_access_count = 0
 
     for index, event in enumerate(events):
         event_type = str(event.get("type", ""))
@@ -214,6 +263,8 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
         if event_type == "item.completed" and item_type == "command_execution":
             output = str(item.get("aggregated_output", ""))
             command = str(item.get("command", "")).replace("\\", "/")
+            if SKILL_ACCESS.search(command):
+                unexpected_skill_access_count += 1
             task_positions = [
                 command.find(path.replace("\\", "/"))
                 for path in task_paths
@@ -276,6 +327,7 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
         "usage": usage,
         "permission_denials": permission_denials,
         "turn_failed": turn_failed,
+        "unexpected_skill_access_count": unexpected_skill_access_count,
     }
 
 
@@ -309,6 +361,10 @@ def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit
         failures.append("hook errors: " + "; ".join(parsed["hook_errors"]))
     if parsed.get("permission_denials"):
         failures.append(f"permission denials: {parsed['permission_denials']}")
+    if parsed.get("unexpected_skill_access_count"):
+        failures.append(
+            f"unexpected external skill access count: {parsed['unexpected_skill_access_count']}"
+        )
     pattern = scenario.get("result_regex")
     if pattern and not re.search(pattern, parsed["final_text"]):
         failures.append(f"result did not match {pattern!r}")
@@ -338,7 +394,13 @@ def run_process(command: list[str], cwd: Path, env: dict[str, str], timeout: int
         return 124, stdout, stderr + f"\nTimed out after {timeout} seconds.", time.monotonic() - started
 
 
-def command_for(client: str, executable: str, project: Path, args: argparse.Namespace) -> list[str]:
+def command_for(
+    client: str,
+    executable: str,
+    project: Path,
+    args: argparse.Namespace,
+    codex_skill_files: list[Path] | None = None,
+) -> list[str]:
     if client == "claude":
         return [
             executable,
@@ -379,6 +441,8 @@ def command_for(client: str, executable: str, project: Path, args: argparse.Name
         args.codex_model,
         "--config",
         f'model_reasoning_effort="{args.codex_effort}"',
+        "--config",
+        disabled_skills_config(codex_skill_files or []),
     ]
     if sys.platform == "win32":
         command.extend(["--config", 'windows.sandbox="elevated"'])
@@ -405,7 +469,8 @@ def run_case(
     case_root = artifact_root / client / f"repeat-{repetition}" / scenario["id"]
     project, agent, state = materialize_case(case_root, scenario)
     args.prompt = scenario["prompt"]
-    command = command_for(client, executable, project, args)
+    codex_skill_files = discover_skill_files(project) if client == "codex" else []
+    command = command_for(client, executable, project, args, codex_skill_files)
     env = os.environ.copy()
     env.update({"PIRA_AGENT_DIR": str(agent), "PIRA_ROUTING_STATE_DIR": str(state), "PYTHONUTF8": "1"})
     exit_code, stdout, stderr, elapsed = run_process(command, project, env, args.timeout)
@@ -430,6 +495,7 @@ def run_case(
         "loaded_modules": parsed["loaded_modules"],
         "task_tools": parsed["task_tools"],
         "permission_denials": parsed.get("permission_denials", []),
+        "unexpected_skill_access_count": parsed.get("unexpected_skill_access_count", 0),
         "duration_seconds": round(elapsed, 3),
         "usage": parsed["usage"],
         "artifact_dir": case_root.relative_to(artifact_root).as_posix(),
@@ -483,6 +549,7 @@ def main() -> int:
         raise RuntimeError("missing client executable(s): " + ", ".join(missing_clients))
     artifact_root = args.artifact_root or Path(tempfile.mkdtemp(prefix="pira-parity-eval-"))
     artifact_root.mkdir(parents=True, exist_ok=True)
+    codex_skill_files = discover_skill_files(artifact_root) if "codex" in clients else []
 
     results: list[dict[str, Any]] = []
     total = len(clients) * args.repetitions * len(scenarios)
@@ -511,7 +578,7 @@ def main() -> int:
         ["git", "status", "--porcelain"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
     ).stdout
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "policy_commit": subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
         ).stdout.strip(),
@@ -543,6 +610,9 @@ def main() -> int:
                 "permission_profile": "pira_eval_read",
                 "filesystem": {":minimal": "read", ":workspace_roots": {".": "read"}},
                 "windows_sandbox": "elevated" if sys.platform == "win32" else None,
+                "external_skills_disabled": True,
+                "disabled_skill_count": len(codex_skill_files),
+                "disabled_skill_manifest_sha256": skill_manifest_hash(codex_skill_files),
             },
         },
         "source_hashes": {

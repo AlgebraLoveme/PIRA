@@ -26,6 +26,10 @@ and do not appear in the primary claim.
   model alias, effort, and tool set recorded in the result manifest.
 - Codex descriptive control: Codex CLI version, model, effort, sandbox, and config
   overrides recorded in the result manifest.
+- Codex control isolation: every locally discoverable Codex skill is disabled with
+  documented per-skill CLI configuration overrides. Any observed `SKILL.md` access
+  invalidates that case. `--ignore-user-config` and `--ignore-rules` remain enabled,
+  but are not treated as sufficient skill isolation by themselves.
 - Test data: synthetic policy paths, profile, modules, and project files. No real
   `USER.md`, prompt history, credentials, or transcript is committed.
 - The same scenario prompt and project artifact content are used for both clients.
@@ -102,6 +106,9 @@ All gates are conjunctive:
 8. **Comparative reporting:** every Codex control result is reported with the same
    scenario identifiers. Differences are disclosed; no failed control is silently
    removed or relabeled.
+9. **Control isolation:** the summary records the disabled-skill count and a
+   path-manifest digest without recording paths. Any external skill read fails the
+   case; a run that did not disable all discovered skills is not parity evidence.
 
 Passing these gates supports the exact primary claim above on each native platform
 where the end-to-end client run was completed. POSIX launcher unit tests alone do

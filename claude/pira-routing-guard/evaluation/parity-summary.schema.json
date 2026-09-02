@@ -20,13 +20,31 @@
     "results"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "policy_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "plugin_version": {"type": "string"},
     "platform": {"type": "object"},
     "client_versions": {"type": "object", "additionalProperties": {"type": "string"}},
     "models": {"type": "object"},
-    "client_config": {"type": "object"},
+    "client_config": {
+      "type": "object",
+      "required": ["codex"],
+      "properties": {
+        "codex": {
+          "type": "object",
+          "required": [
+            "external_skills_disabled",
+            "disabled_skill_count",
+            "disabled_skill_manifest_sha256"
+          ],
+          "properties": {
+            "external_skills_disabled": {"const": true},
+            "disabled_skill_count": {"type": "integer", "minimum": 0},
+            "disabled_skill_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
     "source_hashes": {
       "type": "object",
       "required": ["matrix_sha256", "runner_sha256", "protocol_sha256"],
@@ -50,6 +68,7 @@
           "route_calls",
           "loaded_modules",
           "task_tools",
+          "unexpected_skill_access_count",
           "duration_seconds",
           "usage",
           "artifact_dir",
@@ -61,6 +80,7 @@
           "id": {"type": "string"},
           "passed": {"type": "boolean"},
           "failures": {"type": "array", "items": {"type": "string"}},
+          "unexpected_skill_access_count": {"type": "integer", "minimum": 0},
           "artifact_dir": {"type": "string"},
           "artifact_hashes": {
             "type": "object",
