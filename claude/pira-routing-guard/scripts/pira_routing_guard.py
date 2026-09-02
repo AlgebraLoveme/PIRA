@@ -228,10 +228,16 @@ def missing_modules(session: SessionState, state: dict[str, Any]) -> list[tuple[
     return [(name, paths[name]) for name in required if name in paths and not session.is_loaded(name, paths[name])]
 
 
+NO_SKILL_FALLBACK = (
+    "If the Skill tool is not available to you, do not stop to ask for it: state that in one line and "
+    "continue the task without routing."
+)
+
+
 def route_instruction() -> str:
     return (
         f"PIRA routing is pending. Invoke the `{ROUTE_SKILL}` skill before any task tool or answer, "
-        "passing the applicable module names or `none`."
+        f"passing the applicable module names or `none`. {NO_SKILL_FALLBACK}"
     )
 
 
@@ -297,6 +303,15 @@ def handle_pre_tool(data: dict[str, Any], session: SessionState) -> dict[str, An
     ready, reason = readiness(session, state)
     if ready:
         return None
+    if data.get("agent_id"):
+        # A subagent's tool set is fixed by its definition and may omit Skill, so it can be
+        # unable to route. Deny once so a Skill-bearing subagent routes; then fail open.
+        current = state if isinstance(state, dict) else {"status": "pending", "stop_blocks": 0}
+        denials = int(current.get("tool_denials", 0))
+        if denials >= 1:
+            return None
+        current["tool_denials"] = denials + 1
+        session.write(current)
     return deny_tool(reason)
 
 
@@ -389,7 +404,11 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
         ready, reason = readiness(session, state)
         if ready or not session.consume_stop_block(state):
             return None
-        return block_stop(reason + " The guard will request at most one automatic retry this turn.")
+        return block_stop(
+            reason
+            + " The guard will request at most one automatic retry this turn; if you cannot invoke the "
+            "skill, give your final answer directly now."
+        )
     if event == "PostCompact":
         session.clear_loaded()
         session.reset_route()

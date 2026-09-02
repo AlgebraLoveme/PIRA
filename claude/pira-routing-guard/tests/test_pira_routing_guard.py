@@ -355,6 +355,25 @@ class RoutingGuardTests(unittest.TestCase):
         self.assertEqual(first["decision"], "block")
         self.assertIsNone(guard.dispatch(self.event("SubagentStop", agent_id="subagent-1")))
 
+    def test_subagent_without_skill_tool_is_denied_once_then_fails_open(self) -> None:
+        context = guard.dispatch(self.event("SubagentStart", agent_id="subagent-1", agent_type="claude-code-guide"))
+        self.assertIn("Skill tool is not available", json.dumps(context))
+        read = self.event("PreToolUse", agent_id="subagent-1", tool_name="Read", tool_input={"file_path": "a.md"})
+        self.assertEqual(guard.dispatch(read)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(guard.dispatch(read))
+        self.assertIsNone(guard.dispatch(dict(read, tool_name="WebFetch", tool_input={"url": "https://x"})))
+        # The parent session keeps strict enforcement.
+        parent = self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "a.md"})
+        self.assertEqual(guard.dispatch(parent)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(guard.dispatch(parent)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_stop_block_tells_a_tool_less_session_to_answer_directly(self) -> None:
+        guard.dispatch(self.event("UserPromptSubmit", prompt="what is the token"))
+        blocked = guard.dispatch(self.event("Stop"))
+        self.assertEqual(blocked["decision"], "block")
+        self.assertIn("final answer directly", blocked["reason"])
+        self.assertIsNone(guard.dispatch(self.event("Stop")))
+
     def test_corrupt_state_fails_closed_and_route_recovers(self) -> None:
         session = guard.SessionState("session-1")
         session.directory.mkdir(parents=True)
