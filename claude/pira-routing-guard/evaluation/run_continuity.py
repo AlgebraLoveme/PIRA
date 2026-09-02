@@ -96,6 +96,56 @@ def turn_summary(
     }
 
 
+def compaction_summary(turn: dict[str, Any]) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    parse_errors: list[str] = []
+    for number, line in enumerate(turn["stdout"].splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            parse_errors.append(f"line {number}: {exc.msg}")
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+
+    compact_success = any(
+        event.get("type") == "system"
+        and event.get("subtype") == "status"
+        and event.get("compact_result") == "success"
+        for event in events
+    )
+    pending_after_compact = any(
+        event.get("type") == "system"
+        and event.get("subtype") == "hook_response"
+        and event.get("hook_name") == "SessionStart:compact"
+        and "PIRA routing is pending" in str(event.get("output", ""))
+        for event in events
+    )
+    post_compact_observed = any(
+        event.get("hook_event") == "PostCompact"
+        or "PostCompact" in json.dumps(event, ensure_ascii=False)
+        for event in events
+    )
+    failures = list(parse_errors)
+    if turn["exit_code"] != 0:
+        failures.append(f"Claude exit code {turn['exit_code']}")
+    if not compact_success:
+        failures.append("manual compaction did not report success")
+    if not post_compact_observed:
+        failures.append("PostCompact hook execution was not observed")
+    if not pending_after_compact:
+        failures.append("SessionStart:compact did not restore pending routing context")
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "compact_success": compact_success,
+        "post_compact_observed": post_compact_observed,
+        "pending_after_compact": pending_after_compact,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="sonnet")
@@ -217,21 +267,61 @@ def main() -> int:
         environment,
         args.timeout,
     )
+    compact = run_turn(
+        build_command(
+            claude,
+            plugin_root,
+            "/compact",
+            session_id,
+            resume=True,
+            model=args.model,
+            effort=args.effort,
+            tools=args.tools,
+            max_budget=args.max_budget,
+        ),
+        project,
+        environment,
+        args.timeout,
+    )
+    third = run_turn(
+        build_command(
+            claude,
+            plugin_root,
+            "Explain in one sentence why zero is an even number.",
+            session_id,
+            resume=True,
+            model=args.model,
+            effort=args.effort,
+            tools=args.tools,
+            max_budget=args.max_budget,
+        ),
+        project,
+        environment,
+        args.timeout,
+    )
     (artifact_root / "turn-1.jsonl").write_text(first["stdout"], encoding="utf-8")
     (artifact_root / "turn-2.jsonl").write_text(second["stdout"], encoding="utf-8")
-    (artifact_root / "stderr.txt").write_text(first["stderr"] + second["stderr"], encoding="utf-8")
+    (artifact_root / "compact.jsonl").write_text(compact["stdout"], encoding="utf-8")
+    (artifact_root / "turn-3.jsonl").write_text(third["stdout"], encoding="utf-8")
+    (artifact_root / "stderr.txt").write_text(
+        first["stderr"] + second["stderr"] + compact["stderr"] + third["stderr"],
+        encoding="utf-8",
+    )
 
     summaries = [
         turn_summary(first, ["coding"], ["research", "coding"]),
         turn_summary(second, ["writing"], ["research", "writing"]),
+        turn_summary(third, ["explain"], ["explain"]),
     ]
+    compact_result = compaction_summary(compact)
     output = {
         "schema_version": 1,
         "session_id": session_id,
         "artifact_root": str(artifact_root),
         "persisted_for_resume": True,
+        "compaction": compact_result,
         "turns": summaries,
-        "passed": all(turn["passed"] for turn in summaries),
+        "passed": compact_result["passed"] and all(turn["passed"] for turn in summaries),
     }
     (artifact_root / "summary.json").write_text(
         json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
@@ -244,6 +334,14 @@ def main() -> int:
         )
         for failure in turn["failures"]:
             print(f"  - {failure}")
+    print(
+        f"COMPACT {'PASS' if compact_result['passed'] else 'FAIL'} "
+        f"success={compact_result['compact_success']} "
+        f"post_hook={compact_result['post_compact_observed']} "
+        f"pending={compact_result['pending_after_compact']}"
+    )
+    for failure in compact_result["failures"]:
+        print(f"  - {failure}")
     print(f"SESSION_ID {session_id}")
     print(f"SUMMARY {artifact_root / 'summary.json'}")
     return 0 if output["passed"] else 1

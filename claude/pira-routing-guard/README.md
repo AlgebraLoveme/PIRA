@@ -67,6 +67,7 @@ The runner records Claude CLI's `total_cost_usd` field as a local API-equivalent
 context overhead. It is not authoritative billing and is not an extra charge when Claude Code is using
 included subscription authentication; those runs consume plan usage quota instead.
 
-The separate `run_continuity.py` probe deliberately persists one synthetic session so it can verify a
-fresh Claude Code process with `--resume`. Use it only when writing synthetic session history under the
-active Claude configuration directory is acceptable.
+The separate `run_continuity.py` probe deliberately persists one synthetic session so it can verify
+follow-up routing, a fresh Claude Code process with `--resume`, manual compaction, and a fresh route
+after `PostCompact`. Use it only when writing synthetic session history under the active Claude
+configuration directory is acceptable.
