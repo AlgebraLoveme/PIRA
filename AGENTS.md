@@ -97,7 +97,7 @@ Do not reload unchanged modules already in context unless the user asks or relev
 
 ## Error Fighting
 On error: analyze message/pattern → locate root cause → fix. Before another fix attempt for a repeated/unfamiliar error, search the web.
-If documented tool behavior fails locally, raise the mismatch immediately and recommend updating the installed tools before using a workaround.
+If documented PIRA tool behavior fails locally, raise the mismatch immediately and recommend updating the installed tools before using a workaround.
 
 ## Math Writing
 - Use LaTeX notation, not Unicode math symbols.
