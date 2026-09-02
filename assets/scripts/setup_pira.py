@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Deterministic setup helper for PIRA.
+"""Deterministic setup helper for PIRA on Claude Code.
 
 The script intentionally uses only the Python standard library. It configures the
 current machine for the existing global PIRA layout centered on ``~/agent`` and
-keeps all writes explicit, backed up, and verifiable.
+keeps all writes explicit, backed up, and verifiable. Claude Code reads
+``CLAUDE.md``, so setup manages exactly one marked block in the user-level
+``~/.claude/CLAUDE.md`` that imports the canonical ``~/agent/AGENTS.md``.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import platform
 import re
 import shutil
 import subprocess
@@ -18,10 +19,9 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Literal
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
-DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
 CLAUDE_BLOCK_START = "<!-- PIRA:BEGIN (managed by setup_pira.py; do not edit inside) -->"
 CLAUDE_BLOCK_END = "<!-- PIRA:END -->"
 USER_PLACEHOLDER_TEXT = """# USER
@@ -40,10 +40,6 @@ USER_PLACEHOLDER_TEXT = """# USER
 
 ## Working Preferences
 - fill manually
-"""
-PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
-
-PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
 """
 
 
@@ -64,6 +60,10 @@ class SetupState:
     def warn(self, message: str) -> None:
         self.warnings.append(message)
         print(f"WARNING: {message}")
+
+    def check(self, name: str, passed: bool, detail: str) -> None:
+        self.verification.append((name, passed, detail))
+        print(f"{'PASS' if passed else 'FAIL'}: {name} — {detail}")
 
 
 def expand_path(value: str) -> Path:
@@ -88,18 +88,6 @@ def display_path(path: Path) -> str:
         return str(expanded)
 
 
-def config_path_string(path: Path) -> str:
-    """Return a stable config path string without resolving symlinks."""
-    expanded = path.expanduser()
-    if not expanded.is_absolute():
-        expanded = Path.cwd() / expanded
-    home = Path.home()
-    try:
-        return "~/" + str(expanded.relative_to(home))
-    except ValueError:
-        return str(expanded)
-
-
 def backup_path(path: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
     candidate = path.with_name(f"{path.name}.bak.{stamp}")
@@ -112,7 +100,11 @@ def backup_path(path: Path) -> Path:
 
 def prompt_yes_no(question: str, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
-    answer = input(f"{question} {suffix} ").strip().lower()
+    try:
+        answer = input(f"{question} {suffix} ").strip().lower()
+    except EOFError:  # stdin looked interactive but closed, e.g. some wrapper shells
+        print()
+        return default
     if not answer:
         return default
     return answer in {"y", "yes"}
@@ -290,327 +282,144 @@ def remove_legacy_files(state: SetupState, legacy_mode: Literal["ask", "remove",
         remove_path(state, path)
 
 
-def split_toml_preamble(text: str) -> tuple[list[str], list[str]]:
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if re.match(r"\s*\[", line):
-            return lines[:index], lines[index:]
-    return lines, []
-
-
-def top_level_keys(text: str) -> dict[str, str]:
-    preamble, _ = split_toml_preamble(text)
-    result: dict[str, str] = {}
-    for line in preamble:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        result[key.strip()] = value.strip()
-    return result
-
-
-def toml_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def upsert_top_level(text: str, updates: dict[str, str], remove_keys: Iterable[str] = ()) -> str:
-    remove_set = set(remove_keys)
-    preamble, rest = split_toml_preamble(text)
-    seen: set[str] = set()
-    new_preamble: list[str] = []
-    key_pattern = re.compile(r"^(\s*)([A-Za-z0-9_.-]+)(\s*=)(.*)$")
-    for line in preamble:
-        match = key_pattern.match(line)
-        if not match:
-            new_preamble.append(line)
-            continue
-        key = match.group(2)
-        if key in remove_set:
-            continue
-        if key in updates:
-            new_preamble.append(f"{key} = {updates[key]}\n")
-            seen.add(key)
-        else:
-            new_preamble.append(line)
-    additions = [f"{key} = {value}\n" for key, value in updates.items() if key not in seen]
-    if additions:
-        if new_preamble and new_preamble[-1].strip() != "":
-            new_preamble.append("\n")
-        new_preamble.extend(additions)
-    if rest and new_preamble and new_preamble[-1].strip() != "":
-        new_preamble.append("\n")
-    return "".join(new_preamble + rest)
-
-
-def configure_codex(
-    state: SetupState,
-    config_path: Path,
-    execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
-    replace_permissions: bool,
-) -> None:
-    if execution_mode == "ask":
-        if state.yes or not sys.stdin.isatty():
-            execution_mode = "keep"
-            state.warn("Execution mode left unchanged; pass --execution-mode safe or soft-safe to set it non-interactively")
-        else:
-            print("Execution modes:")
-            print("  1. safe: approval_policy=on-request, sandbox_mode=workspace-write")
-            print("  2. soft-safe: approval_policy=never, sandbox_mode=danger-full-access")
-            print("  3. keep: do not change approval/sandbox settings")
-            choice = input("Choose execution mode [1/2/3, default 1]: ").strip()
-            execution_mode = {"": "safe", "1": "safe", "2": "soft-safe", "3": "keep"}.get(choice, "safe")  # type: ignore[assignment]
-
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    keys = top_level_keys(existing)
-    instructions_path = state.agent_dir / "AGENTS.md"
-    instructions_ref = config_path_string(instructions_path)
-    updates = {
-        "model_instructions_file": toml_string(instructions_ref),
-        "project_doc_max_bytes": DEFAULT_PROJECT_DOC_MAX_BYTES,
-    }
-    remove_keys: list[str] = []
-    if execution_mode == "safe":
-        updates.update({"approval_policy": toml_string("on-request"), "sandbox_mode": toml_string("workspace-write")})
-    elif execution_mode == "soft-safe":
-        updates.update({"approval_policy": toml_string("never"), "sandbox_mode": toml_string("danger-full-access")})
-
-    if execution_mode in {"safe", "soft-safe"} and "default_permissions" in keys:
-        if not replace_permissions:
-            state.warn(
-                "Codex config has top-level default_permissions; not setting sandbox_mode because Codex docs warn not to combine them. "
-                "Rerun with --replace-permissions to remove default_permissions and set the selected mode."
-            )
-            updates.pop("sandbox_mode", None)
-        else:
-            remove_keys.append("default_permissions")
-
-    new_text = upsert_top_level(existing, updates, remove_keys=remove_keys)
-    write_text(state, config_path, new_text, "Codex config.toml")
-    ensure_project_agents_guard(state)
-    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)
-
-
-def ensure_project_agents_guard(state: SetupState) -> None:
-    """Prevent the configured global policy from being rediscovered in the PIRA repo."""
-    write_text(
-        state,
-        state.agent_dir / "AGENTS.override.md",
-        PROJECT_AGENTS_GUARD,
-        "local PIRA repository AGENTS guard",
-        backup=False,
-    )
-
-
-def remove_duplicate_global_agents(state: SetupState, global_path: Path, pira_path: Path) -> None:
-    """Remove only the old PIRA symlink; preserve unrelated global instructions."""
-    global_label = config_path_string(global_path)
-    if not global_path.is_symlink() or not same_location(global_path, pira_path):
-        if global_path.exists() or global_path.is_symlink():
-            state.warn(f"Preserved separate global instructions at {global_label}")
-        return
-    if state.dry_run:
-        print(f"DRY-RUN: would remove duplicate PIRA symlink {global_label}")
-        state.note_change(f"would remove duplicate {global_label} symlink")
-        return
-    global_path.unlink()
-    state.note_change(f"removed duplicate {global_label} symlink")
-
-
 def claude_import_path(path: Path) -> str:
-    """Return a stable path accepted by CLAUDE.md imports."""
+    """Return a stable ``@`` import path for CLAUDE.md.
+
+    Claude Code resolves ``~/`` imports and does not document any quoting for
+    whitespace; upstream issue anthropics/claude-code#56927 shows such imports
+    failing silently, so whitespace is rejected instead of written.
+    """
     expanded = path.expanduser().absolute()
     home = Path.home().absolute()
     try:
-        return "~/" + expanded.relative_to(home).as_posix()
+        import_path = "~/" + expanded.relative_to(home).as_posix()
     except ValueError:
-        return expanded.as_posix()
-
-
-def claude_bridge_is_windows() -> bool:
-    """The Claude bridge adds Windows shell-routing guidance only on Windows hosts."""
-    return os.name == "nt"
+        import_path = expanded.as_posix()
+    if any(character.isspace() for character in import_path):
+        raise RuntimeError(
+            f"CLAUDE.md imports cannot contain whitespace, but the agent directory resolves to {import_path!r}. "
+            "Use --agent-dir with a whitespace-free path or a symlink to one."
+        )
+    return import_path
 
 
 def claude_managed_block(agent_dir: Path) -> str:
-    agents_path = claude_import_path(agent_dir / "AGENTS.md")
-    windows_line = (
-        "- IMPORTANT (Windows): Invoke PIRA tools from the POSIX Bash tool, not PowerShell — "
-        "PowerShell PATH lacks `cat`/`grep`, and `bash` there may resolve to WSL. Inside "
-        "`pira_ctx`, express pipelines or compound commands as `bash -c '...'`.\n"
-        if claude_bridge_is_windows()
-        else ""
-    )
-    return (
-        f"{CLAUDE_BLOCK_START}\n"
-        f"@{agents_path}\n\n"
-        "## Claude Code bridge\n"
-        "- IMPORTANT: Before using task tools, classify the request using the imported Module Loading "
-        "and Routing rules, then load all required modules exactly with Claude Read. Do not route "
-        "PIRA module loading through `pira_ctx`.\n"
-        "- IMPORTANT: For shell/exec, use `pira_ctx` only when its output retention or targeted "
-        "retrieval is useful; otherwise use native Bash so Claude Code permission rules can inspect "
-        "the actual command. Invoke `pira_dec`, `pira_nav`, and `pira_svg_check` directly. Use "
-        "Claude Read/Glob/Grep or `pira_nav` for ordinary read-only inspection instead of raw shell "
-        "find/cat/grep.\n"
-        f"{windows_line}"
-        f"{CLAUDE_BLOCK_END}"
-    )
+    """The whole managed block: one import of the canonical policy, nothing else."""
+    return f"{CLAUDE_BLOCK_START}\n@{claude_import_path(agent_dir / 'AGENTS.md')}\n{CLAUDE_BLOCK_END}"
 
 
-def update_claude_md(state: SetupState, claude_md_path: Path) -> None:
-    """Install the managed Claude bridge while preserving all user-owned content."""
-    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md") if claude_md_path.exists() else ""
-    start_count = existing.count(CLAUDE_BLOCK_START)
-    end_count = existing.count(CLAUDE_BLOCK_END)
+def locate_managed_block(text: str, claude_md_path: Path) -> tuple[int, int] | None:
+    """Return the [start, end) span of the single managed block, or None when absent."""
+    start_count = text.count(CLAUDE_BLOCK_START)
+    end_count = text.count(CLAUDE_BLOCK_END)
     if start_count != end_count or start_count > 1:
         raise RuntimeError(
             f"Refusing to edit malformed PIRA markers in {display_path(claude_md_path)} "
             f"(start={start_count}, end={end_count})"
         )
+    if start_count == 0:
+        return None
+    start = text.index(CLAUDE_BLOCK_START)
+    end_start = text.index(CLAUDE_BLOCK_END)
+    if end_start < start:
+        raise RuntimeError(f"Refusing to edit reversed PIRA markers in {display_path(claude_md_path)}")
+    return start, end_start + len(CLAUDE_BLOCK_END)
 
+
+def update_claude_md(state: SetupState, claude_md_path: Path) -> None:
+    """Install or refresh the managed import while preserving all user-owned content."""
     block = claude_managed_block(state.agent_dir)
-    if start_count == 1:
-        start = existing.index(CLAUDE_BLOCK_START)
-        end_start = existing.find(CLAUDE_BLOCK_END)
-        if end_start < start:
-            raise RuntimeError(f"Refusing to edit reversed PIRA markers in {display_path(claude_md_path)}")
-        end = end_start + len(CLAUDE_BLOCK_END)
-        updated = existing[:start] + block + existing[end:]
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md") if claude_md_path.exists() else ""
+    span = locate_managed_block(existing, claude_md_path)
+    if span is not None:
+        updated = existing[: span[0]] + block + existing[span[1] :]
     else:
         separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
         updated = existing + separator + block + "\n"
     write_text(state, claude_md_path, updated, "Claude Code CLAUDE.md")
 
 
-def verify_claude(state: SetupState, claude_md_path: Path) -> None:
-    def add(name: str, passed: bool, detail: str) -> None:
-        state.verification.append((name, passed, detail))
-        print(f"{'PASS' if passed else 'FAIL'}: {name} — {detail}")
-
+def remove_claude_md_block(state: SetupState, claude_md_path: Path) -> None:
+    """Remove only the managed block; user-owned content and PIRA tools stay untouched."""
     if not claude_md_path.exists():
-        add("Claude Code CLAUDE.md exists", False, display_path(claude_md_path))
+        print(f"OK: {display_path(claude_md_path)} does not exist; nothing to remove")
+        return
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    span = locate_managed_block(existing, claude_md_path)
+    if span is None:
+        print(f"OK: no PIRA block in {display_path(claude_md_path)}")
+        return
+    end = span[1] + 1 if existing[span[1] : span[1] + 1] == "\n" else span[1]
+    before = existing[: span[0]]
+    if before.strip():
+        before = before.rstrip("\n") + "\n"  # drop the separator added when the block was appended
+    remaining = before + existing[end:]
+    if remaining.strip():
+        write_text(state, claude_md_path, remaining, "Claude Code CLAUDE.md")
+        return
+    if state.dry_run:
+        print(f"DRY-RUN: would back up and delete {display_path(claude_md_path)} because only the PIRA block remains")
+        state.note_change(f"would delete {display_path(claude_md_path)}")
+        return
+    backup = backup_path(claude_md_path)
+    shutil.copy2(claude_md_path, backup)
+    print(f"Backup: {display_path(claude_md_path)} -> {display_path(backup)}")
+    claude_md_path.unlink()
+    state.note_change(f"deleted {display_path(claude_md_path)} (only the PIRA block remained)")
+
+
+def verify_claude(state: SetupState, claude_md_path: Path) -> None:
+    if not claude_md_path.exists():
+        state.check("Claude Code CLAUDE.md exists", False, display_path(claude_md_path))
         return
     text = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
-    expected = claude_managed_block(state.agent_dir)
-    add(
+    try:
+        expected = claude_managed_block(state.agent_dir)
+    except RuntimeError as exc:
+        state.check("Claude Code PIRA import", False, str(exc))
+        return
+    state.check(
         "Claude Code PIRA import",
-        text.count(CLAUDE_BLOCK_START) == 1
-        and text.count(CLAUDE_BLOCK_END) == 1
-        and expected in text,
+        text.count(CLAUDE_BLOCK_START) == 1 and text.count(CLAUDE_BLOCK_END) == 1 and expected in text,
         f"{display_path(claude_md_path)} -> {claude_import_path(state.agent_dir / 'AGENTS.md')}",
     )
 
 
-def configure_audio(
-    state: SetupState,
-    audio: Literal["ask", "yes", "no"],
-    config_path: Path,
-    audio_dir: Path | None,
-    force_audio: bool,
-) -> None:
-    system = platform.system().lower()
-    supported = system in {"darwin", "windows"}
-    if audio == "ask":
-        if not supported:
-            print("OK: audio notifications are supported only on macOS and Windows; skipping")
-            return
-        if state.yes or not sys.stdin.isatty():
-            print("OK: audio notifications not enabled by default")
-            return
-        audio = "yes" if prompt_yes_no("Enable optional Codex audio notifications?", default=False) else "no"
-    if audio == "no":
-        print("OK: audio notifications skipped")
-        return
-    if not supported:
-        raise RuntimeError("Audio setup is supported only on macOS and Windows")
-
-    if audio_dir is None:
-        audio_dir = state.agent_dir / "PIRA_Voice" / "Samantha"
-    for name in ["complete_msg.m4a", "waiting_msg.m4a"]:
-        candidate = audio_dir / name
-        if not candidate.exists():
-            raise RuntimeError(f"Audio file missing: {candidate}")
-
-    script = state.agent_dir / "assets" / "scripts" / "setup_codex_audio_mode.py"
-    platform_name = "macos" if system == "darwin" else "windows"
-    cmd = [sys.executable, str(script), "--platform", platform_name, "--config", str(config_path), "--audio-dir", str(audio_dir)]
-    if force_audio:
-        cmd.append("--force")
-
-    if state.dry_run:
-        print("DRY-RUN: would run audio setup command:")
-        print("  " + " ".join(sh_quote(part) for part in cmd))
-        state.note_change("would configure Codex audio notifications")
-        return
-    subprocess.run(cmd, check=True)
-    state.note_change("configured Codex audio notifications")
+def verify_claude_removed(state: SetupState, claude_md_path: Path) -> None:
+    present = claude_md_path.exists() and CLAUDE_BLOCK_START in read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    state.check("Claude Code PIRA import removed", not present, display_path(claude_md_path))
 
 
-def sh_quote(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_./:=+-]+", value):
-        return value
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
-def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
-    def add(name: str, passed: bool, detail: str) -> None:
-        state.verification.append((name, passed, detail))
-        label = "PASS" if passed else "FAIL"
-        print(f"{label}: {name} — {detail}")
-
+def verify(state: SetupState) -> None:
     agents = state.agent_dir / "AGENTS.md"
-    add("AGENTS.md exists", agents.exists(), display_path(agents))
+    state.check("AGENTS.md exists", agents.exists(), display_path(agents))
     user = state.agent_dir / "USER.md"
-    add("USER.md exists", user.exists(), display_path(user))
+    state.check("USER.md exists", user.exists(), display_path(user))
     token_ok = agents.exists() and VERIFY_TOKEN in agents.read_text(encoding="utf-8")
-    add("verification token", token_ok, VERIFY_TOKEN)
+    state.check("verification token", token_ok, VERIFY_TOKEN)
     legacy_existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
-    add("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
-
-    if not skip_codex:
-        if not config_path.exists():
-            add("Codex config exists", False, display_path(config_path))
-        else:
-            text = config_path.read_text(encoding="utf-8")
-            keys = top_level_keys(text)
-            expected_instructions = toml_string(config_path_string(state.agent_dir / "AGENTS.md"))
-            add("Codex config points to PIRA", keys.get("model_instructions_file") == expected_instructions, f"{display_path(config_path)} -> {expected_instructions}")
-            add("Codex project_doc_max_bytes", keys.get("project_doc_max_bytes") == DEFAULT_PROJECT_DOC_MAX_BYTES, keys.get("project_doc_max_bytes", "missing"))
-            guard = state.agent_dir / "AGENTS.override.md"
-            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == PROJECT_AGENTS_GUARD, display_path(guard))
+    state.check("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
+    parser = argparse.ArgumentParser(description="Set up PIRA for Claude Code on the current machine.")
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
-    parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
-    parser.add_argument("--claude-code", action="store_true", help="Configure Claude Code instead of Codex.")
     parser.add_argument("--claude-md", default="~/.claude/CLAUDE.md", help="Claude Code user instruction file.")
-    parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
+    parser.add_argument("--uninstall", action="store_true", help="Remove the PIRA block from CLAUDE.md; leaves tools, ~/agent, and other content untouched.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument(
         "--tools-version",
         action="append",
         default=None,
-        help=(
-            "Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or "
-            "svg=VERSION; repeatable."
-        ),
+        help="Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or svg=VERSION; repeatable.",
     )
-    parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
-    parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")
     parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
     parser.add_argument("--legacy", choices=["ask", "remove", "keep"], default="ask", help="How to handle paths listed in assets/LEGACY_LIST.md.")
     parser.add_argument("--force-agent-link", action="store_true", help="Move a conflicting --agent-dir aside and symlink this repo there.")
-    parser.add_argument("--audio", choices=["ask", "yes", "no"], default="ask", help="Whether to install optional Codex audio notifications.")
-    parser.add_argument("--audio-dir", default=None, help="Audio set directory for optional Codex audio notifications.")
-    parser.add_argument("--force-audio", action="store_true", help="Allow the audio helper to replace an existing notify entry.")
     parser.add_argument("--verify", action="store_true", help="Only verify the current setup; do not write.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing.")
-    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations; does not enable audio unless --audio yes is set.")
+    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations.")
     return parser
 
 
@@ -640,50 +449,36 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes)
-    config_path = expand_path(args.codex_config)
     claude_md_path = expand_path(args.claude_md)
-    audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
 
-    print("PIRA setup")
+    print("PIRA setup (Claude Code)")
     print(f"Repository: {display_path(repo_root)}")
     print(f"Agent dir:  {display_path(state.agent_dir)}")
+    print(f"CLAUDE.md:  {display_path(claude_md_path)}")
     print(f"Dry run:    {state.dry_run}")
 
     try:
-        if args.claude_code and args.execution_mode != "ask":
-            raise RuntimeError("--execution-mode configures Codex only; Claude Code permission settings are left unchanged")
-        if args.claude_code and args.audio == "yes":
-            raise RuntimeError("Claude Code setup does not install Codex audio notifications")
-        if not args.verify:
-            ensure_agent_dir(state, force_agent_link=args.force_agent_link)
-            ensure_user_md(state, args.user_mode)
-            remove_legacy_files(state, args.legacy)
-            if args.claude_code:
-                update_claude_md(state, claude_md_path)
-            else:
-                if not args.skip_codex:
-                    configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
-                configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
-            if not args.skip_tools:
-                configure_tools(
-                    state,
-                    args.tools_install_dir,
-                    args.tools_version,
-                    verify_only=False,
-                )
-        if args.dry_run and not args.verify:
-            print("DRY-RUN: verification skipped because planned changes were not applied")
+        if args.uninstall:
+            if args.verify:
+                raise RuntimeError("--uninstall and --verify cannot be combined")
+            remove_claude_md_block(state, claude_md_path)
+            if not args.dry_run:
+                verify_claude_removed(state, claude_md_path)
         else:
-            verify(state, config_path, skip_codex=args.skip_codex or args.claude_code)
-            if args.claude_code:
+            if not args.verify:
+                ensure_agent_dir(state, force_agent_link=args.force_agent_link)
+                ensure_user_md(state, args.user_mode)
+                remove_legacy_files(state, args.legacy)
+                update_claude_md(state, claude_md_path)
+                if not args.skip_tools:
+                    configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=False)
+            if args.dry_run and not args.verify:
+                print("DRY-RUN: verification skipped because planned changes were not applied")
+            else:
+                verify(state)
                 verify_claude(state, claude_md_path)
-            if args.verify and not args.skip_tools:
-                configure_tools(
-                    state,
-                    args.tools_install_dir,
-                    args.tools_version,
-                    verify_only=True,
-                )
+                if args.verify and not args.skip_tools:
+                    configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=True)
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

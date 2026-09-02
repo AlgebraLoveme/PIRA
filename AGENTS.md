@@ -63,7 +63,7 @@ Retrieve only the smallest relevant memory when the task depends on it; never pr
 - Compact only clearly stale/redundant material after an end-to-end read and concurrent-change check. Keep the workbook untracked by Git.
 
 ## Module Loading and Routing
-Read on-demand instruction files exactly with an available direct file-reading tool, not through `pira_ctx`; if exact reading is unavailable, ask for PIRA setup rather than bypassing the instruction.
+Read on-demand instruction files exactly with the Read tool, never through `pira_ctx` or another shell command; if exact reading is unavailable, ask for PIRA setup rather than bypassing the instruction.
 
 Load on demand (explicit or inferred):
 - `user_profile`: `~/agent/USER.md` when user background, learning needs, communication preferences, or acting on the user's behalf may materially affect the response. Skip ordinary factual, coding, or research tasks needing no personalization.
@@ -80,7 +80,7 @@ Do not reload unchanged modules already in context unless the user asks or relev
 
 ### Constraints
 - Edit instruction files only on explicit user request.
-- PIRA policy sources are `~/agent/AGENTS.md` and explicitly referenced files unless the user adopts another. Generated `AGENTS.override.md` is setup-only; do not edit it manually.
+- PIRA policy sources are `~/agent/AGENTS.md` and explicitly referenced files unless the user adopts another.
 
 ### Routing
 - Hard single-paper explanation → `paper_reading` + `explain`; polished review/manuscript text from a paper → `paper_reading` + `writing`.
@@ -91,7 +91,7 @@ Do not reload unchanged modules already in context unless the user asks or relev
 
 ## Tool Selection
 - Use the lightest reliable tool first; use deterministic, non-interactive commands when available.
-- Set cwd with the execution tool's working-directory option. If none exists, keep the action inside `pira_ctx` and use the called program's native directory option or a scoped child shell; never issue an unwrapped `cd`.
+- The Bash tool has no working-directory option: pass the program's own directory option, such as `git -C DIR`, or run `(cd DIR && CMD)` in a subshell; never issue a bare `cd` that persists across calls.
 - Repeated/reusable workflow → project script, not one-off shell. After creation, ask whether to standardize; review usability/generality.
 - Extend a compatible existing tool before creating another.
 
@@ -135,7 +135,8 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ### `pira_ctx`: Command Output Manager & Event Recorder
 
 #### Rules
-- Every shell/exec invocation → `pira_ctx`, except PIRA internal-tool invocations. Loading PIRA modules should not use `pira_ctx`.
+- Use `pira_ctx` for a shell command whose output must be retained or retrieved later: long-running work, builds, tests, and other large or evidence-bearing output. Run every other shell command with native Bash so Claude Code permission rules see the actual command. Invoke `pira_dec`, `pira_nav`, and `pira_svg_check` directly, never through `pira_ctx`. Load PIRA modules with Read, never with a shell command.
+- On Windows, invoke PIRA tools from the POSIX Bash tool, not PowerShell; inside `pira_ctx`, express pipelines or compound commands as `bash -c '...'`.
 - Use automatic mode by default. Use `check` when only the immediate status matters, `capture` when retention is mandatory, and `exact` only for necessary original content or interactive terminal I/O.
 - Long-running `check` and `capture` invocations publish a live result ID after a brief debounce. Prefer explicit IDs; `--last` means the latest completed capture in the current workspace.
 - Inspect retained output with `search`, then the smallest useful `range` or `transform`. Use `exec` only for custom analysis and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.

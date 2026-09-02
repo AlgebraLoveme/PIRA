@@ -17,17 +17,19 @@ setup = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
+AGENTS_MD = (SCRIPT.parents[2] / "AGENTS.md").read_text(encoding="utf-8")
+
 
 class SetupPiraClaudeTests(unittest.TestCase):
-    def state(self, root: Path) -> Any:
+    def state(self, root: Path, agent_dir: Path | None = None) -> Any:
         return setup.SetupState(
             repo_root=root,
-            agent_dir=root / "agent",
+            agent_dir=agent_dir or root / "agent",
             dry_run=False,
             yes=True,
         )
 
-    def test_adds_one_agents_import_and_thin_bridge(self) -> None:
+    def test_managed_block_is_only_the_import(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             claude_md = root / ".claude" / "CLAUDE.md"
@@ -36,37 +38,18 @@ class SetupPiraClaudeTests(unittest.TestCase):
             setup.update_claude_md(state, claude_md)
             installed = claude_md.read_text(encoding="utf-8")
 
-            self.assertEqual(
-                installed,
-                setup.claude_managed_block(state.agent_dir) + "\n",
-            )
-            self.assertIn(
-                "@" + setup.claude_import_path(state.agent_dir / "AGENTS.md"),
-                installed,
-            )
-            self.assertEqual(installed.count("@"), 1)
-            self.assertIn("load all required modules exactly with Claude Read", installed)
-            self.assertIn("Do not route PIRA module loading through `pira_ctx`", installed)
-            self.assertIn("use `pira_ctx` only when its output retention", installed)
-            self.assertIn("permission rules can inspect the actual command", installed)
-            self.assertIn("`pira_dec`, `pira_nav`, and `pira_svg_check` directly", installed)
+            self.assertEqual(installed, setup.claude_managed_block(state.agent_dir) + "\n")
+            lines = installed.splitlines()
+            self.assertEqual(lines[0], setup.CLAUDE_BLOCK_START)
+            self.assertEqual(lines[1], "@" + setup.claude_import_path(state.agent_dir / "AGENTS.md"))
+            self.assertEqual(lines[2], setup.CLAUDE_BLOCK_END)
+            self.assertEqual(len(lines), 3)
 
-    def test_canonical_module_loading_matches_bridge(self) -> None:
-        agents = (SCRIPT.parents[2] / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "Read on-demand instruction files exactly with an available direct file-reading tool, "
-            "not through `pira_ctx`",
-            agents,
-        )
-        self.assertIn("Loading PIRA modules should not use `pira_ctx`", agents)
-
-    def test_windows_bridge_line_only_on_windows(self) -> None:
-        with patch.object(setup, "claude_bridge_is_windows", return_value=True):
-            windows_block = setup.claude_managed_block(Path("/tmp/agent"))
-        with patch.object(setup, "claude_bridge_is_windows", return_value=False):
-            posix_block = setup.claude_managed_block(Path("/tmp/agent"))
-        self.assertIn("POSIX Bash tool", windows_block)
-        self.assertNotIn("POSIX Bash tool", posix_block)
+    def test_canonical_policy_states_one_shell_rule(self) -> None:
+        self.assertIn("Run every other shell command with native Bash", AGENTS_MD)
+        self.assertIn("Load PIRA modules with Read, never with a shell command", AGENTS_MD)
+        self.assertNotIn("Every shell/exec invocation", AGENTS_MD)
+        self.assertNotIn("AGENTS.override.md", AGENTS_MD)
 
     def test_preserves_user_content_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -80,44 +63,32 @@ class SetupPiraClaudeTests(unittest.TestCase):
             setup.update_claude_md(state, claude_md)
 
             self.assertEqual(claude_md.read_text(encoding="utf-8"), first)
-            self.assertIn("# My instructions\n\nKeep this.\n", first)
+            self.assertTrue(first.startswith("# My instructions\n\nKeep this.\n"))
             self.assertEqual(first.count(setup.CLAUDE_BLOCK_START), 1)
             self.assertEqual(len(list(root.glob("CLAUDE.md.bak.*"))), 1)
 
-    def test_replaces_only_existing_managed_block(self) -> None:
+    def test_replaces_stale_managed_block_in_place(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             claude_md = root / "CLAUDE.md"
-            claude_md.write_text(
-                "before\n"
-                + setup.CLAUDE_BLOCK_START
-                + "\n@/old/AGENTS.md\n"
+            stale = (
+                setup.CLAUDE_BLOCK_START
+                + "\n@/old/AGENTS.md\n\n## Claude Code bridge\n- old override\n"
                 + setup.CLAUDE_BLOCK_END
-                + "\nafter\n",
-                encoding="utf-8",
             )
+            claude_md.write_text("before\n" + stale + "\nafter\n", encoding="utf-8")
             state = self.state(root)
 
             setup.update_claude_md(state, claude_md)
             updated = claude_md.read_text(encoding="utf-8")
 
-            self.assertTrue(updated.startswith("before\n"))
-            self.assertTrue(updated.endswith("\nafter\n"))
-            self.assertNotIn("@/old/AGENTS.md", updated)
+            self.assertEqual(updated, "before\n" + setup.claude_managed_block(state.agent_dir) + "\nafter\n")
 
-    def test_rejects_unbalanced_or_duplicate_markers(self) -> None:
+    def test_rejects_unbalanced_duplicate_or_reversed_markers(self) -> None:
         cases = [
             setup.CLAUDE_BLOCK_START + "\n",
-            setup.CLAUDE_BLOCK_START
-            + "\n"
-            + setup.CLAUDE_BLOCK_END
-            + "\n"
-            + setup.CLAUDE_BLOCK_START,
-            setup.CLAUDE_BLOCK_END
-            + "\n"
-            + setup.CLAUDE_BLOCK_START
-            + "\n"
-            + setup.CLAUDE_BLOCK_END,
+            setup.CLAUDE_BLOCK_START + "\n" + setup.CLAUDE_BLOCK_END + "\n" + setup.CLAUDE_BLOCK_START,
+            setup.CLAUDE_BLOCK_END + "\n" + setup.CLAUDE_BLOCK_START + "\n" + setup.CLAUDE_BLOCK_END,
             setup.CLAUDE_BLOCK_END + "\n" + setup.CLAUDE_BLOCK_START,
         ]
         for content in cases:
@@ -129,28 +100,81 @@ class SetupPiraClaudeTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "PIRA markers"):
                     setup.update_claude_md(state, claude_md)
+                with self.assertRaisesRegex(RuntimeError, "PIRA markers"):
+                    setup.remove_claude_md_block(state, claude_md)
                 self.assertEqual(claude_md.read_text(encoding="utf-8"), content)
 
-    def test_rejects_non_utf8_content_without_modifying_it(self) -> None:
+    def test_rejects_non_utf8_claude_md(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             claude_md = root / "CLAUDE.md"
-            original = b"\xff\xfe\x00"
-            claude_md.write_bytes(original)
+            claude_md.write_bytes(b"\xff\xfe# not utf-8\n")
             state = self.state(root)
 
             with self.assertRaisesRegex(RuntimeError, "not valid UTF-8"):
                 setup.update_claude_md(state, claude_md)
-            with self.assertRaisesRegex(RuntimeError, "not valid UTF-8"):
-                setup.verify_claude(state, claude_md)
+            self.assertEqual(claude_md.read_bytes(), b"\xff\xfe# not utf-8\n")
 
-            self.assertEqual(claude_md.read_bytes(), original)
-            self.assertEqual(list(root.glob("CLAUDE.md.bak.*")), [])
+    def test_rejects_whitespace_in_agent_dir_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_md = root / "CLAUDE.md"
+            state = self.state(root, agent_dir=root / "my agent")
 
-    def test_cli_installs_only_the_managed_bridge(self) -> None:
+            with self.assertRaisesRegex(RuntimeError, "whitespace"):
+                setup.update_claude_md(state, claude_md)
+            self.assertFalse(claude_md.exists())
+
+    def test_verify_fails_for_whitespace_agent_dir_and_wrong_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_md = root / "CLAUDE.md"
+            good = self.state(root)
+            setup.update_claude_md(good, claude_md)
+
+            spaced = self.state(root, agent_dir=root / "my agent")
+            with redirect_stdout(io.StringIO()):
+                setup.verify_claude(spaced, claude_md)
+            self.assertEqual([passed for _, passed, _ in spaced.verification], [False])
+
+            other = self.state(root, agent_dir=root / "elsewhere")
+            with redirect_stdout(io.StringIO()):
+                setup.verify_claude(other, claude_md)
+            self.assertEqual([passed for _, passed, _ in other.verification], [False])
+
+    def test_uninstall_removes_only_the_managed_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_md = root / "CLAUDE.md"
+            claude_md.write_text("# Mine\n", encoding="utf-8")
+            state = self.state(root)
+            setup.update_claude_md(state, claude_md)
+
+            setup.remove_claude_md_block(state, claude_md)
+
+            self.assertEqual(claude_md.read_text(encoding="utf-8"), "# Mine\n")
+            self.assertEqual(len(list(root.glob("CLAUDE.md.bak.*"))), 2)
+            with redirect_stdout(io.StringIO()):
+                setup.remove_claude_md_block(state, claude_md)
+            self.assertEqual(claude_md.read_text(encoding="utf-8"), "# Mine\n")
+
+    def test_uninstall_deletes_file_that_held_only_the_block(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            claude_md = root / "CLAUDE.md"
+            state = self.state(root)
+            setup.update_claude_md(state, claude_md)
+
+            setup.remove_claude_md_block(state, claude_md)
+
+            self.assertFalse(claude_md.exists())
+            self.assertEqual(len(list(root.glob("CLAUDE.md.bak.*"))), 1)
+
+    def test_cli_installs_the_import_and_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             claude_md = Path(temporary) / ".claude" / "CLAUDE.md"
             agent_dir = Path(temporary) / "agent"
+            common = ["--agent-dir", str(agent_dir), "--claude-md", str(claude_md), "--skip-tools"]
             with (
                 patch.object(setup, "ensure_agent_dir"),
                 patch.object(setup, "ensure_user_md"),
@@ -158,46 +182,24 @@ class SetupPiraClaudeTests(unittest.TestCase):
                 patch.object(setup, "verify"),
                 redirect_stdout(io.StringIO()),
             ):
-                result = setup.main(
-                    [
-                        "--claude-code",
-                        "--agent-dir",
-                        str(agent_dir),
-                        "--claude-md",
-                        str(claude_md),
-                        "--yes",
-                        "--skip-tools",
-                        "--user-mode",
-                        "keep",
-                        "--legacy",
-                        "keep",
-                    ]
-                )
+                installed = setup.main([*common, "--yes", "--user-mode", "keep", "--legacy", "keep"])
+                verified = setup.main([*common, "--verify"])
+                removed = setup.main([*common, "--uninstall"])
 
-            self.assertEqual(result, 0)
-            self.assertEqual(
-                claude_md.read_text(encoding="utf-8"),
-                setup.claude_managed_block(agent_dir) + "\n",
-            )
+            self.assertEqual((installed, verified, removed), (0, 0, 0))
+            self.assertFalse(claude_md.exists())
 
-    def test_cli_rejects_codex_only_modes_before_writing(self) -> None:
-        cases = [["--execution-mode", "safe"], ["--audio", "yes"]]
-        for extra_args in cases:
-            with self.subTest(extra_args=extra_args), tempfile.TemporaryDirectory() as temporary:
-                claude_md = Path(temporary) / "CLAUDE.md"
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    result = setup.main(
-                        [
-                            "--claude-code",
-                            "--claude-md",
-                            str(claude_md),
-                            "--skip-tools",
-                            *extra_args,
-                        ]
-                    )
+    def test_prompt_uses_default_when_stdin_closes(self) -> None:
+        with patch("builtins.input", side_effect=EOFError), redirect_stdout(io.StringIO()):
+            self.assertTrue(setup.prompt_yes_no("Continue?", default=True))
+            self.assertFalse(setup.prompt_yes_no("Continue?", default=False))
 
-                self.assertEqual(result, 1)
-                self.assertFalse(claude_md.exists())
+    def test_cli_rejects_codex_only_options(self) -> None:
+        for extra_args in (["--execution-mode", "safe"], ["--audio", "yes"], ["--codex-config", "x"], ["--claude-code"]):
+            with self.subTest(extra_args=extra_args), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    setup.main(["--skip-tools", *extra_args])
+                self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
