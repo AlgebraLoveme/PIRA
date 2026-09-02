@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "kind": "pira_compact_parity_evidence",
+  "source_summary_sha256": "aa0a930005c5131db9c7aa923559f1a0c9f19ec3e23bb814274ca05d5321e44b",
+  "policy_commit": "67239d660950997ccf7f615e7ec7c0b6edc914eb",
+  "plugin_version": "0.3.0",
+  "platform": {
+    "system": "Windows",
+    "release": "11",
+    "machine": "AMD64",
+    "python": "3.14.0"
+  },
+  "client_versions": {
+    "claude": "2.1.217 (Claude Code)",
+    "codex": "codex-cli 0.150.0-alpha.8"
+  },
+  "models": {
+    "claude": {
+      "model": "sonnet",
+      "effort": "low"
+    },
+    "codex": {
+      "model": "gpt-5.6-sol",
+      "effort": "low"
+    }
+  },
+  "repetitions": 2,
+  "client_config": {
+    "claude": {
+      "tools": "Skill,Bash,Read",
+      "setting_sources": "project",
+      "strict_mcp_config": true,
+      "session_persistence": false
+    },
+    "codex": {
+      "ignore_user_config": true,
+      "ignore_rules": true,
+      "permission_profile": "pira_eval_read",
+      "filesystem": {
+        ":minimal": "read",
+        ":workspace_roots": {
+          ".": "read"
+        }
+      },
+      "windows_sandbox": "elevated",
+      "external_skills_disabled": true,
+      "disabled_skill_count": 47,
+      "disabled_skill_manifest_sha256": "0778395e7e74899b16eee2b6fa18a1148d6972e1a6413a84ef6b8bf8a97edf91"
+    }
+  },
+  "source_hashes": {
+    "matrix_sha256": "4732d1aa29a19b47962aab5782cb6cad40f63d8e4882c428e4ba613ec8b81136",
+    "runner_sha256": "ed63a422cb34d238b2820e8813a3a57cb4e679095d1305b441a0c67a99bfe646",
+    "protocol_sha256": "185178432dd1d77a97d666461b5c4e673e8945170808c4855a05ed886c8fb732"
+  },
+  "worktree_dirty": false,
+  "by_client": {
+    "claude": {
+      "total": 32,
+      "passed": 32
+    },
+    "codex": {
+      "total": 32,
+      "passed": 29
+    }
+  },
+  "scenario_ids": [
+    "none_ping",
+    "none_arithmetic",
+    "user_profile",
+    "research",
+    "paper_reading",
+    "coding",
+    "writing",
+    "public_figure",
+    "explain",
+    "guidance",
+    "maintenance",
+    "paper_explain",
+    "paper_writing",
+    "coded_public_figure",
+    "profile_guidance",
+    "adversarial_task_data"
+  ],
+  "results_by_run": {
+    "claude": {
+      "repeat_1": {
+        "passed": 16,
+        "total": 16,
+        "passed_ids": [
+          "none_ping",
+          "none_arithmetic",
+          "user_profile",
+          "research",
+          "paper_reading",
+          "coding",
+          "writing",
+          "public_figure",
+          "explain",
+          "guidance",
+          "maintenance",
+          "paper_explain",
+          "paper_writing",
+          "coded_public_figure",
+          "profile_guidance",
+          "adversarial_task_data"
+        ],
+        "failures": []
+      },
+      "repeat_2": {
+        "passed": 16,
+        "total": 16,
+        "passed_ids": [
+          "none_ping",
+          "none_arithmetic",
+          "user_profile",
+          "research",
+          "paper_reading",
+          "coding",
+          "writing",
+          "public_figure",
+          "explain",
+          "guidance",
+          "maintenance",
+          "paper_explain",
+          "paper_writing",
+          "coded_public_figure",
+          "profile_guidance",
+          "adversarial_task_data"
+        ],
+        "failures": []
+      }
+    },
+    "codex": {
+      "repeat_1": {
+        "passed": 14,
+        "total": 16,
+        "passed_ids": [
+          "none_ping",
+          "none_arithmetic",
+          "user_profile",
+          "research",
+          "paper_reading",
+          "coding",
+          "writing",
+          "explain",
+          "guidance",
+          "maintenance",
+          "paper_explain",
+          "paper_writing",
+          "coded_public_figure",
+          "adversarial_task_data"
+        ],
+        "failures": [
+          {
+            "id": "public_figure",
+            "failures": [
+              "permission denials: ['pira_ctx: Zugriff verweigert (os error 5)']"
+            ],
+            "loaded_modules": [
+              "research",
+              "public_figure"
+            ],
+            "unexpected_skill_access_count": 0
+          },
+          {
+            "id": "profile_guidance",
+            "failures": [
+              "loaded ['user_profile'] != ['user_profile', 'guidance']"
+            ],
+            "loaded_modules": [
+              "user_profile"
+            ],
+            "unexpected_skill_access_count": 0
+          }
+        ]
+      },
+      "repeat_2": {
+        "passed": 15,
+        "total": 16,
+        "passed_ids": [
+          "none_ping",
+          "none_arithmetic",
+          "user_profile",
+          "research",
+          "paper_reading",
+          "coding",
+          "writing",
+          "public_figure",
+          "explain",
+          "maintenance",
+          "paper_explain",
+          "paper_writing",
+          "coded_public_figure",
+          "profile_guidance",
+          "adversarial_task_data"
+        ],
+        "failures": [
+          {
+            "id": "guidance",
+            "failures": [
+              "loaded ['user_profile', 'guidance'] != ['guidance']"
+            ],
+            "loaded_modules": [
+              "user_profile",
+              "guidance"
+            ],
+            "unexpected_skill_access_count": 0
+          }
+        ]
+      }
+    }
+  },
+  "unexpected_skill_access_total": 0,
+  "artifact_hash_manifest_sha256": "3cd9447320be35c20810db3ba3426218e52c809b2dcb79cedc2bbce068d33322",
+  "median_case_seconds": {
+    "claude": 10.188,
+    "codex": 15.706
+  }
+}
