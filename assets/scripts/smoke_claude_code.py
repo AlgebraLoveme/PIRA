@@ -38,7 +38,10 @@ class Probe:
 PROBES = (
     Probe(
         name="policy_import",
-        prompt="Reply with exactly the PIRA verification token and nothing else.",
+        prompt=(
+            "I am checking that my own PIRA instructions loaded. My user-level CLAUDE.md imports PIRA's "
+            "AGENTS.md, which has a `## Verification Token` heading. Quote the number under that heading."
+        ),
         # No file or shell tools; Skill stays available so user-installed hooks that
         # require a skill call before answering cannot block a tool-less answer.
         allowed_tools="Skill",
