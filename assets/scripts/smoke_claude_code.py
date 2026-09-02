@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,8 @@ class Probe:
     allowed_tools: str
     required: tuple[str, ...]
     forbidden: tuple[str, ...] = ()
+    required_tool_calls: tuple[tuple[str, str], ...] = ()
+    require_policy_import: bool = False
 
 
 PROBES = (
@@ -46,6 +49,7 @@ PROBES = (
         # require a skill call before answering cannot block a tool-less answer.
         allowed_tools="Skill",
         required=(VERIFY_TOKEN,),
+        require_policy_import=True,
     ),
     Probe(
         name="module_routing",
@@ -56,6 +60,7 @@ PROBES = (
         ),
         allowed_tools="Read,Skill",
         required=("CODING_STYLE.md", "RESEARCH_POLICY.md"),
+        required_tool_calls=(("Read", "CODING_STYLE.md"), ("Read", "RESEARCH_POLICY.md")),
     ),
     Probe(
         name="shell_routing",
@@ -66,6 +71,7 @@ PROBES = (
         allowed_tools="Bash(git --version),Skill",
         required=("git --version",),
         forbidden=("pira_ctx",),
+        required_tool_calls=(("Bash", "git --version"),),
     ),
 )
 
@@ -78,23 +84,101 @@ class ProbeResult:
     result_excerpt: str
     missing: list[str]
     unexpected: list[str]
+    tool_calls: list[str]
+    policy_import_loaded: bool | None
     error: str | None = None
 
 
-def evaluate(probe: Probe, result_text: str) -> tuple[list[str], list[str]]:
-    """Return (missing required phrases, present forbidden phrases)."""
+def tool_call_text(name: str, tool_input: object) -> str:
+    return f"{name} {json.dumps(tool_input, sort_keys=True, ensure_ascii=False)}"
+
+
+def evaluate(probe: Probe, result_text: str, tool_calls: list[str]) -> tuple[list[str], list[str]]:
+    """Return missing requirements and forbidden phrases found in output or tool calls."""
     missing = [phrase for phrase in probe.required if phrase not in result_text]
-    unexpected = [phrase for phrase in probe.forbidden if phrase in result_text]
+    for tool_name, phrase in probe.required_tool_calls:
+        if not any(call.startswith(f"{tool_name} ") and phrase in call for call in tool_calls):
+            missing.append(f"{tool_name} call containing {phrase!r}")
+    observed = "\n".join((result_text, *tool_calls))
+    unexpected = [phrase for phrase in probe.forbidden if phrase in observed]
     return missing, unexpected
 
 
-def parse_claude_json(stdout: str) -> str:
-    """Extract the final assistant text from ``claude -p --output-format json`` output."""
-    payload = json.loads(stdout)
-    if isinstance(payload, list):
-        payload = next((item for item in reversed(payload) if isinstance(item, dict) and "result" in item), {})
-    result = payload.get("result", "")
-    return result if isinstance(result, str) else json.dumps(result)
+def parse_claude_stream(stdout: str) -> tuple[str, list[str]]:
+    """Extract the final result and actual tool calls from verbose stream JSON."""
+    result_text = ""
+    tool_calls: list[str] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if payload.get("type") == "result":
+            result = payload.get("result", "")
+            result_text = result if isinstance(result, str) else json.dumps(result)
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            continue
+        for block in message.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_calls.append(tool_call_text(str(block.get("name", "")), block.get("input", {})))
+    return result_text, tool_calls
+
+
+def write_instruction_hook(workdir: Path, log_path: Path) -> Path:
+    """Create a session-only hook that records instruction-load events in the smoke directory."""
+    helper = workdir / "record_instruction.py"
+    helper.write_text(
+        "import json, pathlib, sys\n"
+        "event = json.load(sys.stdin)\n"
+        "with pathlib.Path(sys.argv[1]).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(json.dumps(event) + '\\n')\n",
+        encoding="utf-8",
+    )
+    command = " ".join(
+        shlex.quote(Path(value).as_posix()) for value in (sys.executable, helper, log_path)
+    )
+    settings = workdir / "smoke-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "InstructionsLoaded": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": command}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return settings
+
+
+def read_instruction_events(log_path: Path, wait_seconds: float = 2.0) -> list[dict[str, object]]:
+    """Read hook events, briefly allowing for the asynchronous InstructionsLoaded hook."""
+    deadline = time.monotonic() + wait_seconds
+    while not log_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not log_path.exists():
+        return []
+    events: list[dict[str, object]] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
+
+
+def instruction_was_loaded(events: list[dict[str, object]], expected_path: Path) -> bool:
+    expected = os.path.normcase(str(expected_path.resolve(strict=False)))
+    return any(
+        event.get("hook_event_name") == "InstructionsLoaded"
+        and event.get("load_reason") == "include"
+        and os.path.normcase(str(Path(str(event.get("file_path", ""))).resolve(strict=False))) == expected
+        for event in events
+    )
 
 
 def command_output(command: list[str], cwd: Path | None = None) -> str:
@@ -102,18 +186,30 @@ def command_output(command: list[str], cwd: Path | None = None) -> str:
     return completed.stdout.strip()
 
 
-def run_probe(claude: str, probe: Probe, model: str, timeout: int, workdir: Path) -> ProbeResult:
+def run_probe(
+    claude: str,
+    probe: Probe,
+    model: str,
+    timeout: int,
+    workdir: Path,
+    settings_path: Path,
+    instruction_log: Path,
+    policy_path: Path,
+) -> ProbeResult:
     command = [
         claude,
         "-p",
         probe.prompt,
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--model",
         model,
         "--max-turns",
         "8",
         "--no-session-persistence",
+        "--settings",
+        str(settings_path),
     ]
     command.extend(["--allowedTools", probe.allowed_tools])
     started = time.monotonic()
@@ -128,17 +224,29 @@ def run_probe(claude: str, probe: Probe, model: str, timeout: int, workdir: Path
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return ProbeResult(probe.name, False, time.monotonic() - started, "", list(probe.required), [], "timeout")
+        return ProbeResult(probe.name, False, time.monotonic() - started, "", list(probe.required), [], [], None, "timeout")
     seconds = time.monotonic() - started
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-400:]
-        return ProbeResult(probe.name, False, seconds, detail, list(probe.required), [], f"claude exited {completed.returncode}")
+        return ProbeResult(probe.name, False, seconds, detail, list(probe.required), [], [], None, f"claude exited {completed.returncode}")
     try:
-        result_text = parse_claude_json(completed.stdout)
+        result_text, tool_calls = parse_claude_stream(completed.stdout)
     except (json.JSONDecodeError, AttributeError) as exc:
-        return ProbeResult(probe.name, False, seconds, completed.stdout[-400:], list(probe.required), [], f"unparseable output: {exc}")
-    missing, unexpected = evaluate(probe, result_text)
-    return ProbeResult(probe.name, not missing and not unexpected, seconds, result_text[:400], missing, unexpected)
+        return ProbeResult(probe.name, False, seconds, completed.stdout[-400:], list(probe.required), [], [], None, f"unparseable output: {exc}")
+    missing, unexpected = evaluate(probe, result_text, tool_calls)
+    policy_loaded = instruction_was_loaded(read_instruction_events(instruction_log), policy_path)
+    if probe.require_policy_import and not policy_loaded:
+        missing.append(f"InstructionsLoaded include event for {policy_path}")
+    return ProbeResult(
+        probe.name,
+        not missing and not unexpected,
+        seconds,
+        result_text[:400],
+        missing,
+        unexpected,
+        tool_calls,
+        policy_loaded if probe.require_policy_import else None,
+    )
 
 
 def policy_commit(agent_dir: Path) -> str | None:
@@ -181,8 +289,19 @@ def main(argv: list[str] | None = None) -> int:
     results: list[ProbeResult] = []
     with tempfile.TemporaryDirectory(prefix="pira_smoke_") as temporary:
         workdir = Path(temporary)
+        instruction_log = workdir / "instructions.jsonl"
+        settings_path = write_instruction_hook(workdir, instruction_log)
         for probe in selected:
-            result = run_probe(claude, probe, args.model, args.timeout, workdir)
+            result = run_probe(
+                claude,
+                probe,
+                args.model,
+                args.timeout,
+                workdir,
+                settings_path,
+                instruction_log,
+                agent_dir / "AGENTS.md",
+            )
             results.append(result)
             status = "PASS" if result.passed else "FAIL"
             detail = result.error or (f"missing={result.missing} unexpected={result.unexpected}" if not result.passed else "")

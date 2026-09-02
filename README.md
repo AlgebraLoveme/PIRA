@@ -105,7 +105,7 @@ Uninstall backs up `~/.claude/CLAUDE.md`, removes only the PIRA block, and leave
 
 ### Smoke test the installed bridge
 
-`assets/scripts/smoke_claude_code.py` runs three short non-interactive `claude -p` sessions against your real configuration and checks that the verification token is in context, that a coding request loads `CODING_STYLE.md` and `RESEARCH_POLICY.md`, and that an ordinary command runs through native Bash rather than `pira_ctx`. It records the Claude Code version and the policy commit, costs a few model calls, and is not part of setup:
+`assets/scripts/smoke_claude_code.py` runs three short non-interactive `claude -p` sessions against your real configuration. A temporary session-only `InstructionsLoaded` hook verifies that the imported `AGENTS.md` entered context, which is the programmatic counterpart of inspecting `/context` or `/memory`. Verbose stream events then confirm actual Read calls for `CODING_STYLE.md` and `RESEARCH_POLICY.md` and an actual native Bash call for `git --version`, rather than trusting the model's final-text claim. The script records the Claude Code version, policy commit, and observed tool calls; its hook and logs exist only in a system temporary directory. It costs a few model calls and is not part of setup:
 
 ```bash
 python3 assets/scripts/smoke_claude_code.py --report smoke.json
