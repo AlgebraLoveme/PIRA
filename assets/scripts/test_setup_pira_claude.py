@@ -21,6 +21,7 @@ sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
 AGENTS_MD = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+README_MD = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
 
 class SetupPiraClaudeTests(unittest.TestCase):
@@ -58,6 +59,17 @@ class SetupPiraClaudeTests(unittest.TestCase):
         self.assertNotIn("~/agent", AGENTS_MD)
         self.assertNotIn("Every shell/exec invocation", AGENTS_MD)
         self.assertNotIn("AGENTS.override.md", AGENTS_MD)
+
+    def test_readme_defines_agent_managed_installation_and_all_layouts(self) -> None:
+        self.assertIn("agent-managed operation", README_MD)
+        self.assertIn("Install PIRA for Claude", README_MD)
+        self.assertIn("PIRA + Codex only", README_MD)
+        self.assertIn("PIRA + Claude only", README_MD)
+        self.assertIn("Both clients", README_MD)
+        self.assertIn("Separate `USER.md` files by default", README_MD)
+        self.assertIn("one-time copy from Codex", README_MD)
+        self.assertIn("compares the two SHA-256 hashes", README_MD)
+        self.assertIn("must stop and ask rather than overwrite it", README_MD)
 
     def test_install_uninstall_preserves_user_bytes_exactly(self) -> None:
         contents = ["# Mine", "# Mine\n", "# Mine\n\n\n", "before\nafter\n"]

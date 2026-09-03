@@ -24,68 +24,65 @@ PIRA follows five principles:
 
 PIRA's policy and tools were tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort** on the `master` branch. This `claude` branch adapts the same policy and the same tools to **Claude Code**. The adaptation is experimental: its installer is unit-tested and exercised end to end on Windows, and it has not received the same level of behavioral testing as the Codex setup.
 
-## Quick start
+## Install PIRA
 
-Claude Code receives a validated policy snapshot under `~/.claude/pira`; the source repository may be cloned anywhere. Codex can therefore keep its independent `~/agent` checkout on `master`, while both clients share the same released native tools from `PATH`.
+PIRA installation is an **agent-managed operation**. The normal user-facing entry point is a request such as:
 
-Setup is safe to rerun. It preserves `~/.claude/pira/USER.md`, backs up `~/.claude/CLAUDE.md` before changing it, and can preview, verify, or uninstall only the files recorded in its manifest. Git is required. The setup wrapper checks for Python and can offer platform-specific installation help.
+> Install PIRA for Claude. Inspect the current setup first, preserve my files, show the commands you run, and verify the result.
 
-### Recommended install or update
+Tell the agent whether the machine should support Codex only, Claude only, or both. The agent—not the user—should inspect existing paths, obtain the correct branch, run the appropriate setup script, and diagnose any failure. It must not silently switch a dirty checkout or replace a non-Git path.
 
-The commands below use a dedicated source checkout and refuse to run its installer from any branch except `claude` or from a dirty worktree. They never switch a checkout automatically.
+### Supported machine layouts
 
-macOS/Linux:
+#### 1. PIRA + Codex only
 
-```bash
-src="$HOME/pira-claude-source"
-if [ -e "$src" ]; then
-  git -C "$src" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Refusing to replace existing non-Git path: $src" >&2; exit 1; }
-  branch=$(git -C "$src" branch --show-current)
-  [ "$branch" = claude ] || { echo "Refusing to update: $src is on '$branch', not 'claude'." >&2; exit 1; }
-  git -C "$src" pull --ff-only
-else
-  git clone --branch claude --single-branch https://github.com/AlgebraLoveme/PIRA.git "$src"
-fi
-"$src/assets/scripts/setup_pira.sh" --expected-source-branch claude --yes --user-mode placeholder
-```
+- Keep a clean `master` checkout at `~/agent`.
+- Run the Codex installer from that `master` checkout and verify it.
+- Do not run the Claude installer and do not create `~/.claude/pira`.
 
-Windows PowerShell:
+The underlying entry points are `~/agent/assets/scripts/setup_pira.sh` on macOS/Linux and `~/agent/assets/scripts/setup_pira.ps1` on Windows. Their `--dry-run` and `--verify` modes let the agent preview and verify the Codex installation.
 
-```powershell
-$src = Join-Path $HOME "pira-claude-source"
-if (Test-Path $src) {
-    git -C $src rev-parse --is-inside-work-tree *> $null
-    if ($LASTEXITCODE -ne 0) { throw "Refusing to replace existing non-Git path: $src" }
-    $branch = (git -C $src branch --show-current).Trim()
-    if ($branch -ne "claude") { throw "Refusing to update: $src is on '$branch', not 'claude'." }
-    git -C $src pull --ff-only
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} else {
-    git clone --branch claude --single-branch https://github.com/AlgebraLoveme/PIRA.git $src
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
-powershell.exe -ExecutionPolicy Bypass -File "$src\assets\scripts\setup_pira.ps1" --expected-source-branch claude --yes --user-mode placeholder
-```
+#### 2. PIRA + Claude only
 
-`git pull --ff-only` refuses to invent a merge when the source checkout has local or divergent work. Setup does not change Claude Code permission settings.
+- Obtain a clean `claude` branch in any source directory; `~/pira-claude-source` is only a convenient example.
+- Run that branch's Claude-specific installer with `--expected-source-branch claude`.
+- Install the validated policy snapshot into `~/.claude/pira`, manage the marked import in `~/.claude/CLAUDE.md`, and install or verify the shared native tools.
+- The source checkout is not the runtime policy and may be moved or removed after a successful installation.
 
-### Inspect-first install
+#### 3. Both clients
 
-Clone the `claude` branch into any directory if you prefer to inspect it first:
+- Keep the Codex `master` checkout independently at `~/agent` and use its Codex installer.
+- Obtain the `claude` branch elsewhere and use its Claude installer to populate `~/.claude/pira`.
+- Never update one client by switching the other client's checkout to a different branch.
+- Install the native tools once. Both clients use the same verified executables from `PATH`; after one installer has installed or refreshed them, the other may use `--skip-tools`.
+
+### Agent execution and verification
+
+For Claude installation, the agent first verifies that its chosen source is a clean Git checkout on `claude`, updating it only by an explicit fast-forward or obtaining a fresh `claude` checkout. It then runs these branch-specific stages from that source directory:
 
 ```bash
-git clone --branch claude --single-branch https://github.com/AlgebraLoveme/PIRA.git pira-claude-source
-cd pira-claude-source
 assets/scripts/setup_pira.sh --expected-source-branch claude --dry-run
-assets/scripts/setup_pira.sh --expected-source-branch claude
+assets/scripts/setup_pira.sh --expected-source-branch claude --yes --user-mode placeholder
 assets/scripts/setup_pira.sh --expected-source-branch claude --verify
 ```
 
-On Windows, invoke the same setup through `assets/scripts/setup_pira.ps1` from the repository directory:
+On Windows the same stages use the PowerShell wrapper, which forwards the same options:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --dry-run
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --yes --user-mode placeholder
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --verify
 ```
+
+These are the underlying auditable steps for the agent, not a requirement that the user manually paste clone or update programs. `git pull --ff-only` is acceptable only after the agent has confirmed the intended branch and a clean worktree. Setup does not change Claude Code permission settings.
+
+### Separate `USER.md` files by default
+
+Codex owns `~/agent/USER.md`; Claude owns `~/.claude/pira/USER.md`. They are separate by default so neither client depends on the other client's checkout or later edits. A normal Claude installation uses `--user-mode placeholder` when its file is missing and always preserves an existing Claude profile.
+
+If the user explicitly asks for a one-time copy from Codex, the agent instead uses `--user-mode keep`, confirms that `~/agent/USER.md` is a regular UTF-8 file and that `~/.claude/pira/USER.md` does not already exist, copies the bytes once, and compares the two SHA-256 hashes. If the Claude destination already exists, the agent must stop and ask rather than overwrite it. The files are not linked or automatically synchronized; future changes remain independent. Run the Claude installer with `--verify` after the copy.
+
+Setup is safe to rerun. It preserves `~/.claude/pira/USER.md`, backs up `~/.claude/CLAUDE.md` before changing it, and can preview, verify, or uninstall only the files recorded in its manifest. Git is required. The setup wrapper checks for Python and can offer platform-specific installation help.
 
 ### How the Claude Code bridge works
 
