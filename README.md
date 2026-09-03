@@ -24,7 +24,9 @@ PIRA follows five principles:
 
 PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort**. Other models or agent platforms may work, but have not received the same level of testing.
 
-## Quick start
+> **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. The instructions below install PIRA for Codex from `master`.
+
+## Quick start with Codex
 
 PIRA installs to `~/agent` by default. You can use the one-line command for the easiest setup, or the inspect-first path if you want to review every change before it happens.
 
