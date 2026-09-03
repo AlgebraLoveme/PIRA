@@ -41,6 +41,8 @@ Run the deterministic checks with:
 
 ```text
 python claude/pira-routing-guard/tests/test_pira_routing_guard.py
+python claude/pira-routing-guard/tests/test_routing_launcher.py
+python claude/pira-routing-guard/tests/test_marketplace_installation.py
 python claude/pira-routing-guard/evaluation/test_run_matrix.py
 python claude/pira-routing-guard/evaluation/test_run_continuity.py
 python claude/pira-routing-guard/evaluation/test_run_parity.py

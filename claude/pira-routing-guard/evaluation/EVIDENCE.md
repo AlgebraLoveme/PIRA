@@ -1,43 +1,62 @@
-# Claude Code routing-guard parity evidence
+# Claude Code routing-guard evidence
 
 ## Decision and exact claim
 
-The current evidence supports a **scoped PIRA contract-parity claim**:
+The current evidence supports a **scoped reliability and PIRA contract-parity
+claim**:
 
 > On the preregistered 16-case top-level routing suite, repeated twice on native
-> Windows, PIRA's Claude Code routing guard satisfied the same canonical module
-> selection, dependency, ordering, continuity, and permission-boundary contract
-> used by the Codex integration.
+> Windows, guarded Claude Code satisfied the canonical PIRA module-selection,
+> dependency, and pre-work ordering contract in 32/32 cases, versus 5/32 for the
+> same Claude Code model and policy without the guard. Continuity, installed-policy,
+> subagent, failure-recovery, and permission-boundary checks also passed.
 
 This means the Claude bridge is ready for an independently reviewable PR at the
 personal-daily-use target. It does not mean that Claude Code and Codex are identical
-products, that their models always choose identical routes, or that untested native
+products, that every prompt benefits by the same amount, or that untested native
 platforms have been validated.
 
-## Frozen paired result
+## Frozen Claude A/B result
 
-- Runtime/policy commit: `67239d660950997ccf7f615e7ec7c0b6edc914eb`
-- Plugin: `pira-routing-guard` `0.3.0`
+- Runtime/policy commit: `deb449567a929248b15f79cae0c733fa6b00bf6e`
+- Plugin: `pira-routing-guard` `0.4.0`
 - Platform: native Windows 11 AMD64
-- Clients: Claude Code `2.1.217`; Codex CLI `0.150.0-alpha.8`
-- Models: Claude `sonnet` alias (resolved to `claude-sonnet-5`); Codex
-  `gpt-5.6-sol`; both at low effort
+- Client: Claude Code `2.1.217`, `sonnet` alias (resolved to `claude-sonnet-5`),
+  low effort
 - Machine-readable committed result:
-  [`results/windows-67239d6-compact.json`](results/windows-67239d6-compact.json)
+  [`results/windows-deb4495-claude-ab-compact.json`](results/windows-deb4495-claude-ab-compact.json)
 - Full generated summary SHA-256:
-  `aa0a930005c5131db9c7aa923559f1a0c9f19ec3e23bb814274ca05d5321e44b`;
+  `58e4860fbdba5191bd7c7f2d4bb10354d7b026cd23f08b8e77e6e161cc96fa45`;
   it passed `parity-summary.schema.json` validation before privacy-preserving
   compaction for Git
 - Worktree at run time: clean
 
-| Client | Repetition 1 | Repetition 2 | Combined | Median case time |
+| Mode | Repetition 1 | Repetition 2 | Combined | Median case time |
 |---|---:|---:|---:|---:|
-| Claude Code | 16/16 | 16/16 | **32/32** | 10.188 s |
-| Codex control | 14/16 | 15/16 | **29/32** | 15.706 s |
+| Claude policy only | 2/16 | 3/16 | **5/32** | 7.032 s |
+| Claude + routing guard | 16/16 | 16/16 | **32/32** | 9.816 s |
 
-The canonical PIRA policy was the oracle; Codex was a descriptive control rather
-than a source of labels. Claude therefore passed the preregistered exact routing
-gate. The observed Codex differences are retained rather than normalized away:
+Both modes used the same executable, model, effort, prompt matrix, synthetic policy,
+and task artifacts. The policy-only mode omitted the plugin and exposed only native
+`Read` and `Bash`; the guarded mode added the route Skill and its narrowly allowed
+loader. In the 27 policy-only failures, 25 loaded no required module and two loaded
+only a partial dependency set. The only policy-only module-required pass was
+`profile_guidance` in repetition 2; the four remaining passes were the two `none`
+cases in both repetitions.
+
+The result supports an incremental reliability claim for this frozen suite. It does
+not isolate whether every gain comes from enforcement, the explicit routing prompt,
+or their interaction, and the roughly 2.8-second median difference is descriptive,
+not a general performance estimate.
+
+## Earlier Codex descriptive control
+
+The earlier frozen result at runtime commit `67239d6` remains committed as
+[`results/windows-67239d6-compact.json`](results/windows-67239d6-compact.json).
+With the same 16-case matrix repeated twice, guarded Claude passed 32/32 and the
+isolated Codex control passed 29/32. It was not rerun for plugin `0.4.0`, so it is
+historical cross-client context rather than the current A/B result. Its observed
+Codex differences are retained rather than normalized away:
 
 1. `public_figure`, repetition 1: the correct `research + public_figure` route and
    task result completed, but an initial `pira_ctx` call was denied by the read-only
@@ -47,10 +66,9 @@ gate. The observed Codex differences are retained rather than normalized away:
 3. `guidance`, repetition 2: Codex loaded the expected `guidance` plus an unrelated
    `user_profile` module.
 
-These three observations prevent a claim of identical per-run model choices. They
-do not weaken the narrower finding that the Claude bridge met the canonical contract
-on every preregistered case. The sample is not large enough to claim model
-superiority.
+These observations prevent a claim of identical per-run model choices. They do not
+weaken the narrower finding that the Claude bridge met the canonical contract on
+every preregistered case. The sample is not large enough to claim model superiority.
 
 ## Control-isolation correction
 
@@ -73,8 +91,8 @@ configuration-precedence mechanisms:
 
 ## Continuity and compaction
 
-At evaluation-only commit `ca73997`, with no routing-runtime change after the frozen
-paired run, two independent persisted Sonnet sessions each passed:
+At frozen runtime commit `deb4495`, two independent persisted Sonnet sessions each
+passed:
 
 1. initial `coding` route: `research + coding`;
 2. resumed follow-up `writing` route: `research + writing`;
@@ -84,16 +102,16 @@ paired run, two independent persisted Sonnet sessions each passed:
 
 | Run | Summary SHA-256 | Compact-stream SHA-256 | Post-compact turn SHA-256 |
 |---|---|---|---|
-| 1 | `cc8798e6f3d448167d269bfacf185b8ef915588a5dfba5bdac0f6f4828fa95f3` | `b1b3f251dfaa0149d977a9c40f82693c4912426f045917c3a5e360cd4b9e4eda` | `80905fdcc8a9e6e7e77999ae2beff5303ccb44bcb8f1cdb18fd9ce81a798deb0` |
-| 2 | `5260e62de093d6ff69ed74430d6c8079b4516d22e379722364c4662b34d0b472` | `6877261ae2bbcf5c2b1f32ed22ada4b5a9236c11034a9fac4f186dcdef8184bd` | `d44abda6c9090d85eac0e1778a182053630c8f74519ac36fdd1e7e5d564fb04b` |
+| 1 | `92af0252ae8876599a0dc67438b6b453e51bfb3ad853508961132f01fc1ede99` | `e22e12196eb757b53f1741900e0187a20df72d53c9ba0bc1941f5c3bdc8e6323` | `06ec21c5a1a3ba3fa88580e925d09cf07b83b2e3e3cd402caebc806f70052230` |
+| 2 | `b87fefdcba543e18b08b4a9dd42f4a8b0877d6443e9c651dfdf1b6a9c698faa5` | `8aae74a863b5e478a6770e2c0ce9aa0f5a6e95b8c0aa8c7bf49ea4793c8998a7` | `6b82978f574945ce2c8792f81ee8ce0a5c7d37e9918e90397adbe2effcb36924` |
 
 Raw streams are excluded from Git because they contain local paths and session IDs.
 The runner emits the same files for independent reproduction.
 
 ## Subagent extension evidence
 
-A real Claude Code `general-purpose` subagent run with plugin `0.3.0` completed on
-Sonnet and showed:
+A real Claude Code `general-purpose` subagent run with plugin `0.4.0` completed on
+Sonnet against the installed `~/.claude/pira` snapshot and showed:
 
 - independent parent and subagent state directories;
 - `SubagentStart` injected the pending-route instruction;
@@ -102,11 +120,15 @@ Sonnet and showed:
 - `SubagentStop` completed successfully with no retry block;
 - the parent retained its separate confirmed route state.
 
-Successful raw-stream SHA-256:
-`8664af87fbc7a780541589cfe04005a8cf993ce3dbf33a14357574365ac51a76`.
-One preceding attempt reached its deliberately low `$0.30` API-equivalent guard
-after the ordering checkpoint and is retained as a failed attempt; the unchanged
-probe completed after raising only that guard to `$0.50`.
+The subagent loaded `research + coding` before its first task `Read`, reported the
+off-by-one defect, made no file change, and exited with successful `SubagentStop` and
+top-level result events. Raw events remain local because they contain absolute paths
+and session/agent IDs.
+
+A separate zero-tool process verified the bounded fail-open path: it stated that
+the Skill tool was unavailable, received exactly one Stop retry, repeated the final
+answer, and exited successfully. This is availability evidence, not a successful
+route or parity case.
 
 The `$` values are Claude Code's local API-equivalent estimates used as run caps.
 With subscription authentication these runs consume plan quota; they are not
@@ -114,12 +136,14 @@ evidence of separate API billing.
 
 ## Deterministic gates
 
-The explicit suite passed **33/33** tests at `ca73997`, covering routing state,
+The explicit suite passed **37/37** tests at `deb4495`, covering routing state,
 dependency expansion, malformed input, corrupt/stale state, changed module content,
 bounded Stop/SubagentStop behavior, parent/subagent isolation, concurrent distinct
 subagent routes, Windows/POSIX launchers, isolated install/reinstall/disable/rollback,
-matrix parsing, continuity parsing, control isolation, and result evaluation.
-`claude plugin validate claude/pira-routing-guard` also passed.
+matrix parsing, continuity parsing, policy-only observation, control isolation, and
+result evaluation. `claude plugin validate claude/pira-routing-guard` also passed. A
+separate isolated process with no `PIRA_POLICY_DIR` override successfully loaded
+`explain` from the installed `~/.claude/pira` snapshot and completed its answer.
 
 ## Reproduction
 
@@ -138,13 +162,13 @@ py -3 -B -m unittest \
 claude plugin validate claude/pira-routing-guard
 
 py -3 -B claude/pira-routing-guard/evaluation/run_parity.py \
-  --client both --repetitions 2 --artifact-root <fresh-temp-directory>
+  --client claude-ab --repetitions 2 --artifact-root <fresh-temp-directory>
 
 py -3 -B claude/pira-routing-guard/evaluation/run_continuity.py \
   --artifact-root <fresh-temp-directory>
 ```
 
-The paired runner returns nonzero if either descriptive control has any failed case;
+The paired runner returns nonzero if either A/B mode has any failed case;
 use the machine-readable `by_client` fields and the frozen protocol's conjunctive
 gates rather than treating process exit alone as the parity decision.
 
@@ -152,8 +176,9 @@ gates rather than treating process exit alone as the parity decision.
 
 - Synthetic profiles/modules and project files replace real personal context.
 - No credential, real `USER.md`, prompt history, or absolute home path is committed.
-- Codex runs are read-only, ignore user config/rules, disable discovered skills, and
-  record any permission denial or unexpected skill access.
+- Policy-only and guarded Claude runs use synthetic modules and project data; the
+  historical Codex runs are read-only, ignore user config/rules, disable discovered
+  skills, and record any permission denial or unexpected skill access.
 - The plugin does not add a general permission rule or hide arbitrary commands
   behind an allowlisted wrapper. Its only programmatic `allow` is the validated
   route-skill call needed for scoped subagent input rewriting.
