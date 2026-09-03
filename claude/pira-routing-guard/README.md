@@ -82,3 +82,22 @@ The separate `run_continuity.py` probe deliberately persists one synthetic sessi
 follow-up routing, a fresh Claude Code process with `--resume`, manual compaction, and a fresh route
 after `PostCompact`. Use it only when writing synthetic session history under the active Claude
 configuration directory is acceptable.
+
+## Adaptive mode (opt-in experiment)
+
+Strict routing is the default and is unchanged. Setting the environment variable
+`PIRA_ROUTING_GUARD_MODE=adaptive` for the Claude Code process (for example through the `env` block
+of a Claude settings file) lets the `UserPromptSubmit` hook route confident turns itself: a small
+bilingual cue lexicon derived from the module descriptions selects a conservative module superset,
+the hook injects the exact module text and confirms the route, and the model skips the `route`
+Skill round trip. Any prompt without a cue, any selection larger than four modules, the first prompt
+after a resume, `/clear`, or compaction, every subagent, and any continuation whose cues point
+outside the previous route fall back to the strict Skill route. `none` is never selected
+automatically. Design, confidence rules, and failure boundaries: [ADAPTIVE.md](ADAPTIVE.md).
+
+Deterministic coverage lives in `tests/test_adaptive_routing.py` and `evaluation/test_run_modes.py`.
+The paired runner accepts `--client claude-adaptive` and `--client claude-modes` (policy-only,
+strict, adaptive) and reports per-mode medians with paired deltas; `evaluation/heldout.json` holds
+prompts written before the lexicon existed, and `evaluation/run_multiturn.py` compares the modes
+turn by turn in one `stream-json` process, including continuation, task switch, compaction, and
+resume.

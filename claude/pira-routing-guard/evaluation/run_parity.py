@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,10 @@ PLUGIN_ROOT = HERE.parent
 REPO_ROOT = PLUGIN_ROOT.parents[1]
 SETUP_SCRIPT = REPO_ROOT / "assets" / "scripts" / "setup_pira.py"
 ROUTE_SKILL = "pira-routing-guard:route"
+CLAUDE_CLIENTS = {"claude", "claude-policy-only", "claude-adaptive"}
+GUARDED_CLIENTS = {"claude", "claude-adaptive"}
+ADAPTIVE_MARKER = "PIRA adaptive routing selected:"
+ROUTE_COMPLETE_MARKER = "PIRA routing is complete for this turn."
 MODULE_FILES = {
     "user_profile": "USER.md",
     "research": "modules/RESEARCH_POLICY.md",
@@ -180,6 +185,19 @@ def parse_jsonl(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     return events, errors
 
 
+def hook_additional_context(output: str) -> str:
+    """Return the additionalContext carried by a hook_response output, or an empty string."""
+    try:
+        decoded = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(decoded, dict):
+        return ""
+    specific = decoded.get("hookSpecificOutput")
+    context = specific.get("additionalContext") if isinstance(specific, dict) else None
+    return context if isinstance(context, str) else ""
+
+
 def parse_claude(text: str) -> dict[str, Any]:
     events, parse_errors = parse_jsonl(text)
     route_calls: list[list[str]] = []
@@ -190,6 +208,7 @@ def parse_claude(text: str) -> dict[str, Any]:
     first_answer_at: int | None = None
     hook_errors: list[str] = []
     result_event: dict[str, Any] | None = None
+    adaptive_selected = False
 
     for index, event in enumerate(events):
         if event.get("type") == "assistant":
@@ -220,7 +239,12 @@ def parse_claude(text: str) -> dict[str, Any]:
             stderr = str(event.get("stderr", "")).strip()
             if stderr:
                 hook_errors.append(stderr)
-            if "PIRA routing is complete for this turn." in str(event.get("output", "")):
+            output = str(event.get("output", ""))
+            context = hook_additional_context(output)
+            loaded.extend(ROUTE_HEADER.findall(context))
+            if ADAPTIVE_MARKER in context:
+                adaptive_selected = True
+            if ROUTE_COMPLETE_MARKER in output:
                 route_complete_at = index
         if event.get("type") == "result":
             result_event = event
@@ -240,6 +264,8 @@ def parse_claude(text: str) -> dict[str, Any]:
         "result_event": result_event,
         "final_text": str((result_event or {}).get("result", "")),
         "usage": (result_event or {}).get("usage", {}),
+        "num_turns": (result_event or {}).get("num_turns"),
+        "adaptive_selected": adaptive_selected,
     }
 
 
@@ -319,6 +345,8 @@ def parse_claude_policy_only(
         "result_event": result_event,
         "final_text": str((result_event or {}).get("result", "")),
         "usage": (result_event or {}).get("usage", {}),
+        "num_turns": (result_event or {}).get("num_turns"),
+        "adaptive_selected": False,
     }
 
 
@@ -413,12 +441,14 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
 def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -> list[str]:
     failures: list[str] = []
     expected_loaded = sorted(scenario["expected_loaded"])
+    any_route = bool(scenario.get("accept_any_route"))
+    adaptive = client == "claude-adaptive" and bool(parsed.get("adaptive_selected"))
     if exit_code != 0:
         failures.append(f"{client} exit code {exit_code}")
     if parsed["parse_errors"]:
         failures.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
-    if client in {"claude", "claude-policy-only"}:
-        if client == "claude":
+    if client in CLAUDE_CLIENTS:
+        if client in GUARDED_CLIENTS and not adaptive and not any_route:
             if len(parsed["route_calls"]) != 1:
                 failures.append(f"expected one route call, got {parsed['route_calls']}")
             elif matrix_runner.expanded_route(parsed["route_calls"][0]) != expected_loaded:
@@ -426,6 +456,14 @@ def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit
                     f"expanded route {matrix_runner.expanded_route(parsed['route_calls'][0])} "
                     f"!= {scenario['expected_loaded']}"
                 )
+        if adaptive and len(parsed["route_calls"]) > 1:
+            failures.append(f"expected at most one route call after adaptive selection, got {parsed['route_calls']}")
+        if client == "claude-adaptive":
+            expectation = scenario.get("expect_adaptive")
+            if expectation == "select" and not adaptive:
+                failures.append("adaptive routing did not select on a confident prompt")
+            if expectation == "abstain" and adaptive:
+                failures.append("adaptive routing selected on a prompt that must fall back to strict")
         result = parsed["result_event"]
         if not result or result.get("subtype") != "success" or result.get("is_error"):
             failures.append("Claude result was not successful")
@@ -433,7 +471,14 @@ def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit
             failures.append(f"permission denials: {result['permission_denials']}")
     elif parsed.get("turn_failed"):
         failures.append("Codex turn failed")
-    if sorted(parsed["loaded_modules"]) != expected_loaded:
+    loaded = set(parsed["loaded_modules"])
+    if any_route:
+        pass
+    elif adaptive:
+        missing = sorted(set(expected_loaded) - loaded)
+        if missing:
+            failures.append(f"adaptive selection missed required modules {missing}; loaded {sorted(loaded)}")
+    elif sorted(loaded) != expected_loaded:
         failures.append(f"loaded {parsed['loaded_modules']} != {scenario['expected_loaded']}")
     if not parsed["route_complete_before_work"]:
         failures.append("routing did not complete before task work or final answer")
@@ -481,7 +526,7 @@ def command_for(
     args: argparse.Namespace,
     codex_skill_files: list[Path] | None = None,
 ) -> list[str]:
-    if client in {"claude", "claude-policy-only"}:
+    if client in CLAUDE_CLIENTS:
         command = [
             executable,
             "-p",
@@ -490,7 +535,7 @@ def command_for(
             "project",
             "--strict-mcp-config",
             "--tools",
-            args.claude_tools if client == "claude" else "Read,Bash",
+            args.claude_tools if client in GUARDED_CLIENTS else "Read,Bash",
             "--model",
             args.claude_model,
             "--effort",
@@ -503,7 +548,7 @@ def command_for(
             "--max-budget-usd",
             str(args.claude_max_budget),
         ]
-        if client == "claude":
+        if client in GUARDED_CLIENTS:
             command[3:3] = ["--plugin-dir", str(PLUGIN_ROOT)]
             command.extend(
                 ["--allowedTools", f"Skill({ROUTE_SKILL} *),Bash(*pira-routing-guard/*/run-routing-guard.sh *)"]
@@ -556,13 +601,20 @@ def run_case(
     codex_skill_files = discover_skill_files(project) if client == "codex" else []
     command = command_for(client, executable, project, args, codex_skill_files)
     env = os.environ.copy()
-    env.update({"PIRA_POLICY_DIR": str(agent), "PIRA_ROUTING_STATE_DIR": str(state), "PYTHONUTF8": "1"})
+    env.update(
+        {
+            "PIRA_POLICY_DIR": str(agent),
+            "PIRA_ROUTING_STATE_DIR": str(state),
+            "PYTHONUTF8": "1",
+            "PIRA_ROUTING_GUARD_MODE": "adaptive" if client == "claude-adaptive" else "strict",
+        }
+    )
     exit_code, stdout, stderr, elapsed = run_process(command, project, env, args.timeout)
     events_path = case_root / "events.jsonl"
     stderr_path = case_root / "stderr.txt"
     events_path.write_text(stdout, encoding="utf-8")
     stderr_path.write_text(stderr, encoding="utf-8")
-    if client == "claude":
+    if client in GUARDED_CLIENTS:
         parsed = parse_claude(stdout)
     elif client == "claude-policy-only":
         parsed = parse_claude_policy_only(stdout, project, agent)
@@ -583,6 +635,10 @@ def run_case(
         "unexpected_skill_access_count": parsed.get("unexpected_skill_access_count", 0),
         "duration_seconds": round(elapsed, 3),
         "usage": parsed["usage"],
+        "num_turns": parsed.get("num_turns"),
+        "adaptive_selected": bool(parsed.get("adaptive_selected")),
+        "extra_modules": sorted(set(parsed["loaded_modules"]) - set(scenario["expected_loaded"])),
+        "missing_modules": sorted(set(scenario["expected_loaded"]) - set(parsed["loaded_modules"])),
         "artifact_dir": case_root.relative_to(artifact_root).as_posix(),
         "artifact_hashes": {
             "events_jsonl_sha256": sha256_file(events_path),
@@ -591,12 +647,68 @@ def run_case(
     }
 
 
+def context_tokens(usage: dict[str, Any]) -> int:
+    return sum(int(usage.get(key) or 0) for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+
+
+def median_or_none(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
+
+def mode_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-client medians plus paired deltas against the policy-only baseline."""
+    by_client: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        by_client.setdefault(result["client"], []).append(result)
+
+    def measure(result: dict[str, Any]) -> dict[str, float]:
+        usage = result.get("usage") or {}
+        return {
+            "model_turns": float(result.get("num_turns") or 0),
+            "context_tokens": float(context_tokens(usage)),
+            "cache_creation_tokens": float(usage.get("cache_creation_input_tokens") or 0),
+            "cache_read_tokens": float(usage.get("cache_read_input_tokens") or 0),
+            "output_tokens": float(usage.get("output_tokens") or 0),
+            "duration_seconds": float(result.get("duration_seconds") or 0),
+        }
+
+    baseline = {
+        (result["id"], result["repetition"]): measure(result)
+        for result in by_client.get("claude-policy-only", [])
+    }
+    metrics: dict[str, Any] = {}
+    for client, rows in by_client.items():
+        measured = [measure(row) for row in rows]
+        summary: dict[str, Any] = {
+            "cases": len(rows),
+            "passed": sum(bool(row["passed"]) for row in rows),
+            "route_skill_calls": sum(len(row.get("route_calls") or []) for row in rows),
+            "adaptive_selected_cases": sum(bool(row.get("adaptive_selected")) for row in rows),
+            "cases_with_extra_modules": sum(bool(row.get("extra_modules")) for row in rows),
+            "cases_with_missing_modules": sum(bool(row.get("missing_modules")) for row in rows),
+            "median": {key: median_or_none([m[key] for m in measured]) for key in measured[0]} if measured else {},
+        }
+        if client != "claude-policy-only" and baseline:
+            deltas = [
+                {key: measure(row)[key] - baseline[(row["id"], row["repetition"])][key] for key in measure(row)}
+                for row in rows
+                if (row["id"], row["repetition"]) in baseline
+            ]
+            if deltas:
+                summary["paired_delta_vs_policy_only_median"] = {
+                    key: median_or_none([delta[key] for delta in deltas]) for key in deltas[0]
+                }
+                summary["paired_cases"] = len(deltas)
+        metrics[client] = summary
+    return metrics
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--matrix", type=Path, default=HERE / "matrix.json")
     parser.add_argument(
         "--client",
-        choices=["claude", "claude-policy-only", "claude-ab", "codex", "both"],
+        choices=["claude", "claude-policy-only", "claude-adaptive", "claude-ab", "claude-modes", "codex", "both"],
         default="both",
     )
     parser.add_argument("--repetitions", type=int, default=2)
@@ -635,6 +747,8 @@ def main() -> int:
         clients = ["claude", "codex"]
     elif args.client == "claude-ab":
         clients = ["claude-policy-only", "claude"]
+    elif args.client == "claude-modes":
+        clients = ["claude-policy-only", "claude", "claude-adaptive"]
     else:
         clients = [args.client]
     executables = {
@@ -708,6 +822,13 @@ def main() -> int:
                 "session_persistence": False,
                 "routing_guard": False,
             },
+            "claude-adaptive": {
+                "tools": args.claude_tools,
+                "setting_sources": "project",
+                "strict_mcp_config": True,
+                "session_persistence": False,
+                "routing_guard_mode": "adaptive",
+            },
             "codex": {
                 "ignore_user_config": True,
                 "ignore_rules": True,
@@ -735,6 +856,7 @@ def main() -> int:
             }
             for client in clients
         },
+        "metrics": mode_metrics(results),
         "results": results,
     }
     summary_path = args.summary or artifact_root / "summary.json"

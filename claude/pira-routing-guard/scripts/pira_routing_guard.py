@@ -45,6 +45,75 @@ IMPLIED = {
     "writing": {"research"},
     "public_figure": {"research"},
 }
+ADAPTIVE_MODE_ENV = "PIRA_ROUTING_GUARD_MODE"
+ADAPTIVE_MAX_MODULES = 4
+# Cue lexicon for the opt-in adaptive mode, derived from the module descriptions in AGENTS.md.
+# A cue that is ambiguous between modules maps to the union of the plausible modules, so the
+# lexicon can over-select but is never used to exclude a module. English patterns are
+# word-bounded and case-insensitive; Chinese patterns are substrings.
+ADAPTIVE_CUES: tuple[tuple[str, frozenset[str]], ...] = (
+    (
+        r"\bmy (?:stored |saved )?(?:preferences?|profile|background|communication (?:style|preferences?)|"
+        r"learning (?:needs|style|level))\b|\b(?:know about me|on my behalf|personali[sz]e\w*|"
+        r"tailored? (?:to|for) me)\b|我的(?:偏好|背景|资料|档案|个人信息)|个性化|替我|以我的名义|了解我的",
+        frozenset({"user_profile"}),
+    ),
+    (
+        r"\b(?:evidence|verif(?:y|ied|ies|ication)|fact.?check\w*|corroborat\w*|sources?|citations?|"
+        r"cite[sd]?|literature|systematic review|meta.?analysis|claims?|better supported|assess\w*|"
+        r"investigat\w*)\b|证据|核实|查证|验证|来源|出处|文献|引用|调研|事实核查|可信|综述",
+        frozenset({"research"}),
+    ),
+    (
+        r"\b(?:papers?|preprints?|arxiv|excerpts?|th(?:is|e) (?:article|study)|summari[sz]e\w*|summary|"
+        r"critique)\b|论文|文章|预印本|这篇|总结|概括|精读|解读",
+        frozenset({"paper_reading"}),
+    ),
+    (r"\babstract\b|摘要", frozenset({"paper_reading", "writing"})),
+    (
+        r"\b(?:code|coding|codebase|scripts?|functions?|bugs?|debug\w*|implement\w*|refactor\w*|compil\w*|"
+        r"tests?|testing|traceback|stack ?trace|exceptions?|errors?|regex|api|library|libraries|packages?|"
+        r"repo(?:sitory|sitories)?|commits?|git|pull request|diff|patch|python|rust|java(?:script)?|typescript|"
+        r"golang|bash|shell|sql|c\+\+|c#|html|css|docker|dependenc(?:y|ies))\b|"
+        r"\.(?:py|rs|js|ts|tsx|jsx|go|java|c|cpp|h|hpp|cs|sh|ps1|sql|ipynb|toml|yaml|yml)\b|"
+        r"代码|脚本|函数|调试|报错|异常|实现|重构|编译|测试|仓库|提交|依赖|接口|编程|程序|抛出|崩溃",
+        frozenset({"coding"}),
+    ),
+    (r"\b(?:write|writing|written)\b|写", frozenset({"writing", "coding"})),
+    (
+        r"\b(?:draft\w*|polish\w*|proofread\w*|rewrite|reword\w*|rephrase|paraphrase|prose|introduction|"
+        r"related work|conclusion|manuscript|rebuttal|reviewers?|cover letter|grammar|wording|readability|"
+        r"academic (?:english|writing)|scientific writing|technical writing|latex)\b|\.(?:tex|bib)\b|"
+        r"撰写|起草|润色|改写|措辞|引言|结论|相关工作|审稿|语法|学术英文|学术写作|科技写作|写作",
+        frozenset({"writing"}),
+    ),
+    (
+        r"\b(?:figures?|plots?|plotting|charts?|graphs?|diagrams?|schematics?|tikz|svg|posters?|slides?|"
+        r"infographics?|visuali[sz]\w*|histograms?|heatmaps?|axis|axes|legend|colou?r ?(?:map|scheme|palette)|"
+        r"dpi|png|matplotlib|ggplot|seaborn)\b|图表|配图|绘图|画图|作图|示意图|海报|幻灯片|可视化|图片|图像|插图|"
+        r"柱状图|折线图|热图|散点图|配色",
+        frozenset({"public_figure", "coding"}),
+    ),
+    (
+        r"\b(?:explain\w*|explanation|why|intuition|intuitive(?:ly)?|walk me through|teach|difference between|"
+        r"clarify|in simple terms|understand)\b|解释|为什么|为何|原理|讲解|讲讲|通俗|区别|直观|教我|看不懂|"
+        r"不理解|什么意思|怎么理解|是什么",
+        frozenset({"explain"}),
+    ),
+    (
+        r"\b(?:overwhelm\w*|overload\w*|practical|stress\w*|anxious|anxiety|burn\w*out|motivat\w*|procrastinat\w*|"
+        r"feel(?:ing)? (?:stuck|lost|down|tired|behind)|advice|should i|cope|coping|work.life|habits?|routines?|"
+        r"chores?|career|relationship|advisor|supervisor|mentor|colleague|conflict with|time management)\b|"
+        r"焦虑|压力|迷茫|拖延|动力|情绪|心累|怎么办|该不该|要不要|如何应对|平衡|习惯|导师|同事|职业|人际",
+        frozenset({"guidance"}),
+    ),
+    (
+        r"\bpira\b|agents\.md|user\.md|claude\.md|\.claude[\\/]pira|~[\\/]agent\b|"
+        r"\b(?:instruction files?|policy files?|routing (?:rules?|policy|guard)|module[- ]loading)\b|"
+        r"指令文件|路由规则|模块规则|策略文件|模块加载",
+        frozenset({"maintenance"}),
+    ),
+)
 
 
 def emit(value: dict[str, Any] | None = None) -> None:
@@ -177,8 +246,11 @@ class SessionState:
         temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         os.replace(temporary, self.state_path)
 
-    def reset_route(self) -> None:
-        self.write({"status": "pending", "stop_blocks": 0})
+    def reset_route(self, hold_adaptive: bool = False) -> None:
+        state: dict[str, Any] = {"status": "pending", "stop_blocks": 0}
+        if hold_adaptive:
+            state["adaptive_hold"] = 1
+        self.write(state)
 
     def consume_stop_block(self, state: dict[str, Any] | None) -> bool:
         current = state or {"status": "pending"}
@@ -275,6 +347,78 @@ def readiness(session: SessionState, state: dict[str, Any] | None) -> tuple[bool
     return True, "PIRA routing is complete for this turn."
 
 
+def adaptive_enabled() -> bool:
+    return os.environ.get(ADAPTIVE_MODE_ENV, "").strip().lower() == "adaptive"
+
+
+def cue_modules(prompt: str) -> list[str]:
+    """Modules whose cues occur in the prompt, expanded with canonical dependencies."""
+    hits: set[str] = set()
+    for pattern, modules in ADAPTIVE_CUES:
+        if re.search(pattern, prompt, re.IGNORECASE):
+            hits.update(modules)
+    for module in tuple(hits):
+        hits.update(IMPLIED.get(module, set()))
+    return [name for name in MODULE_ORDER if name in hits]
+
+
+def adaptive_selection(prompt: str, previous: list[str] | None) -> list[str] | None:
+    """Return a conservative module superset, or None when the turn must use the strict Skill route."""
+    hits = cue_modules(prompt)
+    if previous:
+        # Continuation: reuse the confirmed route unless a cue points outside it (task switch).
+        return previous if set(hits) <= set(previous) else None
+    if not hits or len(hits) > ADAPTIVE_MAX_MODULES:
+        return None
+    return hits
+
+
+def previous_route(session: SessionState, state: dict[str, Any] | None) -> list[str] | None:
+    if not state or state.get("adaptive_hold"):
+        return None
+    ready, _ = readiness(session, state)
+    required = state.get("required")
+    if ready and isinstance(required, list) and required and all(isinstance(name, str) for name in required):
+        return required
+    return None
+
+
+def adaptive_select(session: SessionState, selection: list[str]) -> dict[str, Any]:
+    state = {
+        "status": "selected",
+        "nonce": secrets.token_hex(12),
+        "required": selection,
+        "tool_use_id": "",
+        "stop_blocks": 0,
+        "source": "adaptive",
+    }
+    session.write(state)
+    rendered, pending_markers = render_modules(session, selection)
+    commit_selected(session, state, pending_markers)
+    context = "PIRA adaptive routing selected: " + ", ".join(selection) + ". "
+    if pending_markers:
+        context += "Apply the module context below to this turn.\n\n" + rendered + "\n"
+    else:
+        context += "All selected modules are already loaded and unchanged in this session. "
+    context += (
+        f"If this turn also needs another PIRA module, invoke `{ROUTE_SKILL}` with the complete module "
+        "list before any task tool; otherwise do not invoke it. PIRA routing is complete for this turn."
+    )
+    return hook_context("UserPromptSubmit", context)
+
+
+def handle_user_prompt(data: dict[str, Any], session: SessionState) -> dict[str, Any]:
+    if adaptive_enabled():
+        state = session.read()
+        prompt = data.get("prompt")
+        if isinstance(prompt, str) and not (state and state.get("adaptive_hold")):
+            selection = adaptive_selection(prompt, previous_route(session, state))
+            if selection is not None:
+                return adaptive_select(session, selection)
+    session.reset_route()
+    return hook_context("UserPromptSubmit", route_instruction())
+
+
 def handle_pre_tool(data: dict[str, Any], session: SessionState) -> dict[str, Any] | None:
     tool_name = str(data.get("tool_name", ""))
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
@@ -358,10 +502,16 @@ def prepare_selected(
         raise RuntimeError(error)
     if required != state.get("required"):
         raise RuntimeError("route arguments do not match the validated hook selection")
-    paths = module_paths(required or [])
+    rendered, pending_markers = render_modules(session, required or [])
+    return rendered, session, state, pending_markers
+
+
+def render_modules(session: SessionState, required: list[str]) -> tuple[str, list[tuple[str, Path]]]:
+    """Render the exact text of modules not yet loaded and return their pending markers."""
+    paths = module_paths(required)
     sections: list[str] = []
     pending_markers: list[tuple[str, Path]] = []
-    for module in required or []:
+    for module in required:
         path = paths[module]
         if session.is_loaded(module, path):
             continue
@@ -369,10 +519,8 @@ def prepare_selected(
         sections.append(f"### Loaded PIRA module: {module}\n\n{content.rstrip()}\n")
         pending_markers.append((module, path))
     if not sections:
-        rendered = "All selected PIRA modules were already loaded and unchanged."
-    else:
-        rendered = "\n".join(sections)
-    return rendered, session, state, pending_markers
+        return "All selected PIRA modules were already loaded and unchanged.", pending_markers
+    return "\n".join(sections), pending_markers
 
 
 def commit_selected(
@@ -400,15 +548,14 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
     session = SessionState(session_id, agent_id=agent_id)
     if event == "SessionStart":
         session.clear_loaded()
-        session.reset_route()
+        session.reset_route(hold_adaptive=data.get("source") != "startup")
         return hook_context("SessionStart", route_instruction())
     if event == "SubagentStart":
         session.clear_loaded()
         session.reset_route()
         return hook_context("SubagentStart", route_instruction())
     if event == "UserPromptSubmit":
-        session.reset_route()
-        return hook_context("UserPromptSubmit", route_instruction())
+        return handle_user_prompt(data, session)
     if event == "PreToolUse":
         return handle_pre_tool(data, session)
     if event == "PostToolUse":
@@ -425,7 +572,7 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
         )
     if event == "PostCompact":
         session.clear_loaded()
-        session.reset_route()
+        session.reset_route(hold_adaptive=True)
         return None
     return None
 
