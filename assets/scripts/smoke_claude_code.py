@@ -249,16 +249,27 @@ def run_probe(
     )
 
 
-def policy_commit(agent_dir: Path) -> str | None:
-    if not shutil.which("git") or not (agent_dir / ".git").exists():
+def policy_manifest(policy_dir: Path) -> dict[str, object] | None:
+    """Read the installed bundle manifest without trusting it as executable input."""
+    manifest = policy_dir / "install.json"
+    if not manifest.is_file():
         return None
-    commit = command_output(["git", "-C", str(agent_dir), "rev-parse", "--short", "HEAD"])
-    return commit or None
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def policy_commit(policy_dir: Path) -> str | None:
+    payload = policy_manifest(policy_dir)
+    commit = payload.get("source_commit") if payload is not None else None
+    return str(commit)[:7] if isinstance(commit, str) and commit else None
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smoke-test the installed PIRA Claude Code bridge with real claude -p sessions.")
-    parser.add_argument("--agent-dir", default="~/agent", help="PIRA agent directory whose policy should be loaded (default: ~/agent).")
+    parser.add_argument("--policy-dir", default="~/.claude/pira", help="Installed PIRA policy directory (default: ~/.claude/pira).")
     parser.add_argument("--model", default="sonnet", help="Claude model alias for the probes (default: sonnet).")
     parser.add_argument("--timeout", type=int, default=300, help="Seconds allowed per probe (default: 300).")
     parser.add_argument("--only", action="append", choices=[probe.name for probe in PROBES], help="Run only the named probe; repeatable.")
@@ -272,19 +283,22 @@ def main(argv: list[str] | None = None) -> int:
     if claude is None:
         print("ERROR: claude CLI not found on PATH", file=sys.stderr)
         return 2
-    agent_dir = Path(os.path.expanduser(args.agent_dir))
+    policy_dir = Path(os.path.expanduser(args.policy_dir))
     selected = [probe for probe in PROBES if not args.only or probe.name in args.only]
 
+    installed_manifest = policy_manifest(policy_dir)
     report: dict[str, object] = {
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "platform": platform.platform(),
         "claude_version": command_output([claude, "--version"]),
         "model": args.model,
-        "agent_dir": str(agent_dir),
-        "policy_commit": policy_commit(agent_dir),
+        "policy_dir": str(policy_dir),
+        "policy_commit": policy_commit(policy_dir),
+        "policy_source_dirty": installed_manifest.get("source_dirty") if installed_manifest else None,
         "probes": [],
     }
-    print(f"claude: {report['claude_version']}  model: {args.model}  policy: {report['policy_commit'] or 'unknown'}")
+    dirty_label = " dirty-source" if report["policy_source_dirty"] else ""
+    print(f"claude: {report['claude_version']}  model: {args.model}  policy: {report['policy_commit'] or 'unknown'}{dirty_label}")
 
     results: list[ProbeResult] = []
     with tempfile.TemporaryDirectory(prefix="pira_smoke_") as temporary:
@@ -300,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
                 workdir,
                 settings_path,
                 instruction_log,
-                agent_dir / "AGENTS.md",
+                policy_dir / "AGENTS.md",
             )
             results.append(result)
             status = "PASS" if result.passed else "FAIL"

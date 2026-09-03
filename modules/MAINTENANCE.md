@@ -3,13 +3,13 @@
 Use only for PIRA configuration, module, and rule maintenance—not ordinary project work.
 
 ## Maintenance Rules
-- Keep memory defaults in `Memory System` in `~/agent/AGENTS.md`; this module maintains them but does not define ordinary memory handling.
-- Add files removed from the active scheme to `~/agent/assets/LEGACY_LIST.md`.
+- Keep memory defaults in `Memory System` in the active Claude PIRA source checkout's `AGENTS.md`; this module maintains them but does not define ordinary memory handling. Refresh the installed snapshot afterward.
+- Add files removed from the active scheme to `assets/LEGACY_LIST.md` in the active Claude PIRA source checkout.
 - Overwrite with current policy only: no timestamps, question IDs, changelogs, or override chains.
 - After every maintenance write, immediately check and raise cross-file conflicts. For instruction or agent-configuration updates, remove introduced or obsolete redundancy without changing unrelated meaning; audit tracked touched files for unexpected personal information and every rule's intended scope. Generalize only deliberately and within the user's intended scope.
 - When an experimental rule conflicts with an established rule, preserve the established default unless the user explicitly approves a scope or routing change.
 - Place default or session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
-- Keep module loading and routing only in `~/agent/AGENTS.md`.
+- Keep module loading and routing only in the Claude branch's source `AGENTS.md`; `~/.claude/pira/AGENTS.md` is an installed snapshot, not an editing target.
 - Keep README public-phase only: public behavior, releases, artifacts, usage, and reproducible public validation—not local development candidates, pending work, private validation state, or rollout plans.
 - After commit and push, remove obsolete temporary backups created for the change.
 

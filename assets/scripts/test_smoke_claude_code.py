@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -34,7 +35,7 @@ class SmokeClaudeCodeTests(unittest.TestCase):
 
     def test_module_probe_requires_both_files(self) -> None:
         probe = self.probe("module_routing")
-        calls = [smoke.tool_call_text("Read", {"file_path": "~/agent/modules/CODING_STYLE.md"})]
+        calls = [smoke.tool_call_text("Read", {"file_path": "~/.claude/pira/modules/CODING_STYLE.md"})]
         missing, unexpected = smoke.evaluate(probe, "LOADED CODING_STYLE.md\nLOADED RESEARCH_POLICY.md", calls)
         self.assertEqual(unexpected, [])
         self.assertEqual(missing, ["Read call containing 'RESEARCH_POLICY.md'"])
@@ -72,6 +73,16 @@ class SmokeClaudeCodeTests(unittest.TestCase):
         self.assertTrue(smoke.instruction_was_loaded(events, expected))
         events[0]["load_reason"] = "session_start"
         self.assertFalse(smoke.instruction_was_loaded(events, expected))
+
+    def test_policy_commit_comes_from_install_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "install.json").write_text(
+                json.dumps({"source_commit": "edc0c8d961373a0cf0619126d08a8ca2e5b0dd8f", "source_dirty": False}),
+                encoding="utf-8",
+            )
+            self.assertEqual(smoke.policy_commit(root), "edc0c8d")
+            self.assertFalse(smoke.policy_manifest(root)["source_dirty"])
 
 
 if __name__ == "__main__":
