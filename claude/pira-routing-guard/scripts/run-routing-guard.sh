@@ -16,5 +16,5 @@ if command -v py >/dev/null 2>&1 && py -3 -c "import sys; raise SystemExit(sys.v
     exec py -3 "$script" "$@"
 fi
 
-echo "PIRA routing guard unavailable: Python 3 was not found" >&2
+echo "PIRA routing guard unavailable: no Python 3.10+ interpreter found (checked python3, python, py -3)" >&2
 exit 1

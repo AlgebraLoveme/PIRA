@@ -397,6 +397,46 @@ class RoutingGuardTests(unittest.TestCase):
             )
         )
 
+    def test_non_object_json_state_fails_closed_without_raising(self) -> None:
+        for content in ('["x"]', '"text"', "7"):
+            session = guard.SessionState("session-1")
+            session.directory.mkdir(parents=True, exist_ok=True)
+            session.state_path.write_text(content, encoding="utf-8")
+            denied = guard.dispatch(
+                self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "project.py"})
+            )
+            self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny", content)
+            self.assertEqual(guard.dispatch(self.event("Stop"))["decision"], "block", content)
+            self.assertIsNone(guard.dispatch(self.event("Stop")), content)
+
+    def test_malformed_stop_counter_keeps_stop_retry_bounded(self) -> None:
+        for value in ('"many"', "null", "true", "-3", "1.5"):
+            session = guard.SessionState("session-1")
+            session.directory.mkdir(parents=True, exist_ok=True)
+            session.state_path.write_text(
+                '{"status": "pending", "stop_blocks": ' + value + "}", encoding="utf-8"
+            )
+            self.assertEqual(guard.dispatch(self.event("Stop"))["decision"], "block", value)
+            self.assertIsNone(guard.dispatch(self.event("Stop")), value)
+
+    def test_malformed_denial_counter_keeps_subagent_denial_bounded(self) -> None:
+        session = guard.SessionState("session-1", agent_id="subagent-1")
+        session.directory.mkdir(parents=True)
+        session.state_path.write_text('{"status": "pending", "tool_denials": "x"}', encoding="utf-8")
+        read = self.event("PreToolUse", agent_id="subagent-1", tool_name="Read", tool_input={"file_path": "a.md"})
+        self.assertEqual(guard.dispatch(read)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(guard.dispatch(read))
+
+    def test_non_string_required_entries_are_ignored_without_raising(self) -> None:
+        session = guard.SessionState("session-1")
+        session.write({"status": "selected", "nonce": "n", "required": [["coding"], 3, "coding"], "stop_blocks": 0})
+        session.confirm("n")
+        denied = guard.dispatch(
+            self.event("PreToolUse", tool_name="Read", tool_input={"file_path": "project.py"})
+        )
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("missing or changed for: coding", reason)
+
     def test_main_reports_malformed_input_without_traceback(self) -> None:
         with (
             patch.object(guard.sys, "stdin", io.StringIO("not-json")),

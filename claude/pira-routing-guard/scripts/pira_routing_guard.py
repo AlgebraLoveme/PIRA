@@ -153,12 +153,23 @@ class SessionState:
         self.state_path = self.directory / "route.json"
 
     def read(self) -> dict[str, Any] | None:
+        """Return the persisted state as a dict with sane counters, or None when absent.
+
+        Undecodable or non-object content is reported as corrupt so callers fail closed;
+        malformed retry counters are reset so bounded retries stay bounded instead of raising.
+        """
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None
         except (json.JSONDecodeError, UnicodeError, OSError):
+            loaded = None
+        if not isinstance(loaded, dict):
             return {"status": "corrupt", "stop_blocks": 0}
+        for counter in ("stop_blocks", "tool_denials"):
+            if counter in loaded and not (type(loaded[counter]) is int and loaded[counter] >= 0):
+                loaded[counter] = 0
+        return loaded
 
     def write(self, state: dict[str, Any]) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -226,8 +237,9 @@ def missing_modules(session: SessionState, state: dict[str, Any]) -> list[tuple[
     required = state.get("required")
     if not isinstance(required, list):
         return []
-    paths = module_paths([name for name in required if name in MODULE_FILES])
-    return [(name, paths[name]) for name in required if name in paths and not session.is_loaded(name, paths[name])]
+    names = [name for name in required if isinstance(name, str) and name in MODULE_FILES]
+    paths = module_paths(names)
+    return [(name, paths[name]) for name in names if not session.is_loaded(name, paths[name])]
 
 
 NO_SKILL_FALLBACK = (
