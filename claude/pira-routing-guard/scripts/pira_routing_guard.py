@@ -211,12 +211,14 @@ class SessionState:
             return False
 
 
-def agent_dir() -> Path:
-    return normalized_path(os.environ.get("PIRA_AGENT_DIR", str(Path.home() / "agent")))
+def policy_dir() -> Path:
+    return normalized_path(
+        os.environ.get("PIRA_POLICY_DIR", str(Path.home() / ".claude" / "pira"))
+    )
 
 
 def module_paths(required: list[str]) -> dict[str, Path]:
-    root = agent_dir()
+    root = policy_dir()
     return {name: normalized_path(str(root / MODULE_FILES[name])) for name in required}
 
 

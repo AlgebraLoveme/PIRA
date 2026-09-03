@@ -24,7 +24,7 @@ class RoutingGuardTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state_dir = self.root / "state"
-        self.agent_dir = self.root / "agent"
+        self.agent_dir = self.root / "policy"
         for relative in guard.MODULE_FILES.values():
             path = self.agent_dir / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -33,7 +33,7 @@ class RoutingGuardTests(unittest.TestCase):
             os.environ,
             {
                 "PIRA_ROUTING_STATE_DIR": str(self.state_dir),
-                "PIRA_AGENT_DIR": str(self.agent_dir),
+                "PIRA_POLICY_DIR": str(self.agent_dir),
             },
         )
         self.environment.start()
@@ -44,6 +44,14 @@ class RoutingGuardTests(unittest.TestCase):
 
     def event(self, name: str, **values: Any) -> dict[str, Any]:
         return {"session_id": "session-1", "hook_event_name": name, **values}
+
+    def test_default_policy_directory_is_the_installed_claude_snapshot(self) -> None:
+        with patch.dict(os.environ, {"PIRA_POLICY_DIR": ""}, clear=False):
+            os.environ.pop("PIRA_POLICY_DIR", None)
+            self.assertEqual(
+                guard.policy_dir(),
+                guard.normalized_path(str(Path.home() / ".claude" / "pira")),
+            )
 
     def route(self, arguments: str, tool_use_id: str = "route-1") -> None:
         decision = guard.dispatch(

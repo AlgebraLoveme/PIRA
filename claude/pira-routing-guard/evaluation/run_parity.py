@@ -121,7 +121,7 @@ def skill_manifest_hash(skill_files: list[Path]) -> str:
 
 def synthetic_policy(canonical: str, agent_dir: Path) -> str:
     root = agent_dir.resolve().as_posix()
-    return canonical.replace("~/agent", root)
+    return canonical.replace(setup_pira.DEFAULT_POLICY_DIR, root)
 
 
 def materialize_case(case_root: Path, scenario: dict[str, Any]) -> tuple[Path, Path, Path]:
@@ -243,6 +243,85 @@ def parse_claude(text: str) -> dict[str, Any]:
     }
 
 
+def resolved_tool_path(value: object, project: Path) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    path = Path(os.path.expanduser(value))
+    if not path.is_absolute():
+        path = project / path
+    return os.path.normcase(str(path.resolve(strict=False)))
+
+
+def parse_claude_policy_only(
+    text: str,
+    project: Path,
+    policy_dir: Path,
+) -> dict[str, Any]:
+    """Observe canonical Read-based routing without the routing-guard plugin."""
+    events, parse_errors = parse_jsonl(text)
+    module_by_path = {
+        os.path.normcase(str((policy_dir / relative).resolve(strict=False))): module
+        for module, relative in MODULE_FILES.items()
+    }
+    pending_modules: dict[str, str] = {}
+    loaded: list[str] = []
+    loaded_at: list[int] = []
+    task_tools: list[str] = []
+    first_work_at: int | None = None
+    result_event: dict[str, Any] | None = None
+
+    for index, event in enumerate(events):
+        if event.get("type") == "assistant":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            has_tool = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    name = str(block.get("name", ""))
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    module = (
+                        module_by_path.get(resolved_tool_path(tool_input.get("file_path"), project))
+                        if name == "Read"
+                        else None
+                    )
+                    if module:
+                        pending_modules[str(block.get("id", ""))] = module
+                    else:
+                        task_tools.append(name)
+                        first_work_at = index if first_work_at is None else first_work_at
+                elif block.get("type") == "text" and str(block.get("text", "")).strip() and not has_tool:
+                    first_work_at = index if first_work_at is None else first_work_at
+        if event.get("type") == "user":
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                module = pending_modules.pop(str(block.get("tool_use_id", "")), None)
+                if module and not block.get("is_error"):
+                    marker = f"PIRA_EVAL_MODULE::{module}"
+                    if marker in json.dumps(block.get("content", ""), ensure_ascii=False):
+                        loaded.append(module)
+                        loaded_at.append(index)
+        if event.get("type") == "result":
+            result_event = event
+
+    route_complete_at = max(loaded_at, default=-1)
+    return {
+        "parse_errors": parse_errors,
+        "route_calls": [],
+        "loaded_modules": unique(loaded),
+        "task_tools": task_tools,
+        "route_complete_before_work": first_work_at is None or route_complete_at < first_work_at,
+        "hook_errors": [],
+        "result_event": result_event,
+        "final_text": str((result_event or {}).get("result", "")),
+        "usage": (result_event or {}).get("usage", {}),
+    }
+
+
 def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
     events, parse_errors = parse_jsonl(text)
     loaded: list[str] = []
@@ -338,14 +417,15 @@ def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit
         failures.append(f"{client} exit code {exit_code}")
     if parsed["parse_errors"]:
         failures.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
-    if client == "claude":
-        if len(parsed["route_calls"]) != 1:
-            failures.append(f"expected one route call, got {parsed['route_calls']}")
-        elif matrix_runner.expanded_route(parsed["route_calls"][0]) != expected_loaded:
-            failures.append(
-                f"expanded route {matrix_runner.expanded_route(parsed['route_calls'][0])} "
-                f"!= {scenario['expected_loaded']}"
-            )
+    if client in {"claude", "claude-policy-only"}:
+        if client == "claude":
+            if len(parsed["route_calls"]) != 1:
+                failures.append(f"expected one route call, got {parsed['route_calls']}")
+            elif matrix_runner.expanded_route(parsed["route_calls"][0]) != expected_loaded:
+                failures.append(
+                    f"expanded route {matrix_runner.expanded_route(parsed['route_calls'][0])} "
+                    f"!= {scenario['expected_loaded']}"
+                )
         result = parsed["result_event"]
         if not result or result.get("subtype") != "success" or result.get("is_error"):
             failures.append("Claude result was not successful")
@@ -401,20 +481,16 @@ def command_for(
     args: argparse.Namespace,
     codex_skill_files: list[Path] | None = None,
 ) -> list[str]:
-    if client == "claude":
-        return [
+    if client in {"claude", "claude-policy-only"}:
+        command = [
             executable,
             "-p",
             args.prompt,
-            "--plugin-dir",
-            str(PLUGIN_ROOT),
             "--setting-sources",
             "project",
             "--strict-mcp-config",
             "--tools",
-            args.claude_tools,
-            "--allowedTools",
-            f"Skill({ROUTE_SKILL} *),Bash(*pira-routing-guard/*/run-routing-guard.sh *)",
+            args.claude_tools if client == "claude" else "Read,Bash",
             "--model",
             args.claude_model,
             "--effort",
@@ -427,6 +503,14 @@ def command_for(
             "--max-budget-usd",
             str(args.claude_max_budget),
         ]
+        if client == "claude":
+            command[3:3] = ["--plugin-dir", str(PLUGIN_ROOT)]
+            command.extend(
+                ["--allowedTools", f"Skill({ROUTE_SKILL} *),Bash(*pira-routing-guard/*/run-routing-guard.sh *)"]
+            )
+        else:
+            command.extend(["--allowedTools", "Read,Bash"])
+        return command
     command = [
         executable,
         "exec",
@@ -472,17 +556,18 @@ def run_case(
     codex_skill_files = discover_skill_files(project) if client == "codex" else []
     command = command_for(client, executable, project, args, codex_skill_files)
     env = os.environ.copy()
-    env.update({"PIRA_AGENT_DIR": str(agent), "PIRA_ROUTING_STATE_DIR": str(state), "PYTHONUTF8": "1"})
+    env.update({"PIRA_POLICY_DIR": str(agent), "PIRA_ROUTING_STATE_DIR": str(state), "PYTHONUTF8": "1"})
     exit_code, stdout, stderr, elapsed = run_process(command, project, env, args.timeout)
     events_path = case_root / "events.jsonl"
     stderr_path = case_root / "stderr.txt"
     events_path.write_text(stdout, encoding="utf-8")
     stderr_path.write_text(stderr, encoding="utf-8")
-    parsed = (
-        parse_claude(stdout)
-        if client == "claude"
-        else parse_codex(stdout, tuple(str(path) for path in scenario.get("files", {})))
-    )
+    if client == "claude":
+        parsed = parse_claude(stdout)
+    elif client == "claude-policy-only":
+        parsed = parse_claude_policy_only(stdout, project, agent)
+    else:
+        parsed = parse_codex(stdout, tuple(str(path) for path in scenario.get("files", {})))
     failures = evaluate(client, scenario, parsed, exit_code)
     return {
         "client": client,
@@ -509,7 +594,11 @@ def run_case(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--matrix", type=Path, default=HERE / "matrix.json")
-    parser.add_argument("--client", choices=["claude", "codex", "both"], default="both")
+    parser.add_argument(
+        "--client",
+        choices=["claude", "claude-policy-only", "claude-ab", "codex", "both"],
+        default="both",
+    )
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--scenario", action="append")
     parser.add_argument("--max-cases", type=int)
@@ -542,8 +631,16 @@ def main() -> int:
             raise ValueError("--max-cases must be positive")
         scenarios = scenarios[: args.max_cases]
 
-    clients = ["claude", "codex"] if args.client == "both" else [args.client]
-    executables = {client: shutil.which(client) for client in clients}
+    if args.client == "both":
+        clients = ["claude", "codex"]
+    elif args.client == "claude-ab":
+        clients = ["claude-policy-only", "claude"]
+    else:
+        clients = [args.client]
+    executables = {
+        client: shutil.which("claude" if client.startswith("claude") else client)
+        for client in clients
+    }
     missing_clients = [client for client, executable in executables.items() if not executable]
     if missing_clients:
         raise RuntimeError("missing client executable(s): " + ", ".join(missing_clients))
@@ -603,6 +700,13 @@ def main() -> int:
                 "setting_sources": "project",
                 "strict_mcp_config": True,
                 "session_persistence": False,
+            },
+            "claude-policy-only": {
+                "tools": "Read,Bash",
+                "setting_sources": "project",
+                "strict_mcp_config": True,
+                "session_persistence": False,
+                "routing_guard": False,
             },
             "codex": {
                 "ignore_user_config": True,

@@ -49,6 +49,76 @@ class ParityRunnerTests(unittest.TestCase):
         parsed = parity.parse_codex("\n".join(json.dumps(event) for event in reversed_events))
         self.assertFalse(parsed["route_complete_before_work"])
 
+    def test_parse_policy_only_requires_successful_module_reads_before_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            policy = root / "policy"
+            project.mkdir()
+            module = policy / "modules" / "RESEARCH_POLICY.md"
+            module.parent.mkdir(parents=True)
+            module.write_text("PIRA_EVAL_MODULE::research\n", encoding="utf-8")
+            module_id = "module-read"
+            events = [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": module_id,
+                                "name": "Read",
+                                "input": {"file_path": str(module)},
+                            }
+                        ]
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": module_id,
+                                "content": "PIRA_EVAL_MODULE::research",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "task-read",
+                                "name": "Read",
+                                "input": {"file_path": str(project / "evidence.txt")},
+                            }
+                        ]
+                    },
+                },
+                {"type": "result", "subtype": "success", "result": "answer"},
+            ]
+            parsed = parity.parse_claude_policy_only(
+                "\n".join(json.dumps(event) for event in events), project, policy
+            )
+            self.assertEqual(parsed["loaded_modules"], ["research"])
+            self.assertEqual(parsed["task_tools"], ["Read"])
+            self.assertTrue(parsed["route_complete_before_work"])
+
+            reversed_events = [events[2], events[0], events[1], events[3]]
+            parsed = parity.parse_claude_policy_only(
+                "\n".join(json.dumps(event) for event in reversed_events), project, policy
+            )
+            self.assertFalse(parsed["route_complete_before_work"])
+
+            events[1]["message"]["content"][0]["is_error"] = True
+            parsed = parity.parse_claude_policy_only(
+                "\n".join(json.dumps(event) for event in events), project, policy
+            )
+            self.assertEqual(parsed["loaded_modules"], [])
+
         batched = [
             {
                 "type": "item.completed",
@@ -180,9 +250,12 @@ class ParityRunnerTests(unittest.TestCase):
         )
         project = Path("project")
         claude = parity.command_for("claude", "claude", project, args)
+        policy_only = parity.command_for("claude-policy-only", "claude", project, args)
         skill = Path("skills") / "example" / "SKILL.md"
         codex = parity.command_for("codex", "codex", project, args, [skill])
         self.assertIn("--plugin-dir", claude)
+        self.assertNotIn("--plugin-dir", policy_only)
+        self.assertIn("Read,Bash", policy_only)
         self.assertIn("--setting-sources", claude)
         self.assertIn("--ignore-user-config", codex)
         self.assertIn("--ignore-rules", codex)

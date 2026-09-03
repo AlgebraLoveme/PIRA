@@ -24,6 +24,10 @@ and do not appear in the primary claim.
   recorded in the result manifest.
 - Claude system under test: the routing-guard plugin commit, Claude Code version,
   model alias, effort, and tool set recorded in the result manifest.
+- Claude policy-only baseline: the same Claude Code executable, model, effort,
+  prompts, synthetic policy, and project artifacts, with the plugin omitted. The
+  baseline may use only native `Read` and `Bash`; a required module counts as loaded
+  only after a successful `Read` result containing its exact synthetic marker.
 - Codex descriptive control: Codex CLI version, model, effort, sandbox, and config
   overrides recorded in the result manifest.
 - Codex control isolation: every locally discoverable Codex skill is disabled with
@@ -51,10 +55,11 @@ The frozen matrix contains:
 - a fresh-process resume;
 - compaction followed by a fresh route.
 
-Run the full 16-case stateless matrix twice independently for each client. Keep all
-runs. Do not replace a failed run with a successful retry. Infrastructure failures
-are labeled separately and rerun only after the cause and the invalidation rule are
-recorded.
+Run the full 16-case stateless matrix twice independently for guarded Claude and the
+policy-only Claude baseline. Run the same matrix twice for Codex when making the
+cross-client descriptive comparison. Keep all runs. Do not replace a failed run
+with a successful retry. Infrastructure failures are labeled separately and rerun
+only after the cause and the invalidation rule are recorded.
 
 ## Core metrics
 
@@ -109,10 +114,21 @@ All gates are conjunctive:
 9. **Control isolation:** the summary records the disabled-skill count and a
    path-manifest digest without recording paths. Any external skill read fails the
    case; a run that did not disable all discovered skills is not parity evidence.
+10. **Claude A/B integrity:** policy-only and guarded Claude use the same model,
+    effort, prompts, synthetic policy, and task artifacts. The baseline has no
+    plugin directory and no `Skill` tool. A baseline failure is reported as an
+    observation, never used to relax any guarded-Claude gate.
 
 Passing these gates supports the exact primary claim above on each native platform
 where the end-to-end client run was completed. POSIX launcher unit tests alone do
 not support a native Linux or macOS parity claim.
+
+The A/B comparison has a narrower interpretation. If guarded Claude passes both
+repetitions and policy-only Claude misses one or more cases, the result supports an
+incremental reliability claim only for this frozen suite. If both modes pass every
+case, do not claim improved accuracy; the demonstrated value is deterministic
+pre-work enforcement, bounded recovery, and continuity checks. No outcome from
+this small synthetic suite establishes a general model-quality improvement.
 
 ## Extension gates
 
@@ -138,6 +154,7 @@ The proposed follow-up PR must include:
 - this frozen protocol;
 - deterministic unit and lifecycle tests;
 - the paired runner and schema;
+- the policy-only/guarded Claude A/B results;
 - a compact committed result summary with client and policy versions;
 - commands needed to reproduce the summaries;
 - a security/privacy section and explicit non-claims;

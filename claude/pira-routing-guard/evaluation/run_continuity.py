@@ -186,7 +186,7 @@ def main() -> int:
         environment = os.environ.copy()
         environment.update(
             {
-                "PIRA_AGENT_DIR": str(agent),
+                "PIRA_POLICY_DIR": str(agent),
                 "PIRA_ROUTING_STATE_DIR": str(state),
                 "PYTHONUTF8": "1",
             }
@@ -229,7 +229,7 @@ def main() -> int:
     environment = os.environ.copy()
     environment.update(
         {
-            "PIRA_AGENT_DIR": str(agent),
+            "PIRA_POLICY_DIR": str(agent),
             "PIRA_ROUTING_STATE_DIR": str(state),
             "PYTHONUTF8": "1",
         }

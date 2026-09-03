@@ -75,7 +75,7 @@
           "artifact_hashes"
         ],
         "properties": {
-          "client": {"enum": ["claude", "codex"]},
+          "client": {"enum": ["claude", "claude-policy-only", "codex"]},
           "repetition": {"type": "integer", "minimum": 1},
           "id": {"type": "string"},
           "passed": {"type": "boolean"},
