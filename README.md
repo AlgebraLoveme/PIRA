@@ -2,7 +2,7 @@
 
 PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
 
-It adds a small, inspectable set of instructions and tools to Codex. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
+It adds a small, inspectable set of instructions and tools to coding agents. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
 
 ## What PIRA helps with
 
@@ -22,95 +22,116 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort**. Other models or agent platforms may work, but have not received the same level of testing.
+PIRA's policy and tools were tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort** on the `master` branch. This `claude` branch adapts the same policy and the same tools to **Claude Code**. The adaptation is experimental: its installer is unit-tested and exercised end to end on Windows, and it has not received the same level of behavioral testing as the Codex setup.
 
-## Quick start
+## Install PIRA
 
-PIRA installs to `~/agent` by default. You can use the one-line command for the easiest setup, or the inspect-first path if you want to review every change before it happens.
+PIRA installation is an **agent-managed operation**. The normal user-facing entry point is a request such as:
 
-Setup is safe to rerun: it preserves an existing `USER.md`, backs up user-level Codex files before changing them, and can preview or verify its work. Git is required. The setup helper checks for Python and can offer platform-specific installation help.
+> Install PIRA for Claude. Inspect the current setup first, preserve my files, show the commands you run, and verify the result.
 
-### Recommended one-line install or update
+Tell the agent whether the machine should support Codex only, Claude only, or both. The agent—not the user—should inspect existing paths, obtain the correct branch, run the appropriate setup script, and diagnose any failure. It must not silently switch a dirty checkout or replace a non-Git path.
 
-The recommended command installs or updates PIRA, then connects it to Codex. It:
-- uses the existing `~/agent` git checkout when present, otherwise clones PIRA into `~/agent`;
-- enables **soft-safe** mode;
-- keeps audio notifications **off**;
-- configures Codex to load PIRA's canonical `AGENTS.md` once;
-- installs or refreshes bundled PIRA tools in the user's `PATH`;
-- moves old PIRA-managed legacy files into backup;
-- creates a private `USER.md` placeholder only if `USER.md` is missing.
+### Supported machine layouts
 
-macOS/Linux:
+#### 1. PIRA + Codex only
 
-```bash
-if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent && cd ~/agent; fi && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
-```
+- Keep a clean `master` checkout at `~/agent`.
+- Run the Codex installer from that `master` checkout and verify it.
+- Do not run the Claude installer and do not create `~/.claude/pira`.
 
-Windows PowerShell:
+The underlying entry points are `~/agent/assets/scripts/setup_pira.sh` on macOS/Linux and `~/agent/assets/scripts/setup_pira.ps1` on Windows. Their `--dry-run` and `--verify` modes let the agent preview and verify the Codex installation.
 
-```powershell
-if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
-```
+#### 2. PIRA + Claude only
 
-If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-mode keep`:
+- Obtain a clean `claude` branch in any source directory; `~/pira-claude-source` is only a convenient example.
+- Run that branch's Claude-specific installer with `--expected-source-branch claude`.
+- Install the validated policy snapshot into `~/.claude/pira`, manage the marked import in `~/.claude/CLAUDE.md`, and install or verify the shared native tools.
+- The source checkout is not the runtime policy and may be moved or removed after a successful installation.
 
-macOS/Linux:
+#### 3. Both clients
 
-```bash
-cd ~/agent && git pull --ff-only && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
-```
+- Keep the Codex `master` checkout independently at `~/agent` and use its Codex installer.
+- Obtain the `claude` branch elsewhere and use its Claude installer to populate `~/.claude/pira`.
+- Never update one client by switching the other client's checkout to a different branch.
+- Install the native tools once. Both clients use the same verified executables from `PATH`; after one installer has installed or refreshed them, the other may use `--skip-tools`.
 
-Windows PowerShell:
+### Agent execution and verification
 
-```powershell
-Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
-```
-
-`git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
-
-> **Soft-safe is not a sandbox.** It sets Codex to no-approval/full-permission mode and relies on PIRA's explicit safety rules before state-changing commands.
-
-### Inspect-first install
-
-Use this path if you prefer to inspect setup before it changes anything:
+For Claude installation, the agent first verifies that its chosen source is a clean Git checkout on `claude`, updating it only by an explicit fast-forward or obtaining a fresh `claude` checkout. It then runs these branch-specific stages from that source directory:
 
 ```bash
-git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent
-cd ~/agent
-assets/scripts/setup_pira.sh --dry-run
-assets/scripts/setup_pira.sh
-assets/scripts/setup_pira.sh --verify
+assets/scripts/setup_pira.sh --expected-source-branch claude --dry-run
+assets/scripts/setup_pira.sh --expected-source-branch claude --yes --user-mode placeholder
+assets/scripts/setup_pira.sh --expected-source-branch claude --verify
 ```
 
-On Windows, invoke the same setup through `assets/scripts/setup_pira.ps1` from the repository directory:
+On Windows the same stages use the PowerShell wrapper, which forwards the same options:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --dry-run
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --yes --user-mode placeholder
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --verify
 ```
+
+These are the underlying auditable steps for the agent, not a requirement that the user manually paste clone or update programs. `git pull --ff-only` is acceptable only after the agent has confirmed the intended branch and a clean worktree. Setup does not change Claude Code permission settings.
+
+### Separate `USER.md` files by default
+
+Codex owns `~/agent/USER.md`; Claude owns `~/.claude/pira/USER.md`. They are separate by default so neither client depends on the other client's checkout or later edits. A normal Claude installation uses `--user-mode placeholder` when its file is missing and always preserves an existing Claude profile.
+
+If the user explicitly asks for a one-time copy from Codex, the agent instead uses `--user-mode keep`, confirms that `~/agent/USER.md` is a regular UTF-8 file and that `~/.claude/pira/USER.md` does not already exist, copies the bytes once, and compares the two SHA-256 hashes. If the Claude destination already exists, the agent must stop and ask rather than overwrite it. The files are not linked or automatically synchronized; future changes remain independent. Run the Claude installer with `--verify` after the copy.
+
+Setup is safe to rerun. It preserves `~/.claude/pira/USER.md`, backs up `~/.claude/CLAUDE.md` before changing it, and can preview, verify, or uninstall only the files recorded in its manifest. Git is required. The setup wrapper checks for Python and can offer platform-specific installation help.
+
+### How the Claude Code bridge works
+
+Claude Code reads `CLAUDE.md`, not `AGENTS.md`. Setup copies `AGENTS.md` and `modules/` from the source checkout into `~/.claude/pira/`, validates them before replacement, and records their SHA-256 hashes and source commit in `install.json`. The user-level `~/.claude/CLAUDE.md` then receives one marked block containing only:
+
+```markdown
+@~/.claude/pira/AGENTS.md
+```
+
+The installed snapshot is not a Git checkout. Switching, moving, or deleting the source clone cannot silently change Claude's active policy. An existing `~/.claude/pira/USER.md` and unrelated files are preserved; setup refuses to overwrite a policy file that is not manifest-owned or that was modified after installation.
+
+Claude loads modules with Read, runs ordinary shell commands with native Bash so permission rules see the command, and uses `pira_ctx` only when output must be retained or retrieved later. Setup does not touch `~/agent` or any Codex configuration.
+
+Without allow rules, Claude Code may ask before PIRA tool calls in Manual mode. Add only the permissions you intentionally trust with `/permissions`. In particular, `pira_ctx` is an output-management wrapper, **not a sandbox**: allowing `Bash(pira_ctx:*)` gives commands run through it the same authority as the Claude process. The four PIRA tools have different capabilities, so granting one permission does not require granting all four.
+
+### Uninstall
+
+Run uninstall from any valid checkout of the Claude branch:
+
+```bash
+assets/scripts/setup_pira.sh --uninstall
+```
+
+Uninstall backs up `~/.claude/CLAUDE.md`, removes only the managed block and files owned by `install.json`, and preserves `~/.claude/pira/USER.md`, unrelated files, source checkouts, and installed tools.
+
+### Smoke test the installed bridge
+
+`assets/scripts/smoke_claude_code.py` runs three short non-interactive `claude -p` sessions against your real configuration. A temporary session-only `InstructionsLoaded` hook verifies that the installed snapshot entered context. Verbose stream events then confirm actual Read calls for `CODING_STYLE.md` and `RESEARCH_POLICY.md` and an actual native Bash call for `git --version`, rather than trusting final text. The report obtains the policy commit from `install.json`. The test costs a few model calls and is not part of setup:
+
+```bash
+python3 assets/scripts/smoke_claude_code.py --report smoke.json
+```
+
+Smoke results so far come from Windows; macOS and Linux have not been exercised end to end.
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
 
 ## Setup options
 
 <details>
-<summary>Execution, user configuration, and tool-install options</summary>
+<summary>User configuration and tool-install options</summary>
 
-Most users can keep the recommended defaults. Open this section when you want stricter permissions, a custom install path, audio, or a tools-only update. Interactive setup asks before sensitive choices; unattended setup requires explicit flags.
-
-### Execution mode
-
-| Option | Codex settings | Use when |
-| --- | --- | --- |
-| `--execution-mode safe` | `approval_policy = "on-request"`, `sandbox_mode = "workspace-write"` | You want a real approval/sandbox boundary. |
-| `--execution-mode soft-safe` | `approval_policy = "never"`, `sandbox_mode = "danger-full-access"` | You want convenience and accept full-permission risk. |
-| `--execution-mode keep` | Leaves existing approval/sandbox settings unchanged. | You already manage Codex permissions yourself. |
+Most users can keep the recommended defaults. Open this section when you want a custom installed-policy path, a different `CLAUDE.md`, or a tools-only update.
 
 ### `USER.md` mode
 
 | Option | Behavior |
 | --- | --- |
-| `--user-mode placeholder` | Creates a private placeholder `USER.md` when it is missing. Existing `USER.md` is preserved. |
+| `--user-mode placeholder` | Creates a private `~/.claude/pira/USER.md` placeholder when missing. Existing content is preserved. |
 | `--user-mode keep` | Leaves `USER.md` exactly as-is; if it is missing, setup leaves it missing. |
 | `--user-mode interactive` | Asks what to do when `USER.md` is missing. |
 
@@ -118,10 +139,11 @@ Most users can keep the recommended defaults. Open this section when you want st
 
 | Option | Behavior |
 | --- | --- |
-| `--yes` | Accepts setup confirmations. It does **not** enable audio unless `--audio yes` is also set. |
-| `--audio yes\|no\|ask` | Controls optional Codex audio notifications. Use `--audio no` for a quiet install. |
-| `--legacy remove\|keep\|ask` | Controls paths listed in `assets/LEGACY_LIST.md`; `remove` moves active legacy files into `.backup/setup_pira_legacy/`. |
-| `--agent-dir PATH` | Installs against a path other than `~/agent`. |
+| `--claude-md PATH` | Manages the PIRA block in this file instead of `~/.claude/CLAUDE.md`. |
+| `--policy-dir PATH` | Installs the Claude policy snapshot somewhere other than `~/.claude/pira`; whitespace is rejected because Claude imports are unquoted. |
+| `--expected-source-branch NAME` | Fails before writing unless the source checkout is on this branch. Setup never switches branches. |
+| `--uninstall` | Removes the PIRA block and manifest-owned policy files; preserves `USER.md`, tools, and unrelated content. |
+| `--yes` | Accepts setup confirmations. |
 | `--skip-tools` | Skips installation or refresh of released native PIRA tools. |
 | `--tools-install-dir PATH` | Overrides the per-user tools directory (`~/.local/bin` on macOS/Linux or `%LOCALAPPDATA%\PIRA\bin` on Windows). |
 | `--tools-version TOOL=VERSION` | Pins one tool version, for example `ctx=1.7.0` or `svg=0.1.0`; repeat for multiple tools. Unspecified tools use the latest release. |
@@ -132,10 +154,9 @@ Most users can keep the recommended defaults. Open this section when you want st
 
 If PIRA itself is already configured, these commands update only its native tools. A normal run downloads the latest GitHub Release for this platform, installs missing tools, replaces outdated copies, and leaves verified matching copies unchanged.
 
-On macOS or Linux:
+Run these from the Claude source checkout on macOS or Linux:
 
 ```bash
-cd ~/agent
 python3 assets/scripts/setup_pira_tools.py          # install or refresh
 python3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 python3 assets/scripts/setup_pira_tools.py --verify # verify without writing
@@ -145,7 +166,6 @@ python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1
 On Windows PowerShell:
 
 ```powershell
-cd $HOME\agent
 py -3 assets/scripts/setup_pira_tools.py          # install or refresh
 py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
 py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
@@ -156,7 +176,7 @@ The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verif
 
 ### Maintainer release procedure
 
-PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all four tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
+PIRA has one tool source and release branch: `master`. The `claude` branch carries only the Claude Code adaptation of the policy and installer, receives merges from `master`, and never changes tool source or publishes releases. Change tool source on `master` and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all four tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -165,18 +185,16 @@ PIRA has one source/install branch: `master`. Change tool source there and bump 
 <details>
 <summary>Files, settings, tools, and verification performed by setup</summary>
 
-In plain language, setup connects PIRA to Codex, installs its tools, and checks the result. More precisely, it:
+In plain language, setup connects a stable PIRA snapshot to Claude Code without occupying Codex's `~/agent` path. More precisely, it:
 
-1. Detects the repository directory and ensures it is available as `~/agent`, unless another `--agent-dir` is given.
-2. Initializes a private `USER.md` placeholder when needed.
-3. Moves legacy files listed in `assets/LEGACY_LIST.md` into `.backup/setup_pira_legacy/` when approved.
-4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536`.
-5. Creates a local repository guard that prevents the same `AGENTS.md` from being rediscovered while working inside the PIRA checkout, and removes an older `~/.codex/AGENTS.md` symlink only when it duplicates PIRA.
-6. Selects and verifies the bundled native tools for the current platform, then installs or refreshes them in a per-user PATH directory. Existing stale copies are atomically replaced; matching copies are left unchanged.
-7. Optionally delegates audio setup to the platform-specific audio helper.
-8. Verifies the setup, including the PIRA verification token and installed native tools.
+1. Reads the source Git commit and optionally verifies the expected source branch before any write.
+2. Stages and validates `AGENTS.md`, `modules/`, and a SHA-256 manifest before replacing installed managed files under `~/.claude/pira/`.
+3. Preserves an existing private `USER.md`; creates a placeholder only when requested and missing.
+4. Adds or refreshes one managed import block in `~/.claude/CLAUDE.md`, backing the file up first and preserving every byte outside the managed span.
+5. Selects and verifies the shared released native tools for the current platform without duplicating them for Claude.
+6. Verifies the source commit, manifest, managed-file contents, token, and exact Claude import.
 
-If setup cannot safely handle an existing conflicting file or Codex setting, it stops or skips that action with a warning instead of silently overwriting it.
+If setup cannot safely handle an existing conflicting file or setting, it stops or skips that action with a warning instead of silently overwriting it.
 
 </details>
 
@@ -468,7 +486,7 @@ Run `pira_svg_check FIGURE.svg` on a finalized SVG. It warns about low contrast,
 <details>
 <summary>Behavior, customization, and manual installation</summary>
 
-Audio notifications are optional and are supported only for **Codex on macOS or Windows**. They are off by default and should not be presented as supported for Claude Code, other agent tools, Linux, or other systems.
+Audio notifications are optional and are supported only for **Codex on macOS or Windows**. They are off by default and should not be presented as supported for Claude Code, other agent tools, Linux, or other systems. The Claude Code setup on this branch does not offer or install them; the helper scripts below remain for a Codex installation on the same machine.
 
 When enabled, PIRA can play:
 - `complete_msg.m4a` when the direct user-facing Codex agent finishes a turn; and
@@ -489,7 +507,7 @@ For customization guidance, postprocessing steps, and ready-to-paste prompts for
 
 ### Install audio manually
 
-Prefer `assets/scripts/setup_pira.* --audio yes` when installing PIRA. If you only want to configure audio, use the dedicated helpers.
+On this branch, audio is configured only through the dedicated helpers below; the Claude Code setup script has no audio option.
 
 macOS:
 
@@ -521,7 +539,7 @@ PIRA is intentionally small and inspectable:
 - **Lightweight.** It avoids a heavy framework and keeps instruction overhead low.
 - **Research-oriented.** Default workflows emphasize reasoning, writing, coding, evidence gathering, and careful iteration.
 - **Lean by default.** Inspired by [Ponytail](https://github.com/DietrichGebert/ponytail) and general lessons from *Clean Code* and *Clean Architecture*, its coding style prefers simple, safe implementations and clear boundaries over speculative abstractions.
-- **Tool-friendly.** The small, explicit design integrates naturally with official tools such as Codex.
+- **Tool-friendly.** The small, explicit design integrates naturally with official tools such as Codex and Claude Code.
 
 ## Safety model
 
@@ -535,7 +553,7 @@ PIRA can run with full system permissions, but full-permission mode is not a san
 - avoid destructive commands without explicit permission;
 - keep temporary artifacts in the platform temp directory unless the user wants them preserved.
 
-Codex subagents load the same policy as the main agent. This behavior has not been equally tested on other agent platforms.
+The base Claude bridge validation covers top-level sessions. Deterministic subagent routing requires the separate optional routing-guard work and is not part of this PR.
 
 </details>
 

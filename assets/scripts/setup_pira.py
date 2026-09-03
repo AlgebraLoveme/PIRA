@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""Deterministic setup helper for PIRA.
+"""Install a stable PIRA policy bundle for Claude Code.
 
-The script intentionally uses only the Python standard library. It configures the
-current machine for the existing global PIRA layout centered on ``~/agent`` and
-keeps all writes explicit, backed up, and verifiable.
+The source checkout may live anywhere. Claude Code imports a validated snapshot
+from ``~/.claude/pira`` so changing a Git branch cannot silently change the
+installed policy. Native PIRA tools remain shared through the user's PATH.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
-import platform
-import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Iterable, Literal
+from pathlib import Path, PurePosixPath
+from typing import Literal
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
-DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
+CLAUDE_BLOCK_START = "<!-- PIRA:BEGIN (managed by setup_pira.py; do not edit inside) -->"
+CLAUDE_BLOCK_END = "<!-- PIRA:END -->"
+DEFAULT_POLICY_DIR = "~/.claude/pira"
+MANIFEST_NAME = "install.json"
+MANIFEST_SCHEMA = 1
 USER_PLACEHOLDER_TEXT = """# USER
 
 ## Knowledge Domains
@@ -39,18 +44,17 @@ USER_PLACEHOLDER_TEXT = """# USER
 ## Working Preferences
 - fill manually
 """
-PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
-
-PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
-"""
 
 
 @dataclass
 class SetupState:
     repo_root: Path
-    agent_dir: Path
+    policy_dir: Path
     dry_run: bool
     yes: bool
+    source_commit: str
+    source_branch: str | None
+    source_dirty: bool
     changed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     verification: list[tuple[str, bool, str]] = field(default_factory=list)
@@ -63,12 +67,14 @@ class SetupState:
         self.warnings.append(message)
         print(f"WARNING: {message}")
 
+    def check(self, name: str, passed: bool, detail: str) -> None:
+        self.verification.append((name, passed, detail))
+        print(f"{'PASS' if passed else 'FAIL'}: {name} — {detail}")
+
 
 def expand_path(value: str) -> Path:
     path = Path(os.path.expandvars(os.path.expanduser(value)))
-    if path.is_absolute():
-        return path
-    return Path.cwd() / path
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def display_path(path: Path) -> str:
@@ -77,23 +83,11 @@ def display_path(path: Path) -> str:
         expanded = Path.cwd() / expanded
     home = Path.home()
     try:
-        return "~/" + str(expanded.relative_to(home))
+        return "~/" + expanded.relative_to(home).as_posix()
     except ValueError:
         pass
     try:
-        return "~/" + str(expanded.resolve(strict=False).relative_to(home.resolve()))
-    except ValueError:
-        return str(expanded)
-
-
-def config_path_string(path: Path) -> str:
-    """Return a stable config path string without resolving symlinks."""
-    expanded = path.expanduser()
-    if not expanded.is_absolute():
-        expanded = Path.cwd() / expanded
-    home = Path.home()
-    try:
-        return "~/" + str(expanded.relative_to(home))
+        return "~/" + expanded.resolve(strict=False).relative_to(home.resolve()).as_posix()
     except ValueError:
         return str(expanded)
 
@@ -110,23 +104,25 @@ def backup_path(path: Path) -> Path:
 
 def prompt_yes_no(question: str, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
-    answer = input(f"{question} {suffix} ").strip().lower()
+    try:
+        answer = input(f"{question} {suffix} ").strip().lower()
+    except EOFError:
+        print()
+        return default
     if not answer:
         return default
     return answer in {"y", "yes"}
 
 
-def confirm_or_skip(state: SetupState, question: str, default: bool = False) -> bool:
-    if state.yes:
-        return True
-    if not sys.stdin.isatty():
-        state.warn(f"Skipped because confirmation is required in non-interactive mode: {question}")
-        return False
-    return prompt_yes_no(question, default=default)
+def read_utf8_text(path: Path, description: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{description} is not valid UTF-8: {display_path(path)}") from exc
 
 
 def write_text(state: SetupState, path: Path, content: str, description: str, *, backup: bool = True) -> None:
-    old = path.read_text(encoding="utf-8") if path.exists() else None
+    old = read_utf8_text(path, description) if path.exists() else None
     if old == content:
         print(f"OK: {description} already up to date ({display_path(path)})")
         return
@@ -136,385 +132,509 @@ def write_text(state: SetupState, path: Path, content: str, description: str, *,
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     if backup and path.exists():
-        backup = backup_path(path)
-        shutil.copy2(path, backup)
-        print(f"Backup: {display_path(path)} -> {display_path(backup)}")
+        backup_file = backup_path(path)
+        shutil.copy2(path, backup_file)
+        print(f"Backup: {display_path(path)} -> {display_path(backup_file)}")
     path.write_text(content, encoding="utf-8")
     state.note_change(f"updated {display_path(path)}")
 
 
 def path_under(path: Path, root: Path) -> bool:
     try:
-        path.absolute().relative_to(root.absolute())
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
         return True
     except ValueError:
         return False
 
 
-def backup_legacy_target(state: SetupState, path: Path) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+def command_output(command: list[str], description: str) -> str:
     try:
-        relative = path.relative_to(state.agent_dir)
-    except ValueError:
-        relative = Path(path.name)
-    candidate = state.agent_dir / ".backup" / "setup_pira_legacy" / relative
-    candidate = candidate.with_name(f"{candidate.name}.bak.{stamp}")
-    suffix = 1
-    while candidate.exists() or candidate.is_symlink():
-        candidate = candidate.with_name(f"{candidate.name}.{suffix}")
-        suffix += 1
-    return candidate
-
-
-def remove_path(state: SetupState, path: Path) -> None:
-    target = backup_legacy_target(state, path)
-    if state.dry_run:
-        print(f"DRY-RUN: would move legacy path {display_path(path)} to backup {display_path(target)}")
-        state.note_change(f"would move legacy {display_path(path)} to backup")
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(path), str(target))
-    state.note_change(f"moved legacy {display_path(path)} to backup {display_path(target)}")
-
-
-def same_location(a: Path, b: Path) -> bool:
-    try:
-        return a.resolve() == b.resolve()
-    except FileNotFoundError:
-        return False
-
-
-def pira_source_root(state: SetupState) -> Path:
-    """Return where PIRA source files can be read during the current run."""
-    if (state.agent_dir / "AGENTS.md").exists():
-        return state.agent_dir
-    return state.repo_root
-
-
-def ensure_agent_dir(state: SetupState, force_agent_link: bool) -> None:
-    agent_dir = state.agent_dir
-    repo_root = state.repo_root
-    if same_location(agent_dir, repo_root):
-        print(f"OK: repository is available at {display_path(agent_dir)}")
-        return
-    if not agent_dir.exists() and not agent_dir.is_symlink():
-        if state.dry_run:
-            print(f"DRY-RUN: would create symlink {display_path(agent_dir)} -> {display_path(repo_root)}")
-            state.note_change(f"would create {display_path(agent_dir)} symlink")
-            return
-        agent_dir.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            agent_dir.symlink_to(repo_root, target_is_directory=True)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Could not create symlink {agent_dir} -> {repo_root}: {exc}. "
-                "Move the repository to ~/agent or rerun with --agent-dir PATH."
-            ) from exc
-        state.note_change(f"created symlink {display_path(agent_dir)} -> {display_path(repo_root)}")
-        return
-
-    if not force_agent_link:
-        raise RuntimeError(
-            f"{display_path(agent_dir)} already exists and does not point to this repository. "
-            "Move it manually, choose --agent-dir PATH, or rerun with --force-agent-link."
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
+    except OSError as exc:
+        raise RuntimeError(f"Could not {description}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(f"Could not {description}: {detail or f'exit {completed.returncode}'}")
+    return completed.stdout.strip()
 
-    target = backup_path(agent_dir)
+
+def source_metadata(repo_root: Path, expected_branch: str | None) -> tuple[str, str | None, bool]:
+    commit = command_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"], "read the source Git commit")
+    branch = command_output(
+        ["git", "-C", str(repo_root), "branch", "--show-current"],
+        "read the source Git branch",
+    ) or None
+    dirty = bool(command_output(["git", "-C", str(repo_root), "status", "--porcelain"], "inspect the source worktree"))
+    if expected_branch and branch != expected_branch:
+        raise RuntimeError(
+            f"Expected source branch {expected_branch!r}, but {display_path(repo_root)} is on {branch or 'detached HEAD'!r}. "
+            "Use a clean checkout of the Claude branch; setup will not switch branches for you."
+        )
+    if expected_branch and dirty:
+        raise RuntimeError(
+            f"Source checkout {display_path(repo_root)} has uncommitted files. "
+            "Commit or remove them before an audited branch installation."
+        )
+    return commit, branch, dirty
+
+
+def claude_import_path(path: Path) -> str:
+    """Return an unquoted Claude import path, rejecting unsupported whitespace."""
+    expanded = path.expanduser().absolute()
+    home = Path.home().absolute()
+    try:
+        import_path = "~/" + expanded.relative_to(home).as_posix()
+    except ValueError:
+        import_path = expanded.as_posix()
+    if any(character.isspace() for character in import_path):
+        raise RuntimeError(
+            f"CLAUDE.md imports cannot contain whitespace, but the policy directory resolves to {import_path!r}. "
+            "Use the default ~/.claude/pira location or another whitespace-free path."
+        )
+    return import_path
+
+
+def claude_managed_block(policy_dir: Path) -> str:
+    return f"{CLAUDE_BLOCK_START}\n@{claude_import_path(policy_dir / 'AGENTS.md')}\n{CLAUDE_BLOCK_END}"
+
+
+def locate_managed_block(text: str, claude_md_path: Path) -> tuple[int, int] | None:
+    start_count = text.count(CLAUDE_BLOCK_START)
+    end_count = text.count(CLAUDE_BLOCK_END)
+    if start_count != end_count or start_count > 1:
+        raise RuntimeError(
+            f"Refusing to edit malformed PIRA markers in {display_path(claude_md_path)} "
+            f"(start={start_count}, end={end_count})"
+        )
+    if start_count == 0:
+        return None
+    start = text.index(CLAUDE_BLOCK_START)
+    end_start = text.index(CLAUDE_BLOCK_END)
+    if end_start < start:
+        raise RuntimeError(f"Refusing to edit reversed PIRA markers in {display_path(claude_md_path)}")
+    end = end_start + len(CLAUDE_BLOCK_END)
+    # The previous bridge format owned one final newline after the end marker.
+    # Absorb it only when it is the complete suffix, never when user text follows.
+    if text[end:] in {"\n", "\r\n"}:
+        end = len(text)
+    return start, end
+
+
+def planned_claude_md(claude_md_path: Path, policy_dir: Path) -> str:
+    """Build the next CLAUDE.md without claiming any surrounding user bytes."""
+    block = claude_managed_block(policy_dir)
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md") if claude_md_path.exists() else ""
+    span = locate_managed_block(existing, claude_md_path)
+    if span is not None:
+        return existing[: span[0]] + block + existing[span[1] :]
+    # The managed marker itself is the separator. Adding no inferred whitespace
+    # makes install followed by uninstall byte-for-byte reversible.
+    return existing + block
+
+
+def update_claude_md(state: SetupState, claude_md_path: Path, planned: str | None = None) -> None:
+    updated = planned if planned is not None else planned_claude_md(claude_md_path, state.policy_dir)
+    write_text(state, claude_md_path, updated, "Claude Code CLAUDE.md")
+
+
+def planned_claude_removal(claude_md_path: Path) -> str | None:
+    if not claude_md_path.exists():
+        return None
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    span = locate_managed_block(existing, claude_md_path)
+    if span is None:
+        return existing
+    return existing[: span[0]] + existing[span[1] :]
+
+
+def remove_claude_md_block(state: SetupState, claude_md_path: Path, planned: str | None = None) -> None:
+    if not claude_md_path.exists():
+        print(f"OK: {display_path(claude_md_path)} does not exist; nothing to remove")
+        return
+    existing = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    remaining = planned if planned is not None else planned_claude_removal(claude_md_path)
+    if remaining == existing:
+        print(f"OK: no PIRA block in {display_path(claude_md_path)}")
+        return
+    assert remaining is not None
+    if remaining:
+        write_text(state, claude_md_path, remaining, "Claude Code CLAUDE.md")
+        return
     if state.dry_run:
-        print(f"DRY-RUN: would move existing {display_path(agent_dir)} to {display_path(target)}")
-        print(f"DRY-RUN: would create symlink {display_path(agent_dir)} -> {display_path(repo_root)}")
-        state.note_change(f"would replace conflicting {display_path(agent_dir)}")
+        print(f"DRY-RUN: would back up and delete {display_path(claude_md_path)} because only the PIRA block remains")
+        state.note_change(f"would delete {display_path(claude_md_path)}")
         return
-    agent_dir.rename(target)
-    agent_dir.symlink_to(repo_root, target_is_directory=True)
-    state.note_change(f"moved existing {display_path(agent_dir)} to {display_path(target)} and linked PIRA")
+    backup_file = backup_path(claude_md_path)
+    shutil.copy2(claude_md_path, backup_file)
+    print(f"Backup: {display_path(claude_md_path)} -> {display_path(backup_file)}")
+    claude_md_path.unlink()
+    state.note_change(f"deleted {display_path(claude_md_path)} (only the PIRA block remained)")
 
 
-def ensure_user_md(state: SetupState, user_mode: Literal["keep", "placeholder", "interactive"]) -> None:
-    user_path = state.agent_dir / "USER.md"
-    source_user_path = pira_source_root(state) / "USER.md"
-    if user_path.exists() or source_user_path.exists():
-        print(f"OK: USER.md exists ({display_path(source_user_path if source_user_path.exists() else user_path)})")
-        return
-    if user_mode == "keep":
-        state.warn("USER.md is missing; leaving it absent because --user-mode keep was selected")
-        return
-    if user_mode == "interactive" and not state.yes and sys.stdin.isatty():
-        print("USER.md is missing. PIRA works best with stable user preferences, but a placeholder is safe.")
-        if not prompt_yes_no("Create a private placeholder USER.md now?", default=True):
-            state.warn("USER.md placeholder was not created")
-            return
-    write_text(state, user_path, USER_PLACEHOLDER_TEXT, "private USER.md placeholder", backup=False)
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
 
 
-def parse_legacy_paths(source_root: Path, agent_dir: Path) -> list[Path]:
-    legacy_file = source_root / "assets" / "LEGACY_LIST.md"
-    if not legacy_file.exists():
-        return []
-    paths: list[Path] = []
-    for line in legacy_file.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"\s*-\s*`([^`]+)`", line)
-        if not match:
-            continue
-        raw = match.group(1).replace("~/agent", str(agent_dir))
-        paths.append(expand_path(raw))
-    return paths
+def safe_manifest_path(value: object) -> str:
+    if not isinstance(value, str) or "\\" in value:
+        raise RuntimeError("PIRA install manifest contains an invalid managed path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise RuntimeError(f"PIRA install manifest contains an unsafe managed path: {value!r}")
+    if value != "AGENTS.md" and path.parts[0] != "modules":
+        raise RuntimeError(f"PIRA install manifest claims an unexpected file: {value!r}")
+    return value
 
 
-def remove_legacy_files(state: SetupState, legacy_mode: Literal["ask", "remove", "keep"]) -> None:
-    existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
-    if not existing:
-        print("OK: no legacy files found")
-        return
-    for path in existing:
-        print(f"Legacy path found: {display_path(path)}")
-    if legacy_mode == "keep":
-        state.warn("Legacy files remain because --legacy keep was selected")
-        return
-    if legacy_mode == "ask" and not confirm_or_skip(state, "Remove the legacy files listed above?", default=True):
-        state.warn("Legacy files remain")
-        return
-    for path in existing:
-        if not path_under(path, state.agent_dir):
-            state.warn(f"Skipped legacy path outside agent directory: {display_path(path)}")
-            continue
-        remove_path(state, path)
-
-
-def split_toml_preamble(text: str) -> tuple[list[str], list[str]]:
-    lines = text.splitlines(keepends=True)
-    for index, line in enumerate(lines):
-        if re.match(r"\s*\[", line):
-            return lines[:index], lines[index:]
-    return lines, []
-
-
-def top_level_keys(text: str) -> dict[str, str]:
-    preamble, _ = split_toml_preamble(text)
-    result: dict[str, str] = {}
-    for line in preamble:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        result[key.strip()] = value.strip()
-    return result
-
-
-def toml_string(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def upsert_top_level(text: str, updates: dict[str, str], remove_keys: Iterable[str] = ()) -> str:
-    remove_set = set(remove_keys)
-    preamble, rest = split_toml_preamble(text)
+def read_manifest(policy_dir: Path) -> dict[str, object] | None:
+    path = policy_dir / MANIFEST_NAME
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"PIRA install manifest is not a regular file: {display_path(path)}")
+    try:
+        payload = json.loads(read_utf8_text(path, "PIRA install manifest"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"PIRA install manifest is invalid JSON: {display_path(path)}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != MANIFEST_SCHEMA or payload.get("target") != "claude-code":
+        raise RuntimeError(f"PIRA install manifest has an unsupported schema or target: {display_path(path)}")
+    source_commit = payload.get("source_commit")
+    source_branch = payload.get("source_branch")
+    if (
+        not isinstance(source_commit, str)
+        or len(source_commit) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in source_commit)
+        or (source_branch is not None and not isinstance(source_branch, str))
+        or not isinstance(payload.get("source_dirty"), bool)
+    ):
+        raise RuntimeError(f"PIRA install manifest has invalid source metadata: {display_path(path)}")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise RuntimeError("PIRA install manifest has no managed file list")
     seen: set[str] = set()
-    new_preamble: list[str] = []
-    key_pattern = re.compile(r"^(\s*)([A-Za-z0-9_.-]+)(\s*=)(.*)$")
-    for line in preamble:
-        match = key_pattern.match(line)
-        if not match:
-            new_preamble.append(line)
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise RuntimeError("PIRA install manifest contains an invalid file entry")
+        relative = safe_manifest_path(entry.get("path"))
+        digest = entry.get("sha256")
+        if (
+            relative in seen
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError(f"PIRA install manifest contains an invalid entry for {relative!r}")
+        seen.add(relative)
+    return payload
+
+
+def manifest_files(manifest: dict[str, object] | None) -> dict[str, str]:
+    if manifest is None:
+        return {}
+    return {str(entry["path"]): str(entry["sha256"]) for entry in manifest["files"] if isinstance(entry, dict)}
+
+
+def tracked_policy_paths(repo_root: Path) -> list[str]:
+    output = command_output(
+        ["git", "-C", str(repo_root), "ls-files", "--", "AGENTS.md", "modules"],
+        "list tracked Claude policy files",
+    )
+    paths = [line.strip().replace("\\", "/") for line in output.splitlines() if line.strip()]
+    if "AGENTS.md" not in paths:
+        raise RuntimeError("Claude PIRA source AGENTS.md is not tracked by Git")
+    for relative in paths:
+        if relative != "AGENTS.md":
+            safe_manifest_path(relative)
+    return sorted(paths)
+
+
+def source_policy_files(state: SetupState) -> dict[str, bytes]:
+    agents_path = state.repo_root / "AGENTS.md"
+    modules_dir = state.repo_root / "modules"
+    if not agents_path.is_file() or agents_path.is_symlink():
+        raise RuntimeError(f"Claude PIRA source AGENTS.md is missing or unsafe: {display_path(agents_path)}")
+    if not modules_dir.is_dir() or modules_dir.is_symlink():
+        raise RuntimeError(f"Claude PIRA source modules directory is missing or unsafe: {display_path(modules_dir)}")
+    source_agents = read_utf8_text(agents_path, "Claude PIRA source AGENTS.md")
+    installed_root = claude_import_path(state.policy_dir)
+    if DEFAULT_POLICY_DIR not in source_agents:
+        raise RuntimeError(f"Claude PIRA source AGENTS.md does not reference {DEFAULT_POLICY_DIR}")
+    rendered_agents = source_agents.replace(DEFAULT_POLICY_DIR, installed_root)
+    if VERIFY_TOKEN not in rendered_agents:
+        raise RuntimeError("Claude PIRA source AGENTS.md is missing the verification token")
+    files = {"AGENTS.md": rendered_agents.encode("utf-8")}
+    for relative in tracked_policy_paths(state.repo_root):
+        if relative == "AGENTS.md":
             continue
-        key = match.group(2)
-        if key in remove_set:
-            continue
-        if key in updates:
-            new_preamble.append(f"{key} = {updates[key]}\n")
-            seen.add(key)
-        else:
-            new_preamble.append(line)
-    additions = [f"{key} = {value}\n" for key, value in updates.items() if key not in seen]
-    if additions:
-        if new_preamble and new_preamble[-1].strip() != "":
-            new_preamble.append("\n")
-        new_preamble.extend(additions)
-    if rest and new_preamble and new_preamble[-1].strip() != "":
-        new_preamble.append("\n")
-    return "".join(new_preamble + rest)
+        source = state.repo_root.joinpath(*PurePosixPath(relative).parts)
+        if source.is_symlink():
+            raise RuntimeError(f"Refusing to copy symlink from PIRA modules: {display_path(source)}")
+        if not source.is_file():
+            raise RuntimeError(f"Tracked Claude PIRA module is missing or not a file: {relative}")
+        module_text = read_utf8_text(source, f"Claude PIRA source module {relative}")
+        files[relative] = module_text.replace(DEFAULT_POLICY_DIR, installed_root).encode("utf-8")
+    if len(files) == 1:
+        raise RuntimeError("Claude PIRA source contains no module files")
+    return files
 
 
-def configure_codex(
-    state: SetupState,
-    config_path: Path,
-    execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
-    replace_permissions: bool,
-) -> None:
-    if execution_mode == "ask":
-        if state.yes or not sys.stdin.isatty():
-            execution_mode = "keep"
-            state.warn("Execution mode left unchanged; pass --execution-mode safe or soft-safe to set it non-interactively")
-        else:
-            print("Execution modes:")
-            print("  1. safe: approval_policy=on-request, sandbox_mode=workspace-write")
-            print("  2. soft-safe: approval_policy=never, sandbox_mode=danger-full-access")
-            print("  3. keep: do not change approval/sandbox settings")
-            choice = input("Choose execution mode [1/2/3, default 1]: ").strip()
-            execution_mode = {"": "safe", "1": "safe", "2": "soft-safe", "3": "keep"}.get(choice, "safe")  # type: ignore[assignment]
-
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    keys = top_level_keys(existing)
-    instructions_path = state.agent_dir / "AGENTS.md"
-    instructions_ref = config_path_string(instructions_path)
-    updates = {
-        "model_instructions_file": toml_string(instructions_ref),
-        "project_doc_max_bytes": DEFAULT_PROJECT_DOC_MAX_BYTES,
+def expected_manifest(state: SetupState, files: dict[str, bytes]) -> dict[str, object]:
+    return {
+        "schema_version": MANIFEST_SCHEMA,
+        "target": "claude-code",
+        "source_commit": state.source_commit,
+        "source_branch": state.source_branch,
+        "source_dirty": state.source_dirty,
+        "files": [
+            {"path": relative, "sha256": sha256_bytes(content)}
+            for relative, content in sorted(files.items())
+        ],
     }
-    remove_keys: list[str] = []
-    if execution_mode == "safe":
-        updates.update({"approval_policy": toml_string("on-request"), "sandbox_mode": toml_string("workspace-write")})
-    elif execution_mode == "soft-safe":
-        updates.update({"approval_policy": toml_string("never"), "sandbox_mode": toml_string("danger-full-access")})
-
-    if execution_mode in {"safe", "soft-safe"} and "default_permissions" in keys:
-        if not replace_permissions:
-            state.warn(
-                "Codex config has top-level default_permissions; not setting sandbox_mode because Codex docs warn not to combine them. "
-                "Rerun with --replace-permissions to remove default_permissions and set the selected mode."
-            )
-            updates.pop("sandbox_mode", None)
-        else:
-            remove_keys.append("default_permissions")
-
-    new_text = upsert_top_level(existing, updates, remove_keys=remove_keys)
-    write_text(state, config_path, new_text, "Codex config.toml")
-    ensure_project_agents_guard(state)
-    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)
 
 
-def ensure_project_agents_guard(state: SetupState) -> None:
-    """Prevent the configured global policy from being rediscovered in the PIRA repo."""
-    write_text(
-        state,
-        state.agent_dir / "AGENTS.override.md",
-        PROJECT_AGENTS_GUARD,
-        "local PIRA repository AGENTS guard",
-        backup=False,
+def manifest_text(manifest: dict[str, object]) -> str:
+    return json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+
+
+def managed_target(policy_dir: Path, relative: str) -> Path:
+    target = policy_dir.joinpath(*PurePosixPath(safe_manifest_path(relative)).parts)
+    if not path_under(target, policy_dir):
+        raise RuntimeError(f"Managed path escapes the Claude PIRA directory: {relative!r}")
+    return target
+
+
+def validate_owned_files(policy_dir: Path, old_manifest: dict[str, object] | None, new_files: dict[str, bytes]) -> None:
+    if policy_dir.is_symlink():
+        raise RuntimeError(f"Claude PIRA policy directory must not be a symlink: {display_path(policy_dir)}")
+    old_files = manifest_files(old_manifest)
+    for relative in sorted(set(old_files) | set(new_files)):
+        target = managed_target(policy_dir, relative)
+        if not target.exists() and not target.is_symlink():
+            continue
+        if target.is_symlink() or not target.is_file():
+            raise RuntimeError(f"Refusing to replace non-regular policy path: {display_path(target)}")
+        if relative not in old_files:
+            raise RuntimeError(f"Refusing to overwrite file not owned by the PIRA manifest: {display_path(target)}")
+        current = hashlib.sha256(target.read_bytes()).hexdigest()
+        if current != old_files[relative]:
+            raise RuntimeError(f"Refusing to overwrite modified managed policy file: {display_path(target)}")
+
+
+def prepare_policy_bundle(state: SetupState) -> tuple[dict[str, bytes], dict[str, object], dict[str, object] | None]:
+    files = source_policy_files(state)
+    manifest = expected_manifest(state, files)
+    old_manifest = read_manifest(state.policy_dir)
+    validate_owned_files(state.policy_dir, old_manifest, files)
+    return files, manifest, old_manifest
+
+
+def bundle_is_current(policy_dir: Path, files: dict[str, bytes], manifest: dict[str, object]) -> bool:
+    manifest_path = policy_dir / MANIFEST_NAME
+    if not manifest_path.is_file() or read_utf8_text(manifest_path, "PIRA install manifest") != manifest_text(manifest):
+        return False
+    for relative, content in files.items():
+        target = managed_target(policy_dir, relative)
+        if not target.is_file() or target.is_symlink() or target.read_bytes() != content:
+            return False
+    return True
+
+
+def install_policy_bundle(
+    state: SetupState,
+    prepared: tuple[dict[str, bytes], dict[str, object], dict[str, object] | None] | None = None,
+) -> None:
+    files, manifest, old_manifest = prepared or prepare_policy_bundle(state)
+    if bundle_is_current(state.policy_dir, files, manifest):
+        print(f"OK: Claude PIRA policy bundle already up to date ({display_path(state.policy_dir)})")
+        return
+    if state.dry_run:
+        print(f"DRY-RUN: would install validated Claude PIRA policy bundle at {display_path(state.policy_dir)}")
+        state.note_change(f"would update {display_path(state.policy_dir)}")
+        return
+
+    state.policy_dir.parent.mkdir(parents=True, exist_ok=True)
+    state.policy_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".pira-stage-", dir=state.policy_dir.parent) as temporary:
+        stage = Path(temporary)
+        for relative, content in files.items():
+            target = stage.joinpath(*PurePosixPath(relative).parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        (stage / MANIFEST_NAME).write_text(manifest_text(manifest), encoding="utf-8")
+        for relative, content in files.items():
+            staged = stage.joinpath(*PurePosixPath(relative).parts)
+            if staged.read_bytes() != content:
+                raise RuntimeError(f"Staged policy validation failed for {relative}")
+        if read_manifest(stage) != manifest:
+            raise RuntimeError("Staged policy manifest validation failed")
+
+        old_files = manifest_files(old_manifest)
+        affected = sorted(set(old_files) | set(files) | {MANIFEST_NAME})
+        rollback = stage / ".rollback"
+        existed: set[str] = set()
+        for relative in affected:
+            target = state.policy_dir / relative
+            if target.is_file() and not target.is_symlink():
+                saved = rollback / relative
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, saved)
+                existed.add(relative)
+        try:
+            for relative in sorted(set(old_files) - set(files)):
+                managed_target(state.policy_dir, relative).unlink(missing_ok=True)
+            for relative in sorted(files):
+                source = stage.joinpath(*PurePosixPath(relative).parts)
+                target = managed_target(state.policy_dir, relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, target)
+            os.replace(stage / MANIFEST_NAME, state.policy_dir / MANIFEST_NAME)
+        except OSError as exc:
+            for relative in reversed(affected):
+                target = state.policy_dir / relative
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                if relative in existed:
+                    saved = rollback / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(saved, target)
+            raise RuntimeError(f"Could not replace the Claude PIRA policy bundle; previous files were restored: {exc}") from exc
+    state.note_change(f"installed Claude PIRA policy bundle at {display_path(state.policy_dir)}")
+
+
+def prepare_user_md(state: SetupState, user_mode: Literal["keep", "placeholder", "interactive"]) -> str | None:
+    user_path = state.policy_dir / "USER.md"
+    if user_path.exists():
+        if user_path.is_symlink() or not user_path.is_file():
+            raise RuntimeError(f"Claude PIRA USER.md must be a regular file: {display_path(user_path)}")
+        read_utf8_text(user_path, "Claude PIRA USER.md")
+        return None
+    if user_mode == "keep":
+        return None
+    if user_mode == "interactive" and not state.yes and sys.stdin.isatty():
+        print("Claude PIRA USER.md is missing. A private placeholder is safe and can be edited later.")
+        if not prompt_yes_no("Create a private placeholder USER.md now?", default=True):
+            return None
+    return USER_PLACEHOLDER_TEXT
+
+
+def ensure_user_md(state: SetupState, prepared_content: str | None) -> None:
+    user_path = state.policy_dir / "USER.md"
+    if user_path.exists():
+        print(f"OK: preserving Claude PIRA USER.md ({display_path(user_path)})")
+        return
+    if prepared_content is None:
+        state.warn("Claude PIRA USER.md is missing; leaving it absent because --user-mode keep was selected")
+        return
+    write_text(state, user_path, prepared_content, "private Claude PIRA USER.md placeholder", backup=False)
+
+
+def prepare_bundle_uninstall(state: SetupState) -> dict[str, object] | None:
+    manifest = read_manifest(state.policy_dir)
+    if manifest is not None:
+        validate_owned_files(state.policy_dir, manifest, {})
+    return manifest
+
+
+def uninstall_policy_bundle(state: SetupState, manifest: dict[str, object] | None) -> None:
+    if manifest is None:
+        print(f"OK: no managed Claude PIRA policy bundle at {display_path(state.policy_dir)}")
+        return
+    owned = manifest_files(manifest)
+    if state.dry_run:
+        print(f"DRY-RUN: would remove manifest-owned policy files from {display_path(state.policy_dir)} and preserve USER.md")
+        state.note_change(f"would uninstall {display_path(state.policy_dir)}")
+        return
+    for relative in sorted(owned, reverse=True):
+        managed_target(state.policy_dir, relative).unlink(missing_ok=True)
+    (state.policy_dir / MANIFEST_NAME).unlink(missing_ok=True)
+    modules_dir = state.policy_dir / "modules"
+    directories = sorted((path for path in modules_dir.rglob("*") if path.is_dir()), reverse=True) if modules_dir.exists() else []
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    if modules_dir.exists():
+        try:
+            modules_dir.rmdir()
+        except OSError:
+            pass
+    try:
+        state.policy_dir.rmdir()
+    except OSError:
+        pass
+    state.note_change(f"removed manifest-owned Claude PIRA policy files from {display_path(state.policy_dir)}")
+
+
+def verify_claude(state: SetupState, claude_md_path: Path) -> None:
+    if not claude_md_path.exists():
+        state.check("Claude Code CLAUDE.md exists", False, display_path(claude_md_path))
+        return
+    text = read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    expected = claude_managed_block(state.policy_dir)
+    state.check(
+        "Claude Code PIRA import",
+        text.count(CLAUDE_BLOCK_START) == 1 and text.count(CLAUDE_BLOCK_END) == 1 and expected in text,
+        f"{display_path(claude_md_path)} -> {claude_import_path(state.policy_dir / 'AGENTS.md')}",
     )
 
 
-def remove_duplicate_global_agents(state: SetupState, global_path: Path, pira_path: Path) -> None:
-    """Remove only the old PIRA symlink; preserve unrelated global instructions."""
-    global_label = config_path_string(global_path)
-    if not global_path.is_symlink() or not same_location(global_path, pira_path):
-        if global_path.exists() or global_path.is_symlink():
-            state.warn(f"Preserved separate global instructions at {global_label}")
+def verify_claude_removed(state: SetupState, claude_md_path: Path) -> None:
+    present = claude_md_path.exists() and CLAUDE_BLOCK_START in read_utf8_text(claude_md_path, "Claude Code CLAUDE.md")
+    state.check("Claude Code PIRA import removed", not present, display_path(claude_md_path))
+
+
+def verify_policy_bundle(state: SetupState) -> None:
+    try:
+        files = source_policy_files(state)
+        expected = expected_manifest(state, files)
+        installed = read_manifest(state.policy_dir)
+    except RuntimeError as exc:
+        state.check("Claude PIRA policy bundle", False, str(exc))
         return
-    if state.dry_run:
-        print(f"DRY-RUN: would remove duplicate PIRA symlink {global_label}")
-        state.note_change(f"would remove duplicate {global_label} symlink")
-        return
-    global_path.unlink()
-    state.note_change(f"removed duplicate {global_label} symlink")
+    state.check("Claude PIRA install manifest", installed == expected, display_path(state.policy_dir / MANIFEST_NAME))
+    installed_files = manifest_files(installed)
+    files_ok = installed is not None and set(installed_files) == set(files)
+    for relative, content in files.items():
+        target = managed_target(state.policy_dir, relative)
+        files_ok = files_ok and target.is_file() and not target.is_symlink() and target.read_bytes() == content
+    state.check("Claude PIRA managed policy files", files_ok, f"{len(files)} files at {display_path(state.policy_dir)}")
+    agents = state.policy_dir / "AGENTS.md"
+    token_ok = agents.is_file() and VERIFY_TOKEN in read_utf8_text(agents, "installed Claude PIRA AGENTS.md")
+    state.check("verification token", token_ok, VERIFY_TOKEN)
+    user = state.policy_dir / "USER.md"
+    state.check("Claude PIRA USER.md", True, display_path(user) if user.exists() else "optional and absent")
 
 
-def configure_audio(
-    state: SetupState,
-    audio: Literal["ask", "yes", "no"],
-    config_path: Path,
-    audio_dir: Path | None,
-    force_audio: bool,
-) -> None:
-    system = platform.system().lower()
-    supported = system in {"darwin", "windows"}
-    if audio == "ask":
-        if not supported:
-            print("OK: audio notifications are supported only on macOS and Windows; skipping")
-            return
-        if state.yes or not sys.stdin.isatty():
-            print("OK: audio notifications not enabled by default")
-            return
-        audio = "yes" if prompt_yes_no("Enable optional Codex audio notifications?", default=False) else "no"
-    if audio == "no":
-        print("OK: audio notifications skipped")
-        return
-    if not supported:
-        raise RuntimeError("Audio setup is supported only on macOS and Windows")
-
-    if audio_dir is None:
-        audio_dir = state.agent_dir / "PIRA_Voice" / "Samantha"
-    for name in ["complete_msg.m4a", "waiting_msg.m4a"]:
-        candidate = audio_dir / name
-        if not candidate.exists():
-            raise RuntimeError(f"Audio file missing: {candidate}")
-
-    script = state.agent_dir / "assets" / "scripts" / "setup_codex_audio_mode.py"
-    platform_name = "macos" if system == "darwin" else "windows"
-    cmd = [sys.executable, str(script), "--platform", platform_name, "--config", str(config_path), "--audio-dir", str(audio_dir)]
-    if force_audio:
-        cmd.append("--force")
-
-    if state.dry_run:
-        print("DRY-RUN: would run audio setup command:")
-        print("  " + " ".join(sh_quote(part) for part in cmd))
-        state.note_change("would configure Codex audio notifications")
-        return
-    subprocess.run(cmd, check=True)
-    state.note_change("configured Codex audio notifications")
-
-
-def sh_quote(value: str) -> str:
-    if re.fullmatch(r"[A-Za-z0-9_./:=+-]+", value):
-        return value
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
-def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
-    def add(name: str, passed: bool, detail: str) -> None:
-        state.verification.append((name, passed, detail))
-        label = "PASS" if passed else "FAIL"
-        print(f"{label}: {name} — {detail}")
-
-    agents = state.agent_dir / "AGENTS.md"
-    add("AGENTS.md exists", agents.exists(), display_path(agents))
-    user = state.agent_dir / "USER.md"
-    add("USER.md exists", user.exists(), display_path(user))
-    token_ok = agents.exists() and VERIFY_TOKEN in agents.read_text(encoding="utf-8")
-    add("verification token", token_ok, VERIFY_TOKEN)
-    legacy_existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
-    add("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
-
-    if not skip_codex:
-        if not config_path.exists():
-            add("Codex config exists", False, display_path(config_path))
-        else:
-            text = config_path.read_text(encoding="utf-8")
-            keys = top_level_keys(text)
-            expected_instructions = toml_string(config_path_string(state.agent_dir / "AGENTS.md"))
-            add("Codex config points to PIRA", keys.get("model_instructions_file") == expected_instructions, f"{display_path(config_path)} -> {expected_instructions}")
-            add("Codex project_doc_max_bytes", keys.get("project_doc_max_bytes") == DEFAULT_PROJECT_DOC_MAX_BYTES, keys.get("project_doc_max_bytes", "missing"))
-            guard = state.agent_dir / "AGENTS.override.md"
-            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == PROJECT_AGENTS_GUARD, display_path(guard))
+def verify_removed(state: SetupState) -> None:
+    state.check("Claude PIRA install manifest removed", not (state.policy_dir / MANIFEST_NAME).exists(), display_path(state.policy_dir))
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
-    parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
-    parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
-    parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
+    parser = argparse.ArgumentParser(description="Install a stable PIRA policy snapshot for Claude Code.")
+    parser.add_argument("--policy-dir", default=DEFAULT_POLICY_DIR, help="Installed Claude policy directory (default: ~/.claude/pira).")
+    parser.add_argument("--claude-md", default="~/.claude/CLAUDE.md", help="Claude Code user instruction file.")
+    parser.add_argument("--expected-source-branch", default=None, help="Fail unless the source checkout is on this branch; setup never switches branches.")
+    parser.add_argument("--uninstall", action="store_true", help="Remove the managed CLAUDE.md block and manifest-owned policy files; preserve USER.md and tools.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument(
         "--tools-version",
         action="append",
         default=None,
-        help=(
-            "Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or "
-            "svg=VERSION; repeatable."
-        ),
+        help="Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or svg=VERSION; repeatable.",
     )
-    parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
-    parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")
     parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
-    parser.add_argument("--legacy", choices=["ask", "remove", "keep"], default="ask", help="How to handle paths listed in assets/LEGACY_LIST.md.")
-    parser.add_argument("--force-agent-link", action="store_true", help="Move a conflicting --agent-dir aside and symlink this repo there.")
-    parser.add_argument("--audio", choices=["ask", "yes", "no"], default="ask", help="Whether to install optional Codex audio notifications.")
-    parser.add_argument("--audio-dir", default=None, help="Audio set directory for optional Codex audio notifications.")
-    parser.add_argument("--force-audio", action="store_true", help="Allow the audio helper to replace an existing notify entry.")
     parser.add_argument("--verify", action="store_true", help="Only verify the current setup; do not write.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing.")
-    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations; does not enable audio unless --audio yes is set.")
+    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations.")
     return parser
 
 
@@ -543,41 +663,56 @@ def configure_tools(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
-    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes)
-    config_path = expand_path(args.codex_config)
-    audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
-
-    print("PIRA setup")
-    print(f"Repository: {display_path(repo_root)}")
-    print(f"Agent dir:  {display_path(state.agent_dir)}")
-    print(f"Dry run:    {state.dry_run}")
-
     try:
-        if not args.verify:
-            ensure_agent_dir(state, force_agent_link=args.force_agent_link)
-            ensure_user_md(state, args.user_mode)
-            remove_legacy_files(state, args.legacy)
-            if not args.skip_codex:
-                configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
-            configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
+        source_commit, source_branch, source_dirty = source_metadata(repo_root, args.expected_source_branch)
+        state = SetupState(
+            repo_root=repo_root,
+            policy_dir=expand_path(args.policy_dir),
+            dry_run=args.dry_run or args.verify,
+            yes=args.yes,
+            source_commit=source_commit,
+            source_branch=source_branch,
+            source_dirty=source_dirty,
+        )
+        claude_md_path = expand_path(args.claude_md)
+
+        print("PIRA setup (Claude Code)")
+        dirty_suffix = ", dirty" if source_dirty else ""
+        print(f"Source:      {display_path(repo_root)} @ {source_commit[:7]} ({source_branch or 'detached HEAD'}{dirty_suffix})")
+        print(f"Policy dir:  {display_path(state.policy_dir)}")
+        print(f"CLAUDE.md:   {display_path(claude_md_path)}")
+        print(f"Dry run:     {state.dry_run}")
+
+        if args.uninstall:
+            if args.verify:
+                raise RuntimeError("--uninstall and --verify cannot be combined")
+            planned_removal = planned_claude_removal(claude_md_path)
+            old_manifest = prepare_bundle_uninstall(state)
+            remove_claude_md_block(state, claude_md_path, planned_removal)
+            uninstall_policy_bundle(state, old_manifest)
+            if not args.dry_run:
+                verify_claude_removed(state, claude_md_path)
+                verify_removed(state)
+        elif args.verify:
+            verify_policy_bundle(state)
+            verify_claude(state, claude_md_path)
             if not args.skip_tools:
-                configure_tools(
-                    state,
-                    args.tools_install_dir,
-                    args.tools_version,
-                    verify_only=False,
-                )
-        if args.dry_run and not args.verify:
-            print("DRY-RUN: verification skipped because planned changes were not applied")
+                configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=True)
         else:
-            verify(state, config_path, skip_codex=args.skip_codex)
-            if args.verify and not args.skip_tools:
-                configure_tools(
-                    state,
-                    args.tools_install_dir,
-                    args.tools_version,
-                    verify_only=True,
-                )
+            # Validate every outcome-changing path and source before the first write.
+            planned_claude = planned_claude_md(claude_md_path, state.policy_dir)
+            prepared_bundle = prepare_policy_bundle(state)
+            prepared_user = prepare_user_md(state, args.user_mode)
+            install_policy_bundle(state, prepared_bundle)
+            ensure_user_md(state, prepared_user)
+            update_claude_md(state, claude_md_path, planned_claude)
+            if not args.skip_tools:
+                configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=False)
+            if args.dry_run:
+                print("DRY-RUN: verification skipped because planned changes were not applied")
+            else:
+                verify_policy_bundle(state)
+                verify_claude(state, claude_md_path)
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
