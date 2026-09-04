@@ -2,11 +2,11 @@
  "schema_version": 2,
  "kind": "pira_compact_claude_modes_evidence",
  "source_summary_sha256": {
-  "matrix": "8f531265192d477a40d67be680c2396d3d96d5560cf83275969295180f7fdf8b",
-  "development": "eec0478a991cce186872e3b9032bd5157e94dca71c4f39d4ee7705bae7aadbca",
-  "prospective": "974be45956426fd7f02dcd7da7d48af158a1192d2aa5545c1e294e8634a49b26",
-  "multiturn": "decdf50c4877369ad5628f78197974c04098a58c5c3ed41f306170ac1195700b",
-  "prospective_multiturn": "1fc2e29ad5171ad56ba50b261078a7829c5a933b85af8057be4e1f1ef8483ba6"
+  "matrix": "828f9012b2256ac6f32de568b86ad892edbc31c39c60070cb6c04ec87aa20f28",
+  "development": "f3ee9eeee93e1dc3226296045bb8c494a432bcc73d479def5484406080d99d60",
+  "prospective": "3c15702812cc94c40dae26ba4b7c891df84f2e4fc598e0070d9dfebe85cb1ea2",
+  "multiturn": "47bfa6c109c105a356fb1fb1d07a8cad5d7ff08d69b3c784c49cda3680af87fe",
+  "prospective_multiturn": "bd387fe8afc7c04fb78e7aee1ac94e47c38918e2ad0c03ed13e9c5e46bf24197"
  },
  "matrix": {
   "policy_commit": "2ba7d1212058f38530a54057df5135afaa11958e",
@@ -16277,8 +16277,8 @@
   "model": "sonnet",
   "effort": "low",
   "repetitions": 2,
-  "passed": 19,
-  "routing_contract_passed": 19,
+  "passed": 20,
+  "routing_contract_passed": 20,
   "task_passed": 20,
   "total": 20,
   "sessions": [
@@ -16286,8 +16286,8 @@
     "mode": "strict",
     "repetition": 1,
     "id": "pm_silent_switch",
-    "passed": false,
-    "routing_passed": false,
+    "passed": true,
+    "routing_passed": true,
     "task_passed": true,
     "totals": {
      "model_turns": 14,
@@ -16308,15 +16308,11 @@
      {
       "index": 1,
       "kind": "task",
-      "passed": false,
-      "routing_passed": false,
+      "passed": true,
+      "routing_passed": true,
       "task_passed": true,
-      "failures": [
-       "routing did not complete before task work or final answer"
-      ],
-      "routing_failures": [
-       "routing did not complete before task work or final answer"
-      ],
+      "failures": [],
+      "routing_failures": [],
       "task_failures": [],
       "route_calls": [
        [

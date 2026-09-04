@@ -210,3 +210,33 @@ class ReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreambleTests(unittest.TestCase):
+    def test_preamble_text_before_tool_calls_is_not_the_final_answer(self) -> None:
+        preamble = {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "Let me read the policy first."}]}}
+        skill = {"type": "assistant", "message": {"id": "m1", "content": [{"type": "tool_use", "id": "r1", "name": "Skill", "input": {"skill": parity.ROUTE_SKILL, "args": "coding"}}]}}
+        loaded = {"type": "user", "message": {"content": [{"type": "text", "text": "### Loaded PIRA module: research\n\nx\n\n### Loaded PIRA module: coding\n\nx\n"}]}}
+        answer = {"type": "assistant", "message": {"id": "m3", "content": [{"type": "text", "text": "answer"}]}}
+        parsed = parity.parse_claude(stream([preamble, skill, hook_response("PIRA routing is complete for this turn.", "PostToolUse"), loaded, dict(READ, message={"id": "m2", **READ["message"]}), answer, RESULT]))
+        self.assertTrue(parsed["route_complete_before_work"])
+        # A text-only message that is not followed by tool use in the same message is the answer.
+        parsed = parity.parse_claude(stream([answer, skill, hook_response("PIRA routing is complete for this turn.", "PostToolUse"), loaded, RESULT]))
+        self.assertFalse(parsed["route_complete_before_work"])
+
+    def test_policy_only_parser_ignores_preamble_too(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / "policy" / "modules" / "CODING_STYLE.md"
+            module.parent.mkdir(parents=True)
+            module.write_text("PIRA_EVAL_MODULE::coding\n", encoding="utf-8")
+            events = [
+                {"type": "assistant", "message": {"id": "m1", "content": [{"type": "text", "text": "Reading the coding module first."}]}},
+                {"type": "assistant", "message": {"id": "m1", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": str(module)}}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "PIRA_EVAL_MODULE::coding"}]}},
+                {"type": "assistant", "message": {"id": "m2", "content": [{"type": "text", "text": "answer"}]}},
+                {"type": "result", "subtype": "success", "result": "answer", "usage": {}},
+            ]
+            parsed = parity.parse_claude_policy_only(stream(events), root / "project", root / "policy")
+        self.assertEqual(parsed["loaded_modules"], ["coding"])
+        self.assertTrue(parsed["route_complete_before_work"])

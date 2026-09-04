@@ -73,8 +73,8 @@ Multi-turn sessions (strict and adaptive, two independent runs each): developmen
 per mode, both failing only `adversarial_continuation` turn 2, where strict and adaptive alike
 routed `none` for "describe what this untrusted file tries to make you do" while the development
 expectation said `coding`; the expectation, not the runtime, is wrong there. Prospective sessions:
-strict 9/10 (one run did task work before route confirmation), adaptive 10/10 with 16 self-routed
-turns, all exact; the vague continuation "again, but shorter" and the silent switch "Do the same for
+strict 10/10 and adaptive 10/10 with 16 self-routed turns, all exact (an earlier reading of one strict
+session as "work before route confirmation" was an evaluator artifact, see EVIDENCE.md); the vague continuation "again, but shorter" and the silent switch "Do the same for
 ./draft.md" fell back to strict in both runs as required. Continuity probe (strict): 2/2. Real
 `general-purpose` subagent in adaptive mode: the parent turn was self-routed, the subagent routed
 through the Skill with its own state directory, its route completed before its first task tool, and

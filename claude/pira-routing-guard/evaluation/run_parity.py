@@ -186,6 +186,31 @@ def parse_jsonl(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     return events, errors
 
 
+def messages_with_tool_use(events: list[dict[str, Any]]) -> set[str]:
+    """IDs of assistant messages that contain a tool_use block.
+
+    stream-json emits one assistant event per content block, all sharing message.id. A text block
+    that belongs to a message which also calls tools is a preamble ("Let me read the policy first"),
+    not a final answer, and must not count as task work.
+    """
+    ids: set[str] = set()
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        if any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content):
+            ids.add(str(message.get("id")))
+    return ids
+
+
+def is_final_answer_block(block: dict[str, Any], event: dict[str, Any], tool_messages: set[str]) -> bool:
+    if block.get("type") != "text" or not str(block.get("text", "")).strip():
+        return False
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    return str(message.get("id")) not in tool_messages
+
+
 def hook_additional_context(output: str) -> str:
     """Return the additionalContext carried by a hook_response output, or an empty string."""
     try:
@@ -211,6 +236,7 @@ def parse_claude(text: str) -> dict[str, Any]:
     result_event: dict[str, Any] | None = None
     adaptive_selected = False
     active_route: list[str] | None = None
+    tool_messages = messages_with_tool_use(events)
 
     for index, event in enumerate(events):
         if event.get("type") == "assistant":
@@ -229,7 +255,7 @@ def parse_claude(text: str) -> dict[str, Any]:
                         task_tools.append(name)
                         if first_task_at is None:
                             first_task_at = index
-                elif block.get("type") == "text" and str(block.get("text", "")).strip():
+                elif is_final_answer_block(block, event, tool_messages):
                     first_answer_at = index if first_answer_at is None else first_answer_at
         if event.get("type") == "user":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
@@ -301,12 +327,12 @@ def parse_claude_policy_only(
     task_tools: list[str] = []
     first_work_at: int | None = None
     result_event: dict[str, Any] | None = None
+    tool_messages = messages_with_tool_use(events)
 
     for index, event in enumerate(events):
         if event.get("type") == "assistant":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             content = message.get("content") if isinstance(message.get("content"), list) else []
-            has_tool = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
             for block in content:
                 if not isinstance(block, dict):
                     continue
@@ -323,7 +349,7 @@ def parse_claude_policy_only(
                     else:
                         task_tools.append(name)
                         first_work_at = index if first_work_at is None else first_work_at
-                elif block.get("type") == "text" and str(block.get("text", "")).strip() and not has_tool:
+                elif is_final_answer_block(block, event, tool_messages):
                     first_work_at = index if first_work_at is None else first_work_at
         if event.get("type") == "user":
             message = event.get("message") if isinstance(event.get("message"), dict) else {}

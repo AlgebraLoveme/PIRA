@@ -742,8 +742,8 @@
    "failure_categories": {
     "exact and ordered": 5,
     "nothing loaded": 8,
-    "incomplete set, late": 2,
-    "incomplete set": 1
+    "incomplete set": 2,
+    "incomplete set, late": 1
    },
    "median_model_turns": 2.0,
    "median_context_tokens": 48284.5,
@@ -896,7 +896,7 @@
     "public_figure#1": {
      "routing_passed": false,
      "task_passed": true,
-     "category": "incomplete set, late",
+     "category": "incomplete set",
      "loaded_modules": [
       "public_figure"
      ],
@@ -906,8 +906,7 @@
      "expected_extra": [],
      "routing_failures": [
       "active route ['public_figure'] != expected ['public_figure', 'research']",
-      "loaded ['public_figure'] != expected ['public_figure', 'research']",
-      "routing did not complete before task work or final answer"
+      "loaded ['public_figure'] != expected ['public_figure', 'research']"
      ],
      "task_failures": [],
      "model_turns": 5,
@@ -1110,14 +1109,13 @@
    "worktree_dirty": false,
    "matrix_sha256": "80e5f5f48f3d9dcc2e514ee4783df78e7910f1a77f6184483eaca69ffe5d995a",
    "cases": 32,
-   "routing_contract_passed": 5,
+   "routing_contract_passed": 6,
    "task_passed": 32,
    "failure_categories": {
-    "exact and ordered": 5,
+    "exact and ordered": 6,
     "nothing loaded": 22,
     "incomplete set, late": 2,
-    "incomplete set": 2,
-    "right set, loaded after task work": 1
+    "incomplete set": 2
    },
    "median_model_turns": 2.0,
    "median_context_tokens": 28701.5,
@@ -1511,17 +1509,15 @@
      }
     },
     "user_profile#2": {
-     "routing_passed": false,
+     "routing_passed": true,
      "task_passed": true,
-     "category": "right set, loaded after task work",
+     "category": "exact and ordered",
      "loaded_modules": [
       "user_profile"
      ],
      "expected_missing": [],
      "expected_extra": [],
-     "routing_failures": [
-      "routing did not complete before task work or final answer"
-     ],
+     "routing_failures": [],
      "task_failures": [],
      "model_turns": 2,
      "context_tokens": 28726,
@@ -2596,11 +2592,11 @@
    "worktree_dirty": false,
    "matrix_sha256": "80e5f5f48f3d9dcc2e514ee4783df78e7910f1a77f6184483eaca69ffe5d995a",
    "cases": 16,
-   "routing_contract_passed": 6,
+   "routing_contract_passed": 7,
    "task_passed": 16,
    "failure_categories": {
-    "exact and ordered": 6,
-    "right set, loaded after task work": 6,
+    "exact and ordered": 7,
+    "right set, loaded after task work": 5,
     "extra module": 1,
     "incomplete set, late": 2,
     "nothing loaded": 1
@@ -2684,18 +2680,16 @@
      }
     },
     "paper_reading#1": {
-     "routing_passed": false,
+     "routing_passed": true,
      "task_passed": true,
-     "category": "right set, loaded after task work",
+     "category": "exact and ordered",
      "loaded_modules": [
       "paper_reading",
       "research"
      ],
      "expected_missing": [],
      "expected_extra": [],
-     "routing_failures": [
-      "routing did not complete before task work or final answer"
-     ],
+     "routing_failures": [],
      "task_failures": [],
      "model_turns": 4,
      "context_tokens": 29191,

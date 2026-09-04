@@ -203,7 +203,8 @@ to the strict script of ca9cf92 and `PIRA_ROUTING_GUARD_MODE` has no effect.
 
 Prospective strict observations from the same run, reported as observed: 84/86 exact routes (one
 `explain` added to a paper-reading prompt, one `coding` dropped from an explain-code prompt) and
-2/86 task failures from denied Bash or absolute-path Read calls.
+2/86 task failures from denied Bash or absolute-path Read calls. Prospective multi-turn sessions: strict
+10/10 and adaptive 10/10 after the evaluator correction below.
 
 ## Does a stronger model or higher effort remove the need for the guard?
 
@@ -216,10 +217,10 @@ loaded before the first task tool or answer). Compact, redacted evidence:
 |---|---|---:|---:|---:|---:|---:|
 | Sonnet 5 | low (formal, 2 reps) | 6/32 | 24 | 0 | 2 | 0 |
 | Sonnet 5 | high | 5/16 | 8 | 0 | 3 | 0 |
-| Opus 4.8 (`opus` alias) | low (2 reps) | 5/32 | 22 | 1 | 4 | 0 |
+| Opus 4.8 (`opus` alias) | low (2 reps) | 6/32 | 22 | 0 | 4 | 0 |
 | Opus 5 | low | 5/16 | 6 | 1 | 4 | 0 |
 | Opus 5 | medium | 5/16 | 1 | 4 | 5 | 1 |
-| Opus 5 | high | 6/16 | 1 | 6 | 2 | 1 |
+| Opus 5 | high | 7/16 | 1 | 5 | 2 | 1 |
 
 No model or effort level moved the pass rate. Higher effort changes the failure mode rather than
 removing it: Opus 5 at high effort almost always reads some module, but in 6 of 16 cases only after
@@ -233,3 +234,52 @@ Caveats: single repetitions except where noted; the synthetic policy is the repo
 with the module tree pointed at a synthetic directory; results describe this suite, not general model
 quality. In Claude Code 2.1.217 the `opus` alias resolves to `claude-opus-4-8`; Opus 5 must be
 requested as `claude-opus-5`.
+
+## Evaluator correction: preamble text is not an answer
+
+`claude --output-format stream-json` emits one `assistant` event per content block, all sharing the
+same `message.id`. The Claude parsers treated any non-empty text block as the final answer, so a
+preamble such as "Let me read the policy first" followed by tool calls in the same message made
+every later module load count as "after task work". `messages_with_tool_use()` now groups blocks by
+message id; a text block is an answer only when its message contains no tool call. All saved event
+streams were re-scored with `rescore_summary.py` (model outputs untouched, verdicts recomputed):
+
+- v2 single-turn suites: no verdict changed (matrix 70/96, development 72/96, prospective 183/258).
+- v2 prospective multi-turn: strict `pm_silent_switch` run 1 flips to pass; strict 10/10, adaptive 10/10.
+- model/effort baselines: Opus 4.8 low 5/32 → 6/32, Opus 5 high 6/16 → 7/16; others unchanged.
+- the reminder-variant probes below were affected most, because a per-turn reminder makes the model
+  announce "reading the modules first" before it reads them.
+
+The committed compact files were regenerated from the re-scored summaries and carry a `rescored`
+field with the parser digest.
+
+## Reminder-only hooks versus enforcement
+
+Question: does the guard need the `route` Skill and the `PreToolUse` deny, or would a text reminder
+in the right place make the model route itself? Three policy-only variants on the frozen matrix,
+Sonnet 5 low and Opus 5 low, one repetition each, exact and ordered routing contract. Compact,
+redacted evidence including the exact reminder texts:
+`results/windows-5cdbdc4-policy-only-reminder-variants-compact.json`.
+
+| Variant | Sonnet 5 | Opus 5 | Residual failures |
+|---|---:|---:|---|
+| Baseline: CLAUDE.md only | 6/32 | 5/16 | mostly nothing loaded |
+| A: CLAUDE.md + one sentence ("mandatory; read the required modules before you open any project file") | 8/16 | 10/16 | incomplete sets (Sonnet); right set loaded after the task file (Opus) |
+| B: reminder-only plugin, SessionStart + per-turn UserPromptSubmit text, no deny, no Skill | 14/16 | 15/16 | Sonnet: `profile_guidance` missing user_profile, `adversarial_task_data` nothing loaded; Opus: `guidance` plus an unneeded user_profile |
+| C: policy via `--append-system-prompt-file`, CLAUDE.md removed | 2/16 | 7/16 | mostly nothing loaded or incomplete |
+| Strict guard (hooks + deny + Skill), Sonnet 5, formal run | 32/32 | – | – |
+
+Reading of the result:
+
+- A per-turn hook reminder adjacent to the prompt recovers most of the compliance (14–15 of 16)
+  with one fewer model turn than the guard (median 3 against 4), because the model reads the modules
+  itself in one Read round trip instead of a Skill round trip. What it does not give is a guarantee:
+  the residual failures are exactly the guard's two mechanical checks, canonical dependency expansion
+  and an explicit, verifiable route before the first tool. Without a declared route the hook cannot
+  know what to verify, and without a deny it cannot stop a turn that skips the step.
+- Placement in the system prompt (variant C) did not help either model; the "may or may not be
+  relevant" wrapper that Claude Code puts around CLAUDE.md is therefore not the main cause of the
+  baseline's non-compliance.
+- These are single repetitions on a synthetic suite. They justify testing a lighter enforcement
+  design (per-turn reminder plus deny, without the Skill) but do not by themselves justify shipping a
+  reminder-only mode.
