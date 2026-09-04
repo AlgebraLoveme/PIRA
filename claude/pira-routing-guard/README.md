@@ -97,7 +97,7 @@ automatically. Design, confidence rules, and failure boundaries: [ADAPTIVE.md](A
 
 Deterministic coverage lives in `tests/test_adaptive_routing.py` and `evaluation/test_run_modes.py`.
 The paired runner accepts `--client claude-adaptive` and `--client claude-modes` (policy-only,
-strict, adaptive) and reports per-mode medians with paired deltas; `evaluation/heldout.json` holds
-prompts written before the lexicon existed, and `evaluation/run_multiturn.py` compares the modes
+strict, adaptive) and reports per-mode medians with paired deltas; `evaluation/development.json` (formerly `heldout.json`, a development set) holds
+prompts written before the first lexicon and used to tune it, and `evaluation/run_multiturn.py` compares the modes
 turn by turn in one `stream-json` process, including continuation, task switch, compaction, and
 resume.

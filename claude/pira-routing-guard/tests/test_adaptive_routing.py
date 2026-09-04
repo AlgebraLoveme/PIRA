@@ -103,7 +103,7 @@ class AdaptiveRoutingTests(unittest.TestCase):
         self.assertIsNone(guard.adaptive_selection("thanks. Reply PONG.", []))
 
     def test_frozen_and_heldout_prompts_never_miss_a_required_module(self) -> None:
-        for name in ("matrix.json", "heldout.json"):
+        for name in ("matrix.json", "development.json"):
             document = json.loads((EVALUATION / name).read_text(encoding="utf-8"))
             for scenario in document["scenarios"]:
                 with self.subTest(case=scenario["id"]):
