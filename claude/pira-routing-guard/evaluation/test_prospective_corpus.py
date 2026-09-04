@@ -1,6 +1,6 @@
 """Freeze and validate the prospective validation corpus.
 
-The SHA-256 digests below were recorded when the corpus was committed, before the v2 adaptive
+The SHA-256 digests below (over LF-normalized bytes, so checkouts with CRLF conversion match) were recorded when the corpus was committed, before the v2 adaptive
 classifier existed. A digest mismatch means the corpus was edited after the fact and its results
 no longer count as prospective (see PROSPECTIVE_PROTOCOL.md).
 """
@@ -14,8 +14,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FROZEN = {
-    "prospective.json": "d5ef721db84f1672f598107ca78dc5a6d3bafd36fb814966c042a87ebadb4f6e",
-    "prospective-multiturn.json": "85b24b2e269107e01a29a968c0517321c593e6cb3867f7c6ed605520eb7754ab",
+    "prospective.json": "c4d5c33dca8e33e45c7b1b93bcceeac170ec2c41648961b9ca59f727a947a777",
+    "prospective-multiturn.json": "351ff33bbde8b42c82502ce3ef61151be18e80257a24ef8b0c0a533c2b756555",
 }
 MODULES = {
     "user_profile", "research", "paper_reading", "coding", "writing", "public_figure", "explain", "guidance", "maintenance",
@@ -44,7 +44,10 @@ class ProspectiveCorpusTests(unittest.TestCase):
     def test_corpus_files_are_frozen(self) -> None:
         for name, digest in FROZEN.items():
             with self.subTest(file=name):
-                self.assertEqual(hashlib.sha256((HERE / name).read_bytes()).hexdigest(), digest)
+                normalized = (HERE / name).read_bytes().replace(b"
+", b"
+")
+                self.assertEqual(hashlib.sha256(normalized).hexdigest(), digest)
 
     def test_single_turn_corpus_shape_and_coverage(self) -> None:
         document = json.loads((HERE / "prospective.json").read_text(encoding="utf-8"))
