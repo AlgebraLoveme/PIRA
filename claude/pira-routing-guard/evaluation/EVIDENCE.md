@@ -283,3 +283,45 @@ Reading of the result:
 - These are single repetitions on a synthetic suite. They justify testing a lighter enforcement
   design (per-turn reminder plus deny, without the Skill) but do not by themselves justify shipping a
   reminder-only mode.
+
+## Reminder, gate, and once-at-start on Opus 5
+
+Follow-up to the reminder-variant probes, with Opus 5 (`claude-opus-5`, low effort) as the primary
+model. Three text-only or near-text-only designs were compared with the same exact, ordered routing
+contract; none of them uses the `route` Skill. Compact, redacted evidence with the gate's hook
+script embedded: `results/windows-b072c2c-opus5-reminder-gate-variants-compact.json`.
+
+- **B** reminder at SessionStart and at every UserPromptSubmit; no deny.
+- **D** the same reminder plus a `PreToolUse` deny of any tool other than a module-file `Read` until
+  one module has been read in the session (a temporary plugin, not part of the repository).
+- **E** the reminder at SessionStart only (startup, resume, clear, compact).
+
+| Suite | B | D | E | Reference |
+|---|---:|---:|---:|---|
+| Frozen matrix (16) | 15/16, 15/16 | 16/16, 16/16 | – | strict guard, Sonnet: 32/32 |
+| Prospective corpus (43) | 40/43 | 40/43, 39/43 | – | strict guard, Sonnet: 84/86 |
+| Prospective multi-turn (5 sessions) | 5/5 | 5/5, 5/5 | 5/5, 5/5 | strict guard, Sonnet: 10/10 |
+| Gate denials fired | – | 0 in 118 cases and 26 turns | – | |
+| Median model turns (single-turn) | 3–4 | 3–4 | – | strict 4, policy-only 2 |
+
+Failures are the same in every variant: `p_explain_code` loads only `explain` (also missed once by
+the strict Sonnet run), and the two `guidance` prompts add `user_profile`, which Opus 5 does
+consistently when asked for personal practical advice. Task completion was 100 % throughout.
+
+Reading of the result:
+
+- For Opus 5 on these suites the gate never had to fire; B and D are indistinguishable, and even one
+  reminder at session start carried short 2–3-turn sessions, including task switches to a new domain.
+  The gate is therefore zero-cost insurance rather than a driver of the result. Whether the
+  once-at-start reminder survives long gaps between compactions is untested.
+- What no text design delivers is exactness: canonical dependency expansion (`p_explain_code`) and the
+  policy's boundary for `user_profile` are the residual misses, and the hook has no declared route to
+  check them against. That is the remaining case for the strict guard's explicit `route` step, at the
+  cost of one model turn per prompt.
+- A lighter shipped mode ("reminder plus gate, no Skill") is now a well-characterised candidate for
+  Opus 5 users: about 93 % exact routes on unseen prompts, one fewer model turn than strict, and a
+  deny that has not yet been observed to trigger. It is not implemented in the plugin; the plugin still
+  ships strict only.
+
+Caveats: Opus 5 low effort only; one to two repetitions per cell; synthetic policy; single-turn matrix
+cannot distinguish SessionStart from per-turn injection because both precede the first model call.

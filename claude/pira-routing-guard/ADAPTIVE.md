@@ -115,6 +115,15 @@ corpus, the adaptive runtime was removed in the following commit: the guard scri
 to the strict script of ca9cf92, the plugin version stays 0.4.0, and `PIRA_ROUTING_GUARD_MODE` has
 no effect. The evaluator, corpora, protocol and evidence remain so the result is reproducible.
 
+## Simpler alternative measured afterwards
+
+After the withdrawal, three text-only designs were measured with Opus 5 (see EVIDENCE.md, "Reminder,
+gate, and once-at-start on Opus 5"): a per-turn hook reminder without any Skill reaches 40/43 exact
+routes on the prospective corpus and 10/10 multi-turn sessions, with or without a PreToolUse gate,
+at one model turn less than strict. Its residual misses are dependency expansion and the
+`user_profile` boundary, which only a declared route can check. A future cost reduction should start
+from that design rather than from a lexicon classifier.
+
 ## What a future attempt would need
 
 - A new prospective corpus committed before the change; the current one has been seen.
