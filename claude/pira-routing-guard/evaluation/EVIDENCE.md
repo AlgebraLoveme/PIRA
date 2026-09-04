@@ -204,3 +204,32 @@ to the strict script of ca9cf92 and `PIRA_ROUTING_GUARD_MODE` has no effect.
 Prospective strict observations from the same run, reported as observed: 84/86 exact routes (one
 `explain` added to a paper-reading prompt, one `coding` dropped from an explain-code prompt) and
 2/86 task failures from denied Bash or absolute-path Read calls.
+
+## Does a stronger model or higher effort remove the need for the guard?
+
+Tested on 2026-09-04 with policy-only Claude (no plugin, `Read` and `Bash` only) on the frozen
+16-case matrix and the synthetic policy, scored by the exact routing contract (canonical module set
+loaded before the first task tool or answer). Compact, redacted evidence:
+`results/windows-d0c466e-policy-only-model-effort-compact.json`.
+
+| Model (served id) | Effort | Routing contract | Nothing loaded | Right set, loaded after task work | Incomplete set | Extra module |
+|---|---|---:|---:|---:|---:|---:|
+| Sonnet 5 | low (formal, 2 reps) | 6/32 | 24 | 0 | 2 | 0 |
+| Sonnet 5 | high | 5/16 | 8 | 0 | 3 | 0 |
+| Opus 4.8 (`opus` alias) | low (2 reps) | 5/32 | 22 | 1 | 4 | 0 |
+| Opus 5 | low | 5/16 | 6 | 1 | 4 | 0 |
+| Opus 5 | medium | 5/16 | 1 | 4 | 5 | 1 |
+| Opus 5 | high | 6/16 | 1 | 6 | 2 | 1 |
+
+No model or effort level moved the pass rate. Higher effort changes the failure mode rather than
+removing it: Opus 5 at high effort almost always reads some module, but in 6 of 16 cases only after
+it has already read the task file, and in 2 more it drops a canonical dependency (`research` under
+coding or writing, `paper_reading` beside `writing`). Those are exactly the two properties the strict
+guard enforces deterministically: routing before the first task tool and canonical dependency
+expansion. The strict guard with Sonnet 5 passes the same matrix 32/32. Task completion was 100 %
+in every run, so the failures are policy compliance, not capability.
+
+Caveats: single repetitions except where noted; the synthetic policy is the repository `AGENTS.md`
+with the module tree pointed at a synthetic directory; results describe this suite, not general model
+quality. In Claude Code 2.1.217 the `opus` alias resolves to `claude-opus-4-8`; Opus 5 must be
+requested as `claude-opus-5`.
