@@ -19,8 +19,11 @@ UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 ABSOLUTE_PATH = re.compile(r"[A-Za-z]:\\\\|[A-Za-z]:/|/Users/|/home/|\\\\Users\\\\")
 
 
+PATH_LIKE = re.compile(r"(?:[A-Za-z]:(?:\\\\|\\|/)|/tmp/|/Users/|/home/)[^'\"\\s,}\\]]*")
+
+
 def redact(text: str) -> str:
-    return UUID.sub("<id>", TOOL_USE_ID.sub("toolu_<redacted>", text))
+    return PATH_LIKE.sub("<path>", UUID.sub("<id>", TOOL_USE_ID.sub("toolu_<redacted>", text)))
 
 
 def sha256_file(path: Path) -> str:
