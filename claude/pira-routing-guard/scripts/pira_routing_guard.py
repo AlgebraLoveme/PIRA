@@ -46,89 +46,6 @@ IMPLIED = {
     "public_figure": {"research"},
 }
 
-ADAPTIVE_MODE_ENV = "PIRA_ROUTING_GUARD_MODE"
-ADAPTIVE_MAX_MODULES = 4
-ADAPTIVE_MAX_PROMPT_CHARS = 2000
-ADAPTIVE_MARKER = "PIRA adaptive route confirmed:"
-ROUTE_COMPLETE = "PIRA routing is complete for this turn."
-
-
-def _cue(pattern: str) -> re.Pattern[str]:
-    return re.compile(pattern, re.IGNORECASE)
-
-
-# Signals for the opt-in adaptive mode, derived from the module descriptions and routing rules in
-# AGENTS.md. A signal is evidence for a module only in the combinations encoded in classify();
-# any combination the rules do not resolve exactly makes the turn fall back to the strict Skill
-# route. English patterns are word-bounded; Chinese patterns are substrings.
-ADAPTIVE_SIGNALS: dict[str, re.Pattern[str]] = {
-    "code": _cue(
-        r"\b(?:the|this|my|our|your|source|python)\s+code\b|\bcode\s+(?:review|changes?|base|snippet|block|quality)\b|"
-        r"\b(?:codebase|scripts?|functions?|bugs?|debug\w*|refactor\w*|traceback|stack ?trace|exceptions?|"
-        r"(?:type|key|value|index|attribute|zero.?division)error|crash\w*|compil\w*|unit tests?|test suite|"
-        r"(?:failing|broken) tests?|tests? (?:fail|hang|pass|break)\w*|pytest|regex|repo(?:sitory)?|commits?|"
-        r"pull request|python|rust|java(?:script)?|typescript|golang|bash|shell|sql|c\+\+|c#|docker|"
-        r"matplotlib|pandas|numpy|decorator|context manager)\b|"
-        r"\.(?:py|rs|js|ts|tsx|jsx|go|java|c|cpp|h|hpp|cs|sh|ps1|sql|ipynb)\b|"
-        r"代码|脚本|函数|调试|报错|重构|编译|单元测试|仓库|编程|程序|跑不通|跑起来|有没有 ?bug"
-    ),
-    "prose": _cue(
-        r"\b(?:polish\w*|proofread\w*|rewrite|reword\w*|rephrase|paraphrase|tighten the (?:wording|prose)|"
-        r"wording|grammar|readability|paragraph|introduction|related[- ]work|conclusion|manuscript|rebuttal|"
-        r"cover letter|response to (?:the )?reviewers?|academic english|scientific writing|technical writing)\b|"
-        r"润色|改写|措辞|引言|结论|相关工作|段落|审稿|语法|学术英文|学术写作|科技写作"
-    ),
-    "paper": _cue(r"\b(?:papers?|preprints?|arxiv|excerpts?|articles?|study)\b|论文|预印本|这篇|文章"),
-    "read": _cue(
-        r"\b(?:read|reading|summari[sz]e\w*|summary|critique|critiques?|extract|skim)\b|精读|阅读|总结|概括|解读|评述"
-    ),
-    "abstract": _cue(r"\babstracts?\b|摘要"),
-    "figure": _cue(
-        r"\bfigures?\b(?! of merit)|\b(?:plots?|charts?|diagrams?|svg|posters?|slides?|histograms?|heatmaps?|tikz|"
-        r"visuali[sz]ations?)\b|图表|配图|绘图|画图|作图|示意图|海报|幻灯片|可视化|生成的图|这张图|图片|图像|插图"
-    ),
-    "public": _cue(
-        r"\b(?:publication|publish\w*|journal|conference|posters?|slides?|talk|readme|documentation|website|blog|"
-        r"public|submission|camera.ready)\b|论文|发表|投稿|海报|幻灯片|公开|期刊|会议"
-    ),
-    "figure_review_only": _cue(
-        r"\b(?:existing|audit\w*|no (?:source[- ])?code changes?|without (?:source[- ])?code changes?|"
-        r"no source-code changes?)\b|不改代码|不要求改代码|不需要改代码|只看"
-    ),
-    "explain": _cue(
-        r"\b(?:explain\w*|explanation|walk me through|teach|intuition|in simple terms|clarify)\b|"
-        r"解释|讲解|讲讲|通俗|原理|教我"
-    ),
-    "why": _cue(r"\bwhy\b|为什么|为何"),
-    "research": _cue(
-        r"\b(?:evidence|verif(?:y|ied|ies|ication)|fact.?check\w*|corroborat\w*|sources?|citations?|cite[sd]?|"
-        r"literature|systematic review|meta.?analysis|claims?|(?:better|stronger|well) supported|supported by)\b|"
-        r"证据|核实|查证|验证|来源|出处|文献|引用|可信"
-    ),
-    "guidance": _cue(
-        r"\b(?:overwhelm\w*|overload\w*|stress\w*|anxious|anxiety|burn\w*out|motivat\w*|procrastinat\w*|"
-        r"putting off|feel(?:ing)? (?:stuck|lost|down|tired|guilty|behind)|guilty|cope|coping|work.life|habits?|"
-        r"routines?|chores?|career|relationship|advisor|supervisor|mentor|colleague|time management|practical plan)\b|"
-        r"焦虑|压力|迷茫|拖延|动力|情绪|心累|怎么办|该不该|如何应对|平衡|习惯|导师|同事|职业|人际"
-    ),
-    "profile": _cue(
-        r"\bmy (?:stored |saved )?(?:preferences?|profile|background|communication (?:style|preferences?))\b|"
-        r"\b(?:know about me|about me|on my behalf|personali[sz]\w*|tailored? (?:to|for) me)\b|"
-        r"我的(?:偏好|背景|资料|档案|个人信息)|个性化|替我|了解我"
-    ),
-    "maintenance": _cue(
-        r"\bpira\b|agents\.md|user\.md|claude\.md|\b(?:instruction files?|policy files?|routing (?:rules?|policy|guard)|"
-        r"module[- ]loading)\b|指令文件|路由规则|模块规则|策略文件|模块加载"
-    ),
-    "write": _cue(r"\b(?:write|writing|written|draft\w*|compose)\b|写|撰写|起草"),
-}
-FENCED_OR_QUOTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”", re.DOTALL)
-NEGATED_CODE = re.compile(
-    r"\b(?:no|without|not|never)\s+(?:source[- ])?code(?:[- ]changes?)?\b|不改代码|不要求改代码|不需要改代码", re.IGNORECASE
-)
-LOAD_ON_DEMAND_BULLET = re.compile(r"^- `([a-z_]+)`: ", re.MULTILINE)
-
-
 
 def emit(value: dict[str, Any] | None = None) -> None:
     if value:
@@ -260,11 +177,8 @@ class SessionState:
         temporary.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         os.replace(temporary, self.state_path)
 
-    def reset_route(self, hold_adaptive: bool = False) -> None:
-        state: dict[str, Any] = {"status": "pending", "stop_blocks": 0}
-        if hold_adaptive:
-            state["adaptive_hold"] = 1
-        self.write(state)
+    def reset_route(self) -> None:
+        self.write({"status": "pending", "stop_blocks": 0})
 
     def consume_stop_block(self, state: dict[str, Any] | None) -> bool:
         current = state or {"status": "pending"}
@@ -361,150 +275,6 @@ def readiness(session: SessionState, state: dict[str, Any] | None) -> tuple[bool
     return True, "PIRA routing is complete for this turn."
 
 
-def adaptive_enabled() -> bool:
-    return os.environ.get(ADAPTIVE_MODE_ENV, "").strip().lower() == "adaptive"
-
-
-def adaptive_policy_compatible() -> bool:
-    """The hardcoded signals assume the module list of the installed AGENTS.md; otherwise stay strict."""
-    try:
-        text = (policy_dir() / "AGENTS.md").read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return False
-    listed = set(LOAD_ON_DEMAND_BULLET.findall(text))
-    return listed == set(MODULE_FILES)
-
-
-def classify(prompt: str) -> list[str] | None:
-    """Exact module set for a confident prompt, or None when the strict Skill route must decide."""
-    if len(prompt) > ADAPTIVE_MAX_PROMPT_CHARS:
-        return None
-    text = FENCED_OR_QUOTED.sub(" ", prompt)
-    if not text.strip():
-        return None
-    review_only = bool(ADAPTIVE_SIGNALS["figure_review_only"].search(text))
-    text = NEGATED_CODE.sub(" ", text)
-    seen = {name: bool(pattern.search(text)) for name, pattern in ADAPTIVE_SIGNALS.items()}
-    modules: set[str] = set()
-    conflict = False
-
-    if seen["code"]:
-        modules.add("coding")
-    if seen["prose"]:
-        modules.add("writing")
-    if seen["paper"] and seen["read"]:
-        modules.add("paper_reading")
-    if seen["abstract"]:
-        if seen["read"]:
-            modules.add("paper_reading")
-        if seen["prose"]:
-            modules.add("writing")
-        if not seen["read"] and not seen["prose"]:
-            conflict = True
-    if seen["paper"] and not seen["read"] and seen["write"] and not seen["prose"]:
-        conflict = True  # "write a paper": reading, prose, or both is unclear
-    if seen["figure"]:
-        if seen["code"] and seen["public"]:
-            modules.update({"coding", "public_figure"})
-        elif not seen["code"] and seen["public"] and review_only:
-            modules.add("public_figure")
-        else:
-            conflict = True  # exploratory plot or unclear publication status
-    if seen["research"]:
-        modules.add("research")
-    if seen["explain"]:
-        others = modules - {"research"}
-        if not others or others <= {"coding"} or others <= {"paper_reading"}:
-            modules.add("explain")
-        else:
-            conflict = True
-    if seen["guidance"]:
-        if modules - {"user_profile"}:
-            conflict = True  # technical and emotional signals together
-        else:
-            modules.add("guidance")
-    if seen["profile"]:
-        if modules - {"guidance", "research"}:
-            conflict = True
-        else:
-            modules.add("user_profile")
-    if seen["maintenance"]:
-        if modules:
-            conflict = True
-        else:
-            modules.add("maintenance")
-    if seen["write"] and not seen["code"] and not seen["prose"] and not modules:
-        conflict = True  # "write something": code or prose is unclear
-    if seen["write"] and seen["code"] and seen["prose"]:
-        conflict = True
-    if seen["why"] and not seen["explain"] and not modules:
-        conflict = True  # a bare "why" question: explanation or analysis is unclear
-
-    for module in tuple(modules):
-        modules.update(IMPLIED.get(module, set()))
-    if conflict or not modules or len(modules) > ADAPTIVE_MAX_MODULES:
-        return None
-    return [name for name in MODULE_ORDER if name in modules]
-
-
-def adaptive_selection(prompt: str, previous: list[str] | None) -> list[str] | None:
-    """Exact selection for this turn, or None for the strict route.
-
-    With a confirmed previous route, the turn is treated as a continuation only when the prompt's
-    own domain signals resolve to exactly that route; a prompt without signals, or with signals
-    that resolve to a different route, goes strict. Nothing is ever reused on signal-free text.
-    """
-    selection = classify(prompt)
-    if previous:
-        return previous if selection == previous else None
-    return selection
-
-
-def previous_route(session: SessionState, state: dict[str, Any] | None) -> list[str] | None:
-    if not state or state.get("adaptive_hold"):
-        return None
-    ready, _ = readiness(session, state)
-    required = state.get("required")
-    if ready and isinstance(required, list) and required and all(isinstance(name, str) for name in required):
-        return required
-    return None
-
-
-def adaptive_select(session: SessionState, selection: list[str]) -> dict[str, Any]:
-    state = {
-        "status": "selected",
-        "nonce": secrets.token_hex(12),
-        "required": selection,
-        "tool_use_id": "",
-        "stop_blocks": 0,
-        "source": "adaptive",
-    }
-    session.write(state)
-    rendered, pending_markers = render_modules(session, selection)
-    commit_selected(session, state, pending_markers)
-    listed = ", ".join(selection)
-    if pending_markers:
-        body = f"{ADAPTIVE_MARKER} {listed}.\n\n{rendered}\n"
-    else:
-        body = f"{ADAPTIVE_MARKER} {listed} (already loaded and unchanged). "
-    return hook_context(
-        "UserPromptSubmit",
-        body + f"Invoke `{ROUTE_SKILL}` only if a required PIRA module is missing from this route. {ROUTE_COMPLETE}",
-    )
-
-
-def handle_user_prompt(data: dict[str, Any], session: SessionState) -> dict[str, Any]:
-    if adaptive_enabled():
-        state = session.read()
-        prompt = data.get("prompt")
-        if isinstance(prompt, str) and not (state and state.get("adaptive_hold")) and adaptive_policy_compatible():
-            selection = adaptive_selection(prompt, previous_route(session, state))
-            if selection is not None:
-                return adaptive_select(session, selection)
-    session.reset_route()
-    return hook_context("UserPromptSubmit", route_instruction())
-
-
 def handle_pre_tool(data: dict[str, Any], session: SessionState) -> dict[str, Any] | None:
     tool_name = str(data.get("tool_name", ""))
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
@@ -588,16 +358,10 @@ def prepare_selected(
         raise RuntimeError(error)
     if required != state.get("required"):
         raise RuntimeError("route arguments do not match the validated hook selection")
-    rendered, pending_markers = render_modules(session, required or [])
-    return rendered, session, state, pending_markers
-
-
-def render_modules(session: SessionState, required: list[str]) -> tuple[str, list[tuple[str, Path]]]:
-    """Render the exact text of modules not yet loaded and return their pending markers."""
-    paths = module_paths(required)
+    paths = module_paths(required or [])
     sections: list[str] = []
     pending_markers: list[tuple[str, Path]] = []
-    for module in required:
+    for module in required or []:
         path = paths[module]
         if session.is_loaded(module, path):
             continue
@@ -605,8 +369,10 @@ def render_modules(session: SessionState, required: list[str]) -> tuple[str, lis
         sections.append(f"### Loaded PIRA module: {module}\n\n{content.rstrip()}\n")
         pending_markers.append((module, path))
     if not sections:
-        return "All selected PIRA modules were already loaded and unchanged.", pending_markers
-    return "\n".join(sections), pending_markers
+        rendered = "All selected PIRA modules were already loaded and unchanged."
+    else:
+        rendered = "\n".join(sections)
+    return rendered, session, state, pending_markers
 
 
 def commit_selected(
@@ -634,14 +400,15 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
     session = SessionState(session_id, agent_id=agent_id)
     if event == "SessionStart":
         session.clear_loaded()
-        session.reset_route(hold_adaptive=data.get("source") != "startup")
+        session.reset_route()
         return hook_context("SessionStart", route_instruction())
     if event == "SubagentStart":
         session.clear_loaded()
         session.reset_route()
         return hook_context("SubagentStart", route_instruction())
     if event == "UserPromptSubmit":
-        return handle_user_prompt(data, session)
+        session.reset_route()
+        return hook_context("UserPromptSubmit", route_instruction())
     if event == "PreToolUse":
         return handle_pre_tool(data, session)
     if event == "PostToolUse":
@@ -658,7 +425,7 @@ def dispatch(data: dict[str, Any]) -> dict[str, Any] | None:
         )
     if event == "PostCompact":
         session.clear_loaded()
-        session.reset_route(hold_adaptive=True)
+        session.reset_route()
         return None
     return None
 

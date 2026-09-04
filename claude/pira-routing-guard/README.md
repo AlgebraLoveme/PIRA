@@ -46,7 +46,6 @@ python claude/pira-routing-guard/tests/test_marketplace_installation.py
 python claude/pira-routing-guard/evaluation/test_run_matrix.py
 python claude/pira-routing-guard/evaluation/test_run_continuity.py
 python claude/pira-routing-guard/evaluation/test_run_parity.py
-python claude/pira-routing-guard/tests/test_adaptive_routing.py
 python claude/pira-routing-guard/evaluation/test_run_modes.py
 python claude/pira-routing-guard/evaluation/test_prospective_corpus.py
 ```
@@ -86,36 +85,30 @@ follow-up routing, a fresh Claude Code process with `--resume`, manual compactio
 after `PostCompact`. Use it only when writing synthetic session history under the active Claude
 configuration directory is acceptable.
 
-## Adaptive mode (opt-in)
+## Adaptive routing experiment (withdrawn)
 
-Strict routing is the default and is unchanged. Setting `PIRA_ROUTING_GUARD_MODE=adaptive` for the
-Claude Code process (for example through the `env` block of a Claude settings file) lets the
-`UserPromptSubmit` hook route a turn itself when, and only when, deterministic signals derived from
-the module descriptions in `AGENTS.md` resolve to one exact module set. The hook then injects the
-exact module text, confirms the route, and the model skips the `route` Skill round trip. Everything
-else falls back to the unchanged strict route: prompts without a resolving signal, conflicting
-signals (for example a figure whose publication status or code involvement is unclear, a generic
-"write" without a code or prose object, technical and emotional signals together), prompts longer
-than 2000 characters, the first prompt after a resume, `/clear`, or compaction, every subagent, and
-any follow-up whose own signals do not resolve to exactly the previous route. `none` is never
-selected automatically. If the installed `AGENTS.md` lists a different module set than the guard
-was written for, adaptive silently stays strict. Design, rules, and measured results:
-[ADAPTIVE.md](ADAPTIVE.md).
+An opt-in mode that let the `UserPromptSubmit` hook route confident turns itself was built and
+evaluated in this branch (commits 5df1df5 to 2ba7d12) and then removed: on the prospective corpus it
+cut the strict guard's context overhead by about 80 % and its model turns from 4 to 2 on the 93 % of
+module-requiring prompts it handled, but it selected one extra module on 4 of 58 self-routed cases,
+so it failed the preregistered exact-routing gate. `PIRA_ROUTING_GUARD_MODE` has no effect in the
+shipped plugin. The full record, measurements and the failure modes a future attempt must fix are in
+[ADAPTIVE.md](ADAPTIVE.md); the evaluator that scored it stays in `evaluation/`.
 
-Deterministic coverage lives in `tests/test_adaptive_routing.py`, `evaluation/test_run_modes.py`,
-and `evaluation/test_prospective_corpus.py`. The paired runner accepts `--client claude-adaptive` and
-`--client claude-modes` (policy-only, strict, adaptive) and reports, per mode, an exact
-routing-contract verdict and a task verdict for every case, overall medians, and the
-adaptive-selected subset with coverage. `evaluation/development.json` (formerly `heldout.json`) is
-the development set used while tuning; `evaluation/prospective.json` and
-`evaluation/prospective-multiturn.json` are frozen before the v2 classifier existed
-(`PROSPECTIVE_PROTOCOL.md`). `evaluation/run_multiturn.py` compares the modes turn by turn in one
-`stream-json` process, including continuation, task switch, compaction, and resume, and
-`evaluation/report_modes.py` produces the compact, redacted evidence file:
+The paired runner accepts `--client claude-modes` (policy-only, strict, adaptive) and reports, per
+mode, an exact routing-contract verdict and a task verdict for every case, overall medians, and the
+adaptive-selected subset with coverage; running the adaptive client against the shipped plugin
+behaves like strict. `evaluation/development.json` (formerly `heldout.json`) was the development
+set; `evaluation/prospective.json` and `evaluation/prospective-multiturn.json` are hash-pinned
+(`PROSPECTIVE_PROTOCOL.md`). `evaluation/run_multiturn.py` compares modes turn by turn in one
+`stream-json` process (continuation, task switch, compaction, resume), `evaluation/run_subagent_probe.py`
+checks the parent/subagent boundary with a real subagent, and `evaluation/report_modes.py` writes
+the compact, redacted evidence file:
 
 ```text
 python claude/pira-routing-guard/evaluation/run_parity.py --client claude-modes --repetitions 2 --artifact-root <fresh-temp-directory>
 python claude/pira-routing-guard/evaluation/run_parity.py --client claude-modes --repetitions 2 --matrix claude/pira-routing-guard/evaluation/prospective.json --artifact-root <fresh-temp-directory>
 python claude/pira-routing-guard/evaluation/run_multiturn.py --mode strict --mode adaptive --repetitions 2 --artifact-root <fresh-temp-directory>
+python claude/pira-routing-guard/evaluation/run_subagent_probe.py --mode adaptive --artifact-root <fresh-temp-directory>
 python claude/pira-routing-guard/evaluation/report_modes.py --matrix-summary <...>/summary.json --prospective-summary <...>/summary.json --multiturn-summary <...>/summary.json --output <compact.json>
 ```

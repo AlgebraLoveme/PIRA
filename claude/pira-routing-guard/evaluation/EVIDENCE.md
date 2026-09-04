@@ -186,3 +186,21 @@ gates rather than treating process exit alone as the parity decision.
   evidence, not native Linux/macOS client validation.
 - No claim is made about full product parity, all prompts, all models, long-horizon
   autonomous work, performance superiority, or zero operational overhead.
+
+## Adaptive routing experiment (withdrawn)
+
+Between 5df1df5 and 2ba7d12 this branch carried an opt-in adaptive mode that routed confident
+prompts from the `UserPromptSubmit` hook. Its v1 evidence (`windows-ca9cf92-adaptive-modes-compact.json`,
+recorded from an uncommitted tree) was superseded and removed. The v2 runtime was evaluated on the
+clean commit 2ba7d12 against the frozen matrix, the development set, the hash-pinned prospective
+corpus, multi-turn sessions, the strict continuity probe and a real subagent; results are in
+`results/windows-2ba7d12-adaptive-v2-modes-compact.json` and
+`results/windows-2ba7d12-subagent-probe-adaptive.json` and are summarised in `../ADAPTIVE.md`.
+Strict stayed at 32/32 on the matrix; adaptive cut the context overhead of self-routed cases by
+about 80 % but selected an extra module on 4 of 58 prospective self-routed cases, failing the
+exact-routing gate, so the adaptive runtime was removed. The shipped guard script is byte-identical
+to the strict script of ca9cf92 and `PIRA_ROUTING_GUARD_MODE` has no effect.
+
+Prospective strict observations from the same run, reported as observed: 84/86 exact routes (one
+`explain` added to a paper-reading prompt, one `coding` dropped from an explain-code prompt) and
+2/86 task failures from denied Bash or absolute-path Read calls.
