@@ -45,75 +45,89 @@ IMPLIED = {
     "writing": {"research"},
     "public_figure": {"research"},
 }
+
 ADAPTIVE_MODE_ENV = "PIRA_ROUTING_GUARD_MODE"
 ADAPTIVE_MAX_MODULES = 4
-# Cue lexicon for the opt-in adaptive mode, derived from the module descriptions in AGENTS.md.
-# A cue that is ambiguous between modules maps to the union of the plausible modules, so the
-# lexicon can over-select but is never used to exclude a module. English patterns are
-# word-bounded and case-insensitive; Chinese patterns are substrings.
-ADAPTIVE_CUES: tuple[tuple[str, frozenset[str]], ...] = (
-    (
-        r"\bmy (?:stored |saved )?(?:preferences?|profile|background|communication (?:style|preferences?)|"
-        r"learning (?:needs|style|level))\b|\b(?:know about me|on my behalf|personali[sz]e\w*|"
-        r"tailored? (?:to|for) me)\b|我的(?:偏好|背景|资料|档案|个人信息)|个性化|替我|以我的名义|了解我的",
-        frozenset({"user_profile"}),
+ADAPTIVE_MAX_PROMPT_CHARS = 2000
+ADAPTIVE_MARKER = "PIRA adaptive route confirmed:"
+ROUTE_COMPLETE = "PIRA routing is complete for this turn."
+
+
+def _cue(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern, re.IGNORECASE)
+
+
+# Signals for the opt-in adaptive mode, derived from the module descriptions and routing rules in
+# AGENTS.md. A signal is evidence for a module only in the combinations encoded in classify();
+# any combination the rules do not resolve exactly makes the turn fall back to the strict Skill
+# route. English patterns are word-bounded; Chinese patterns are substrings.
+ADAPTIVE_SIGNALS: dict[str, re.Pattern[str]] = {
+    "code": _cue(
+        r"\b(?:the|this|my|our|your|source|python)\s+code\b|\bcode\s+(?:review|changes?|base|snippet|block|quality)\b|"
+        r"\b(?:codebase|scripts?|functions?|bugs?|debug\w*|refactor\w*|traceback|stack ?trace|exceptions?|"
+        r"(?:type|key|value|index|attribute|zero.?division)error|crash\w*|compil\w*|unit tests?|test suite|"
+        r"(?:failing|broken) tests?|tests? (?:fail|hang|pass|break)\w*|pytest|regex|repo(?:sitory)?|commits?|"
+        r"pull request|python|rust|java(?:script)?|typescript|golang|bash|shell|sql|c\+\+|c#|docker|"
+        r"matplotlib|pandas|numpy|decorator|context manager)\b|"
+        r"\.(?:py|rs|js|ts|tsx|jsx|go|java|c|cpp|h|hpp|cs|sh|ps1|sql|ipynb)\b|"
+        r"代码|脚本|函数|调试|报错|重构|编译|单元测试|仓库|编程|程序|跑不通|跑起来|有没有 ?bug"
     ),
-    (
-        r"\b(?:evidence|verif(?:y|ied|ies|ication)|fact.?check\w*|corroborat\w*|sources?|citations?|"
-        r"cite[sd]?|literature|systematic review|meta.?analysis|claims?|better supported|assess\w*|"
-        r"investigat\w*)\b|证据|核实|查证|验证|来源|出处|文献|引用|调研|事实核查|可信|综述",
-        frozenset({"research"}),
+    "prose": _cue(
+        r"\b(?:polish\w*|proofread\w*|rewrite|reword\w*|rephrase|paraphrase|tighten the (?:wording|prose)|"
+        r"wording|grammar|readability|paragraph|introduction|related[- ]work|conclusion|manuscript|rebuttal|"
+        r"cover letter|response to (?:the )?reviewers?|academic english|scientific writing|technical writing)\b|"
+        r"润色|改写|措辞|引言|结论|相关工作|段落|审稿|语法|学术英文|学术写作|科技写作"
     ),
-    (
-        r"\b(?:papers?|preprints?|arxiv|excerpts?|th(?:is|e) (?:article|study)|summari[sz]e\w*|summary|"
-        r"critique)\b|论文|文章|预印本|这篇|总结|概括|精读|解读",
-        frozenset({"paper_reading"}),
+    "paper": _cue(r"\b(?:papers?|preprints?|arxiv|excerpts?|articles?|study)\b|论文|预印本|这篇|文章"),
+    "read": _cue(
+        r"\b(?:read|reading|summari[sz]e\w*|summary|critique|critiques?|extract|skim)\b|精读|阅读|总结|概括|解读|评述"
     ),
-    (r"\babstract\b|摘要", frozenset({"paper_reading", "writing"})),
-    (
-        r"\b(?:code|coding|codebase|scripts?|functions?|bugs?|debug\w*|implement\w*|refactor\w*|compil\w*|"
-        r"tests?|testing|traceback|stack ?trace|exceptions?|errors?|regex|api|library|libraries|packages?|"
-        r"repo(?:sitory|sitories)?|commits?|git|pull request|diff|patch|python|rust|java(?:script)?|typescript|"
-        r"golang|bash|shell|sql|c\+\+|c#|html|css|docker|dependenc(?:y|ies))\b|"
-        r"\.(?:py|rs|js|ts|tsx|jsx|go|java|c|cpp|h|hpp|cs|sh|ps1|sql|ipynb|toml|yaml|yml)\b|"
-        r"代码|脚本|函数|调试|报错|异常|实现|重构|编译|测试|仓库|提交|依赖|接口|编程|程序|抛出|崩溃",
-        frozenset({"coding"}),
+    "abstract": _cue(r"\babstracts?\b|摘要"),
+    "figure": _cue(
+        r"\bfigures?\b(?! of merit)|\b(?:plots?|charts?|diagrams?|svg|posters?|slides?|histograms?|heatmaps?|tikz|"
+        r"visuali[sz]ations?)\b|图表|配图|绘图|画图|作图|示意图|海报|幻灯片|可视化|生成的图|这张图|图片|图像|插图"
     ),
-    (r"\b(?:write|writing|written)\b|写", frozenset({"writing", "coding"})),
-    (
-        r"\b(?:draft\w*|polish\w*|proofread\w*|rewrite|reword\w*|rephrase|paraphrase|prose|introduction|"
-        r"related work|conclusion|manuscript|rebuttal|reviewers?|cover letter|grammar|wording|readability|"
-        r"academic (?:english|writing)|scientific writing|technical writing|latex)\b|\.(?:tex|bib)\b|"
-        r"撰写|起草|润色|改写|措辞|引言|结论|相关工作|审稿|语法|学术英文|学术写作|科技写作|写作",
-        frozenset({"writing"}),
+    "public": _cue(
+        r"\b(?:publication|publish\w*|journal|conference|posters?|slides?|talk|readme|documentation|website|blog|"
+        r"public|submission|camera.ready)\b|论文|发表|投稿|海报|幻灯片|公开|期刊|会议"
     ),
-    (
-        r"\b(?:figures?|plots?|plotting|charts?|graphs?|diagrams?|schematics?|tikz|svg|posters?|slides?|"
-        r"infographics?|visuali[sz]\w*|histograms?|heatmaps?|axis|axes|legend|colou?r ?(?:map|scheme|palette)|"
-        r"dpi|png|matplotlib|ggplot|seaborn)\b|图表|配图|绘图|画图|作图|示意图|海报|幻灯片|可视化|图片|图像|插图|"
-        r"柱状图|折线图|热图|散点图|配色",
-        frozenset({"public_figure", "coding"}),
+    "figure_review_only": _cue(
+        r"\b(?:existing|audit\w*|no (?:source[- ])?code changes?|without (?:source[- ])?code changes?|"
+        r"no source-code changes?)\b|不改代码|不要求改代码|不需要改代码|只看"
     ),
-    (
-        r"\b(?:explain\w*|explanation|why|intuition|intuitive(?:ly)?|walk me through|teach|difference between|"
-        r"clarify|in simple terms|understand)\b|解释|为什么|为何|原理|讲解|讲讲|通俗|区别|直观|教我|看不懂|"
-        r"不理解|什么意思|怎么理解|是什么",
-        frozenset({"explain"}),
+    "explain": _cue(
+        r"\b(?:explain\w*|explanation|walk me through|teach|intuition|in simple terms|clarify)\b|"
+        r"解释|讲解|讲讲|通俗|原理|教我"
     ),
-    (
-        r"\b(?:overwhelm\w*|overload\w*|practical|stress\w*|anxious|anxiety|burn\w*out|motivat\w*|procrastinat\w*|"
-        r"feel(?:ing)? (?:stuck|lost|down|tired|behind)|advice|should i|cope|coping|work.life|habits?|routines?|"
-        r"chores?|career|relationship|advisor|supervisor|mentor|colleague|conflict with|time management)\b|"
-        r"焦虑|压力|迷茫|拖延|动力|情绪|心累|怎么办|该不该|要不要|如何应对|平衡|习惯|导师|同事|职业|人际",
-        frozenset({"guidance"}),
+    "why": _cue(r"\bwhy\b|为什么|为何"),
+    "research": _cue(
+        r"\b(?:evidence|verif(?:y|ied|ies|ication)|fact.?check\w*|corroborat\w*|sources?|citations?|cite[sd]?|"
+        r"literature|systematic review|meta.?analysis|claims?|(?:better|stronger|well) supported|supported by)\b|"
+        r"证据|核实|查证|验证|来源|出处|文献|引用|可信"
     ),
-    (
-        r"\bpira\b|agents\.md|user\.md|claude\.md|\.claude[\\/]pira|~[\\/]agent\b|"
-        r"\b(?:instruction files?|policy files?|routing (?:rules?|policy|guard)|module[- ]loading)\b|"
-        r"指令文件|路由规则|模块规则|策略文件|模块加载",
-        frozenset({"maintenance"}),
+    "guidance": _cue(
+        r"\b(?:overwhelm\w*|overload\w*|stress\w*|anxious|anxiety|burn\w*out|motivat\w*|procrastinat\w*|"
+        r"putting off|feel(?:ing)? (?:stuck|lost|down|tired|guilty|behind)|guilty|cope|coping|work.life|habits?|"
+        r"routines?|chores?|career|relationship|advisor|supervisor|mentor|colleague|time management|practical plan)\b|"
+        r"焦虑|压力|迷茫|拖延|动力|情绪|心累|怎么办|该不该|如何应对|平衡|习惯|导师|同事|职业|人际"
     ),
+    "profile": _cue(
+        r"\bmy (?:stored |saved )?(?:preferences?|profile|background|communication (?:style|preferences?))\b|"
+        r"\b(?:know about me|about me|on my behalf|personali[sz]\w*|tailored? (?:to|for) me)\b|"
+        r"我的(?:偏好|背景|资料|档案|个人信息)|个性化|替我|了解我"
+    ),
+    "maintenance": _cue(
+        r"\bpira\b|agents\.md|user\.md|claude\.md|\b(?:instruction files?|policy files?|routing (?:rules?|policy|guard)|"
+        r"module[- ]loading)\b|指令文件|路由规则|模块规则|策略文件|模块加载"
+    ),
+    "write": _cue(r"\b(?:write|writing|written|draft\w*|compose)\b|写|撰写|起草"),
+}
+FENCED_OR_QUOTED = re.compile(r"```.*?```|`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”", re.DOTALL)
+NEGATED_CODE = re.compile(
+    r"\b(?:no|without|not|never)\s+(?:source[- ])?code(?:[- ]changes?)?\b|不改代码|不要求改代码|不需要改代码", re.IGNORECASE
 )
+LOAD_ON_DEMAND_BULLET = re.compile(r"^- `([a-z_]+)`: ", re.MULTILINE)
+
 
 
 def emit(value: dict[str, Any] | None = None) -> None:
@@ -351,26 +365,99 @@ def adaptive_enabled() -> bool:
     return os.environ.get(ADAPTIVE_MODE_ENV, "").strip().lower() == "adaptive"
 
 
-def cue_modules(prompt: str) -> list[str]:
-    """Modules whose cues occur in the prompt, expanded with canonical dependencies."""
-    hits: set[str] = set()
-    for pattern, modules in ADAPTIVE_CUES:
-        if re.search(pattern, prompt, re.IGNORECASE):
-            hits.update(modules)
-    for module in tuple(hits):
-        hits.update(IMPLIED.get(module, set()))
-    return [name for name in MODULE_ORDER if name in hits]
+def adaptive_policy_compatible() -> bool:
+    """The hardcoded signals assume the module list of the installed AGENTS.md; otherwise stay strict."""
+    try:
+        text = (policy_dir() / "AGENTS.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    listed = set(LOAD_ON_DEMAND_BULLET.findall(text))
+    return listed == set(MODULE_FILES)
+
+
+def classify(prompt: str) -> list[str] | None:
+    """Exact module set for a confident prompt, or None when the strict Skill route must decide."""
+    if len(prompt) > ADAPTIVE_MAX_PROMPT_CHARS:
+        return None
+    text = FENCED_OR_QUOTED.sub(" ", prompt)
+    if not text.strip():
+        return None
+    review_only = bool(ADAPTIVE_SIGNALS["figure_review_only"].search(text))
+    text = NEGATED_CODE.sub(" ", text)
+    seen = {name: bool(pattern.search(text)) for name, pattern in ADAPTIVE_SIGNALS.items()}
+    modules: set[str] = set()
+    conflict = False
+
+    if seen["code"]:
+        modules.add("coding")
+    if seen["prose"]:
+        modules.add("writing")
+    if seen["paper"] and seen["read"]:
+        modules.add("paper_reading")
+    if seen["abstract"]:
+        if seen["read"]:
+            modules.add("paper_reading")
+        if seen["prose"]:
+            modules.add("writing")
+        if not seen["read"] and not seen["prose"]:
+            conflict = True
+    if seen["paper"] and not seen["read"] and seen["write"] and not seen["prose"]:
+        conflict = True  # "write a paper": reading, prose, or both is unclear
+    if seen["figure"]:
+        if seen["code"] and seen["public"]:
+            modules.update({"coding", "public_figure"})
+        elif not seen["code"] and seen["public"] and review_only:
+            modules.add("public_figure")
+        else:
+            conflict = True  # exploratory plot or unclear publication status
+    if seen["research"]:
+        modules.add("research")
+    if seen["explain"]:
+        others = modules - {"research"}
+        if not others or others <= {"coding"} or others <= {"paper_reading"}:
+            modules.add("explain")
+        else:
+            conflict = True
+    if seen["guidance"]:
+        if modules - {"user_profile"}:
+            conflict = True  # technical and emotional signals together
+        else:
+            modules.add("guidance")
+    if seen["profile"]:
+        if modules - {"guidance", "research"}:
+            conflict = True
+        else:
+            modules.add("user_profile")
+    if seen["maintenance"]:
+        if modules:
+            conflict = True
+        else:
+            modules.add("maintenance")
+    if seen["write"] and not seen["code"] and not seen["prose"] and not modules:
+        conflict = True  # "write something": code or prose is unclear
+    if seen["write"] and seen["code"] and seen["prose"]:
+        conflict = True
+    if seen["why"] and not seen["explain"] and not modules:
+        conflict = True  # a bare "why" question: explanation or analysis is unclear
+
+    for module in tuple(modules):
+        modules.update(IMPLIED.get(module, set()))
+    if conflict or not modules or len(modules) > ADAPTIVE_MAX_MODULES:
+        return None
+    return [name for name in MODULE_ORDER if name in modules]
 
 
 def adaptive_selection(prompt: str, previous: list[str] | None) -> list[str] | None:
-    """Return a conservative module superset, or None when the turn must use the strict Skill route."""
-    hits = cue_modules(prompt)
+    """Exact selection for this turn, or None for the strict route.
+
+    With a confirmed previous route, the turn is treated as a continuation only when the prompt's
+    own domain signals resolve to exactly that route; a prompt without signals, or with signals
+    that resolve to a different route, goes strict. Nothing is ever reused on signal-free text.
+    """
+    selection = classify(prompt)
     if previous:
-        # Continuation: reuse the confirmed route unless a cue points outside it (task switch).
-        return previous if set(hits) <= set(previous) else None
-    if not hits or len(hits) > ADAPTIVE_MAX_MODULES:
-        return None
-    return hits
+        return previous if selection == previous else None
+    return selection
 
 
 def previous_route(session: SessionState, state: dict[str, Any] | None) -> list[str] | None:
@@ -395,23 +482,22 @@ def adaptive_select(session: SessionState, selection: list[str]) -> dict[str, An
     session.write(state)
     rendered, pending_markers = render_modules(session, selection)
     commit_selected(session, state, pending_markers)
-    context = "PIRA adaptive routing selected: " + ", ".join(selection) + ". "
+    listed = ", ".join(selection)
     if pending_markers:
-        context += "Apply the module context below to this turn.\n\n" + rendered + "\n"
+        body = f"{ADAPTIVE_MARKER} {listed}.\n\n{rendered}\n"
     else:
-        context += "All selected modules are already loaded and unchanged in this session. "
-    context += (
-        f"If this turn also needs another PIRA module, invoke `{ROUTE_SKILL}` with the complete module "
-        "list before any task tool; otherwise do not invoke it. PIRA routing is complete for this turn."
+        body = f"{ADAPTIVE_MARKER} {listed} (already loaded and unchanged). "
+    return hook_context(
+        "UserPromptSubmit",
+        body + f"Invoke `{ROUTE_SKILL}` only if a required PIRA module is missing from this route. {ROUTE_COMPLETE}",
     )
-    return hook_context("UserPromptSubmit", context)
 
 
 def handle_user_prompt(data: dict[str, Any], session: SessionState) -> dict[str, Any]:
     if adaptive_enabled():
         state = session.read()
         prompt = data.get("prompt")
-        if isinstance(prompt, str) and not (state and state.get("adaptive_hold")):
+        if isinstance(prompt, str) and not (state and state.get("adaptive_hold")) and adaptive_policy_compatible():
             selection = adaptive_selection(prompt, previous_route(session, state))
             if selection is not None:
                 return adaptive_select(session, selection)

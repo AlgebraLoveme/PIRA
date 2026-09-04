@@ -206,7 +206,7 @@ class ParityRunnerTests(unittest.TestCase):
         parsed = parity.parse_codex(json.dumps(event))
         self.assertEqual(parsed["unexpected_skill_access_count"], 1)
         scenario = {"expected_loaded": [], "prompt": "test"}
-        failures = parity.evaluate("codex", scenario, parsed | {"final_text": "answer"}, 0)
+        failures = sum(parity.evaluate("codex", scenario, parsed | {"final_text": "answer"}, 0), [])
         self.assertTrue(any("external skill" in failure for failure in failures))
 
     def test_skill_disable_config_covers_discovered_skill_files(self) -> None:
@@ -235,7 +235,7 @@ class ParityRunnerTests(unittest.TestCase):
             "turn_failed": False,
             "final_text": "finding",
         }
-        failures = parity.evaluate("codex", scenario, parsed, 0)
+        failures = sum(parity.evaluate("codex", scenario, parsed, 0), [])
         self.assertTrue(any("loaded" in failure for failure in failures))
 
     def test_commands_isolate_codex_and_load_claude_plugin(self) -> None:

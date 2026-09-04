@@ -4,8 +4,11 @@
 Each session runs in one `claude -p --input-format stream-json` process, so follow-up turns
 trigger UserPromptSubmit without a SessionStart, as in interactive use. A turn marked
 `compact` sends `/compact`; a turn marked `resume` closes the process and resumes the
-persisted session in a new one. Per-turn model turns, usage, duration, route Skill calls,
-adaptive selections, and loaded modules are recorded; raw streams stay under the artifact root.
+persisted session in a new one. Every prompt turn records two verdicts: the routing contract
+(the active route at the end of the turn equals the turn's exact expected set, its modules were
+loaded in the session, and routing completed before work) and the task outcome. Per-turn model
+turns, usage, duration, route Skill calls and adaptive selections are recorded; raw streams stay
+under the artifact root.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -96,7 +100,6 @@ class ClaudeProcess:
             bufsize=1,
         )
         self.lines: queue.Queue[str | None] = queue.Queue()
-        self.raw: list[str] = []
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self) -> None:
@@ -128,7 +131,6 @@ class ClaudeProcess:
             if line is None:
                 return collected, False
             collected.append(line)
-            self.raw.append(line)
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -171,39 +173,50 @@ def evaluate_turn(
     parsed: dict[str, Any],
     cumulative_loaded: set[str],
     completed: bool,
-) -> list[str]:
-    failures: list[str] = []
-    expected = set(turn.get("expected_loaded", []))
+) -> tuple[list[str], list[str]]:
+    """Return (routing_contract_failures, task_failures) for one prompt turn."""
+    routing: list[str] = []
+    task: list[str] = []
+    expected = sorted(turn.get("expected_loaded", []))
+    any_route = bool(turn.get("accept_any_route"))
     adaptive = mode == "adaptive" and bool(parsed.get("adaptive_selected"))
+    active = parsed.get("active_route")
     if not completed:
-        failures.append("turn did not produce a result event before the timeout")
+        task.append("turn did not produce a result event before the timeout")
     if parsed["parse_errors"]:
-        failures.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
-    result = parsed["result_event"]
-    if not result or result.get("subtype") != "success" or result.get("is_error"):
-        failures.append("Claude result was not successful")
-    elif result.get("permission_denials"):
-        failures.append(f"permission denials: {result['permission_denials']}")
+        routing.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
     if parsed["hook_errors"]:
-        failures.append("hook errors: " + "; ".join(parsed["hook_errors"]))
+        routing.append("hook errors: " + "; ".join(parsed["hook_errors"]))
     if mode == "adaptive":
         expectation = turn.get("expect_adaptive")
         if expectation == "select" and not adaptive:
-            failures.append("adaptive routing did not select on a confident turn")
+            routing.append("adaptive routing did not select on a confident turn")
         if expectation == "abstain" and adaptive:
-            failures.append("adaptive routing selected on a turn that must be strict")
+            routing.append("adaptive routing selected on a turn that must be strict")
     if mode != "policy-only":
-        if not adaptive and not turn.get("accept_any_route") and len(parsed["route_calls"]) != 1:
-            failures.append(f"expected one route call, got {parsed['route_calls']}")
+        if adaptive and len(parsed["route_calls"]) > 1:
+            routing.append(f"more than one route call after adaptive selection: {parsed['route_calls']}")
+        if not adaptive and not any_route and len(parsed["route_calls"]) != 1:
+            routing.append(f"expected one route call, got {parsed['route_calls']}")
         if not parsed["route_complete_before_work"]:
-            failures.append("routing did not complete before task work or final answer")
-    missing = sorted(expected - cumulative_loaded)
-    if missing and not turn.get("accept_any_route"):
-        failures.append(f"required modules never loaded in this session: {missing}")
+            routing.append("routing did not complete before task work or final answer")
+    if not any_route:
+        if mode == "policy-only":
+            if sorted(cumulative_loaded & set(expected)) != expected:
+                routing.append(f"required modules never loaded in this session: {sorted(set(expected) - cumulative_loaded)}")
+        elif (active or []) != expected:
+            routing.append(f"active route {active} != expected {expected}")
+    if active and not set(active) <= cumulative_loaded:
+        routing.append(f"active route modules never loaded in this session: {sorted(set(active) - cumulative_loaded)}")
+    result = parsed["result_event"]
+    if not result or result.get("subtype") != "success" or result.get("is_error"):
+        task.append("Claude result was not successful")
+    elif result.get("permission_denials"):
+        task.append(f"permission denials: {result['permission_denials']}")
     pattern = turn.get("result_regex")
-    if pattern and not __import__("re").search(pattern, parsed["final_text"]):
-        failures.append(f"result did not match {pattern!r}")
-    return failures
+    if pattern and not re.search(pattern, parsed["final_text"]):
+        task.append(f"result did not match {pattern!r}")
+    return routing, task
 
 
 def turn_metrics(parsed: dict[str, Any], elapsed: float) -> dict[str, Any]:
@@ -219,11 +232,11 @@ def turn_metrics(parsed: dict[str, Any], elapsed: float) -> dict[str, Any]:
     }
 
 
-def run_session(mode: str, scenario: dict[str, Any], artifact_root: Path, args: argparse.Namespace) -> dict[str, Any]:
+def run_session(mode: str, scenario: dict[str, Any], repetition: int, artifact_root: Path, args: argparse.Namespace) -> dict[str, Any]:
     executable = shutil.which("claude")
     if not executable:
         raise RuntimeError("Claude Code executable was not found")
-    case_root = artifact_root / mode / scenario["id"]
+    case_root = artifact_root / mode / f"repeat-{repetition}" / scenario["id"]
     project, agent, state = parity.materialize_case(case_root, scenario)
     env = os.environ.copy()
     env.update(
@@ -240,9 +253,10 @@ def run_session(mode: str, scenario: dict[str, Any], artifact_root: Path, args: 
     cumulative_loaded: set[str] = set()
     turns: list[dict[str, Any]] = []
     stderr_chunks: list[str] = []
+    hashes: dict[str, str] = {}
     for index, turn in enumerate(scenario["turns"], start=1):
         if turn.get("resume"):
-            code, stderr = process.close(args.timeout)
+            _, stderr = process.close(args.timeout)
             stderr_chunks.append(stderr)
             process = ClaudeProcess(build_command(mode, executable, session_id, resume=True, **options), project, env)
         started = time.monotonic()
@@ -250,47 +264,76 @@ def run_session(mode: str, scenario: dict[str, Any], artifact_root: Path, args: 
         lines, completed = process.read_turn(args.timeout, until_compact=bool(turn.get("compact")))
         elapsed = time.monotonic() - started
         text = "".join(lines)
-        (case_root / f"turn-{index}.jsonl").write_text(text, encoding="utf-8")
+        turn_path = case_root / f"turn-{index}.jsonl"
+        turn_path.write_text(text, encoding="utf-8")
+        hashes[turn_path.name] = parity.sha256_file(turn_path)
         if turn.get("compact"):
             observed = compaction_observed(lines)
-            turns.append({"index": index, "kind": "compact", "passed": observed, "failures": [] if observed else ["compaction was not observed"]})
+            turns.append(
+                {
+                    "index": index,
+                    "kind": "compact",
+                    "passed": observed,
+                    "routing_passed": observed,
+                    "task_passed": True,
+                    "failures": [] if observed else ["compaction was not observed"],
+                }
+            )
             continue
         parsed = parity.parse_claude(text) if mode != "policy-only" else parity.parse_claude_policy_only(text, project, agent)
         cumulative_loaded.update(parsed["loaded_modules"])
-        failures = evaluate_turn(mode, turn, parsed, cumulative_loaded, completed)
+        routing_failures, task_failures = evaluate_turn(mode, turn, parsed, cumulative_loaded, completed)
+        expected = set(turn.get("expected_loaded", []))
+        active = set(parsed.get("active_route") or [])
         turns.append(
             {
                 "index": index,
                 "kind": "resume" if turn.get("resume") else turn.get("kind", "prompt"),
-                "passed": not failures,
-                "failures": failures,
+                "passed": not routing_failures and not task_failures,
+                "routing_passed": not routing_failures,
+                "task_passed": not task_failures,
+                "failures": routing_failures + task_failures,
+                "routing_failures": routing_failures,
+                "task_failures": task_failures,
                 "route_calls": parsed["route_calls"],
+                "active_route": parsed.get("active_route"),
                 "adaptive_selected": bool(parsed.get("adaptive_selected")),
                 "loaded_modules_this_turn": parsed["loaded_modules"],
-                "extra_modules": sorted(set(parsed["loaded_modules"]) - set(turn.get("expected_loaded", []))),
+                "extra_modules": sorted(active - expected),
+                "missing_modules": sorted(expected - active) if not turn.get("accept_any_route") else [],
+                "module_requiring": bool(expected) and turn.get("expect_adaptive") != "abstain",
                 "task_tools": parsed["task_tools"],
                 "metrics": turn_metrics(parsed, elapsed),
             }
         )
-    code, stderr = process.close(args.timeout)
+    _, stderr = process.close(args.timeout)
     stderr_chunks.append(stderr)
     (case_root / "stderr.txt").write_text("".join(stderr_chunks), encoding="utf-8")
     prompt_turns = [turn for turn in turns if turn.get("metrics")]
+
+    def total(key: str) -> float:
+        return sum(float(turn["metrics"][key] or 0) for turn in prompt_turns)
+
     return {
         "mode": mode,
+        "client": client_for(mode),
+        "repetition": repetition,
         "id": scenario["id"],
         "passed": all(turn["passed"] for turn in turns),
+        "routing_passed": all(turn["routing_passed"] for turn in turns),
+        "task_passed": all(turn["task_passed"] for turn in turns),
         "turns": turns,
         "totals": {
-            "model_turns": sum(int(turn["metrics"]["model_turns"] or 0) for turn in prompt_turns),
-            "context_tokens": sum(int(turn["metrics"]["context_tokens"] or 0) for turn in prompt_turns),
-            "cache_creation_tokens": sum(int(turn["metrics"]["cache_creation_tokens"] or 0) for turn in prompt_turns),
-            "cache_read_tokens": sum(int(turn["metrics"]["cache_read_tokens"] or 0) for turn in prompt_turns),
-            "output_tokens": sum(int(turn["metrics"]["output_tokens"] or 0) for turn in prompt_turns),
-            "duration_seconds": round(sum(float(turn["metrics"]["duration_seconds"] or 0) for turn in prompt_turns), 3),
+            "model_turns": int(total("model_turns")),
+            "context_tokens": int(total("context_tokens")),
+            "cache_creation_tokens": int(total("cache_creation_tokens")),
+            "cache_read_tokens": int(total("cache_read_tokens")),
+            "output_tokens": int(total("output_tokens")),
+            "duration_seconds": round(total("duration_seconds"), 3),
             "route_skill_calls": sum(len(turn.get("route_calls") or []) for turn in prompt_turns),
             "adaptive_selected_turns": sum(bool(turn.get("adaptive_selected")) for turn in prompt_turns),
         },
+        "artifact_hashes": hashes,
         "artifact_dir": case_root.relative_to(artifact_root).as_posix(),
     }
 
@@ -300,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scenarios", type=Path, default=parity.HERE / "multiturn.json")
     parser.add_argument("--mode", action="append", choices=MODES, help="Routing mode to run; repeatable (default: all)")
     parser.add_argument("--scenario", action="append", help="Run only this session ID; repeatable")
+    parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--model", default="sonnet")
     parser.add_argument("--effort", default="low")
     parser.add_argument("--tools", default="Skill,Bash,Read")
@@ -312,6 +356,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.repetitions < 1:
+        raise ValueError("--repetitions must be positive")
     document = json.loads(args.scenarios.read_text(encoding="utf-8"))
     scenarios = document["scenarios"]
     if args.scenario:
@@ -322,22 +368,35 @@ def main() -> int:
     artifact_root.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     for mode in modes:
-        for scenario in scenarios:
-            result = run_session(mode, scenario, artifact_root, args)
-            results.append(result)
-            print(f"{'PASS' if result['passed'] else 'FAIL'} {mode} {scenario['id']} totals={result['totals']}", flush=True)
-            for turn in result["turns"]:
-                if turn.get("failures"):
-                    print(f"  turn {turn['index']}: " + "; ".join(turn["failures"]), flush=True)
+        for repetition in range(1, args.repetitions + 1):
+            for scenario in scenarios:
+                result = run_session(mode, scenario, repetition, artifact_root, args)
+                results.append(result)
+                print(
+                    f"{'PASS' if result['passed'] else 'FAIL'} (routing={'ok' if result['routing_passed'] else 'FAIL'} "
+                    f"task={'ok' if result['task_passed'] else 'FAIL'}) {mode} repeat={repetition} {scenario['id']} "
+                    f"totals={result['totals']}",
+                    flush=True,
+                )
+                for turn in result["turns"]:
+                    if turn.get("failures"):
+                        print(f"  turn {turn['index']}: " + "; ".join(turn["failures"]), flush=True)
+    git_status = subprocess.run(["git", "status", "--porcelain"], cwd=parity.REPO_ROOT, capture_output=True, text=True, check=True).stdout
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "policy_commit": subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=parity.REPO_ROOT, capture_output=True, text=True, check=True
         ).stdout.strip(),
+        "plugin_version": json.loads((parity.PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))["version"],
+        "worktree_dirty": bool(git_status.strip()),
+        "scenarios_sha256": parity.sha256_file(args.scenarios),
         "model": args.model,
         "effort": args.effort,
         "modes": modes,
+        "repetitions": args.repetitions,
         "passed": sum(bool(result["passed"]) for result in results),
+        "routing_contract_passed": sum(bool(result["routing_passed"]) for result in results),
+        "task_passed": sum(bool(result["task_passed"]) for result in results),
         "total": len(results),
         "results": results,
     }

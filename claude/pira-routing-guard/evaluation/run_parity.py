@@ -26,7 +26,8 @@ SETUP_SCRIPT = REPO_ROOT / "assets" / "scripts" / "setup_pira.py"
 ROUTE_SKILL = "pira-routing-guard:route"
 CLAUDE_CLIENTS = {"claude", "claude-policy-only", "claude-adaptive"}
 GUARDED_CLIENTS = {"claude", "claude-adaptive"}
-ADAPTIVE_MARKER = "PIRA adaptive routing selected:"
+ADAPTIVE_MARKER = "PIRA adaptive route confirmed:"
+ADAPTIVE_ROUTE = re.compile(re.escape(ADAPTIVE_MARKER) + r"\s*([a-z_, ]+?)\s*(?:\(|\.)")
 ROUTE_COMPLETE_MARKER = "PIRA routing is complete for this turn."
 MODULE_FILES = {
     "user_profile": "USER.md",
@@ -209,6 +210,7 @@ def parse_claude(text: str) -> dict[str, Any]:
     hook_errors: list[str] = []
     result_event: dict[str, Any] | None = None
     adaptive_selected = False
+    active_route: list[str] | None = None
 
     for index, event in enumerate(events):
         if event.get("type") == "assistant":
@@ -222,6 +224,7 @@ def parse_claude(text: str) -> dict[str, Any]:
                     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
                     if name == "Skill" and tool_input.get("skill") == ROUTE_SKILL:
                         route_calls.append(route_tokens(str(tool_input.get("args", ""))))
+                        active_route = matrix_runner.expanded_route(route_calls[-1])
                     elif name != "Skill":
                         task_tools.append(name)
                         if first_task_at is None:
@@ -242,8 +245,10 @@ def parse_claude(text: str) -> dict[str, Any]:
             output = str(event.get("output", ""))
             context = hook_additional_context(output)
             loaded.extend(ROUTE_HEADER.findall(context))
-            if ADAPTIVE_MARKER in context:
+            match = ADAPTIVE_ROUTE.search(context)
+            if match:
                 adaptive_selected = True
+                active_route = sorted(token.strip() for token in match.group(1).split(",") if token.strip())
             if ROUTE_COMPLETE_MARKER in output:
                 route_complete_at = index
         if event.get("type") == "result":
@@ -266,6 +271,7 @@ def parse_claude(text: str) -> dict[str, Any]:
         "usage": (result_event or {}).get("usage", {}),
         "num_turns": (result_event or {}).get("num_turns"),
         "adaptive_selected": adaptive_selected,
+        "active_route": active_route,
     }
 
 
@@ -347,6 +353,7 @@ def parse_claude_policy_only(
         "usage": (result_event or {}).get("usage", {}),
         "num_turns": (result_event or {}).get("num_turns"),
         "adaptive_selected": False,
+        "active_route": sorted(unique(loaded)) if loaded else None,
     }
 
 
@@ -438,64 +445,62 @@ def parse_codex(text: str, task_paths: tuple[str, ...] = ()) -> dict[str, Any]:
     }
 
 
-def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -> list[str]:
-    failures: list[str] = []
-    expected_loaded = sorted(scenario["expected_loaded"])
+def evaluate(client: str, scenario: dict[str, Any], parsed: dict[str, Any], exit_code: int) -> tuple[list[str], list[str]]:
+    """Return (routing_contract_failures, task_failures); a case passes only when both are empty."""
+    routing: list[str] = []
+    task: list[str] = []
+    expected = sorted(scenario["expected_loaded"])
     any_route = bool(scenario.get("accept_any_route"))
     adaptive = client == "claude-adaptive" and bool(parsed.get("adaptive_selected"))
     if exit_code != 0:
-        failures.append(f"{client} exit code {exit_code}")
+        task.append(f"{client} exit code {exit_code}")
     if parsed["parse_errors"]:
-        failures.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
-    if client in CLAUDE_CLIENTS:
-        if client in GUARDED_CLIENTS and not adaptive and not any_route:
-            if len(parsed["route_calls"]) != 1:
-                failures.append(f"expected one route call, got {parsed['route_calls']}")
-            elif matrix_runner.expanded_route(parsed["route_calls"][0]) != expected_loaded:
-                failures.append(
-                    f"expanded route {matrix_runner.expanded_route(parsed['route_calls'][0])} "
-                    f"!= {scenario['expected_loaded']}"
-                )
+        routing.append("stream parse errors: " + "; ".join(parsed["parse_errors"]))
+    if parsed["hook_errors"]:
+        routing.append("hook errors: " + "; ".join(parsed["hook_errors"]))
+
+    if client in GUARDED_CLIENTS:
         if adaptive and len(parsed["route_calls"]) > 1:
-            failures.append(f"expected at most one route call after adaptive selection, got {parsed['route_calls']}")
+            routing.append(f"more than one route call after adaptive selection: {parsed['route_calls']}")
+        if not adaptive and not any_route and len(parsed["route_calls"]) != 1:
+            routing.append(f"expected one route call, got {parsed['route_calls']}")
         if client == "claude-adaptive":
             expectation = scenario.get("expect_adaptive")
             if expectation == "select" and not adaptive:
-                failures.append("adaptive routing did not select on a confident prompt")
+                routing.append("adaptive routing did not select on a confident prompt")
             if expectation == "abstain" and adaptive:
-                failures.append("adaptive routing selected on a prompt that must fall back to strict")
+                routing.append("adaptive routing selected on a prompt that must fall back to strict")
+    active = parsed.get("active_route")
+    loaded = sorted(parsed["loaded_modules"])
+    if not any_route:
+        if client in CLAUDE_CLIENTS or client == "codex":
+            if (active or []) != expected:
+                routing.append(f"active route {active} != expected {expected}")
+        if loaded != expected:
+            routing.append(f"loaded {loaded} != expected {expected}")
+    elif active is not None and loaded and sorted(set(loaded)) != active:
+        routing.append(f"loaded {loaded} != active route {active}")
+    if not parsed["route_complete_before_work"]:
+        routing.append("routing did not complete before task work or final answer")
+    if parsed.get("unexpected_skill_access_count"):
+        routing.append(f"unexpected external skill access count: {parsed['unexpected_skill_access_count']}")
+
+    if client in CLAUDE_CLIENTS:
         result = parsed["result_event"]
         if not result or result.get("subtype") != "success" or result.get("is_error"):
-            failures.append("Claude result was not successful")
+            task.append("Claude result was not successful")
         elif result.get("permission_denials"):
-            failures.append(f"permission denials: {result['permission_denials']}")
+            task.append(f"permission denials: {result['permission_denials']}")
     elif parsed.get("turn_failed"):
-        failures.append("Codex turn failed")
-    loaded = set(parsed["loaded_modules"])
-    if any_route:
-        pass
-    elif adaptive:
-        missing = sorted(set(expected_loaded) - loaded)
-        if missing:
-            failures.append(f"adaptive selection missed required modules {missing}; loaded {sorted(loaded)}")
-    elif sorted(loaded) != expected_loaded:
-        failures.append(f"loaded {parsed['loaded_modules']} != {scenario['expected_loaded']}")
-    if not parsed["route_complete_before_work"]:
-        failures.append("routing did not complete before task work or final answer")
-    if parsed["hook_errors"]:
-        failures.append("hook errors: " + "; ".join(parsed["hook_errors"]))
+        task.append("Codex turn failed")
     if parsed.get("permission_denials"):
-        failures.append(f"permission denials: {parsed['permission_denials']}")
-    if parsed.get("unexpected_skill_access_count"):
-        failures.append(
-            f"unexpected external skill access count: {parsed['unexpected_skill_access_count']}"
-        )
+        task.append(f"permission denials: {parsed['permission_denials']}")
     pattern = scenario.get("result_regex")
     if pattern and not re.search(pattern, parsed["final_text"]):
-        failures.append(f"result did not match {pattern!r}")
+        task.append(f"result did not match {pattern!r}")
     if not parsed["final_text"].strip():
-        failures.append("final answer is empty")
-    return failures
+        task.append("final answer is empty")
+    return routing, task
 
 
 def run_process(command: list[str], cwd: Path, env: dict[str, str], timeout: int) -> tuple[int, str, str, float]:
@@ -620,14 +625,22 @@ def run_case(
         parsed = parse_claude_policy_only(stdout, project, agent)
     else:
         parsed = parse_codex(stdout, tuple(str(path) for path in scenario.get("files", {})))
-    failures = evaluate(client, scenario, parsed, exit_code)
+    routing_failures, task_failures = evaluate(client, scenario, parsed, exit_code)
+    expected = set(scenario["expected_loaded"])
+    active = set(parsed.get("active_route") or [])
     return {
         "client": client,
         "repetition": repetition,
         "id": scenario["id"],
         "category": scenario.get("category", "uncategorized"),
-        "passed": not failures,
-        "failures": failures,
+        "passed": not routing_failures and not task_failures,
+        "routing_passed": not routing_failures,
+        "task_passed": not task_failures,
+        "failures": routing_failures + task_failures,
+        "routing_failures": routing_failures,
+        "task_failures": task_failures,
+        "active_route": parsed.get("active_route"),
+        "module_requiring": bool(expected) and scenario.get("expect_adaptive") != "abstain",
         "route_calls": parsed["route_calls"],
         "loaded_modules": parsed["loaded_modules"],
         "task_tools": parsed["task_tools"],
@@ -637,8 +650,8 @@ def run_case(
         "usage": parsed["usage"],
         "num_turns": parsed.get("num_turns"),
         "adaptive_selected": bool(parsed.get("adaptive_selected")),
-        "extra_modules": sorted(set(parsed["loaded_modules"]) - set(scenario["expected_loaded"])),
-        "missing_modules": sorted(set(scenario["expected_loaded"]) - set(parsed["loaded_modules"])),
+        "extra_modules": sorted(active - expected) if parsed.get("active_route") is not None else sorted(set(parsed["loaded_modules"]) - expected),
+        "missing_modules": sorted(expected - active) if parsed.get("active_route") is not None else sorted(expected - set(parsed["loaded_modules"])),
         "artifact_dir": case_root.relative_to(artifact_root).as_posix(),
         "artifact_hashes": {
             "events_jsonl_sha256": sha256_file(events_path),
@@ -655,51 +668,69 @@ def median_or_none(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+def measure(result: dict[str, Any]) -> dict[str, float]:
+    usage = result.get("usage") or {}
+    return {
+        "model_turns": float(result.get("num_turns") or 0),
+        "context_tokens": float(context_tokens(usage)),
+        "cache_creation_tokens": float(usage.get("cache_creation_input_tokens") or 0),
+        "cache_read_tokens": float(usage.get("cache_read_input_tokens") or 0),
+        "output_tokens": float(usage.get("output_tokens") or 0),
+        "duration_seconds": float(result.get("duration_seconds") or 0),
+    }
+
+
+def summarize_rows(rows: list[dict[str, Any]], baseline: dict[tuple[str, int], dict[str, float]]) -> dict[str, Any]:
+    measured = [measure(row) for row in rows]
+    summary: dict[str, Any] = {
+        "cases": len(rows),
+        "passed": sum(bool(row["passed"]) for row in rows),
+        "routing_contract_passed": sum(bool(row.get("routing_passed")) for row in rows),
+        "task_passed": sum(bool(row.get("task_passed")) for row in rows),
+        "route_skill_calls": sum(len(row.get("route_calls") or []) for row in rows),
+        "adaptive_selected_cases": sum(bool(row.get("adaptive_selected")) for row in rows),
+        "cases_with_extra_modules": sum(bool(row.get("extra_modules")) for row in rows),
+        "cases_with_missing_modules": sum(bool(row.get("missing_modules")) for row in rows),
+        "median": {key: median_or_none([m[key] for m in measured]) for key in measured[0]} if measured else {},
+    }
+    deltas = [
+        {key: measure(row)[key] - baseline[(row["id"], row["repetition"])][key] for key in measure(row)}
+        for row in rows
+        if (row["id"], row["repetition"]) in baseline
+    ]
+    if deltas:
+        summary["paired_cases"] = len(deltas)
+        summary["paired_delta_vs_policy_only_median"] = {key: median_or_none([d[key] for d in deltas]) for key in deltas[0]}
+    return summary
+
+
 def mode_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Per-client medians plus paired deltas against the policy-only baseline."""
+    """Per-client summaries over all cases, plus the adaptive-selected subset compared with strict on the same cases."""
     by_client: dict[str, list[dict[str, Any]]] = {}
     for result in results:
         by_client.setdefault(result["client"], []).append(result)
+    baseline = {(r["id"], r["repetition"]): measure(r) for r in by_client.get("claude-policy-only", [])}
+    metrics: dict[str, Any] = {"overall": {client: summarize_rows(rows, baseline) for client, rows in by_client.items()}}
 
-    def measure(result: dict[str, Any]) -> dict[str, float]:
-        usage = result.get("usage") or {}
-        return {
-            "model_turns": float(result.get("num_turns") or 0),
-            "context_tokens": float(context_tokens(usage)),
-            "cache_creation_tokens": float(usage.get("cache_creation_input_tokens") or 0),
-            "cache_read_tokens": float(usage.get("cache_read_input_tokens") or 0),
-            "output_tokens": float(usage.get("output_tokens") or 0),
-            "duration_seconds": float(result.get("duration_seconds") or 0),
+    adaptive_rows = by_client.get("claude-adaptive", [])
+    selected = [row for row in adaptive_rows if row.get("adaptive_selected")]
+    module_requiring = [row for row in adaptive_rows if row.get("module_requiring")]
+    if adaptive_rows:
+        keys = {(row["id"], row["repetition"]) for row in selected}
+        strict_same = [row for row in by_client.get("claude", []) if (row["id"], row["repetition"]) in keys]
+        subset: dict[str, Any] = {
+            "selected_cases": len(selected),
+            "module_requiring_cases": len(module_requiring),
+            "coverage": round(sum(bool(row.get("adaptive_selected")) for row in module_requiring) / len(module_requiring), 3) if module_requiring else None,
+            "adaptive": summarize_rows(selected, baseline) if selected else {},
+            "strict_on_same_cases": summarize_rows(strict_same, baseline) if strict_same else {},
         }
-
-    baseline = {
-        (result["id"], result["repetition"]): measure(result)
-        for result in by_client.get("claude-policy-only", [])
-    }
-    metrics: dict[str, Any] = {}
-    for client, rows in by_client.items():
-        measured = [measure(row) for row in rows]
-        summary: dict[str, Any] = {
-            "cases": len(rows),
-            "passed": sum(bool(row["passed"]) for row in rows),
-            "route_skill_calls": sum(len(row.get("route_calls") or []) for row in rows),
-            "adaptive_selected_cases": sum(bool(row.get("adaptive_selected")) for row in rows),
-            "cases_with_extra_modules": sum(bool(row.get("extra_modules")) for row in rows),
-            "cases_with_missing_modules": sum(bool(row.get("missing_modules")) for row in rows),
-            "median": {key: median_or_none([m[key] for m in measured]) for key in measured[0]} if measured else {},
-        }
-        if client != "claude-policy-only" and baseline:
-            deltas = [
-                {key: measure(row)[key] - baseline[(row["id"], row["repetition"])][key] for key in measure(row)}
-                for row in rows
-                if (row["id"], row["repetition"]) in baseline
-            ]
-            if deltas:
-                summary["paired_delta_vs_policy_only_median"] = {
-                    key: median_or_none([delta[key] for delta in deltas]) for key in deltas[0]
-                }
-                summary["paired_cases"] = len(deltas)
-        metrics[client] = summary
+        adaptive_delta = (subset["adaptive"].get("paired_delta_vs_policy_only_median") or {})
+        strict_delta = (subset["strict_on_same_cases"].get("paired_delta_vs_policy_only_median") or {})
+        if adaptive_delta and strict_delta and strict_delta.get("context_tokens"):
+            subset["context_overhead_reduction_vs_strict"] = round(1 - adaptive_delta["context_tokens"] / strict_delta["context_tokens"], 3)
+            subset["model_turn_reduction_vs_strict_median"] = (subset["strict_on_same_cases"]["median"]["model_turns"] - subset["adaptive"]["median"]["model_turns"])
+        metrics["adaptive_selected_subset"] = subset
     return metrics
 
 
@@ -773,7 +804,8 @@ def main() -> int:
                 results.append(result)
                 print(
                     f"[{counter}/{total}] {'PASS' if result['passed'] else 'FAIL'} "
-                    f"{client} repeat={repetition} {scenario['id']} loaded={result['loaded_modules']}",
+                    f"(routing={'ok' if result['routing_passed'] else 'FAIL'} task={'ok' if result['task_passed'] else 'FAIL'}) "
+                    f"{client} repeat={repetition} {scenario['id']} route={result['active_route']}",
                     flush=True,
                 )
                 for failure in result["failures"]:
@@ -857,6 +889,8 @@ def main() -> int:
             for client in clients
         },
         "metrics": mode_metrics(results),
+        "routing_contract_passed": sum(bool(result.get("routing_passed")) for result in results),
+        "task_passed": sum(bool(result.get("task_passed")) for result in results),
         "results": results,
     }
     summary_path = args.summary or artifact_root / "summary.json"
