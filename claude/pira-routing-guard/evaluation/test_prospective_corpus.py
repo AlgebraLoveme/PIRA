@@ -44,9 +44,7 @@ class ProspectiveCorpusTests(unittest.TestCase):
     def test_corpus_files_are_frozen(self) -> None:
         for name, digest in FROZEN.items():
             with self.subTest(file=name):
-                normalized = (HERE / name).read_bytes().replace(b"
-", b"
-")
+                normalized = (HERE / name).read_bytes().replace(b"\r\n", b"\n")
                 self.assertEqual(hashlib.sha256(normalized).hexdigest(), digest)
 
     def test_single_turn_corpus_shape_and_coverage(self) -> None:
