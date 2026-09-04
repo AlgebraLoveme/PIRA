@@ -1,4 +1,4 @@
-"""Unit tests for the adaptive-mode additions to run_parity.py, run_multiturn.py and report_modes.py."""
+"""Unit tests for the adaptive-mode additions to run_parity.py, run_multiturn.py and compact_evidence.py."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def load(name: str, filename: str):
 
 parity = load("run_parity", "run_parity.py")
 multiturn = load("run_multiturn", "run_multiturn.py")
-report = load("report_modes", "report_modes.py")
+compact = load("compact_evidence", "compact_evidence.py")
 
 
 def hook_response(context: str, hook_name: str = "UserPromptSubmit") -> dict:
@@ -181,31 +181,38 @@ class MultiturnV2Tests(unittest.TestCase):
                         self.assertLessEqual(set(turn["expected_loaded"]), set(parity.MODULE_FILES))
 
 
-class ReportTests(unittest.TestCase):
-    def test_report_redacts_identifiers_and_keeps_case_detail(self) -> None:
+class CompactEvidenceTests(unittest.TestCase):
+    def test_outcome_tokens_replace_failure_strings(self) -> None:
+        self.assertEqual(compact.outcome(True, True, [], [], ["coding"], [], []), "ok")
+        self.assertEqual(compact.outcome(False, True, ["active route x != y"], [], ["coding", "explain"], ["explain"], []), "extra-module")
+        self.assertEqual(compact.outcome(False, True, ["active route x != y"], [], ["explain"], [], ["coding"]), "missing-module")
+        self.assertEqual(compact.outcome(False, True, ["routing did not complete before task work"], [], ["coding"], [], []), "loaded-late")
+        self.assertEqual(compact.outcome(False, False, ["loaded [] != expected"], ["permission denials: x"], [], [], ["coding"]), "nothing-loaded,task:denied-tool")
+
+    def test_compact_single_keeps_one_row_per_case_without_identifiers(self) -> None:
         summary = {
-            "policy_commit": "abc", "plugin_version": "0.5.0", "worktree_dirty": False, "repetitions": 1,
-            "by_client": {"claude-adaptive": {"total": 1, "passed": 0}}, "routing_contract_passed": 1, "task_passed": 0,
-            "metrics": {"overall": {"claude-adaptive": {"cases": 1, "passed": 0, "routing_contract_passed": 1, "task_passed": 0, "adaptive_selected_cases": 1,
-                                                          "route_skill_calls": 0, "cases_with_extra_modules": 0, "cases_with_missing_modules": 0, "median": {}}}},
-            "results": [{"client": "claude-adaptive", "id": "x", "repetition": 1, "passed": False, "routing_passed": True, "task_passed": False,
-                         "routing_failures": [], "task_failures": ["permission denials: toolu_01ABC in 12345678-1234-1234-1234-123456789abc"],
+            "policy_commit": "abc", "worktree_dirty": False, "plugin_version": "0.4.0", "client_versions": {"claude": "2.1.217"},
+            "models": {"claude": {"model": "sonnet", "effort": "low"}}, "source_hashes": {"matrix_sha256": "00"}, "repetitions": 1,
+            "metrics": {"overall": {}},
+            "results": [{"client": "claude-adaptive", "id": "x", "repetition": 1, "routing_passed": True, "task_passed": False,
+                         "routing_failures": [], "task_failures": ["permission denials: toolu_01ABCDEF in 12345678-1234-1234-1234-123456789abc"],
                          "route_calls": [], "active_route": ["coding", "research"], "adaptive_selected": True, "loaded_modules": ["research", "coding"],
-                         "extra_modules": [], "missing_modules": [], "num_turns": 2, "usage": {}, "duration_seconds": 1.0,
-                         "artifact_hashes": {"events_jsonl_sha256": "00"}}],
+                         "extra_modules": [], "missing_modules": [], "num_turns": 2, "usage": {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3, "output_tokens": 4},
+                         "duration_seconds": 1.0, "artifact_dir": "claude-adaptive/repeat-1/x", "artifact_hashes": {"events_jsonl_sha256": "ee"}}],
         }
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "summary.json"
             path.write_text(json.dumps(summary), encoding="utf-8")
-            block = report.compact_parity(json.loads(path.read_text(encoding="utf-8")))
-        case = block["cases"]["claude-adaptive"]["x#1"]
-        self.assertIn("toolu_<redacted>", case["task_failures"][0])
-        self.assertIn("<id>", case["task_failures"][0])
-        self.assertEqual(case["active_route"], ["coding", "research"])
-        self.assertFalse(case["passed"])
-        self.assertTrue(case["routing_passed"])
-        text = report.markdown({"matrix": block})
-        self.assertIn("Routing contract", text)
+            block = compact.compact_single("label", path)
+        row = dict(zip(block["case_columns"], block["cases"][0]))
+        self.assertEqual(row["active_route"], ["coding", "research"])
+        self.assertEqual(row["outcome"], "task:denied-tool")
+        self.assertEqual(row["context_tokens"], 6)
+        self.assertEqual(row["events_sha256"], "ee")
+        text = json.dumps(block)
+        self.assertNotIn("toolu_", text)
+        self.assertNotIn("12345678-1234", text)
+        self.assertFalse(compact.IDENTIFIER.search(text))
 
 
 if __name__ == "__main__":

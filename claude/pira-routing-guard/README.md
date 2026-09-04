@@ -102,7 +102,7 @@ behaves like strict. `evaluation/development.json` (formerly `heldout.json`) was
 set; `evaluation/prospective.json` and `evaluation/prospective-multiturn.json` are hash-pinned
 (`PROSPECTIVE_PROTOCOL.md`). `evaluation/run_multiturn.py` compares modes turn by turn in one
 `stream-json` process (continuation, task switch, compaction, resume), `evaluation/run_subagent_probe.py`
-checks the parent/subagent boundary with a real subagent, and `evaluation/report_modes.py` writes
+checks the parent/subagent boundary with a real subagent, and `evaluation/compact_evidence.py` writes
 the compact, redacted evidence file:
 
 ```text
@@ -110,5 +110,5 @@ python claude/pira-routing-guard/evaluation/run_parity.py --client claude-modes 
 python claude/pira-routing-guard/evaluation/run_parity.py --client claude-modes --repetitions 2 --matrix claude/pira-routing-guard/evaluation/prospective.json --artifact-root <fresh-temp-directory>
 python claude/pira-routing-guard/evaluation/run_multiturn.py --mode strict --mode adaptive --repetitions 2 --artifact-root <fresh-temp-directory>
 python claude/pira-routing-guard/evaluation/run_subagent_probe.py --mode adaptive --artifact-root <fresh-temp-directory>
-python claude/pira-routing-guard/evaluation/report_modes.py --matrix-summary <...>/summary.json --prospective-summary <...>/summary.json --multiturn-summary <...>/summary.json --output <compact.json>
+python claude/pira-routing-guard/evaluation/compact_evidence.py --kind <kind> --single matrix=<...>/summary.json --multiturn sessions=<...>/summary.json --output <compact.json>
 ```
