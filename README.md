@@ -22,7 +22,7 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, and 5.6-sol, each using high reasoning effort**. Other models or agent platforms may work, but have not received the same level of testing.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6-sol and GPT-6 Astra**. Other models or agent platforms may work, but have not received the same level of testing.
 
 > **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. The instructions below install PIRA for Codex from `master`.
 
@@ -172,7 +172,7 @@ In plain language, setup connects PIRA to Codex, installs its tools, and checks 
 1. Detects the repository directory and ensures it is available as `~/agent`, unless another `--agent-dir` is given.
 2. Initializes a private `USER.md` placeholder when needed.
 3. Moves legacy files listed in `assets/LEGACY_LIST.md` into `.backup/setup_pira_legacy/` when approved.
-4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536`.
+4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536` and `tui.auto_recap = false` (Codex 0.153.0+; manual `/recap` remains available).
 5. Creates a local repository guard that prevents the same `AGENTS.md` from being rediscovered while working inside the PIRA checkout, and removes an older `~/.codex/AGENTS.md` symlink only when it duplicates PIRA.
 6. Selects and verifies the bundled native tools for the current platform, then installs or refreshes them in a per-user PATH directory. Existing stale copies are atomically replaced; matching copies are left unchanged.
 7. Optionally delegates audio setup to the platform-specific audio helper.
@@ -194,7 +194,7 @@ PIRA separates memory by how long it should remain useful. This prevents raw com
 
 Detailed activity remains searchable for as long as retention allows. After a conversation is compacted, `pira_ctx recap` can restore the recent activity needed to continue the work; it is part of the activity layer, not another memory layer.
 
-PIRA creates `AGENT_WORKBOOK.md` lazily at the workspace root only when the first durable project entry is warranted. It starts with only the needed headings and uses Git's local exclude file without changing the project's shared `.gitignore`.
+PIRA creates `AGENT_WORKBOOK.md` lazily at the workspace root only when the first durable project entry is warranted. It starts with only the needed headings. In Git, the workbook stays untracked and its anchored repository-relative path goes in the local exclude file located by `git rev-parse --git-path info/exclude`, without changing `.gitignore`.
 
 <details>
 <summary><strong>Difference from a Codex session log</strong></summary>
@@ -532,7 +532,7 @@ PIRA is intentionally small and inspectable:
 
 PIRA can run with full system permissions, but full-permission mode is not a sandbox. Its rules require the agent to:
 
-- review the action, scope, destructive risk, privacy impact, and rollback path before a state-changing command;
+- in full-permission/no-approval mode, print a brief review beginning with `Safety:` before any state-changing command, including small writes; cover the action, scope/blast radius, destructive risk, secrets/privacy impact, and rollback when available, with no other required formatting;
 - prefer narrow, reversible actions;
 - avoid destructive commands without explicit permission;
 - keep temporary artifacts in the platform temp directory unless the user wants them preserved.

@@ -42,6 +42,8 @@ USER_PLACEHOLDER_TEXT = """# USER
 PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
 
 PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
+
+Creating a sandbox requires explicit user approval. Prefer fully cleaning a stale task sandbox and reusing it; never use the global `sbx reset` command for routine cleanup. For sandbox tests, copy only the explicit source, configuration, and test files required for the run; never recursively copy a repository/tool root or any build, cache, or artifact tree. Remove task-local temporary test artifacts after each run.
 """
 
 
@@ -335,6 +337,22 @@ def upsert_top_level(text: str, updates: dict[str, str], remove_keys: Iterable[s
     return "".join(new_preamble + rest)
 
 
+def disable_auto_recap(text: str) -> str:
+    """Set the TUI default while preserving other configuration text."""
+    preamble, rest = split_toml_preamble(text)
+    if "tui.auto_recap" in top_level_keys(text):
+        return upsert_top_level(text, {"tui.auto_recap": "false"})
+    for index, line in enumerate(rest):
+        if re.fullmatch(r"\s*\[tui\]\s*(?:#.*)?", line.strip()):
+            end = index + 1
+            while end < len(rest) and not re.match(r"\s*\[", rest[end]):
+                end += 1
+            body = upsert_top_level("".join(rest[index + 1:end]), {"auto_recap": "false"})
+            header = rest[index].rstrip("\r\n") + "\n"
+            return "".join(preamble + rest[:index]) + header + body + "".join(rest[end:])
+    return upsert_top_level(text, {"tui.auto_recap": "false"})
+
+
 def configure_codex(
     state: SetupState,
     config_path: Path,
@@ -377,7 +395,7 @@ def configure_codex(
         else:
             remove_keys.append("default_permissions")
 
-    new_text = upsert_top_level(existing, updates, remove_keys=remove_keys)
+    new_text = disable_auto_recap(upsert_top_level(existing, updates, remove_keys=remove_keys))
     write_text(state, config_path, new_text, "Codex config.toml")
     ensure_project_agents_guard(state)
     remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)

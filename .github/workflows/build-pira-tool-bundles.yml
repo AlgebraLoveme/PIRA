@@ -64,6 +64,7 @@ jobs:
       - name: Check source and tests
         run: |
           python3 -m unittest \
+            assets.scripts.test_setup_pira \
             assets.scripts.test_setup_pira_tools \
             tools.build.test_build_pira_ctx_platform_bins \
             tools.build.test_package_github_release
@@ -130,6 +131,7 @@ jobs:
       - name: Run native Windows tests
         run: |
           python -m unittest `
+            assets.scripts.test_setup_pira `
             assets.scripts.test_setup_pira_tools `
             tools.build.test_build_pira_ctx_platform_bins `
             tools.build.test_package_github_release

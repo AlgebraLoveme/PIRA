@@ -8,3 +8,4 @@ Legacy files removed from the active scheme. During setup or migration, if any o
 - `~/agent/TOOLS.md`
 - `~/agent/MEMORY_SYSTEM.md`
 - `~/agent/modules/PAPER_FIGURE_STYLE.md`
+- `~/agent/modules/PAPER_READING.md`
