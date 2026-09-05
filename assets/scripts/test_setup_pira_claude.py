@@ -238,13 +238,17 @@ class SetupPiraClaudeTests(unittest.TestCase):
             root = Path(temporary)
             claude_md = root / ".claude" / "CLAUDE.md"
             policy_dir = root / ".claude" / "pira"
-            common = ["--policy-dir", str(policy_dir), "--claude-md", str(claude_md), "--skip-tools"]
+            settings = root / ".claude" / "settings.json"
+            common = ["--policy-dir", str(policy_dir), "--claude-md", str(claude_md), "--claude-settings", str(settings), "--skip-tools"]
             with redirect_stdout(io.StringIO()):
                 installed = setup.main([*common, "--yes", "--user-mode", "placeholder"])
+                hooks_after_install = json.loads(settings.read_text(encoding="utf-8"))["hooks"]
                 verified = setup.main([*common, "--verify"])
                 removed = setup.main([*common, "--uninstall"])
 
             self.assertEqual((installed, verified, removed), (0, 0, 0))
+            self.assertEqual(set(hooks_after_install), set(setup.ROUTING_HOOK_EVENTS))
+            self.assertFalse(settings.exists())
             self.assertFalse(claude_md.exists())
             self.assertTrue((policy_dir / "USER.md").exists())
             self.assertFalse((policy_dir / setup.MANIFEST_NAME).exists())
@@ -375,6 +379,68 @@ class SetupPiraClaudeTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     setup.main(["--skip-tools", *extra_args])
                 self.assertEqual(raised.exception.code, 2)
+
+
+    def test_routing_hooks_are_added_once_and_preserve_other_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "settings.json"
+            user_hook = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo mine"}]}
+            settings.write_text(json.dumps({"model": "opus", "hooks": {"PreToolUse": [user_hook], "UserPromptSubmit": [user_hook]}}), encoding="utf-8")
+            state = self.state(Path(temporary) / "pira")
+
+            setup.update_claude_settings(state, settings)
+            setup.update_claude_settings(state, settings)
+            data = json.loads(settings.read_text(encoding="utf-8"))
+
+            self.assertEqual(data["model"], "opus")
+            self.assertEqual(data["hooks"]["PreToolUse"], [user_hook])
+            self.assertEqual(data["hooks"]["UserPromptSubmit"][0], user_hook)
+            for event in setup.ROUTING_HOOK_EVENTS:
+                groups = data["hooks"][event]
+                self.assertEqual(sum(setup.is_pira_hook_group(group) for group in groups), 1)
+            command = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            self.assertTrue(command.startswith("echo PIRA routing:"))
+            self.assertIn("Read the exact PIRA module files", command)
+            self.assertNotIn('"', command)
+
+    def test_routing_hooks_uninstall_restores_other_settings_or_deletes_created_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.state(root / "pira")
+            shared = root / "shared.json"
+            original = {"permissions": {"allow": ["Read"]}, "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "echo done"}]}]}}
+            shared.write_text(json.dumps(original), encoding="utf-8")
+            setup.update_claude_settings(state, shared)
+            setup.remove_claude_settings_hooks(state, shared, setup.planned_settings_removal(shared))
+            self.assertEqual(json.loads(shared.read_text(encoding="utf-8")), original)
+            self.assertIsNone(setup.planned_settings_removal(shared))
+
+            created = root / "created.json"
+            setup.update_claude_settings(state, created)
+            self.assertTrue(created.exists())
+            setup.remove_claude_settings_hooks(state, created, setup.planned_settings_removal(created))
+            self.assertFalse(created.exists())
+
+    def test_routing_hooks_refuse_invalid_settings_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings = Path(temporary) / "settings.json"
+            for content in ("{not json", "[]", json.dumps({"hooks": "text"})):
+                settings.write_text(content, encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    setup.planned_settings_install(settings)
+                self.assertEqual(settings.read_text(encoding="utf-8"), content)
+
+    def test_routing_hooks_dry_run_and_skip_flag_write_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings.json"
+            state = self.state(root / "pira", dry_run=True)
+            setup.update_claude_settings(state, settings)
+            self.assertFalse(settings.exists())
+            common = ["--policy-dir", str(root / "pira"), "--claude-md", str(root / "CLAUDE.md"), "--claude-settings", str(settings), "--skip-tools", "--skip-routing-hooks"]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(setup.main([*common, "--yes", "--user-mode", "placeholder"]), 0)
+            self.assertFalse(settings.exists())
 
 
 if __name__ == "__main__":

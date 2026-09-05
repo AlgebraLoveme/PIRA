@@ -25,6 +25,16 @@ VERIFY_TOKEN = "31415926535897932384626433832795"
 CLAUDE_BLOCK_START = "<!-- PIRA:BEGIN (managed by setup_pira.py; do not edit inside) -->"
 CLAUDE_BLOCK_END = "<!-- PIRA:END -->"
 DEFAULT_POLICY_DIR = "~/.claude/pira"
+DEFAULT_CLAUDE_SETTINGS = "~/.claude/settings.json"
+# Per-turn routing reminder. Claude Code adds a hook's plain stdout to the model context for these
+# events, so one echo is enough; the prefix marks the entries this installer owns.
+ROUTING_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "SubagentStart")
+ROUTING_REMINDER_PREFIX = "echo PIRA routing:"
+ROUTING_REMINDER_COMMAND = (
+    "echo PIRA routing: before any project file read, command, or answer, Read the exact PIRA module files "
+    "the project policy requires for this task, including their canonical dependencies. Do not re-read "
+    "modules already loaded in this session. If no module applies, answer directly."
+)
 MANIFEST_NAME = "install.json"
 MANIFEST_SCHEMA = 1
 USER_PLACEHOLDER_TEXT = """# USER
@@ -276,6 +286,131 @@ def remove_claude_md_block(state: SetupState, claude_md_path: Path, planned: str
     print(f"Backup: {display_path(claude_md_path)} -> {display_path(backup_file)}")
     claude_md_path.unlink()
     state.note_change(f"deleted {display_path(claude_md_path)} (only the PIRA block remained)")
+
+
+def routing_hook_group() -> dict[str, object]:
+    return {"matcher": "", "hooks": [{"type": "command", "command": ROUTING_REMINDER_COMMAND}]}
+
+
+def is_pira_hook_group(group: object) -> bool:
+    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list) or not group["hooks"]:
+        return False
+    return all(isinstance(hook, dict) and str(hook.get("command", "")).startswith(ROUTING_REMINDER_PREFIX) for hook in group["hooks"])
+
+
+def read_settings(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    text = read_utf8_text(path, "Claude Code settings.json")
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Refusing to edit invalid JSON in {display_path(path)}: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Refusing to edit {display_path(path)}: the top level is not a JSON object")
+    return data
+
+
+def settings_text(data: dict[str, object]) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def hooks_table(data: dict[str, object], path: Path) -> dict[str, object]:
+    hooks = data.get("hooks")
+    if hooks is None:
+        return {}
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"Refusing to edit {display_path(path)}: \"hooks\" is not a JSON object")
+    return hooks
+
+
+def planned_settings_install(settings_path: Path) -> str:
+    """settings.json with exactly one PIRA reminder group per event; every other entry is kept."""
+    data = read_settings(settings_path)
+    hooks = hooks_table(data, settings_path)
+    for event in ROUTING_HOOK_EVENTS:
+        groups = hooks.get(event, [])
+        if not isinstance(groups, list):
+            raise RuntimeError(f"Refusing to edit {display_path(settings_path)}: hooks.{event} is not a list")
+        hooks[event] = [group for group in groups if not is_pira_hook_group(group)] + [routing_hook_group()]
+    data["hooks"] = hooks
+    return settings_text(data)
+
+
+def planned_settings_removal(settings_path: Path) -> str | None:
+    """settings.json without the PIRA reminder groups, or None when there is nothing to remove."""
+    if not settings_path.exists():
+        return None
+    data = read_settings(settings_path)
+    hooks = hooks_table(data, settings_path)
+    changed = False
+    for event in ROUTING_HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        kept = [group for group in groups if not is_pira_hook_group(group)]
+        if len(kept) != len(groups):
+            changed = True
+            if kept:
+                hooks[event] = kept
+            else:
+                hooks.pop(event)
+    if not changed:
+        return None
+    if hooks:
+        data["hooks"] = hooks
+    else:
+        data.pop("hooks", None)
+    return settings_text(data)
+
+
+def update_claude_settings(state: SetupState, settings_path: Path, planned: str | None = None) -> None:
+    planned = planned if planned is not None else planned_settings_install(settings_path)
+    write_text(state, settings_path, planned, "Claude Code settings.json")
+
+
+def remove_claude_settings_hooks(state: SetupState, settings_path: Path, planned: str | None) -> None:
+    if planned is None:
+        print(f"OK: no PIRA routing hooks in {display_path(settings_path)}")
+        return
+    if planned.strip() != "{}":
+        write_text(state, settings_path, planned, "Claude Code settings.json")
+        return
+    if state.dry_run:
+        print(f"DRY-RUN: would back up and delete {display_path(settings_path)} because only the PIRA hooks remained")
+        state.note_change(f"would delete {display_path(settings_path)}")
+        return
+    backup_file = backup_path(settings_path)
+    shutil.copy2(settings_path, backup_file)
+    print(f"Backup: {display_path(settings_path)} -> {display_path(backup_file)}")
+    settings_path.unlink()
+    state.note_change(f"deleted {display_path(settings_path)} (only the PIRA hooks remained)")
+
+
+def verify_claude_hooks(state: SetupState, settings_path: Path) -> None:
+    try:
+        hooks = hooks_table(read_settings(settings_path), settings_path)
+    except RuntimeError as exc:
+        state.check("Claude Code PIRA routing hooks", False, str(exc))
+        return
+    present = all(
+        isinstance(hooks.get(event), list) and sum(is_pira_hook_group(group) for group in hooks[event]) == 1
+        for event in ROUTING_HOOK_EVENTS
+    )
+    state.check("Claude Code PIRA routing hooks", present, f"{display_path(settings_path)} -> {', '.join(ROUTING_HOOK_EVENTS)}")
+
+
+def verify_claude_hooks_removed(state: SetupState, settings_path: Path) -> None:
+    present = False
+    if settings_path.exists():
+        try:
+            hooks = hooks_table(read_settings(settings_path), settings_path)
+            present = any(is_pira_hook_group(group) for groups in hooks.values() if isinstance(groups, list) for group in groups)
+        except RuntimeError:
+            present = False
+    state.check("Claude Code PIRA routing hooks removed", not present, display_path(settings_path))
 
 
 def sha256_bytes(content: bytes) -> str:
@@ -621,6 +756,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install a stable PIRA policy snapshot for Claude Code.")
     parser.add_argument("--policy-dir", default=DEFAULT_POLICY_DIR, help="Installed Claude policy directory (default: ~/.claude/pira).")
     parser.add_argument("--claude-md", default="~/.claude/CLAUDE.md", help="Claude Code user instruction file.")
+    parser.add_argument("--claude-settings", default=DEFAULT_CLAUDE_SETTINGS, help="Claude Code user settings file that receives the routing reminder hooks.")
+    parser.add_argument("--skip-routing-hooks", action="store_true", help="Do not install, verify, or remove the per-turn PIRA routing reminder hooks.")
     parser.add_argument("--expected-source-branch", default=None, help="Fail unless the source checkout is on this branch; setup never switches branches.")
     parser.add_argument("--uninstall", action="store_true", help="Remove the managed CLAUDE.md block and manifest-owned policy files; preserve USER.md and tools.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
@@ -675,37 +812,49 @@ def main(argv: list[str] | None = None) -> int:
             source_dirty=source_dirty,
         )
         claude_md_path = expand_path(args.claude_md)
+        settings_path = expand_path(args.claude_settings)
 
         print("PIRA setup (Claude Code)")
         dirty_suffix = ", dirty" if source_dirty else ""
         print(f"Source:      {display_path(repo_root)} @ {source_commit[:7]} ({source_branch or 'detached HEAD'}{dirty_suffix})")
         print(f"Policy dir:  {display_path(state.policy_dir)}")
         print(f"CLAUDE.md:   {display_path(claude_md_path)}")
+        print(f"Settings:    {display_path(settings_path)}{' (routing hooks skipped)' if args.skip_routing_hooks else ''}")
         print(f"Dry run:     {state.dry_run}")
 
         if args.uninstall:
             if args.verify:
                 raise RuntimeError("--uninstall and --verify cannot be combined")
             planned_removal = planned_claude_removal(claude_md_path)
+            planned_hooks_removal = None if args.skip_routing_hooks else planned_settings_removal(settings_path)
             old_manifest = prepare_bundle_uninstall(state)
             remove_claude_md_block(state, claude_md_path, planned_removal)
+            if not args.skip_routing_hooks:
+                remove_claude_settings_hooks(state, settings_path, planned_hooks_removal)
             uninstall_policy_bundle(state, old_manifest)
             if not args.dry_run:
                 verify_claude_removed(state, claude_md_path)
+                if not args.skip_routing_hooks:
+                    verify_claude_hooks_removed(state, settings_path)
                 verify_removed(state)
         elif args.verify:
             verify_policy_bundle(state)
             verify_claude(state, claude_md_path)
+            if not args.skip_routing_hooks:
+                verify_claude_hooks(state, settings_path)
             if not args.skip_tools:
                 configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=True)
         else:
             # Validate every outcome-changing path and source before the first write.
             planned_claude = planned_claude_md(claude_md_path, state.policy_dir)
+            planned_hooks = None if args.skip_routing_hooks else planned_settings_install(settings_path)
             prepared_bundle = prepare_policy_bundle(state)
             prepared_user = prepare_user_md(state, args.user_mode)
             install_policy_bundle(state, prepared_bundle)
             ensure_user_md(state, prepared_user)
             update_claude_md(state, claude_md_path, planned_claude)
+            if not args.skip_routing_hooks:
+                update_claude_settings(state, settings_path, planned_hooks)
             if not args.skip_tools:
                 configure_tools(state, args.tools_install_dir, args.tools_version, verify_only=False)
             if args.dry_run:
@@ -713,6 +862,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 verify_policy_bundle(state)
                 verify_claude(state, claude_md_path)
+                if not args.skip_routing_hooks:
+                    verify_claude_hooks(state, settings_path)
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
