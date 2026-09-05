@@ -325,3 +325,35 @@ Reading of the result:
 
 Caveats: Opus 5 low effort only; one to two repetitions per cell; synthetic policy; single-turn matrix
 cannot distinguish SessionStart from per-turn injection because both precede the first model call.
+
+## Variant F: reminder, gate, and automatic dependency injection (Opus 5)
+
+The lighter design proposed after the reminder probes: the per-turn reminder and the PreToolUse gate of
+variant D, plus a `PostToolUse` hook on module `Read`s that injects the exact text of any canonical
+dependency not yet loaded (`coding`, `writing`, `paper_reading`, `public_figure` → `research`), so
+dependency expansion is mechanical and costs no model turn. No `route` Skill. Temporary plugin outside
+the repository; hook script attached in
+`results/windows-577d340-opus5-autodep-variant-compact.json`. Opus 5 low, two repetitions each,
+exact ordered routing; hook-injected dependencies count as loaded.
+
+| Suite | F | D (reminder + gate) | strict guard (Sonnet, formal) |
+|---|---:|---:|---:|
+| Frozen matrix | 32/32 | 32/32 | 32/32 |
+| Prospective corpus | 78/86 | 79/86 | 84/86 |
+| Prospective multi-turn sessions | 10/10 | 10/10 | 10/10 |
+| Gate denials | 0 | 0 | – |
+| Dependency injections | 110 | – | – |
+| Median model turns, prospective | 3 | 4 | 4 |
+| Median seconds, prospective | 9.9 | 12.8 | 9.9 |
+
+Paired on the 86 prospective cases, F used fewer model turns than D in 49 cases and more in 3.
+No dependency-type miss remains; the eight F misses are domain judgement: `explain` added to a
+paper-critique or debugging prompt (3), `explain` alone where `coding` was also required (2), and
+`user_profile` added to `guidance` (3). Task completion 100 %.
+
+Reading: automatic dependency injection removes one Read round trip and the only class of miss a hook
+can fix mechanically, without changing precision (F 78 vs D 79 of 86 is within repetition noise). The
+remaining gap to the strict guard (about 7 points) is the model's domain judgement on ambiguous
+prompts, which only a declared and checked route can catch. F is the strongest Skill-free candidate
+measured so far: one model turn cheaper than strict, ~91 % exact routes on unseen prompts, zero
+denials observed. It is not implemented in the plugin.
