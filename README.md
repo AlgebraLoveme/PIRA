@@ -74,7 +74,7 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --exp
 powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --expected-source-branch claude --verify
 ```
 
-These are the underlying auditable steps for the agent, not a requirement that the user manually paste clone or update programs. `git pull --ff-only` is acceptable only after the agent has confirmed the intended branch and a clean worktree. Setup does not change Claude Code permission settings.
+These are the underlying auditable steps for the agent, not a requirement that the user manually paste clone or update programs. `git pull --ff-only` is acceptable only after the agent has confirmed the intended branch and a clean worktree. Setup does not change Claude Code permission settings; it adds three marked routing-reminder hook entries to `~/.claude/settings.json` (see `claude/ROUTING.md`), verifies them with `--verify`, and removes only those entries on `--uninstall`. Pass `--skip-routing-hooks` to leave `settings.json` untouched.
 
 ### Separate `USER.md` files by default
 
