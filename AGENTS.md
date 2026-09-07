@@ -152,12 +152,13 @@ If a needed tool is unavailable, immediately ask for setup; do not bypass its ru
 ```text
 pira_ctx [auto] --intent TEXT -- PROGRAM [ARG...]
 pira_ctx check|capture|exact --intent TEXT -- PROGRAM [ARG...]
-pira_ctx search RESULT QUERY [-e QUERY]... [--regex] [--context N]
+pira_ctx search RESULT QUERY [-e QUERY]... [--regex] [--context N] [--limit N]
 pira_ctx cancel RESULT|--current
 pira_ctx range RESULT START_LINE END_LINE
+pira_ctx range RESULT START:END
 pira_ctx transform RESULT OPERATION [ARG...]
 pira_ctx exec RESULT --code CODE
-pira_ctx list [OPTION...]
+pira_ctx list [--live] [OPTION...]
 pira_ctx history [QUERY]
 pira_ctx watch --current --deadline DURATION --unchanged-after DURATION
 ```
@@ -201,7 +202,7 @@ pira_dec help [COMMAND]
 - Omitted path defaults to cwd for `search`/`symbols`/`map`; omitted `--root` defaults to cwd for `dependents`/`deps`.
 - For positional paths/targets beginning with `-`, end option parsing with `--`. `query` instead pairs each semantic operation option directly with its target.
 - Targets: bare `FILE`, `FILE:START-END`, `FILE:LINE[:COLUMN]`, fully qualified `FILE::ITEM` for named symbols, or freshness-checked `outline --selectors` selectors. Use any of these with `show`. Semantic commands require an LSP; use one-based UTF-8-byte `FILE:LINE:COLUMN` for known source positions, the named-symbol form, or selectors when freshness-checked identity matters.
-- In every code/document format, separate `ITEM` hierarchy segments with `::`, append `[N]` for indices, and JSON-quote arbitrary segments in brackets, e.g., `["a.b"]`. Shell-quote targets containing metacharacters. Postfix `--head N`/`--tail N` bounds only the preceding bare file.
+- In every code/document format, separate `ITEM` hierarchy segments with `::`, append `[N]` for indices, and JSON-quote arbitrary segments in brackets, e.g., `["a.b"]`. Shell-quote targets containing metacharacters. Postfix `--head N`/`--tail N` bounds the preceding resolved target.
 - `show` defaults to exact. For ultra-long-line orientation, use `--glance`: line numbers, at most the first 160 UTF-8-safe source bytes per physical line, and explicit clipping metadata. Do not use it when exact source is required.
 - Markdown outlines show local heading titles under indented ancestors; construct fully qualified `show` targets from that hierarchy.
 - Start with the operation directly answering the question: `search`, `symbols`, `outline`, or `show` for known text/name/file/target. Use `map` only for topology discovery.
@@ -216,12 +217,12 @@ pira_dec help [COMMAND]
 
 #### Forms
 ```text
-pira_nav map [PATH] [--max-depth N] [OPTION...]
+pira_nav map [PATH...] [-g GLOB]... [--max-depth N] [OPTION...]
 pira_nav search PATTERN [PATH...] [OPTION...]
 pira_nav symbols QUERY [PATH...] [OPTION...]
 pira_nav outline FILE... [OPTION...]
 pira_nav show TARGET... [OPTION...]
-pira_nav show FILE [--head N|--tail N] [OPTION...]
+pira_nav show TARGET [--head N|--tail N] [OPTION...]
 pira_nav imports FILE... [OPTION...]
 pira_nav dependents FILE [--root DIR] [OPTION...]
 pira_nav deps FILE [--root DIR] [--depth N] [OPTION...]

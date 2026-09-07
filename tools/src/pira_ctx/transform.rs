@@ -119,6 +119,13 @@ pub fn run(store: &StoredResult, options: &TransformOptions) -> Result<Vec<Strin
     Ok(rows.into_iter().map(|r| r.text).collect())
 }
 
+fn check_materialization_budget(used: usize, next: u64) -> Result<(), String> {
+    if next > MAX_MATERIALIZED_BYTES.saturating_sub(used) as u64 {
+        return Err("transform plan input exceeds 128 MiB; use direct transform flags or a narrower capture".into());
+    }
+    Ok(())
+}
+
 fn load_rows(store: &StoredResult) -> Result<Vec<Row>, String> {
     let mut reader = store.reader()?;
     if store.metadata.line_timeline.len() > MAX_MATERIALIZED_ROWS {
@@ -129,6 +136,7 @@ fn load_rows(store: &StoredResult) -> Result<Vec<Row>, String> {
     let mut rows = Vec::with_capacity(store.metadata.line_timeline.len());
     let mut bytes = 0_usize;
     for line in &store.metadata.line_timeline {
+        check_materialization_budget(bytes, line.length)?;
         let mut line_bytes = Vec::new();
         reader.copy_line(line, &mut line_bytes)?;
         bytes = bytes
@@ -383,4 +391,17 @@ fn value_text(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn materialization_preflight_rejects_before_copying() {
+        assert!(check_materialization_budget(0, MAX_MATERIALIZED_BYTES as u64).is_ok());
+        assert!(check_materialization_budget(0, MAX_MATERIALIZED_BYTES as u64 + 1).is_err());
+        assert!(check_materialization_budget(MAX_MATERIALIZED_BYTES - 10, 11).is_err());
+        assert!(check_materialization_budget(MAX_MATERIALIZED_BYTES - 10, 10).is_ok());
+        assert!(check_materialization_budget(0, u64::MAX).is_err());
+    }
 }

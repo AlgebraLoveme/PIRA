@@ -184,6 +184,18 @@ pub fn record_paths(layout: &Layout) -> Result<Vec<PathBuf>, String> {
 }
 
 pub fn resolve(layout: &Layout, query: &str, exact: bool) -> Result<Resolution, String> {
+    if exact || model::validate_id_syntax(query).is_ok() {
+        model::validate_id_syntax(query)?;
+        if !layout.records_available()? {
+            return Ok(Resolution::Missing);
+        }
+        let path = layout.records_dir.join(format!("{query}.piradec"));
+        return match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(Resolution::Found(path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Resolution::Missing),
+            Err(error) => Err(format!("inspect decision {query}: {error}")),
+        };
+    }
     let mut matches = Vec::new();
     for path in record_paths(layout)? {
         let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {

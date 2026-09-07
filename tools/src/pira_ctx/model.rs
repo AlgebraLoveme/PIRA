@@ -495,6 +495,11 @@ impl StreamReaders {
     }
 
     pub fn read_search_line(&mut self, line: &LineMeta) -> Result<String, String> {
+        if line.length > util::MAX_SEARCH_LINE_BYTES {
+            return Err(
+                "search line exceeds coverage limit; use exec for full-capture analysis".into(),
+            );
+        }
         let bytes = self.read_bounded(line, util::MAX_SEARCH_LINE_BYTES)?;
         Ok(util::sanitize_terminal(&String::from_utf8_lossy(&bytes)))
     }
@@ -598,11 +603,13 @@ impl SectionReader {
                 ..
             } => {
                 let end = offset + length;
-                for (index, b) in blocks.iter().enumerate() {
-                    let bend = b.logical_offset + b.uncompressed_length;
-                    if bend <= offset || b.logical_offset >= end {
-                        continue;
+                let first =
+                    blocks.partition_point(|b| b.logical_offset + b.uncompressed_length <= offset);
+                for (index, b) in blocks.iter().enumerate().skip(first) {
+                    if b.logical_offset >= end {
+                        break;
                     }
+                    let bend = b.logical_offset + b.uncompressed_length;
                     if cache.as_ref().is_none_or(|(i, _)| *i != index) {
                         file.seek(SeekFrom::Start(*base + b.payload_offset))
                             .map_err(|e| e.to_string())?;
@@ -650,4 +657,69 @@ fn validate_line(line: &LineMeta, section_length: u64) -> Result<(), String> {
         return Err(format!("invalid timeline offset at L{}", line.line));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod block_lookup_tests {
+    use super::*;
+    #[test]
+    fn indexed_reads_preserve_variable_blocks_crossings_and_checksums() {
+        let path = std::env::temp_dir().join(format!(
+            "pira-block-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parts = [vec![b'a'; 113], vec![b'b'; 257], vec![b'c'; 61]];
+        let mut payload = Vec::new();
+        let mut blocks = Vec::new();
+        let mut logical = 0;
+        for (i, part) in parts.iter().enumerate() {
+            let stored = if i == 1 {
+                lz4_flex::block::compress(part)
+            } else {
+                part.clone()
+            };
+            blocks.push(BlockDescriptor {
+                codec: u8::from(i == 1),
+                logical_offset: logical,
+                uncompressed_length: part.len() as u64,
+                stored_length: stored.len() as u64,
+                payload_offset: payload.len() as u64,
+                content_sha256: Some(sha2::Sha256::digest(part).into()),
+            });
+            logical += part.len() as u64;
+            payload.extend(stored);
+        }
+        std::fs::write(&path, payload).unwrap();
+        let expected = parts.concat();
+        let mut reader = SectionReader::Blocks {
+            file: File::open(&path).unwrap(),
+            base: 0,
+            length: logical,
+            blocks: blocks.clone(),
+            cache: None,
+        };
+        for (offset, len) in [(0, 431), (112, 4), (120, 8), (3, 1), (431, 0), (0, 0)] {
+            assert_eq!(
+                reader.read_range(offset, len).unwrap(),
+                expected[offset as usize..(offset + len) as usize]
+            );
+        }
+        assert!(reader.read_range(431, 1).is_err());
+        blocks[1].content_sha256 = Some([0; 32]);
+        let mut corrupt = SectionReader::Blocks {
+            file: File::open(&path).unwrap(),
+            base: 0,
+            length: logical,
+            blocks,
+            cache: None,
+        };
+        assert!(corrupt.read_range(113, 1).unwrap_err().contains("checksum"));
+        drop(reader);
+        drop(corrupt);
+        std::fs::remove_file(path).unwrap();
+    }
 }

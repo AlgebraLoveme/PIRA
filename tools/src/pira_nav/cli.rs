@@ -11,9 +11,7 @@ use crate::command::{
     positive_usize,
 };
 use crate::deps;
-use crate::discovery::{
-    DiscoverySelection, discover_files, discover_files_many, discover_files_with_max_depth,
-};
+use crate::discovery::{DiscoverySelection, discover_files, discover_files_many};
 use crate::document::MAX_DOCUMENT_SYMBOLS;
 use crate::language::Language;
 use crate::lsp_options::{self, LspOptions};
@@ -385,12 +383,13 @@ fn command_outline(
         .collect::<Vec<_>>();
     let mut resolver = structural_resolver(lsp, cwd)?;
     let mut remaining_items = options.max_items;
-    for (path, absolute) in resolved_paths {
+    for (file_index, (path, absolute)) in resolved_paths.into_iter().enumerate() {
         let result = (|| {
             validate_regular_file(&absolute, cwd, "outline")?;
             let language = language_for(&absolute, explicit)?;
             let parsed = resolver.resolve_path(&absolute, language)?;
-            let shown = render_outline(&parsed, cwd, &options, remaining_items, output)?;
+            let share = remaining_items.div_ceil(total - file_index);
+            let shown = render_outline(&parsed, cwd, &options, share, output)?;
             remaining_items = remaining_items.saturating_sub(shown);
             Ok(())
         })();
@@ -447,6 +446,7 @@ struct OutlineOptions {
 
 fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String)> {
     let mut paths = Vec::new();
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_OUTLINE_MAX_ITEMS;
     let mut max_depth = None;
     let mut selectors = false;
@@ -458,13 +458,23 @@ fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String
         if option == "--" {
             paths.extend(args[index + 1..].iter().cloned());
             break;
-        } else if matches!(option, "--max-items" | "--depth" | "--match") {
+        } else if matches!(
+            option,
+            "--max-items" | "--limit" | "--depth" | "--max-depth" | "--match"
+        ) {
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| (2, format!("{option} requires a value")))?;
-            if option == "--max-items" {
+            if matches!(option, "--max-items" | "--limit") {
+                if max_items_set {
+                    return Err((2, "--limit/--max-items may be specified only once".into()));
+                }
+                max_items_set = true;
                 max_items = positive_usize(value, option)?;
-            } else if option == "--depth" {
+            } else if matches!(option, "--depth" | "--max-depth") {
+                if max_depth.is_some() {
+                    return Err((2, "--depth/--max-depth may be specified only once".into()));
+                }
                 let depth = value
                     .parse::<usize>()
                     .map_err(|_| (2, "--depth must be a non-negative integer".into()))?;
@@ -512,29 +522,23 @@ fn command_show(
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_show_options(args)?;
+    let mut parsed_files = ParsedFileCache::new();
+    let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1 && options.targets[0].file_slice.is_some() {
         if options.max_items.is_some() {
             return usage("show --max-items does not apply to a single --head/--tail target");
         }
         let target = &options.targets[0];
-        let file_slice = target.file_slice.expect("file slice was present");
-        let path = plain_show_path(&target.value, cwd).ok_or_else(|| {
-            let (option, lines) = file_slice.option_and_lines();
-            (
-                2,
-                show_file_slice_target_error(&target.value, option, lines),
-            )
-        })?;
-        validate_show_file_target(&target.value, &path, cwd)?;
         let mut item = Vec::new();
-        match file_slice {
-            ShowFileSlice::Head(lines) => {
-                render_file_head(&path, lines, cwd, options.glance, &mut item)?
-            }
-            ShowFileSlice::Tail(lines) => {
-                render_file_tail(&path, lines, cwd, options.glance, &mut item)?
-            }
-        }
+        render_show_slice(
+            target,
+            explicit,
+            cwd,
+            options.glance,
+            &mut parsed_files,
+            &mut resolver,
+            &mut item,
+        )?;
         if let Some(max_bytes) = options.max_bytes
             && item.len() > max_bytes
         {
@@ -608,8 +612,6 @@ fn command_show(
         output.write_all(&item).map_err(output_error)?;
         return Ok(());
     }
-    let mut parsed_files = ParsedFileCache::new();
-    let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1
         && let Some((path_text, start, end)) = parse_line_range(&options.targets[0].value)
     {
@@ -668,6 +670,7 @@ fn command_show(
         Lines(PathBuf, usize, usize),
         Head(PathBuf, usize),
         Tail(PathBuf, usize),
+        Slice(String, ShowFileSlice),
         Symbol(PathBuf, usize, usize),
     }
 
@@ -676,35 +679,28 @@ fn command_show(
             break;
         }
         if let Some(file_slice) = target.file_slice {
-            let (option, lines) = file_slice.option_and_lines();
-            let Some(path) = plain_show_path(&target.value, cwd) else {
-                failures.record(
-                    target.value.clone(),
-                    2,
-                    show_file_slice_target_error(&target.value, option, lines),
-                );
-                continue;
-            };
-            let identity = match file_slice {
-                ShowFileSlice::Head(lines) => ShowIdentity::Head(path.clone(), lines),
-                ShowFileSlice::Tail(lines) => ShowIdentity::Tail(path.clone(), lines),
+            let identity = if let Some(path) = plain_show_path(&target.value, cwd) {
+                match file_slice {
+                    ShowFileSlice::Head(n) => ShowIdentity::Head(path, n),
+                    ShowFileSlice::Tail(n) => ShowIdentity::Tail(path, n),
+                }
+            } else {
+                ShowIdentity::Slice(target.value.clone(), file_slice)
             };
             if !identities.insert(identity.clone()) {
                 duplicates += 1;
                 continue;
             }
             let mut item = Vec::new();
-            let result =
-                validate_show_file_target(&target.value, &path, cwd).and_then(
-                    |()| match file_slice {
-                        ShowFileSlice::Head(lines) => {
-                            render_file_head(&path, lines, cwd, options.glance, &mut item)
-                        }
-                        ShowFileSlice::Tail(lines) => {
-                            render_file_tail(&path, lines, cwd, options.glance, &mut item)
-                        }
-                    },
-                );
+            let result = render_show_slice(
+                target,
+                explicit,
+                cwd,
+                options.glance,
+                &mut parsed_files,
+                &mut resolver,
+                &mut item,
+            );
             if let Err((code, message)) = result {
                 identities.remove(&identity);
                 failures.record(target.value.clone(), code, message);
@@ -867,7 +863,7 @@ struct ShowTarget {
     file_slice: Option<ShowFileSlice>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum ShowFileSlice {
     Head(usize),
     Tail(usize),
@@ -1163,20 +1159,6 @@ fn plain_show_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     .then(|| absolute_lexical(Path::new(target), cwd))
 }
 
-fn show_file_slice_target_error(target: &str, option: &str, lines: usize) -> String {
-    let base = parse_line_range(target)
-        .map(|(path, _, _)| path)
-        .or_else(|| parse_location(target).map(|(path, _, _)| path))
-        .or_else(|| target.split_once("::").map(|(path, _)| path));
-    if let Some(path) = base {
-        format!(
-            "{option} applies to a bare file, not a range or item; try `pira_nav show {path} {option} {lines}`, or omit {option} to show the requested target"
-        )
-    } else {
-        format!("show {option} requires one bare FILE target")
-    }
-}
-
 fn validate_show_file_target(target: &str, path: &Path, cwd: &Path) -> CommandResult {
     if !path.exists()
         && let Some((base, suffix)) = target.rsplit_once(':')
@@ -1254,19 +1236,62 @@ fn command_map(
         mut paths,
         max_items,
         max_depth,
+        globs,
     } = parse_map_options(args)?;
     if paths.is_empty() {
         paths.push(".".into());
-    } else if paths.len() != 1 {
-        return usage("map requires exactly one directory");
     }
-    let root = absolute_lexical(Path::new(&paths[0]), cwd);
-    validate_directory(&root, cwd, "map", "target")?;
-    let discovery = discover_files_with_max_depth(
-        &root,
-        explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
-        max_depth,
-    );
+    let roots = paths
+        .iter()
+        .map(|p| absolute_lexical(Path::new(p), cwd))
+        .collect::<BTreeSet<_>>();
+    let root = if roots.len() == 1 {
+        roots.first().unwrap().clone()
+    } else {
+        cwd.to_path_buf()
+    };
+    let mut discovery = crate::discovery::FileDiscovery {
+        files: Vec::new(),
+        all_files: Vec::new(),
+        discovered: 0,
+        unsupported: 0,
+        ambiguous: 0,
+        walk_errors: Vec::new(),
+        walk_errors_total: 0,
+    };
+    for requested in &roots {
+        validate_directory(requested, cwd, "map", "target")?;
+        let found = crate::discovery::discover_filtered_files(
+            requested,
+            explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+            max_depth,
+            &globs,
+        )
+        .map_err(input_error)?;
+        discovery.files.extend(found.files);
+        discovery.all_files.extend(found.all_files);
+        discovery.walk_errors_total += found.walk_errors_total;
+        for error in found.walk_errors {
+            if discovery.walk_errors.len() < 20 {
+                discovery.walk_errors.push(error);
+            }
+        }
+    }
+    discovery.files.sort_by(|a, b| a.0.cmp(&b.0));
+    discovery.files.dedup_by(|a, b| a.0 == b.0);
+    discovery.all_files.sort();
+    discovery.all_files.dedup();
+    discovery.discovered = discovery.all_files.len();
+    for path in &discovery.all_files {
+        match crate::discovery::classify(
+            path,
+            explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+        ) {
+            crate::discovery::DiscoveredLanguage::Eligible(_) => {}
+            crate::discovery::DiscoveredLanguage::Unsupported => discovery.unsupported += 1,
+            crate::discovery::DiscoveredLanguage::Ambiguous => discovery.ambiguous += 1,
+        }
+    }
     let shape = collect_map_shape(&root, &discovery.all_files);
     let mut failures = FailureCollector::default();
     for error in &discovery.walk_errors {
@@ -1341,6 +1366,12 @@ fn command_map(
         source_files
     )
     .map_err(output_error)?;
+    if roots.len() > 1 {
+        write!(output, " roots={}", roots.len()).map_err(output_error)?;
+    }
+    if !globs.is_empty() {
+        write!(output, " globs={}", globs.len()).map_err(output_error)?;
+    }
     if let Some(max_depth) = max_depth {
         write!(output, " max_depth={max_depth}").map_err(output_error)?;
     }
@@ -2054,6 +2085,7 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
     let mut contains = false;
     let mut regex = false;
     let mut kind = None;
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_SYMBOL_MAX_ITEMS;
     let mut selectors = false;
     let mut signatures = false;
@@ -2061,7 +2093,7 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--query" => {
+            "--query" | "-e" => {
                 explicit_queries.push(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--query requires a value".into()))?
@@ -2104,7 +2136,11 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
                 kind = Some(value.to_lowercase());
                 index += 2;
             }
-            "--max-items" => {
+            "--max-items" | "--limit" => {
+                if max_items_set {
+                    return Err((2, "--limit/--max-items may be specified only once".into()));
+                }
+                max_items_set = true;
                 max_items = positive_usize(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--max-items requires a value".into()))?,
@@ -2164,26 +2200,19 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
             }
         }
     }
-    let paths;
-    let queries;
-    if explicit_queries.is_empty() {
+    let queries = if explicit_queries.is_empty() {
         if positional.is_empty() {
             return Err((2, "symbols requires QUERY [PATH...]".into()));
         }
-        queries = vec![positional.remove(0)];
-        paths = if positional.is_empty() {
-            vec![".".into()]
-        } else {
-            positional
-        };
+        vec![positional.remove(0)]
     } else {
-        queries = explicit_queries;
-        paths = if positional.is_empty() {
-            vec![".".into()]
-        } else {
-            positional
-        };
-    }
+        explicit_queries
+    };
+    let paths = if positional.is_empty() {
+        vec![".".into()]
+    } else {
+        positional
+    };
     if paths.len() > MAX_SYMBOL_PATHS {
         return Err((
             2,
@@ -3524,6 +3553,81 @@ fn render_source(
     Ok(())
 }
 
+fn render_show_slice(
+    target: &ShowTarget,
+    explicit: Option<Language>,
+    cwd: &Path,
+    glance: bool,
+    cache: &mut ParsedFileCache,
+    resolver: &mut StructuralResolver,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let slice = target.file_slice.expect("slice target");
+    if let Some(path) = plain_show_path(&target.value, cwd) {
+        validate_show_file_target(&target.value, &path, cwd)?;
+        let source = read_source(&path).map_err(input_error)?;
+        return render_slice(&path, &source, 1, slice, cwd, glance, output);
+    }
+    if let Some((path, start, end)) = parse_line_range(&target.value) {
+        let path = absolute_lexical(Path::new(path), cwd);
+        let source = read_source(&path).map_err(input_error)?;
+        if start == 0 || end < start {
+            return usage("line range must satisfy 1 <= START <= END");
+        }
+        let (_, selected) = select_line_range(&source, &path, start, end)?;
+        return render_slice(&path, selected, start, slice, cwd, glance, output);
+    }
+    let (key, index) = resolve_show_target(&target.value, explicit, cwd, cache, resolver)?;
+    let parsed = cache
+        .get(&key)
+        .and_then(|r| r.as_ref().ok())
+        .expect("resolved parse");
+    let symbol = &parsed.symbols[index];
+    let source = parsed
+        .source
+        .get(symbol.start_byte..symbol.end_byte)
+        .ok_or_else(|| input_error("invalid symbol source bounds"))?;
+    render_slice(
+        &parsed.path,
+        source,
+        symbol.start_row + 1,
+        slice,
+        cwd,
+        glance,
+        output,
+    )
+}
+
+fn render_slice(
+    path: &Path,
+    source: &str,
+    base: usize,
+    slice: ShowFileSlice,
+    cwd: &Path,
+    glance: bool,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let count = source_line_count(source);
+    let (_, n) = slice.option_and_lines();
+    if n == 0 || count == 0 {
+        return render_text_range(path, "", 0, 0, cwd, glance, output);
+    }
+    let (start, end) = match slice {
+        ShowFileSlice::Head(n) => (1, n.min(count)),
+        ShowFileSlice::Tail(n) => (count.saturating_sub(n) + 1, count),
+    };
+    let (_, selected) = select_line_range(source, path, start, end)?;
+    render_text_range(
+        path,
+        selected,
+        base + start - 1,
+        base + end - 1,
+        cwd,
+        glance,
+        output,
+    )
+}
+
 fn render_line_range(
     path: &Path,
     start: usize,
@@ -3557,44 +3661,6 @@ fn render_entire_file(
         glance,
         output,
     )
-}
-
-fn render_file_head(
-    path: &Path,
-    lines: usize,
-    cwd: &Path,
-    glance: bool,
-    output: &mut dyn Write,
-) -> CommandResult {
-    let source = read_source(path).map_err(input_error)?;
-    if lines == 0 {
-        return render_text_range(path, "", 0, 0, cwd, glance, output);
-    }
-    if source.is_empty() {
-        return render_text_range(path, &source, 0, 0, cwd, glance, output);
-    }
-    let (end, selected) = select_line_range(&source, path, 1, lines)?;
-    render_text_range(path, selected, 1, end, cwd, glance, output)
-}
-
-fn render_file_tail(
-    path: &Path,
-    lines: usize,
-    cwd: &Path,
-    glance: bool,
-    output: &mut dyn Write,
-) -> CommandResult {
-    let source = read_source(path).map_err(input_error)?;
-    if lines == 0 {
-        return render_text_range(path, "", 0, 0, cwd, glance, output);
-    }
-    let line_count = source_line_count(&source);
-    if line_count == 0 {
-        return render_text_range(path, &source, 0, 0, cwd, glance, output);
-    }
-    let start = line_count.saturating_sub(lines) + 1;
-    let (end, selected) = select_line_range(&source, path, start, line_count)?;
-    render_text_range(path, selected, start, end, cwd, glance, output)
 }
 
 fn source_line_count(source: &str) -> usize {
@@ -3738,10 +3804,13 @@ struct MapOptions {
     paths: Vec<String>,
     max_items: usize,
     max_depth: Option<usize>,
+    globs: Vec<String>,
 }
 
 fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
     let mut paths = Vec::new();
+    let mut globs = Vec::new();
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_MAP_MAX_ITEMS;
     let mut max_depth = None;
     let mut index = 0;
@@ -3749,10 +3818,25 @@ fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
         if args[index] == "--" {
             paths.extend(args[index + 1..].iter().cloned());
             break;
-        } else if args[index] == "--max-items" {
+        } else if matches!(args[index].as_str(), "--glob" | "-g") {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| input_error("map -g requires GLOB"))?;
+            if globs.len() >= 64 || value.len() > 4096 {
+                return Err(input_error(
+                    "map accepts at most 64 globs of at most 4096 bytes",
+                ));
+            }
+            globs.push(value.clone());
+            index += 2;
+        } else if matches!(args[index].as_str(), "--max-items" | "--limit") {
             let Some(value) = args.get(index + 1) else {
                 return Err((2, "--max-items requires a positive integer".into()));
             };
+            if max_items_set {
+                return Err((2, "--limit/--max-items may be specified only once".into()));
+            }
+            max_items_set = true;
             max_items = value
                 .parse::<usize>()
                 .ok()
@@ -3795,8 +3879,12 @@ fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
             index += 1;
         }
     }
+    if paths.len() > 64 {
+        return Err(input_error("map accepts at most 64 roots"));
+    }
     Ok(MapOptions {
         paths,
+        globs,
         max_items,
         max_depth,
     })
@@ -3930,7 +4018,7 @@ mod tests {
         command_show, help_requested, outline_display_name, parse_dependency_options,
         parse_import_options, parse_location, parse_map_options, parse_selector,
         parse_show_options, parse_symbol_options, render_glance, select_line_range,
-        show_file_slice_target_error, source_line_count,
+        source_line_count,
     };
     use crate::language::Language;
     use crate::lsp_options::LspOptions;
@@ -4042,9 +4130,6 @@ mod tests {
         .expect("different files may each have a slice");
         assert_eq!(multiple.targets[0].file_slice, Some(ShowFileSlice::Head(2)));
         assert_eq!(multiple.targets[1].file_slice, Some(ShowFileSlice::Tail(3)));
-
-        let suggestion = show_file_slice_target_error("README.md:10-20", "--head", 5);
-        assert!(suggestion.contains("pira_nav show README.md --head 5"));
     }
 
     #[test]

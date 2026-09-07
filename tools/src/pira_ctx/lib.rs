@@ -28,7 +28,6 @@ const EXACT_GUARD_MAX_LINES: usize = 20_000;
 const MAX_IMPORTANT_LINES: usize = 10;
 const MAX_JSON_IMPORTANT_LINES: usize = 4;
 const MAX_JSON_SYNOPSIS_LINES: usize = 16;
-const MAX_SEARCH_RESULTS: usize = 5;
 
 pub fn run() -> i32 {
     match real_main() {
@@ -545,12 +544,16 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
     let omitted_lines = capture.total_lines.saturating_sub(shown.len());
     let omitted_bytes = capture.total_bytes().saturating_sub(shown_bytes);
     let mut rendered = Vec::with_capacity(shown.len());
+    let mut clipped_lines = 0usize;
     if !shown.is_empty() {
         let mut readers = capture.readers()?;
         for &index in &shown {
             let line = &capture.timeline[index];
             let raw = readers.read_security_line(line)?;
             let (text, risk) = prepare_program_display(&raw);
+            if line.length > util::MAX_DISPLAY_READ_BYTES || text != util::sanitize_terminal(&raw) {
+                clipped_lines += 1;
+            }
             rendered.push((line, text, risk));
         }
     }
@@ -589,7 +592,7 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             .chain(rendered_json.iter().map(|(text, _)| text.as_str())),
     );
     output.line(&format!(
-        "Result: {} | {}exit={} | {} B/{} lines | omitted={} B/{} lines",
+        "Result: {} | {}exit={} | {} B/{} lines | unselected={} B/{} lines",
         metadata.result_id,
         if capture.cancelled {
             "state=cancelled | "
@@ -660,7 +663,13 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             output.line(&format!("  {count}x {example}"))?;
         }
     }
-    let recovery_needed = omitted_lines > 0
+    if clipped_lines > 0 {
+        output.line(&format!(
+            "display_clipped_lines={clipped_lines}; exact bytes remain retained"
+        ))?;
+    }
+    let recovery_needed = clipped_lines > 0
+        || omitted_lines > 0
         || omitted_bytes > 0
         || capture.timeline_truncated
         || capture.retention_truncated;
@@ -721,6 +730,11 @@ fn print_retention_notice(
     output: &mut util::BoundedStdout,
     capture: &CaptureResult,
 ) -> Result<(), String> {
+    if capture.timeline_truncated {
+        output.line(
+            "Index: truncated; search covers only the indexed retained prefix; range unavailable",
+        )?;
+    }
     if capture.retention_truncated {
         output.line(&format!(
             "Retention limit reached: kept {} of {} observed bytes; excess PROGRAM output was discarded while the command continued.",
@@ -807,134 +821,229 @@ fn prepare_program_display(raw: &str) -> (String, security::ContentRisk) {
     (displayed, risk)
 }
 
+struct CaptureQuery {
+    matcher: regex::Regex,
+    terms: Vec<String>,
+    hits: Vec<(usize, i64)>,
+    count: usize,
+    lexical_hits: Vec<(usize, i64)>,
+    lexical_count: usize,
+}
+
 fn run_search(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
+    let lines = &store.metadata.line_timeline;
     let mut reader = store.reader()?;
-    let mut output = util::BoundedStdout::new(64 * 1024);
-    if store.metadata.timeline_truncated {
-        output.line("Index: truncated; search covered only the indexed retained prefix")?;
-    }
-    for (query_index, query) in config.search_queries.iter().enumerate() {
-        let matcher = if config.regex {
-            regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?
+    let mut queries = config
+        .search_queries
+        .iter()
+        .map(|query| {
+            let matcher = if config.regex {
+                regex::Regex::new(query)
+            } else {
+                regex::RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(true)
+                    .build()
+            }
+            .map_err(|error| format!("invalid search query: {error}"))?;
+            Ok(CaptureQuery {
+                matcher,
+                terms: lexical_terms(query),
+                hits: Vec::new(),
+                count: 0,
+                lexical_hits: Vec::new(),
+                lexical_count: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut oversized = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if line.length > util::MAX_SEARCH_LINE_BYTES {
+            oversized += 1;
+            continue;
+        }
+        let text = reader.read_search_line(line)?;
+        let terms = if config.regex {
+            Vec::new()
         } else {
-            regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(true)
-                .build()
-                .map_err(|error| format!("invalid literal query: {error}"))?
+            lexical_terms(&text)
         };
-        let query_terms = lexical_terms(query);
-        let mut hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-        let mut hit_count = 0_usize;
-        let mut lexical_hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-        let mut lexical_count = 0_usize;
-        for (index, line) in store.metadata.line_timeline.iter().enumerate() {
-            let text = reader.read_search_line(line)?;
-            let length_penalty = (line.length / 4096).min(200) as i64;
-            if matcher.is_match(&text) {
-                hit_count += 1;
+        let penalty = (line.length / 4096).min(200) as i64;
+        for query in &mut queries {
+            if query.matcher.is_match(&text) {
+                query.count += 1;
                 offer_search_hit(
-                    &mut hits,
+                    &mut query.hits,
                     (
                         index,
-                        line.score + if config.regex { 70 } else { 80 } - length_penalty,
+                        line.score + if config.regex { 70 } else { 80 } - penalty,
                     ),
-                    &store.metadata.line_timeline,
+                    lines,
+                    config.search_limit,
                 );
-            } else if !config.regex {
-                let score = lexical_score(&text, &query_terms);
+            } else if !config.regex && query.count == 0 {
+                let score = lexical_score_terms(&terms, &query.terms);
                 if score > 0 {
-                    lexical_count += 1;
+                    query.lexical_count += 1;
                     offer_search_hit(
-                        &mut lexical_hits,
-                        (index, line.score + score - length_penalty),
-                        &store.metadata.line_timeline,
+                        &mut query.lexical_hits,
+                        (index, line.score + score - penalty),
+                        lines,
+                        config.search_limit,
                     );
                 }
             }
         }
-        let lexical = hit_count == 0 && lexical_count > 0;
-        if lexical {
-            hits = lexical_hits;
-            hit_count = lexical_count;
+    }
+    let lexical = queries
+        .iter()
+        .map(|q| q.count == 0 && q.lexical_count > 0)
+        .collect::<Vec<_>>();
+    let mut queues = Vec::new();
+    for (q, use_lexical) in queries.iter_mut().zip(&lexical) {
+        if *use_lexical {
+            q.hits = std::mem::take(&mut q.lexical_hits);
+            q.count = q.lexical_count;
         }
-        if config.search_queries.len() == 1 {
-            output.line(&format!(
-                "{}{} hits",
-                hit_count,
-                if lexical { " lexical" } else { "" }
-            ))?;
-        } else {
-            output.line(&format!(
-                "Query {} {:?}: {}{} hits",
-                query_index + 1,
-                query,
-                hit_count,
-                if lexical { " lexical" } else { "" }
-            ))?;
-        }
-        let mut selected = std::collections::BTreeMap::new();
-        for (index, score) in hits.into_iter().take(MAX_SEARCH_RESULTS) {
-            let start = index.saturating_sub(config.context);
-            let end = index
-                .saturating_add(config.context)
-                .min(store.metadata.line_timeline.len().saturating_sub(1));
-            for nearby in start..=end {
-                let is_hit = nearby == index;
-                let nearby_score = if is_hit {
-                    score
-                } else {
-                    store.metadata.line_timeline[nearby].score
-                };
-                selected
-                    .entry(nearby)
-                    .and_modify(|entry: &mut (i64, bool)| {
-                        if is_hit {
-                            *entry = (nearby_score, true);
-                        }
-                    })
-                    .or_insert((nearby_score, is_hit));
+        let mut queue = q.hits.iter().map(|(i, _)| (*i, true)).collect::<Vec<_>>();
+        let mut seen = q
+            .hits
+            .iter()
+            .map(|(i, _)| *i)
+            .collect::<std::collections::BTreeSet<_>>();
+        for (i, _) in &q.hits {
+            for nearby in i.saturating_sub(config.context)
+                ..=i.saturating_add(config.context)
+                    .min(lines.len().saturating_sub(1))
+            {
+                if seen.insert(nearby) {
+                    queue.push((nearby, false));
+                }
             }
         }
-        let mut rendered = Vec::with_capacity(selected.len());
-        for (index, (score, is_hit)) in selected {
-            let line = &store.metadata.line_timeline[index];
-            let raw = if is_hit {
+        queues.push(std::collections::VecDeque::from(queue));
+    }
+    let context_totals = queues
+        .iter()
+        .map(|q| q.iter().filter(|(_, hit)| !hit).count())
+        .collect::<Vec<_>>();
+    let mut context_shown = vec![0; queries.len()];
+    let mut shown = vec![0; queries.len()];
+    let mut byte_limited = vec![false; queries.len()];
+    let mut rendered = Vec::new();
+    let mut remaining = 56 * 1024usize; // Status and warnings share the remaining 8 KiB.
+    while queues.iter().any(|q| !q.is_empty()) {
+        for (qi, queue) in queues.iter_mut().enumerate() {
+            let Some((index, hit)) = queue.pop_front() else {
+                continue;
+            };
+            let line = &lines[index];
+            let raw = if hit {
                 reader.read_search_line(line)?
             } else {
                 reader.read_security_line(line)?
             };
             let risk = security::inspect(&raw);
-            let text = if is_hit && !lexical {
-                matcher.find(&raw).map_or_else(
+            let text = if hit && !lexical[qi] {
+                queries[qi].matcher.find(&raw).map_or_else(
                     || prepare_program_display(&raw).0,
-                    |matched| util::clip_match_display(&raw, matched.start(), matched.end()),
+                    |m| util::clip_match_display(&raw, m.start(), m.end()),
                 )
             } else {
                 prepare_program_display(&raw).0
             };
-            rendered.push((line, score, text, risk));
+            let prefix = if queries.len() > 1 {
+                format!("q{} ", qi + 1)
+            } else {
+                String::new()
+            };
+            let row = format!("{prefix}L{} {}: {}", line.line, line.stream, text);
+            let bytes = row.len() + 1;
+            if bytes > remaining {
+                byte_limited[qi] = true;
+                continue;
+            }
+            remaining -= bytes;
+            if hit {
+                shown[qi] += 1;
+            } else {
+                context_shown[qi] += 1;
+            }
+            rendered.push((line.line, row, risk));
         }
-        print_content_warnings(
-            &mut output,
-            rendered
-                .iter()
-                .map(|(line, _, _, risk)| (Some(line.line), *risk))
-                .chain(std::iter::once((
-                    None,
-                    security::inspect_combined(
-                        rendered.iter().map(|(_, _, text, _)| text.as_str()),
-                    ),
-                ))),
-        )?;
-        for (line, score, text, _) in rendered {
-            output.line(&format_scored_line(line, score, &text))?;
+        if remaining < 64 {
+            for (qi, queue) in queues.iter_mut().enumerate() {
+                byte_limited[qi] |= !queue.is_empty();
+                queue.clear();
+            }
         }
+    }
+    let mut output = util::BoundedStdout::new(64 * 1024);
+    if store.metadata.timeline_truncated {
+        output.line("Index: truncated; search covered only the indexed retained prefix")?;
+    }
+    if store.metadata.retention_truncated {
+        output.line("complete=0 retention_truncated=1; discarded bytes are not recoverable")?;
+    }
+    if oversized > 0 {
+        output.line(&format!("complete=0 skipped_lines={oversized} max_search_line_bytes={}; use pira_ctx exec {} --code CODE for full-capture analysis", util::MAX_SEARCH_LINE_BYTES, store.metadata.result_id))?;
+    }
+    for (qi, query) in queries.iter().enumerate() {
+        let label = if queries.len() > 1 {
+            format!(
+                "Query {} {:?}: ",
+                qi + 1,
+                util::single_line_clip(&config.search_queries[qi], 120)
+            )
+        } else {
+            String::new()
+        };
+        let mut status = format!(
+            "{label}{}{} hits",
+            query.count,
+            if lexical[qi] { " lexical" } else { "" }
+        );
+        let omitted = query.count.saturating_sub(shown[qi]);
+        let context_omitted = context_totals[qi] - context_shown[qi];
+        if omitted > 0 || context_omitted > 0 {
+            status.push_str(&format!(" shown={} omitted={omitted}", shown[qi]));
+            if query.count > config.search_limit {
+                status.push_str(&format!(
+                    " per_query_limit={}; raise --limit (max 100) or narrow query",
+                    config.search_limit
+                ));
+            }
+            if byte_limited[qi] {
+                status.push_str(" byte_limited=1; reduce --context or narrow query");
+            }
+            if context_omitted > 0 {
+                status.push_str(&format!(" context_omitted={context_omitted}"));
+            }
+        }
+        output.line(&status)?;
+    }
+    print_content_warnings(
+        &mut output,
+        rendered
+            .iter()
+            .map(|(line, _, risk)| (Some(*line), *risk))
+            .chain(std::iter::once((
+                None,
+                security::inspect_combined(rendered.iter().map(|(_, row, _)| row.as_str())),
+            ))),
+    )?;
+    for (_, row, _) in rendered {
+        output.line(&row)?;
     }
     Ok(0)
 }
 
-fn offer_search_hit(hits: &mut Vec<(usize, i64)>, hit: (usize, i64), lines: &[model::LineMeta]) {
+fn offer_search_hit(
+    hits: &mut Vec<(usize, i64)>,
+    hit: (usize, i64),
+    lines: &[model::LineMeta],
+    limit: usize,
+) {
     hits.push(hit);
     hits.sort_by(|a, b| {
         lines[b.0]
@@ -943,7 +1052,7 @@ fn offer_search_hit(hits: &mut Vec<(usize, i64)>, hit: (usize, i64), lines: &[mo
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| lines[a.0].line.cmp(&lines[b.0].line))
     });
-    hits.truncate(MAX_SEARCH_RESULTS);
+    hits.truncate(limit);
 }
 
 fn lexical_terms(value: &str) -> Vec<String> {
@@ -971,11 +1080,10 @@ fn stem(value: &str) -> String {
     }
     value.to_string()
 }
-fn lexical_score(text: &str, query: &[String]) -> i64 {
+fn lexical_score_terms(terms: &[String], query: &[String]) -> i64 {
     if query.is_empty() {
         return 0;
     }
-    let terms = lexical_terms(text);
     let matched = query
         .iter()
         .filter(|q| {
@@ -1222,6 +1330,9 @@ fn run_list(config: &Config) -> Result<i32, String> {
     };
     let mut entries = storage::scan_store(&store_dir, filter.as_deref())?;
     entries.extend(watch::list_entries(&store_dir, filter.as_deref())?);
+    if config.live_only {
+        entries.retain(|entry| entry.running);
+    }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.start_ms));
     let omitted = entries.len().saturating_sub(config.limit);
     util::stdout_line("id | kind | state | timestamp | exit | bytes | lines | command")?;
@@ -1695,10 +1806,6 @@ fn open_target(config: &Config) -> Result<StoredResult, String> {
         .ok_or_else(|| cli::USAGE.to_string())?;
     let path = storage::resolve_result(&store_dir, target)?;
     storage::read_result_path(&path)
-}
-
-fn format_scored_line(line: &model::LineMeta, score: i64, text: &str) -> String {
-    format!("L{} {} score={}: {}", line.line, line.stream, score, text)
 }
 
 fn table_field(value: &str, maximum_bytes: usize) -> String {

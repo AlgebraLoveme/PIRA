@@ -109,6 +109,8 @@ pub struct Config {
     pub stats_brief: bool,
     pub query: Option<String>,
     pub search_queries: Vec<String>,
+    pub search_limit: usize,
+    pub live_only: bool,
     pub regex: bool,
     pub history_scope: HistoryScope,
     pub history_details: bool,
@@ -169,6 +171,8 @@ impl Default for Config {
             stats_brief: false,
             query: None,
             search_queries: vec![],
+            search_limit: 5,
+            live_only: false,
             regex: false,
             history_scope: HistoryScope::Current,
             history_details: false,
@@ -258,14 +262,22 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
         "range" => {
             c.mode = Mode::Range;
             let mut p = parse_store(&mut c, args, 1)?;
-            if p + 3 != args.len() {
-                return Err(USAGE.into());
+            c.target = Some(take(args, &mut p, "RESULT")?.into());
+            let start = take(args, &mut p, "START_LINE END_LINE or START:END")?;
+            let (start, end) = if let Some((start, end)) = start.split_once(':') {
+                (start, end)
+            } else {
+                (start, take(args, &mut p, "END_LINE")?)
+            };
+            if p != args.len() {
+                return Err("range requires RESULT START END or RESULT START:END".into());
             }
-            c.target = Some(args[p].clone());
-            p += 1;
-            c.start_line = Some(args[p].parse().map_err(|_| "invalid start_line")?);
-            p += 1;
-            c.end_line = Some(args[p].parse().map_err(|_| "invalid end_line")?);
+            c.start_line = Some(
+                start
+                    .parse()
+                    .map_err(|_| "range START must be an integer")?,
+            );
+            c.end_line = Some(end.parse().map_err(|_| "range END must be an integer")?);
         }
         "raw" => parse_raw(&mut c, args)?,
         "exec" => parse_python_exec(&mut c, args)?,
@@ -303,6 +315,10 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
             let mut p = parse_store(&mut c, args, 1)?;
             while p < args.len() {
                 match args[p].as_str() {
+                    "--live" => {
+                        c.live_only = true;
+                        p += 1;
+                    }
                     "--workspace" if args.get(p + 1).map(String::as_str) == Some("current") => {
                         c.workspace_current = true;
                         p += 2;
@@ -674,7 +690,19 @@ fn usage_error(topic: &str, error: String) -> String {
     } else {
         error
     };
-    format!("{message}\nRun `pira_ctx {topic} --help` for usage.")
+    if message.starts_with("invalid ") && message.ends_with(" usage") {
+        let form = match topic {
+            "range" => "range RESULT START END (or START:END)",
+            "search" => "search RESULT QUERY [-e QUERY] [--regex] [--limit N] [--context N]",
+            "list" => "list [--live] [--limit N] [--workspace current]",
+            "transform" => "transform RESULT --match REGEX|--head N|--tail N|--count|--plan FILE",
+            "recap" => "recap [--limit N] (thread memory; use search for a capture)",
+            _ => return format!("{message}; run pira_ctx {topic} --help"),
+        };
+        format!("{message}; use pira_ctx {form}")
+    } else {
+        message
+    }
 }
 
 fn parse_python_exec(c: &mut Config, args: &[String]) -> Result<(), String> {
@@ -927,11 +955,23 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
                 c.regex = true;
                 p += 1
             }
+            "--limit" => {
+                p += 1;
+                c.search_limit = parse_value(args, &mut p, "--limit")?;
+                if !(1..=100).contains(&c.search_limit) {
+                    return Err("search --limit must be 1..100 hits per query; shared output is capped at 64 KiB".into());
+                }
+            }
             "--context" => {
                 p += 1;
                 c.context = parse_value(args, &mut p, "--context")?
             }
-            _ => return Err(USAGE.into()),
+            _ => {
+                return Err(format!(
+                    "unknown search option {:?}; use -e QUERY, --regex, --context N, or --limit N",
+                    args[p]
+                ));
+            }
         }
     }
     if c.search_queries.is_empty() || c.search_queries.len() > MAX_SEARCH_QUERIES {
@@ -1100,19 +1140,19 @@ fn parse_transform(c: &mut Config, args: &[String]) -> Result<(), String> {
                     .excludes
                     .push(take(args, &mut p, "--exclude")?.into())
             }
-            "--unique" => {
+            "--unique" | "unique" => {
                 c.transform.unique = true;
                 p += 1
             }
-            "--count" => {
+            "--count" | "count" => {
                 c.transform.count = true;
                 p += 1
             }
-            "--head" => {
+            "--head" | "head" => {
                 p += 1;
                 c.transform.head = Some(parse_value(args, &mut p, "--head")?)
             }
-            "--tail" => {
+            "--tail" | "tail" => {
                 p += 1;
                 c.transform.tail = Some(parse_value(args, &mut p, "--tail")?)
             }

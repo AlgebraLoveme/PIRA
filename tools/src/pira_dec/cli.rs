@@ -45,7 +45,8 @@ USAGE
   pira_dec show ID [--json] [--store-dir PATH]
 
 ID may be complete or an unambiguous prefix. The requested record is integrity-checked before
-display. Use --json for stable programmatic output.
+display. Text output identifies the selected choice by index without repeating its body.
+Use --json for stable programmatic output.
 "#;
 
 const LIST_HELP: &str = r#"pira_dec list — show recent decisions concisely
@@ -56,8 +57,9 @@ USAGE
 Results are newest first. Default rows contain only ID and selected decision text; context,
 alternatives, maker, and a separate timestamp are omitted. --limit accepts 1..1000 and defaults to 20.
 TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since is inclusive and --until
-exclusive. An empty list prints no rows and succeeds. Invalid unrelated records are skipped with a
-warning. Use --json for stable structured rows and skipped-record details.
+exclusive. An empty list prints decisions=0 and succeeds. Extra matching records trigger a limit
+notice; JSON includes has_more. Invalid unrelated records are skipped with bounded warnings.
+Use --json for structured rows, skipped_count, and full skipped-record details.
 "#;
 
 const EXPORT_HELP: &str = r#"pira_dec export — write standalone human-readable decision HTML
@@ -91,8 +93,10 @@ TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since includes rec
 bound; --until excludes records at or after its bound. Use either a field/regex pair, a time bound,
 or both. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
 newest first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records,
-reports them as warnings, and may omit a record published concurrently. Use --json for structured
-matches and skipped-record details. A human-readable search with no matches prints an explicit
+reports them with bounded warnings, and may omit a record published concurrently. Rows include ID,
+maker, and selected text; context/choice searches add match-local excerpts, without a separate
+timestamp. Extra matches trigger a limit notice. JSON includes has_more, skipped_count, and full
+skipped-record details; has_more describes the result limit, not skipped-record completeness. A human-readable search with no matches prints an explicit
 `decisions_matched=0` status and exits 1.
 
 EXAMPLES

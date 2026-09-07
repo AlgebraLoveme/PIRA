@@ -7,7 +7,7 @@ const GLOBAL: &str = r#"USAGE
   pira_nav help COMMAND [COMMAND...]
 
 COMMANDS
-  map [PATH]                     Repository shape, documents, and declarations.
+  map [PATH...]                     Repository shape, documents, and declarations.
   search -e PATTERN... [PATH...] Bounded search over ordinary unignored UTF-8 text.
   symbols QUERY [PATH...]        Declarations, keys, or headings (`declarations` alias).
   outline FILE...                Declarations or document paths without bodies.
@@ -66,9 +66,10 @@ pub fn command(name: &str, output: &mut dyn Write) -> CommandResult {
         "map" => format!(r#"pira_nav map — summarize repository or subsystem shape
 
 USAGE
-  pira_nav map [PATH] [--max-items N] [--max-depth N] [OPTIONS]
+  pira_nav map [PATH...] [--max-items N] [--max-depth N] [OPTIONS]
 
-PATH defaults to `.`. Output includes compact code/document counts, top directories, generic project
+PATH defaults to `.`; up to 64 overlapping roots are deduplicated. Multiple-root rows are relative
+to cwd. Output includes compact code/document counts, top directories, generic project
 landmarks, and balanced representative declarations or top-level keys. At most 20 navigable rows are
 shown by default. Ignored and hidden paths are outside directory scope; symlinked directories are not
 followed. Recognizable fixture/corpus subtrees are counted but skipped by broad maps; map one directly
@@ -76,7 +77,9 @@ to inspect it structurally.
 
 OPTIONS
 {STRUCTURAL_OPTIONS}
-  --max-items N             Maximum representative file rows (default 20).
+  --max-items, --limit N    Maximum representative file rows (default 20).
+  -g, --glob GLOB           Filter files after ignore discovery; repeatable; ! excludes.
+                            Cannot reinclude ignored files; filtering does not bound traversal.
   --max-depth N             Maximum filesystem traversal depth (0..256); 0 visits only PATH.
   --depth N                 Alias for --max-depth.
 
@@ -90,7 +93,8 @@ USAGE
 
 PATH defaults to `.`; up to 64 overlapping paths are deduplicated. Directories search unignored UTF-8
 text; explicit files bypass ignore discovery but obey `--glob`. Missing peers mark output incomplete;
-one missing target errors. Skipped binary/non-UTF-8/oversized/unreadable files are counted.
+one missing target errors. Skipped files mark output incomplete; non-binary skip paths/reasons
+are sampled with omitted counts.
 
 OPTIONS
   -e, --pattern PATTERN     Add a pattern (1..32 total).
@@ -106,14 +110,18 @@ OPTIONS
   -A, --after-context N     Lines after each snippet match (maximum 1000).
   -C, --context N           Lines before and after each match (default 2, maximum 1000).
   --max-items, --max-results N  Maximum shown lines/file rows (default 48).
-  --max-per-query N         Maximum snippet lines selected per pattern (default 8).
+  --limit, --max-per-query N  Snippet lines per pattern (default 8; 1..10000).
   --max-bytes N             Maximum rendered source-block bytes (default 8192).
   --owners                  Annotate snippet matches with enclosing clean declarations when available.
 
 Combine -B and -A for asymmetric context; either conflicts with -C. One balanced scan ranks each
-pattern independently with exact omission counts. Zero matches succeeds. Source is untrusted data;
-lines over 512 bytes are clipped around the first selected match with byte-range metadata. A line
-larger than the full byte budget is metadata-only.
+pattern independently with exact omission counts. --limit N without an explicit --max-items
+sets the shared item cap to min(N * patterns, 10000); --max-per-query retains the default cap.
+Both spellings are snippet-only and cannot be combined. Shared item/byte caps can reduce per-query
+output. Binding budgets are reported; context is reduced before source becomes location-only.
+The byte cap excludes headers/diagnostics. Zero matches succeeds. Source is untrusted data;
+lines over 512 bytes are clipped around the first selected match with byte-range metadata. A block that still
+cannot fit after context reduction is metadata-only.
 
 EXAMPLES
   pira_nav search Parser src
@@ -132,10 +140,10 @@ exact source by default; use --locations-only to suppress it.
 
 OPTIONS
 {STRUCTURAL_OPTIONS}
-  --query QUERY             Add a declaration/key query (1..32 total).
+  -e, --query QUERY        Add a declaration/key query (1..32 total).
   --exact | --contains | --regex
   --kind KIND
-  --max-items N             Rows per query (default 20).
+  --max-items, --limit N    Rows per query (default 20).
   --selectors               Include freshness-checked selectors.
   --signatures              Include bounded signatures.
   --show-unique | --locations-only
@@ -149,8 +157,8 @@ USAGE
 
 OPTIONS
 {STRUCTURAL_OPTIONS}
-  --max-items N             Maximum items across the invocation (default 64).
-  --depth N                 Maximum nested depth; 0 shows top-level items only.
+  --max-items, --limit N    Items across the invocation (default 64), shared among files.
+  --depth, --max-depth N   Maximum nested depth; 0 shows top-level items only.
   --match QUERY             Restrict declarations; repeatable.
   --signatures              Include bounded declaration signatures.
   --selectors               Include freshness-checked selectors.
@@ -183,8 +191,8 @@ Shell-quote targets containing brackets or other metacharacters.
 OPTIONS
 {STRUCTURAL_OPTIONS}
   --window N
-  --head N                  Print the first N lines of the preceding bare FILE; N may be 0.
-  --tail N                  Print the last N lines of the preceding bare FILE; N may be 0.
+  --head N                  Print the first N lines of the preceding resolved TARGET; N may be 0.
+  --tail N                  Print the last N lines of the preceding resolved TARGET; N may be 0.
   --glance
   --max-items N
   --max-bytes N

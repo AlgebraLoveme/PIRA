@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BROKEN_PIPE: &str = "__PIRA_CTX_BROKEN_PIPE__";
 pub const MAX_DISPLAY_READ_BYTES: u64 = 64 * 1024;
-pub const MAX_SEARCH_LINE_BYTES: u64 = 128 * 1024;
+pub const MAX_SEARCH_LINE_BYTES: u64 = 16 * 1024 * 1024;
 const DISPLAY_CLIP_BYTES: usize = 1200;
 
 pub struct BoundedStdout {
@@ -26,7 +26,9 @@ impl BoundedStdout {
         }
         let clean = sanitize_terminal(text);
         let needed = clean.len().saturating_add(1);
-        if needed <= self.remaining {
+        // Reserve the marker even when the next line nearly fills the budget.
+        const RESERVE: usize = "[pira_ctx output truncated by byte limit]".len() + 1;
+        if needed <= self.remaining.saturating_sub(RESERVE) {
             stdout_line(&clean)?;
             self.remaining -= needed;
             return Ok(());

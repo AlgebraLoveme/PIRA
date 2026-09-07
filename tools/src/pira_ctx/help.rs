@@ -27,8 +27,8 @@ Choosing a command:
 Common forms:
   pira_ctx [auto] --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
   pira_ctx exact|check|capture --intent TEXT -- PROGRAM [ARG...]
-  pira_ctx search RESULT QUERY [-e QUERY ...] [--regex] [--context N]
-  pira_ctx range RESULT START_LINE END_LINE
+  pira_ctx search RESULT QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
+  pira_ctx range RESULT START_LINE END_LINE | RESULT START:END
   pira_ctx transform RESULT OPERATION [ARGS...]
   pira_ctx exec RESULT --code CODE [--intent TEXT]
   pira_ctx exec --input NAME=RESULT [--input NAME=RESULT ...] --file - [--intent TEXT]
@@ -184,7 +184,9 @@ OUTPUT AND STORAGE
   If a non-interactive invocation remains active after a brief debounce, it publishes
   `LIVE | result=ID` on wrapper stderr. Every completed child is stored with retained stdout/stderr,
   metadata, indexes, compression, and integrity hashes. A bounded extractive synopsis and capture ID
-  are printed, even for empty output.
+  are printed, even for empty output. unselected counts bytes/lines outside selected synopsis
+  rows, not all undisplayed bytes. display_clipped_lines reports clipped selected lines; exact
+  retained bytes remain retrievable. Index truncation is reported separately.
   If the configured byte ceiling is reached, excess output is drained without storage and the report
   states the observed and retained sizes. Spawn failures have no capture. Child status is preserved.
 
@@ -298,19 +300,22 @@ WHEN TO USE
   needed. Use transform for systematic processing or exec for custom analysis.
 
 USAGE
-  pira_ctx search [--store-dir PATH] RESULT QUERY [-e QUERY ...] [--regex] [--context N]
-  pira_ctx search [--store-dir PATH] RESULT -e QUERY [-e QUERY ...] [--regex] [--context N]
+  pira_ctx search [--store-dir PATH] RESULT QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
+  pira_ctx search [--store-dir PATH] RESULT -e QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
 
 OPTIONS AND OUTPUT
   Literal matching is Unicode case-insensitive. Only when it has no literal hits, a lexical fallback
   may return related lines. --regex uses Rust regex syntax and is case-sensitive unless the pattern
-  requests otherwise. -e/--query adds an independently ranked query, up to 16 total. Up to five
-  ranked hits per query are printed as line number, stream, score, and terminal-sanitized text.
+  requests otherwise. -e/--query adds an independently ranked query, up to 16 total. --limit N
+  selects up to N hits per query (default 5, range 1..100). Rows contain line number, stream,
+  and terminal-sanitized text, with query labels for multiple queries.
   Long matching lines show a match-local excerpt and receive a bounded length penalty. A warning
   precedes displayed hits that may contain prompt injection.
   --context N (default 0, maximum 20) includes de-duplicated neighboring indexed lines, clipped at
-  capture boundaries. Total displayed evidence is capped at 64 KiB. Use range when exact
-  unsanitized bytes are required.
+  capture boundaries. Hits are admitted round-robin before context within a shared 64 KiB output
+  cap. Limit/byte omissions and incomplete coverage are reported. Complete lines up to 16 MiB
+  are searched; larger lines are skipped with complete=0. Index/retention truncation is disclosed.
+  Use range for exact unsanitized bytes, or exec for analysis beyond search coverage.
 
 EXIT STATUS
   Returns 0 even with no hits; invalid queries, missing results, or wrapper failures use 125.
@@ -326,6 +331,7 @@ WHEN TO USE
 
 USAGE
   pira_ctx range [--store-dir PATH] RESULT START_LINE END_LINE
+  pira_ctx range [--store-dir PATH] RESULT START:END
 
 BEHAVIOR
   Lines are 1-based and inclusive in observed merged stdout/stderr timeline order. Negative numbers count
@@ -369,6 +375,8 @@ USAGE
                      [--exclude REGEX ...] [--unique] [--count] [--head N] [--tail N]
 
 DIRECT OPTIONS
+  Positional head N, tail N, count, and unique are aliases for the corresponding flags.
+  Aliases preserve the fixed operation order below, not argument order.
   Lines are replacement-decoded text with trailing CR/LF removed. Regexes use Rust syntax, are
   case-sensitive by default, and accept inline flags such as (?i). Repeated --match values are all
   required; any --exclude match removes a line. Operations apply as match, exclude, unique, head,
@@ -567,14 +575,15 @@ EXAMPLE
 const LIST: &str = r#"pira_ctx list — list stored captures and watches
 
 USAGE
-  pira_ctx list [--store-dir PATH] [--workspace current] [--limit N]
+  pira_ctx list [--store-dir PATH] [--workspace current] [--live] [--limit N]
 
 OUTPUT
   Prints up to 20 newest-first rows with ID, kind, state, timestamp, exit status, bytes, lines, and a
   redacted command clipped to 256 bytes. Capture states are running/complete. Watch states are
   active, interrupted, paused, stopped, succeeded, job-failed, deadline, or monitor-failed. Active
   entries use `-` as exit status. --limit accepts 0..100. Without --workspace current, entries from
-  every workspace in the selected store are considered.
+  every workspace in the selected store are considered. --live keeps only running captures
+  and running watch entries without changing workspace scope.
 
 EXAMPLE
   pira_ctx list --workspace current"#;

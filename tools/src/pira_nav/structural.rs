@@ -5,7 +5,7 @@ use crate::command::{CommandError, input_error, lsp_error};
 use crate::language::Language;
 use crate::lsp::{LspConfigs, LspService};
 use crate::model::ParseBackend;
-use crate::parse::{ParsedFile, parse_file, parse_source_symbols};
+use crate::parse::{ParsedFile, parse_file};
 
 pub struct StructuralResolver {
     service: LspService,
@@ -65,12 +65,14 @@ impl StructuralResolver {
             };
             return Err(lsp_error(message));
         }
+        let native_clean = parsed.syntax_defects == 0;
+        let native_symbols = parsed.symbols;
         let source = parsed.source;
         let mut symbols = self
             .service
             .document_symbols(&path, language, &source)
             .map_err(lsp_error)?;
-        if let Ok((native_symbols, 0)) = parse_source_symbols(&path, language, &source) {
+        if native_clean {
             let lsp_names = symbols
                 .iter()
                 .map(|symbol| symbol.qualified_name.clone())
