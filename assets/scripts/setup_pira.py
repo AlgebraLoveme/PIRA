@@ -30,10 +30,29 @@ DEFAULT_CLAUDE_SETTINGS = "~/.claude/settings.json"
 # events, so one echo is enough; the prefix marks the entries this installer owns.
 ROUTING_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "SubagentStart")
 ROUTING_REMINDER_PREFIX = "echo PIRA routing:"
+# The wording is measured, not decorative: a rephrased clause made Opus 5 skip module reads on fresh
+# turns entirely, and a quote or other shell metacharacter makes the hook exit 2, which blocks every
+# prompt. Change one clause at a time and re-run the evaluation before shipping a new sentence.
 ROUTING_REMINDER_COMMAND = (
     "echo PIRA routing: before any project file read, command, or answer, Read the exact PIRA module files "
     "the project policy requires for this task, including their canonical dependencies. Do not re-read "
-    "modules already loaded in this session. If no module applies, answer directly."
+    "modules whose full text is still in the current context. If no module applies, answer directly."
+)
+# After compaction the module text read earlier is gone while the summary may still mention it;
+# without this the model treats the summary as loaded and never re-reads. A plain resume keeps the
+# transcript, so it gets the ordinary reminder.
+ROUTING_RESTORE_COMMAND = (
+    "echo PIRA routing: this session was just compacted, so PIRA module text read earlier is no longer "
+    "in the current context even if the summary mentions it. Before any project file read, "
+    "command, or answer, Read the exact PIRA module files the current task requires, including their "
+    "canonical dependencies. If no module applies, answer directly."
+)
+# (event, matcher, command): one hook group per row.
+ROUTING_HOOK_GROUPS = (
+    ("SessionStart", "startup|resume|clear", ROUTING_REMINDER_COMMAND),
+    ("SessionStart", "compact", ROUTING_RESTORE_COMMAND),
+    ("UserPromptSubmit", "", ROUTING_REMINDER_COMMAND),
+    ("SubagentStart", "", ROUTING_REMINDER_COMMAND),
 )
 MANIFEST_NAME = "install.json"
 MANIFEST_SCHEMA = 1
@@ -288,8 +307,16 @@ def remove_claude_md_block(state: SetupState, claude_md_path: Path, planned: str
     state.note_change(f"deleted {display_path(claude_md_path)} (only the PIRA block remained)")
 
 
-def routing_hook_group() -> dict[str, object]:
-    return {"matcher": "", "hooks": [{"type": "command", "command": ROUTING_REMINDER_COMMAND}]}
+def routing_hook_commands() -> list[str]:
+    return sorted({command for _, _, command in ROUTING_HOOK_GROUPS})
+
+
+def routing_hook_groups(event: str) -> list[dict[str, object]]:
+    return [
+        {"matcher": matcher, "hooks": [{"type": "command", "command": command}]}
+        for hook_event, matcher, command in ROUTING_HOOK_GROUPS
+        if hook_event == event
+    ]
 
 
 def is_pira_hook_group(group: object) -> bool:
@@ -334,7 +361,7 @@ def planned_settings_install(settings_path: Path) -> str:
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             raise RuntimeError(f"Refusing to edit {display_path(settings_path)}: hooks.{event} is not a list")
-        hooks[event] = [group for group in groups if not is_pira_hook_group(group)] + [routing_hook_group()]
+        hooks[event] = [group for group in groups if not is_pira_hook_group(group)] + routing_hook_groups(event)
     data["hooks"] = hooks
     return settings_text(data)
 
@@ -396,7 +423,8 @@ def verify_claude_hooks(state: SetupState, settings_path: Path) -> None:
         state.check("Claude Code PIRA routing hooks", False, str(exc))
         return
     present = all(
-        isinstance(hooks.get(event), list) and sum(is_pira_hook_group(group) for group in hooks[event]) == 1
+        isinstance(hooks.get(event), list)
+        and [group for group in hooks[event] if is_pira_hook_group(group)] == routing_hook_groups(event)
         for event in ROUTING_HOOK_EVENTS
     )
     state.check("Claude Code PIRA routing hooks", present, f"{display_path(settings_path)} -> {', '.join(ROUTING_HOOK_EVENTS)}")

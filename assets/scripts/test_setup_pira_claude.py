@@ -396,12 +396,14 @@ class SetupPiraClaudeTests(unittest.TestCase):
             self.assertEqual(data["hooks"]["PreToolUse"], [user_hook])
             self.assertEqual(data["hooks"]["UserPromptSubmit"][0], user_hook)
             for event in setup.ROUTING_HOOK_EVENTS:
-                groups = data["hooks"][event]
-                self.assertEqual(sum(setup.is_pira_hook_group(group) for group in groups), 1)
-            command = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                groups = [group for group in data["hooks"][event] if setup.is_pira_hook_group(group)]
+                self.assertEqual(groups, setup.routing_hook_groups(event))
+            session_start = data["hooks"]["SessionStart"]
+            self.assertEqual([group["matcher"] for group in session_start], ["startup|resume|clear", "compact"])
+            self.assertIn("no longer in the current context", session_start[1]["hooks"][0]["command"])
+            command = session_start[0]["hooks"][0]["command"]
             self.assertTrue(command.startswith("echo PIRA routing:"))
             self.assertIn("Read the exact PIRA module files", command)
-            self.assertNotIn('"', command)
 
     def test_routing_hooks_uninstall_restores_other_settings_or_deletes_created_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -441,6 +443,16 @@ class SetupPiraClaudeTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(setup.main([*common, "--yes", "--user-mode", "placeholder"]), 0)
             self.assertFalse(settings.exists())
+
+
+    def test_routing_reminder_commands_are_shell_safe(self) -> None:
+        # A quote, apostrophe, or other shell metacharacter in the echo makes the hook exit 2, and a
+        # UserPromptSubmit hook that exits 2 blocks every prompt (observed 2026-09-07).
+        import re
+        for command in setup.routing_hook_commands():
+            self.assertTrue(command.startswith(setup.ROUTING_REMINDER_PREFIX))
+            self.assertIsNone(re.search(r"['\"`$\\|&;<>(){}!*?#~]", command), command)
+            self.assertNotIn("\n", command)
 
 
 if __name__ == "__main__":
