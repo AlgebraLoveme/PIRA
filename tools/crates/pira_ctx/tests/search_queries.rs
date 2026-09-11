@@ -246,7 +246,7 @@ fn relative_results_are_session_and_workspace_local() {
                     "--",
                     python(),
                     "-c",
-                    &format!("print('{value}')")
+                    &format!("import sys; sys.stdout.buffer.write(b'{value}\\n')")
                 ])
                 .output()
                 .unwrap()
@@ -274,7 +274,7 @@ fn relative_results_are_session_and_workspace_local() {
                 "--",
                 python(),
                 "-c",
-                "print('one\\ntwo\\nthree')"
+                r"import sys; sys.stdout.buffer.write(b'one\ntwo\nthree\n')"
             ])
             .output()
             .unwrap()
@@ -364,7 +364,10 @@ fn checks_show_failure_evidence_and_recovery_hints_only_when_needed() {
             assert!(String::from_utf8_lossy(&recovered.stdout).contains("diagnostic-payload"));
         }
     }
-    let (id, text) = capture_fixture(&sandbox, "print('A' * 3000)");
+    let (id, text) = capture_fixture(
+        &sandbox,
+        r"import sys; sys.stdout.buffer.write(b'A' * 3000 + b'\n')",
+    );
     assert!(text.contains(&format!(
         "If needed (clipped line): pira_ctx range {id} 1:1"
     )));
@@ -391,10 +394,9 @@ fn failed_check_diagnostics_are_bounded_and_original_output_is_retained() {
             }
         })
         .collect::<String>();
-    let script = format!(
-        "import sys; sys.stdout.write({}); sys.exit(7)",
-        serde_json::to_string(&payload).unwrap()
-    );
+    let payload_path = sandbox.path().join("payload.txt");
+    fs::write(&payload_path, &payload).unwrap();
+    let script = "import pathlib,sys; sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes()); sys.exit(7)";
     let output = session_command(&sandbox, Some("failure"), "check")
         .args([
             "--intent",
@@ -402,8 +404,9 @@ fn failed_check_diagnostics_are_bounded_and_original_output_is_retained() {
             "--",
             python(),
             "-c",
-            &script,
+            script,
         ])
+        .arg(&payload_path)
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
@@ -655,7 +658,7 @@ fn short_handles_are_stable_scoped_and_preserve_full_ids() {
                 "--",
                 python(),
                 "-c",
-                &format!("print({text:?})"),
+                &format!("import sys; sys.stdout.buffer.write({text:?}.encode('utf-8') + b'\\n')"),
             ])
             .output()
             .unwrap();
@@ -761,8 +764,8 @@ fn batch_returns_independent_short_handles_in_specification_order() {
     fs::write(&spec, serde_json::json!({
         "concurrency": 2,
         "commands": [
-            {"intent": "Slow first item", "argv": [python(), "-c", "import time; time.sleep(0.15); print('slow')"]},
-            {"intent": "Fast second item", "argv": [python(), "-c", "print('fast')"]}
+            {"intent": "Slow first item", "argv": [python(), "-c", r"import sys,time; time.sleep(0.15); sys.stdout.buffer.write(b'slow\n')"]},
+            {"intent": "Fast second item", "argv": [python(), "-c", r"import sys; sys.stdout.buffer.write(b'fast\n')"]}
         ]
     }).to_string()).unwrap();
     let output = session_command(&sandbox, Some("batch-handles"), "batch")
@@ -801,7 +804,7 @@ fn mixed_redirection_bounds_only_visible_output_and_marks_capture_scope() {
         for hidden in ["stdout", "stderr"] {
             let path = s.path().join(format!("{mode}-{hidden}-data"));
             let script = format!(
-                "import sys; sys.{hidden}.buffer.write(bytes(range(256))*1024); sys.{hidden}.flush(); [print(f'progress item {{i}}',file=sys.{visible}) for i in range(10000)]; raise SystemExit(7)",
+                r"import sys; sys.{hidden}.buffer.write(bytes(range(256))*1024); sys.{hidden}.buffer.flush(); sys.{visible}.buffer.write(''.join(f'progress item {{i}}\n' for i in range(10000)).encode('utf-8')); raise SystemExit(7)",
                 visible = if hidden == "stdout" {
                     "stderr"
                 } else {
@@ -898,7 +901,7 @@ fn mixed_short_output_and_spawn_errors_never_pollute_redirected_files() {
                     cmd.args([
                         python(),
                         "-c",
-                        "import sys; sys.stdout.write('out\\n'); sys.stderr.write('err\\n')",
+                        r"import sys; sys.stdout.buffer.write(b'out\n'); sys.stderr.buffer.write(b'err\n')",
                     ]);
                 }
                 let file = fs::File::create(&path).unwrap();

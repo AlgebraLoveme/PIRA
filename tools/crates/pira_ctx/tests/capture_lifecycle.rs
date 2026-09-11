@@ -308,7 +308,7 @@ fn large_live_index_is_bounded_disclosed_and_final_capture_remains_complete() {
             "--",
             python(),
             "-c",
-            r"import sys; sys.stdout.write('x\n'*400000); sys.stdout.flush(); sys.stdin.read(1)",
+            r"import sys; sys.stdout.buffer.write(b'x\n'*400000); sys.stdout.buffer.flush(); sys.stdin.read(1)",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -442,7 +442,7 @@ fn cancelled_short_exact_retains_partial_output_and_live_id() {
         let mut command = Command::new(binary());
         command.env("PIRA_CTX_LIVE_CHECKPOINT_MS", "100")
             .args(["exact", "--store-dir", s.path().to_str().unwrap(), "--intent", "Cancel short exact output", "--", python(), "-c",
-                "import sys,time; print('out',flush=True); print('err',file=sys.stderr,flush=True); time.sleep(10)"])
+                r"import sys,time; sys.stdout.buffer.write(b'out\n'); sys.stdout.buffer.flush(); sys.stderr.buffer.write(b'err\n'); sys.stderr.buffer.flush(); time.sleep(10)"])
             .stderr(Stdio::piped());
         if redirected_stdout {
             command.stdout(Stdio::from(fs::File::create(&data).unwrap()));
