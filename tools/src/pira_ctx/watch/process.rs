@@ -18,13 +18,24 @@ impl ProcessTree {
         Self::isolate(child, label)
     }
 
-    pub fn spawn_capture(cmd: &[String]) -> Result<Self, String> {
+    pub fn spawn_capture(
+        cmd: &[String],
+        redirected: Option<crate::model::StreamKind>,
+    ) -> Result<Self, String> {
         let mut command = Command::new(&cmd[0]);
         command
             .args(&cmd[1..])
             .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(if redirected == Some(crate::model::StreamKind::Stdout) {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            })
+            .stderr(if redirected == Some(crate::model::StreamKind::Stderr) {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            });
         configure(&mut command);
         let child = command.spawn().map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {

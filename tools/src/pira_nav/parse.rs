@@ -242,19 +242,47 @@ fn push_symbol(
         name_node.start_byte(),
         name_node.end_byte(),
     ));
-    push_symbol_name(node, &name, source, qualification, kind, depth, output)
+    push_symbol_name(
+        node,
+        (&name, declaration_name_position(name_node)),
+        source,
+        qualification,
+        kind,
+        depth,
+        output,
+    )
+}
+
+// Keep qualified display names, but query the declared member rather than its owner.
+fn declaration_name_position(node: Node<'_>) -> Option<Point> {
+    for field in ["name", "field", "method"] {
+        if let Some(name) = node.child_by_field_name(field) {
+            return declaration_name_position(name);
+        }
+    }
+    if node.kind() == "field_expression" {
+        // Julia gives the receiver a `value` field; the member is the final child.
+        let member = node.named_child(node.named_child_count().checked_sub(1)?.try_into().ok()?)?;
+        return (member.kind() == "identifier").then(|| member.start_position());
+    }
+    match node.named_child_count() {
+        0 => Some(node.start_position()),
+        1 => declaration_name_position(node.named_child(0)?),
+        _ => None,
+    }
 }
 
 fn push_symbol_name(
     node: Node<'_>,
-    name: &str,
+    name: (&str, Option<Point>),
     source: &str,
     qualification: (Option<&str>, &str),
     kind: &'static str,
     depth: usize,
     output: &mut SymbolCollector,
 ) -> String {
-    let name = one_line(name);
+    let name_position = name.1.map(|point| (point.row, point.column));
+    let name = one_line(name.0);
     let (path, qualified, legacy_qualified_name) =
         qualified_names(qualification.0, &name, qualification.1, output);
     output.push(Symbol {
@@ -263,6 +291,7 @@ fn push_symbol_name(
         qualified_name: qualified.clone(),
         legacy_qualified_name,
         signature: signature(node, source, node.start_byte()),
+        name_position,
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_row: node.start_position().row,
@@ -835,7 +864,7 @@ fn walk_csharp(
         );
         push_symbol_name(
             node,
-            &name,
+            (&name, Some(operator.start_position())),
             source,
             (parent, "."),
             "operator",
@@ -857,7 +886,7 @@ fn walk_csharp(
         );
         push_symbol_name(
             node,
-            &name,
+            (&name, None),
             source,
             (parent, "."),
             "operator",
@@ -1159,8 +1188,15 @@ fn walk_hcl(
             .collect::<Vec<_>>();
         if !segments.is_empty() {
             let name = segments.join(".");
-            let qualified =
-                push_symbol_name(node, &name, source, (parent, "."), "block", depth, output);
+            let qualified = push_symbol_name(
+                node,
+                (&name, None),
+                source,
+                (parent, "."),
+                "block",
+                depth,
+                output,
+            );
             if let Some(body) = named_child_with_kind(&node, &["body"]) {
                 walk_hcl(body, source, Some(&qualified), depth + 1, output);
             }
@@ -1348,11 +1384,14 @@ fn walk_swift(
     if matches!(node.kind(), "init_declaration" | "deinit_declaration") {
         push_symbol_name(
             node,
-            if node.kind() == "init_declaration" {
-                "init"
-            } else {
-                "deinit"
-            },
+            (
+                if node.kind() == "init_declaration" {
+                    "init"
+                } else {
+                    "deinit"
+                },
+                None,
+            ),
             source,
             (parent, "."),
             "method",
@@ -1959,7 +1998,10 @@ fn walk_julia(
         let text = source_slice(source, name.start_byte(), name.end_byte());
         push_symbol_name(
             node,
-            &format!("@{}", one_line(&text)),
+            (
+                &format!("@{}", one_line(&text)),
+                Some(name.start_position()),
+            ),
             source,
             (parent, "."),
             "macro",
@@ -2224,6 +2266,10 @@ fn add_python_definition(
         qualified_name: qualified.clone(),
         legacy_qualified_name,
         signature: signature(node, source, start_byte),
+        name_position: Some((
+            name_node.start_position().row,
+            name_node.start_position().column,
+        )),
         start_byte,
         end_byte: node.end_byte(),
         start_row: start_position.row,
@@ -2298,6 +2344,10 @@ fn walk_rust(
                 legacy_qualified_name,
                 // Attached docs/attributes belong to `show`, not the compact signature.
                 signature: signature(node, source, node.start_byte()),
+                name_position: Some((
+                    name_node.start_position().row,
+                    name_node.start_position().column,
+                )),
                 start_byte,
                 end_byte: node.end_byte(),
                 start_row: start_position.row,

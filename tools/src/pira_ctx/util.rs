@@ -10,13 +10,27 @@ const DISPLAY_CLIP_BYTES: usize = 1200;
 pub struct BoundedStdout {
     remaining: usize,
     truncated: bool,
+    stderr: bool,
 }
 
 impl BoundedStdout {
     pub fn new(maximum_bytes: usize) -> Self {
+        Self::report(maximum_bytes, None)
+    }
+
+    pub fn report(maximum_bytes: usize, redirected: Option<crate::model::StreamKind>) -> Self {
         Self {
             remaining: maximum_bytes,
             truncated: false,
+            stderr: redirected == Some(crate::model::StreamKind::Stdout),
+        }
+    }
+
+    fn emit(&self, text: &str) -> Result<(), String> {
+        if self.stderr {
+            writeln!(io::stderr().lock(), "{text}").map_err(io_error)
+        } else {
+            stdout_line(text)
         }
     }
 
@@ -29,7 +43,7 @@ impl BoundedStdout {
         // Reserve the marker even when the next line nearly fills the budget.
         const RESERVE: usize = "[pira_ctx output truncated by byte limit]".len() + 1;
         if needed <= self.remaining.saturating_sub(RESERVE) {
-            stdout_line(&clean)?;
+            self.emit(&clean)?;
             self.remaining -= needed;
             return Ok(());
         }
@@ -37,11 +51,11 @@ impl BoundedStdout {
         let marker_needed = MARKER.len() + 1;
         let available = self.remaining.saturating_sub(marker_needed + 1);
         if available > 0 {
-            stdout_line(safe_prefix(&clean, available))?;
+            self.emit(safe_prefix(&clean, available))?;
             self.remaining = self.remaining.saturating_sub(available + 1);
         }
         if marker_needed <= self.remaining {
-            stdout_line(MARKER)?;
+            self.emit(MARKER)?;
         }
         self.remaining = 0;
         self.truncated = true;
@@ -409,5 +423,63 @@ mod tests {
         assert!(excerpt.contains("NEEDLE"));
         assert!(excerpt.len() < 1_100);
         assert!(excerpt.contains("bytes omitted"));
+    }
+}
+
+// Pipes are ambiguous: Codex itself uses them. Only known non-display destinations bypass routing.
+#[cfg(unix)]
+fn is_data_destination(stream: &impl std::os::fd::AsFd) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    stream
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| std::fs::File::from(fd).metadata().ok())
+        .is_some_and(|metadata| {
+            let kind = metadata.file_type();
+            kind.is_file() || kind.is_char_device()
+        })
+}
+
+#[cfg(windows)]
+fn is_data_destination(stream: &impl std::os::windows::io::AsRawHandle) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, GetFileType};
+    // SAFETY: standard output/error own valid handles for the duration of this query.
+    matches!(
+        unsafe { GetFileType(stream.as_raw_handle()) },
+        FILE_TYPE_DISK | FILE_TYPE_CHAR
+    )
+}
+
+pub fn stdout_is_data_destination() -> bool {
+    use std::io::IsTerminal;
+    #[cfg(any(unix, windows))]
+    {
+        !io::stdout().is_terminal() && is_data_destination(&io::stdout())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+pub fn stderr_is_data_destination() -> bool {
+    use std::io::IsTerminal;
+    #[cfg(any(unix, windows))]
+    {
+        !io::stderr().is_terminal() && is_data_destination(&io::stderr())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// Do not append wrapper diagnostics to a caller's redirected data stream.
+pub fn diagnostic_line(text: &str) {
+    if !stderr_is_data_destination() {
+        let _ = writeln!(io::stderr().lock(), "{text}");
+    } else if !stdout_is_data_destination() {
+        let _ = writeln!(io::stdout().lock(), "{text}");
     }
 }

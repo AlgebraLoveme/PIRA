@@ -37,6 +37,18 @@ impl SymbolPath {
         path
     }
 
+    /// Literal heading ancestry for diagnostics only, never for target resolution.
+    pub fn unquoted_names(&self) -> Option<String> {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                SymbolPathSegment::Name(name) => Some(name.as_str()),
+                SymbolPathSegment::Index(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|names| names.join("::"))
+    }
+
     pub fn last_name(&self) -> Option<&str> {
         self.segments
             .iter()
@@ -236,6 +248,8 @@ pub struct Symbol {
     pub qualified_name: String,
     pub legacy_qualified_name: String,
     pub signature: String,
+    /// Declaration-name position: zero-based row and UTF-8 byte column, not the show range.
+    pub name_position: Option<(usize, usize)>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_row: usize,
@@ -247,12 +261,17 @@ pub struct Symbol {
 
 impl Symbol {
     pub fn name_matches(&self, query: &str) -> bool {
-        self.qualified_name == query || self.legacy_qualified_name == query
+        match SymbolPath::parse_canonical(query) {
+            Some(path) => self.path == path,
+            None => self.legacy_qualified_name == query,
+        }
     }
 
     pub fn name_suffix_matches(&self, query: &str) -> bool {
-        SymbolPath::parse_canonical(query).is_some_and(|path| self.path.ends_with(&path))
-            || legacy_suffix_matches(&self.legacy_qualified_name, query)
+        match SymbolPath::parse_canonical(query) {
+            Some(path) => self.path.ends_with(&path),
+            None => legacy_suffix_matches(&self.legacy_qualified_name, query),
+        }
     }
 
     pub fn contains_line(&self, one_based_line: usize) -> bool {
@@ -272,6 +291,23 @@ impl Symbol {
     pub fn byte_len(&self) -> usize {
         self.end_byte.saturating_sub(self.start_byte)
     }
+}
+
+/// Exact paths take precedence over abbreviations. Callers reject multiple matches.
+pub fn target_matches<'a>(symbols: &'a [Symbol], query: &str) -> Vec<(usize, &'a Symbol)> {
+    let exact: Vec<_> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name_matches(query))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name_suffix_matches(query))
+        .collect()
 }
 
 fn legacy_suffix_matches(candidate: &str, query: &str) -> bool {

@@ -262,7 +262,7 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
         "range" => {
             c.mode = Mode::Range;
             let mut p = parse_store(&mut c, args, 1)?;
-            c.target = Some(take(args, &mut p, "RESULT")?.into());
+            c.target = Some(take_result(args, &mut p)?.into());
             let start = take(args, &mut p, "START_LINE END_LINE or START:END")?;
             let (start, end) = if let Some((start, end)) = start.split_once(':') {
                 (start, end)
@@ -353,6 +353,9 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
                         c.stats_brief = true;
                         p += 1;
                     }
+                    "--id" => {
+                        c.stats_targets.push(take_result(args, &mut p)?.into());
+                    }
                     value if value.starts_with('-') && value != "--last" => {
                         return Err(USAGE.into());
                     }
@@ -376,19 +379,19 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
         }
         "verify" => {
             c.mode = Mode::Verify;
-            let p = parse_store(&mut c, args, 1)?;
-            if p + 1 != args.len() {
+            let mut p = parse_store(&mut c, args, 1)?;
+            c.target = Some(take_result(args, &mut p)?.into());
+            if p != args.len() {
                 return Err(USAGE.into());
             }
-            c.target = Some(args[p].clone());
         }
         "command" => {
             c.mode = Mode::Command;
-            let p = parse_store(&mut c, args, 1)?;
-            if p + 1 != args.len() {
+            let mut p = parse_store(&mut c, args, 1)?;
+            c.target = Some(take_result(args, &mut p)?.into());
+            if p != args.len() {
                 return Err(USAGE.into());
             }
-            c.target = Some(args[p].clone());
         }
         "prune" => parse_prune(&mut c, args)?,
         "forget" => {
@@ -413,6 +416,13 @@ fn parse_non_help(args: &[String]) -> Result<Config, String> {
             parse_command(&mut c, args, p)?;
             require_intent(&mut c)?;
         }
+    }
+    if matches!(c.mode, Mode::Cancel | Mode::Forget)
+        && c.target.as_deref().is_some_and(|target| {
+            target.starts_with('-') && target != "--current" && target != "--last"
+        })
+    {
+        return Err("cancel/forget require an explicit result target, not a relative ID".into());
     }
     validate_keywords(&c.keywords)?;
     validate_interest(c.interest.as_deref())?;
@@ -750,6 +760,9 @@ fn parse_python_exec(c: &mut Config, args: &[String]) -> Result<(), String> {
                     return Err("provide --python PATH at most once".into());
                 }
             }
+            "--id" if c.target.is_none() => {
+                c.target = Some(take_result(args, &mut p)?.into());
+            }
             value if c.target.is_none() && (value == "--last" || !value.starts_with('-')) => {
                 c.target = Some(value.into());
                 p += 1;
@@ -935,10 +948,27 @@ fn parse_store(c: &mut Config, args: &[String], mut p: usize) -> Result<usize, S
     }
     Ok(p)
 }
+fn take_result<'a>(args: &'a [String], p: &mut usize) -> Result<&'a str, String> {
+    let value = take(args, p, "RESULT or --id -N")?;
+    if value != "--id" {
+        return Ok(value);
+    }
+    let value = take(args, p, "--id -N")?;
+    let valid = value.strip_prefix('-').is_some_and(|digits| {
+        !digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+            && digits.parse::<usize>().is_ok_and(|n| n > 0)
+    });
+    if !valid {
+        return Err("--id requires a negative integer: -1 is the newest retained result in the current session".into());
+    }
+    Ok(value)
+}
+
 fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Search;
     let mut p = parse_store(c, args, 1)?;
-    c.target = Some(take(args, &mut p, "RESULT")?.into());
+    c.target = Some(take_result(args, &mut p)?.into());
     if args
         .get(p)
         .is_some_and(|value| !matches!(value.as_str(), "-e" | "--query"))
@@ -1104,7 +1134,7 @@ fn parse_history_scope(value: &str) -> Result<HistoryScope, String> {
 fn parse_raw(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Raw;
     let mut p = parse_store(c, args, 1)?;
-    c.target = Some(take(args, &mut p, "RESULT")?.into());
+    c.target = Some(take_result(args, &mut p)?.into());
     while p < args.len() {
         let s = match args[p].as_str() {
             "--stdout" => RawStream::Stdout,
@@ -1121,7 +1151,7 @@ fn parse_raw(c: &mut Config, args: &[String]) -> Result<(), String> {
 fn parse_transform(c: &mut Config, args: &[String]) -> Result<(), String> {
     c.mode = Mode::Transform;
     let mut p = parse_store(c, args, 1)?;
-    c.target = Some(take(args, &mut p, "RESULT")?.into());
+    c.target = Some(take_result(args, &mut p)?.into());
     while p < args.len() {
         match args[p].as_str() {
             "--plan" => {
@@ -1228,6 +1258,47 @@ mod tests {
     fn a(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
+    #[test]
+    fn relative_result_selectors_are_read_side_and_validated() {
+        for args in [
+            vec!["range", "--id", "-1", "1:2"],
+            vec!["search", "--id", "-2", "failure"],
+            vec!["raw", "--id", "-1"],
+            vec!["stats", "--id", "-1"],
+            vec!["command", "--id", "-1"],
+            vec!["verify", "--id", "-1"],
+            vec!["transform", "--id", "-1", "--head", "2"],
+            vec!["exec", "--id", "-1", "--code", "print(MSG)"],
+        ] {
+            assert!(parse_args(&a(&args)).is_ok(), "{args:?}");
+        }
+        for index in [
+            "0",
+            "1",
+            "-0",
+            "--last",
+            "-",
+            "-99999999999999999999999999999",
+        ] {
+            assert!(parse_args(&a(&["range", "--id", index, "1:2"])).is_err());
+        }
+        for operation in ["cancel", "forget"] {
+            assert!(parse_args(&a(&[operation, "--id", "-1"])).is_err());
+            assert!(parse_args(&a(&[operation, "-1"])).is_err());
+        }
+        let command = parse_args(&a(&[
+            "auto",
+            "--intent",
+            "Pass child flags unchanged",
+            "--",
+            "echo",
+            "--id",
+            "-1",
+        ]))
+        .unwrap();
+        assert_eq!(command.cmd, ["echo", "--id", "-1"]);
+    }
+
     #[test]
     fn intent_required() {
         assert!(parse_args(&a(&["--", "echo"])).is_err());

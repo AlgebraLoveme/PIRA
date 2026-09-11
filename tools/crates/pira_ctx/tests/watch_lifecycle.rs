@@ -44,6 +44,26 @@ fn run(store: &Path, arguments: &[&str]) -> Output {
     Command::new(binary()).args(argv).output().unwrap()
 }
 
+fn full_capture_id(store: &Path, handle: &str, session: Option<&str>) -> String {
+    let mut command = Command::new(binary());
+    command.args(["stats", "--store-dir", store.to_str().unwrap(), handle]);
+    if let Some(session) = session {
+        command.env("PIRA_CTX_THREAD_ID", session);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Result: "))
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn completed_probe_reports_final_exit_instead_of_an_idle_attempt() {
     let sandbox = Sandbox::new("watch-complete-probe");
@@ -204,6 +224,7 @@ fn capture_announces_a_discoverable_id_before_completion() {
         .trim()
         .strip_prefix("LIVE | result=")
         .expect("capture live ID announcement");
+    let id = full_capture_id(sandbox.path(), id, None);
     assert!(
         sandbox
             .path()
@@ -273,7 +294,11 @@ fn current_selects_exactly_one_live_capture_in_detected_thread() {
     BufReader::new(capture.stderr.take().unwrap())
         .read_line(&mut announcement)
         .unwrap();
-    let capture_id = announcement.trim().strip_prefix("LIVE | result=").unwrap();
+    let capture_id = full_capture_id(
+        sandbox.path(),
+        announcement.trim().strip_prefix("LIVE | result=").unwrap(),
+        Some(&thread_id),
+    );
 
     let mut watch = Command::new(binary())
         .env("PIRA_CTX_THREAD_ID", &thread_id)
@@ -353,13 +378,11 @@ fn current_rejects_multiple_live_captures_and_names_candidates() {
         BufReader::new(child.stderr.take().unwrap())
             .read_line(&mut announcement)
             .unwrap();
-        ids.push(
-            announcement
-                .trim()
-                .strip_prefix("LIVE | result=")
-                .unwrap()
-                .to_string(),
-        );
+        ids.push(full_capture_id(
+            sandbox.path(),
+            announcement.trim().strip_prefix("LIVE | result=").unwrap(),
+            Some(&thread_id),
+        ));
         captures.push(child);
     }
     let output = Command::new(binary())

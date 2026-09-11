@@ -34,7 +34,7 @@ pub fn run() -> i32 {
         Ok(code) => code,
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
-            eprintln!("pira_ctx: {error}");
+            util::diagnostic_line(&format!("pira_ctx: {error}"));
             125
         }
     }
@@ -43,6 +43,12 @@ pub fn run() -> i32 {
 fn real_main() -> Result<i32, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = cli::parse_args(&args)?;
+    if matches!(config.mode, Mode::Auto | Mode::Exact)
+        && util::stdout_is_data_destination()
+        && util::stderr_is_data_destination()
+    {
+        return run_streaming_exact(&config);
+    }
     match config.mode {
         Mode::Help => {
             let text = config
@@ -161,20 +167,23 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             capture.duration_ms,
             Some(&stored.metadata),
         );
-        if capture.retention_truncated {
-            util::stdout_line(&format!(
+        let mut notice = util::BoundedStdout::report(1024, capture.redirected_stream);
+        if capture.cancelled {
+            notice.line("Cancelled command: partial captured output retained.")?;
+        } else if capture.retention_truncated {
+            notice.line(&format!(
                 "Auto-switched exact -> retained report: kept {} of {} observed bytes after the output-space ceiling was reached.",
                 capture.total_bytes(),
                 capture.observed_bytes()
             ))?;
         } else if capture.timeline_truncated {
-            util::stdout_line(&format!(
+            notice.line(&format!(
                 "Auto-switched exact -> retained report: output exceeded the {}-line index ceiling; complete retained streams remain available through raw --stdout/--stderr.",
                 capture.timeline.len()
             ))?;
         } else {
-            util::stdout_line(&format!(
-                "Auto-switched exact -> summary: non-interactive output was {} B/{} lines and highly repetitive; full capture retained.",
+            notice.line(&format!(
+                "Auto-switched exact -> summary: non-interactive output was {} B/{} lines and highly repetitive; captured output retained.",
                 capture.total_bytes(),
                 capture.total_lines
             ))?;
@@ -203,16 +212,16 @@ fn run_streaming_exact(config: &Config) -> Result<i32, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let duration = start.elapsed().as_millis();
             record_event(config, 127, duration, None);
-            eprintln!("pira_ctx: command not found: {}", cmd[0]);
+            util::diagnostic_line(&format!("pira_ctx: command not found: {}", cmd[0]));
             Ok(127)
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             let duration = start.elapsed().as_millis();
             record_event(config, 126, duration, None);
-            eprintln!(
+            util::diagnostic_line(&format!(
                 "pira_ctx: command not executable/permission denied: {}",
                 cmd[0]
-            );
+            ));
             Ok(126)
         }
         Err(error) => Err(format!("failed to spawn {}: {error}", cmd[0])),
@@ -220,7 +229,7 @@ fn run_streaming_exact(config: &Config) -> Result<i32, String> {
 }
 
 fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
-    if capture.timeline_truncated {
+    if capture.cancelled || capture.retention_truncated || capture.timeline_truncated {
         return Ok(true);
     }
     if capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
@@ -372,6 +381,7 @@ fn run_check(config: &Config) -> Result<i32, String> {
         capture.duration_ms,
         Some(&stored.metadata),
     );
+    let display_id = storage::display_result_id(&store_dir, &stored.metadata.result_id);
     util::stdout_line(&format!(
         "{} | exit={} | duration={}ms | result={}{}",
         if capture.cancelled {
@@ -381,9 +391,14 @@ fn run_check(config: &Config) -> Result<i32, String> {
         },
         capture.exit_code,
         capture.duration_ms,
-        stored.metadata.result_id,
+        display_id,
         retention
     ))?;
+    if capture.exit_code != 0 && !capture.cancelled {
+        let mut display = stored.metadata.clone();
+        display.result_id = display_id;
+        print_summary(&display, &capture)?;
+    }
     Ok(capture.exit_code)
 }
 
@@ -473,10 +488,12 @@ fn store_and_summarize(
         capture.duration_ms,
         Some(&stored.metadata),
     );
+    let mut display = stored.metadata.clone();
+    display.result_id = storage::display_result_id(&store_dir, &display.result_id);
     if compact {
-        print_compact_summary(&stored.metadata, capture)?;
+        print_compact_summary(&display, capture)?;
     } else {
-        print_summary(&stored.metadata, capture)?;
+        print_summary(&display, capture)?;
     }
     Ok(capture.exit_code)
 }
@@ -512,7 +529,18 @@ fn capture_program(
     announce_live: bool,
 ) -> Result<Result<CaptureResult, i32>, String> {
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
-    capture::capture_command(command, Some(&store_dir), announce_live)
+    let redirected = if matches!(config.mode, Mode::Auto | Mode::Exact) {
+        if util::stdout_is_data_destination() {
+            Some(StreamKind::Stdout)
+        } else if util::stderr_is_data_destination() {
+            Some(StreamKind::Stderr)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    capture::capture_command(command, Some(&store_dir), announce_live, redirected)
 }
 
 fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Metadata>) {
@@ -522,12 +550,14 @@ fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Me
     let result = effective_store_dir(config.store_dir.as_ref())
         .and_then(|store| events::record(&store, intent, &config.cmd, exit, duration, metadata));
     if let Err(error) = result {
-        eprintln!("pira_ctx: warning: command completed but event recording failed: {error}");
+        util::diagnostic_line(&format!(
+            "pira_ctx: warning: command completed but event recording failed: {error}"
+        ));
     }
 }
 
 fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), String> {
-    let mut output = util::BoundedStdout::new(16 * 1024);
+    let mut output = util::BoundedStdout::report(16 * 1024, capture.redirected_stream);
     let json_synopsis = summarize::json_synopsis(capture, MAX_JSON_SYNOPSIS_LINES)?;
     let shown = summarize::select_important(
         &capture.timeline,
@@ -545,6 +575,7 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
     let omitted_bytes = capture.total_bytes().saturating_sub(shown_bytes);
     let mut rendered = Vec::with_capacity(shown.len());
     let mut clipped_lines = 0usize;
+    let mut first_clipped_line = None;
     if !shown.is_empty() {
         let mut readers = capture.readers()?;
         for &index in &shown {
@@ -553,6 +584,7 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             let (text, risk) = prepare_program_display(&raw);
             if line.length > util::MAX_DISPLAY_READ_BYTES || text != util::sanitize_terminal(&raw) {
                 clipped_lines += 1;
+                first_clipped_line.get_or_insert(line.line);
             }
             rendered.push((line, text, risk));
         }
@@ -676,9 +708,19 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
     if recovery_needed && !metadata.suggested_keywords.is_empty() {
         output.line(&format!("Search terms: {displayed_keywords}"))?;
     }
-    if recovery_needed {
+    if let Some(line) = first_clipped_line {
         output.line(&format!(
-            "Retrieve: pira_ctx search {} <query>",
+            "If needed (clipped line): pira_ctx range {} {line}:{line}",
+            metadata.result_id
+        ))?;
+    }
+    if omitted_lines > 0
+        || omitted_bytes > 0
+        || capture.timeline_truncated
+        || capture.retention_truncated
+    {
+        output.line(&format!(
+            "If needed (other output): pira_ctx search {} <query>",
             metadata.result_id
         ))?;
     }
@@ -730,6 +772,9 @@ fn print_retention_notice(
     output: &mut util::BoundedStdout,
     capture: &CaptureResult,
 ) -> Result<(), String> {
+    if let Some(stream) = capture.redirected_stream {
+        output.line(&format!("Scope: {stream} was redirected, not retained; counts and evidence cover the captured stream only"))?;
+    }
     if capture.timeline_truncated {
         output.line(
             "Index: truncated; search covers only the indexed retained prefix; range unavailable",
@@ -768,7 +813,7 @@ fn stream_description(
 }
 
 fn print_compact_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), String> {
-    let mut output = util::BoundedStdout::new(4 * 1024);
+    let mut output = util::BoundedStdout::report(4 * 1024, capture.redirected_stream);
     let mut rendered = Vec::with_capacity(capture.timeline.len());
     if capture.total_lines > 0 {
         let mut readers = capture.readers()?;
@@ -1149,6 +1194,17 @@ fn run_range(config: &Config) -> Result<i32, String> {
 
 fn run_raw(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
+    let selected = match config.raw_stream {
+        Some(RawStream::Stdout) => Some(StreamKind::Stdout),
+        Some(RawStream::Stderr) => Some(StreamKind::Stderr),
+        None => None,
+    };
+    if selected.is_some() && selected == store.metadata.redirected_stream {
+        return Err(format!(
+            "{} was redirected and was not retained",
+            selected.unwrap()
+        ));
+    }
     let mut reader = store.reader()?;
     let mut output = io::stdout().lock();
     match config.raw_stream {
@@ -1228,6 +1284,11 @@ fn run_stats(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
     let metadata = &store.metadata;
     util::stdout_line(&format!("Result: {}", metadata.result_id))?;
+    if let Some(stream) = metadata.redirected_stream {
+        util::stdout_line(&format!(
+            "Scope: {stream} was redirected, not retained; sizes cover captured output only"
+        ))?;
+    }
     if store.is_running() {
         util::stdout_line("State: running (checkpoint snapshot)")?;
         util::stdout_line(&format!(
@@ -1731,7 +1792,7 @@ fn run_batch(config: &Config) -> Result<i32, String> {
             };
             let worker_dir = dir.clone();
             handles.push(std::thread::spawn(move || {
-                let result = capture::capture_command(&argv, Some(&worker_dir), false);
+                let result = capture::capture_command(&argv, Some(&worker_dir), false, None);
                 (index, intent, argv, result)
             }));
         }
@@ -1772,7 +1833,7 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                 index,
                 capture.exit_code,
                 capture.duration_ms,
-                Some(stored.metadata.result_id),
+                Some(storage::display_result_id(&dir, &stored.metadata.result_id)),
                 intent,
             ));
         }

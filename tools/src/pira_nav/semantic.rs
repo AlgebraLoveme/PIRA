@@ -119,14 +119,21 @@ fn parse_semantic_target(
             .expect("dirty resolver was initialized")
             .resolve_parsed(parsed)?;
     }
-    let matches = parsed
-        .symbols
-        .iter()
+    if parsed.symbols_truncated {
+        return Err((
+            2,
+            format!(
+                "cannot establish uniqueness of {name}: symbol inventory is truncated; use FILE:LINE:COLUMN"
+            ),
+        ));
+    }
+    let matches = crate::model::target_matches(&parsed.symbols, &name)
+        .into_iter()
+        .map(|(_, symbol)| symbol)
         .filter(|symbol| {
-            (symbol.name_matches(&name) || symbol.name_suffix_matches(&name))
-                && expected_kind
-                    .as_ref()
-                    .is_none_or(|kind| symbol.kind == *kind)
+            expected_kind
+                .as_ref()
+                .is_none_or(|kind| symbol.kind == *kind)
         })
         .collect::<Vec<_>>();
     if matches.is_empty() {
@@ -164,7 +171,12 @@ fn parse_semantic_target(
             ));
         }
     }
-    let (row, byte_column) = symbol_name_position(&parsed.source, symbol);
+    let (row, byte_column) = symbol.name_position.ok_or_else(|| {
+        (
+            2,
+            format!("no reliable declaration-name position for {name}; use FILE:LINE:COLUMN"),
+        )
+    })?;
     Ok(SemanticTarget {
         path,
         language,
@@ -241,23 +253,6 @@ fn ensure_target_root(path: &Path, root: &Path, cwd: &Path) -> Result<PathBuf, (
             display_path(root, cwd)
         ),
     ))
-}
-
-fn symbol_name_position(source: &str, symbol: &crate::model::Symbol) -> (usize, usize) {
-    let simple_name = symbol.path.last_name().unwrap_or(&symbol.qualified_name);
-    let Some(relative) = source
-        .get(symbol.start_byte..symbol.end_byte)
-        .and_then(|item| item.find(simple_name))
-    else {
-        return (symbol.start_row, symbol.start_column);
-    };
-    let offset = symbol.start_byte + relative;
-    let prefix = &source[..offset];
-    let row = prefix.bytes().filter(|byte| *byte == b'\n').count();
-    let byte_column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.len(), |(_, line)| line.len());
-    (row, byte_column)
 }
 
 fn cached_source(
@@ -339,7 +334,7 @@ fn semantic_service(
     options: &LspOptions,
     requests: &[SemanticRequest],
     cwd: &Path,
-    command: &str,
+    _command: &str,
 ) -> Result<LspService, (i32, String)> {
     let configured_root = options.root(cwd);
     let root = std::fs::canonicalize(configured_root).map_err(|error| {
@@ -359,16 +354,6 @@ fn semantic_service(
                     "semantic target {} is outside the selected LSP root {}",
                     display_path(&target.path, cwd),
                     display_path(configured_root, cwd)
-                ),
-            ));
-        }
-        if !options.has_server(target.language) {
-            return Err((
-                2,
-                format!(
-                    "{command} requires an LSP for {}; install a conventional server on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH",
-                    target.language.name(),
-                    target.language.name()
                 ),
             ));
         }
@@ -456,18 +441,18 @@ fn parse_options(
                 targets.extend(args[index + 1..].iter().cloned());
                 break;
             }
-            "--max-items" if !matches!(command, SemanticCommand::Hover) => {
+            "--max-items" | "--limit" if !matches!(command, SemanticCommand::Hover) => {
                 if max_items.is_some() {
-                    return usage("--max-items may be specified only once");
+                    return usage("item limit may be specified only once");
                 }
                 let value = positive_usize(
                     args.get(index + 1)
-                        .ok_or_else(|| (2, "--max-items requires a value".into()))?,
-                    "--max-items",
+                        .ok_or_else(|| (2, "--limit requires a value".into()))?,
+                    "--limit",
                 )?;
                 if value > MAX_SEMANTIC_ITEMS_PER_REQUEST {
                     return usage(format!(
-                        "{} --max-items may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}",
+                        "{} --limit may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}",
                         command.name()
                     ));
                 }
@@ -674,48 +659,134 @@ pub fn query(
 ) -> CommandResult {
     let options = parse_query_options(args)?;
     let mut sources = BTreeMap::new();
-    let prepared = prepare_requests(
-        options.requests,
-        explicit,
-        cwd,
-        &mut sources,
-        RequestDefaults {
-            max_items: options.max_items,
-            max_bytes: options.max_bytes,
-            include_declaration: options.include_declaration,
-        },
-        lsp,
-    )?;
-    run_requests(prepared, lsp, cwd, BatchKind::Query, output)
+    let mut resolver = None;
+    let mut service = None;
+    let attempted = options.requests.len();
+    let mut succeeded = 0;
+    let mut first_failure = None;
+    let mut errors = 0;
+    for request in options.requests {
+        let (subject, result) = match request {
+            QueryRequest::Show(mut args) => {
+                let subject = format!("show={}", args[0]);
+                args.extend(["--max-bytes".into(), options.max_bytes.to_string()]);
+                (
+                    subject,
+                    crate::cli::command_show(&args, explicit, cwd, lsp, output),
+                )
+            }
+            QueryRequest::Semantic(command, value) => {
+                let result = (|| {
+                    let target = parse_semantic_target(
+                        &value,
+                        explicit,
+                        cwd,
+                        &mut sources,
+                        lsp,
+                        &mut resolver,
+                    )?;
+                    let request = SemanticRequest {
+                        command,
+                        value: value.clone(),
+                        target,
+                        max_items: options.max_items.unwrap_or(command.default_max_items()),
+                        max_bytes: options.max_bytes,
+                        include_declaration: options.include_declaration,
+                    };
+                    // Validate each request independently; reuse the running service.
+                    if !lsp.has_server(request.target.language) {
+                        return Err((
+                            2,
+                            format!(
+                                "{} requires an LSP for {}; install a conventional server on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH",
+                                command.name(),
+                                request.target.language.name(),
+                                request.target.language.name()
+                            ),
+                        ));
+                    }
+                    if service.is_none() {
+                        service = Some(semantic_service(
+                            lsp,
+                            std::slice::from_ref(&request),
+                            cwd,
+                            "query",
+                        )?);
+                    }
+                    execute_one(&request, service.as_mut().unwrap(), cwd, output)
+                })();
+                (format!("{}={value}", command.name()), result)
+            }
+        };
+        match result {
+            Ok(()) => succeeded += 1,
+            Err(error) if error.0 <= 1 => return Err(error),
+            Err((code, message)) => {
+                first_failure.get_or_insert((code, message.clone()));
+                if errors < MAX_BATCH_ERRORS {
+                    writeln!(
+                        output,
+                        "# pira_nav query error target={} code={} message={}",
+                        quote_metadata(&subject),
+                        code,
+                        quote_metadata(&message)
+                    )
+                    .map_err(output_error)?;
+                }
+                errors += 1;
+            }
+        }
+    }
+    write!(
+        output,
+        "# pira_nav query requests={attempted} succeeded={succeeded}"
+    )
+    .map_err(output_error)?;
+    if errors > 0 {
+        write!(output, " failed={errors} complete=0").map_err(output_error)?;
+    }
+    if errors > MAX_BATCH_ERRORS {
+        write!(output, " errors_omitted={}", errors - MAX_BATCH_ERRORS).map_err(output_error)?;
+    }
+    writeln!(output).map_err(output_error)?;
+    if succeeded == 0 {
+        return Err(first_failure.unwrap_or_else(|| (3, "all query requests failed".into())));
+    }
+    Ok(())
+}
+
+enum QueryRequest {
+    Semantic(SemanticCommand, String),
+    Show(Vec<String>),
 }
 
 struct QueryOptions {
-    requests: Vec<(SemanticCommand, String)>,
+    requests: Vec<QueryRequest>,
     max_items: Option<usize>,
     max_bytes: usize,
     include_declaration: bool,
 }
 
 fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
-    let mut requests = Vec::new();
+    let mut requests: Vec<QueryRequest> = Vec::new();
     let mut max_items = None;
     let mut max_bytes = None;
     let mut include_declaration = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--max-items" => {
+            "--max-items" | "--limit" => {
                 if max_items.is_some() {
-                    return usage("--max-items may be specified only once");
+                    return usage("item limit may be specified only once");
                 }
                 let value = positive_usize(
                     args.get(index + 1)
-                        .ok_or_else(|| (2, "--max-items requires a value".into()))?,
-                    "--max-items",
+                        .ok_or_else(|| (2, "--limit requires a value".into()))?,
+                    "--limit",
                 )?;
                 if value > MAX_SEMANTIC_ITEMS_PER_REQUEST {
                     return usage(format!(
-                        "query --max-items may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}"
+                        "query --limit may not exceed {MAX_SEMANTIC_ITEMS_PER_REQUEST}"
                     ));
                 }
                 max_items = Some(value);
@@ -738,6 +809,16 @@ fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
                 max_bytes = Some(value);
                 index += 2;
             }
+            "--range" => {
+                let Some(QueryRequest::Show(show)) = requests.last_mut() else {
+                    return usage("query --range must follow --show TARGET");
+                };
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| (2, "--range requires START:END".into()))?;
+                show.extend(["--range".into(), value.clone()]);
+                index += 2;
+            }
             "--include-declaration" => {
                 if include_declaration {
                     return usage("--include-declaration may be specified only once");
@@ -752,18 +833,28 @@ fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
                     ));
                 }
                 let operation = value.trim_start_matches('-');
+                let target = args
+                    .get(index + 1)
+                    .ok_or_else(|| (2, format!("{value} requires a target")))?;
+                if operation == "show" {
+                    let show_target = if target.starts_with('-') {
+                        format!("./{target}")
+                    } else {
+                        target.clone()
+                    };
+                    requests.push(QueryRequest::Show(vec![show_target]));
+                    index += 2;
+                    continue;
+                }
                 let command = SemanticCommand::parse(operation).ok_or_else(|| {
                     (
                         2,
                         format!(
-                            "unknown query option `{value}`; use --definition, --implementation, --type-definition, --references, --hover, --callers, --callees, --supertypes, or --subtypes"
+                            "unknown query option `{value}`; use --show, --definition, --implementation, --type-definition, --references, --hover, --callers, --callees, --supertypes, or --subtypes"
                         ),
                     )
                 })?;
-                let target = args
-                    .get(index + 1)
-                    .ok_or_else(|| (2, format!("{value} requires a target")))?;
-                requests.push((command, target.clone()));
+                requests.push(QueryRequest::Semantic(command, target.clone()));
                 index += 2;
             }
             value => {
@@ -778,6 +869,36 @@ fn parse_query_options(args: &[String]) -> Result<QueryOptions, (i32, String)> {
             2,
             "query requires at least one --OPERATION TARGET request".into(),
         ));
+    }
+    if max_items.is_some() && !requests.iter().any(|request| matches!(
+        request, QueryRequest::Semantic(command, _) if !matches!(command, SemanticCommand::Hover)
+    )) {
+        return usage("query --limit requires a semantic row operation, such as --references");
+    }
+    if max_bytes.is_some()
+        && !requests.iter().any(|request| {
+            matches!(
+                request,
+                QueryRequest::Show(_) | QueryRequest::Semantic(SemanticCommand::Hover, _)
+            )
+        })
+    {
+        return usage("query --max-bytes requires --show or --hover");
+    }
+    if include_declaration
+        && !requests.iter().any(|request| {
+            matches!(
+                request,
+                QueryRequest::Semantic(SemanticCommand::References, _)
+            )
+        })
+    {
+        return usage("query --include-declaration requires --references");
+    }
+    for request in &requests {
+        if let QueryRequest::Show(args) = request {
+            crate::cli::validate_query_show(args)?;
+        }
     }
     Ok(QueryOptions {
         requests,
@@ -804,7 +925,6 @@ struct RequestDefaults {
 }
 
 struct RequestFailure {
-    command: SemanticCommand,
     value: String,
     code: i32,
     message: String,
@@ -847,7 +967,6 @@ fn prepare_requests(
                 first_failure.get_or_insert((code, message.clone()));
                 if failures.len() < MAX_BATCH_ERRORS {
                     failures.push(RequestFailure {
-                        command,
                         value,
                         code,
                         message,
@@ -865,12 +984,6 @@ fn prepare_requests(
         omitted_errors,
         first_failure,
     })
-}
-
-#[derive(Clone, Copy)]
-enum BatchKind {
-    Homogeneous(SemanticCommand),
-    Query,
 }
 
 fn run_command(
@@ -900,14 +1013,14 @@ fn run_command(
         },
         lsp,
     )?;
-    run_requests(prepared, lsp, cwd, BatchKind::Homogeneous(command), output)
+    run_requests(prepared, lsp, cwd, command, output)
 }
 
 fn run_requests(
     prepared: PreparedRequests,
     lsp: &LspOptions,
     cwd: &Path,
-    batch: BatchKind,
+    command: SemanticCommand,
     output: &mut dyn Write,
 ) -> CommandResult {
     let PreparedRequests {
@@ -917,10 +1030,7 @@ fn run_requests(
         mut omitted_errors,
         mut first_failure,
     } = prepared;
-    let label = match batch {
-        BatchKind::Homogeneous(command) => command.name(),
-        BatchKind::Query => "query",
-    };
+    let label = command.name();
     if requests.is_empty() {
         return Err(first_failure.unwrap_or_else(|| (3, format!("all {label} requests failed"))));
     }
@@ -929,31 +1039,33 @@ fn run_requests(
     let mut failures = preparation_failures
         .into_iter()
         .map(|failure| {
-            let subject = match batch {
-                BatchKind::Homogeneous(_) => failure.value,
-                BatchKind::Query => format!("{}={}", failure.command.name(), failure.value),
-            };
+            let subject = failure.value;
             (subject, failure.code, failure.message)
         })
         .collect::<Vec<_>>();
     for request in &requests {
-        match execute_one(request, &mut service, cwd, output) {
+        let result = if lsp.has_server(request.target.language) {
+            execute_one(request, &mut service, cwd, output)
+        } else {
+            Err((
+                2,
+                format!(
+                    "{label} requires an LSP for {}; install a conventional server on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH",
+                    request.target.language.name(),
+                    request.target.language.name()
+                ),
+            ))
+        };
+        match result {
             Ok(()) => succeeded += 1,
             Err((code, message)) if code <= 1 => return Err((code, message)),
-            Err((code, message))
-                if attempted == 1 && matches!(batch, BatchKind::Homogeneous(_)) =>
-            {
+            Err((code, message)) if attempted == 1 => {
                 return Err((code, message));
             }
             Err((code, message)) => {
                 first_failure.get_or_insert((code, message.clone()));
                 if failures.len() < MAX_BATCH_ERRORS {
-                    let subject = match batch {
-                        BatchKind::Homogeneous(_) => request.value.clone(),
-                        BatchKind::Query => {
-                            format!("{}={}", request.command.name(), request.value)
-                        }
-                    };
+                    let subject = request.value.clone();
                     failures.push((subject, code, message));
                 } else {
                     omitted_errors += 1;
@@ -972,21 +1084,14 @@ fn run_requests(
         )
         .map_err(output_error)?;
     }
-    if attempted > 1 || matches!(batch, BatchKind::Query) {
-        match batch {
-            BatchKind::Homogeneous(command) => write!(
-                output,
-                "# pira_nav {} batch targets={} succeeded={}",
-                command.name(),
-                attempted,
-                succeeded
-            ),
-            BatchKind::Query => write!(
-                output,
-                "# pira_nav query requests={} succeeded={}",
-                attempted, succeeded
-            ),
-        }
+    if attempted > 1 {
+        write!(
+            output,
+            "# pira_nav {} batch targets={} succeeded={}",
+            command.name(),
+            attempted,
+            succeeded
+        )
         .map_err(output_error)?;
         let failed = attempted.saturating_sub(succeeded);
         if failed > 0 {
@@ -1508,6 +1613,64 @@ mod tests {
     };
 
     #[test]
+    fn named_targets_use_declaration_coordinates() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("pira-nav-names-{}-{unique}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let lsp = crate::lsp_options::LspOptions::default();
+        for (file, source, name, expected) in [
+            ("a.py", "def f():\n    return 1\n", "f", (0, 4)),
+            ("b.py", "@decorate('f')\ndef f():\n    pass\n", "f", (1, 4)),
+            ("a.c", "void id(void) {}\n", "id", (0, 5)),
+            ("a.cpp", "void A::run() {}\n", "A::run", (0, 8)),
+            (
+                "b.cpp",
+                "void outer::A::run() {}\n",
+                "outer::A::run",
+                (0, 15),
+            ),
+            ("a.jl", "Base.foo(x) = x\n", "Base.foo", (0, 5)),
+            ("a.lua", "function pkg:run() end\n", "pkg:run", (0, 13)),
+            ("a.rs", "/// f docs\nfn f() {}\n", "f", (1, 3)),
+        ] {
+            fs::write(root.join(file), source).unwrap();
+            let target = parse_semantic_target(
+                &format!("{file}::{name}"),
+                None,
+                &root,
+                &mut BTreeMap::new(),
+                &lsp,
+                &mut None,
+            )
+            .unwrap();
+            assert_eq!((target.row, target.byte_column), expected, "{file}");
+        }
+        fs::write(
+            root.join("large.rs"),
+            (0..20001)
+                .map(|i| format!("fn item{i}() {{}}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let error = parse_semantic_target(
+            "large.rs::item0",
+            None,
+            &root,
+            &mut BTreeMap::new(),
+            &lsp,
+            &mut None,
+        )
+        .err()
+        .unwrap();
+        assert!(error.1.contains("cannot establish uniqueness"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn repeated_targets_share_one_source_allocation() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1586,5 +1749,80 @@ mod tests {
         assert!(error.1.contains("outside the selected LSP root"));
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(outside).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn limit_matches_max_items_and_validates_shared_slot() {
+        for command in [
+            SemanticCommand::References,
+            SemanticCommand::Definition,
+            SemanticCommand::Callers,
+        ] {
+            for option in ["--limit", "--max-items"] {
+                assert_eq!(
+                    parse_options(&args(&["file.py::item", option, "7"]), command)
+                        .unwrap()
+                        .max_items,
+                    7
+                );
+                for value in ["0", "-1", "10001", "bad"] {
+                    assert!(
+                        parse_options(&args(&["file.py::item", option, value]), command).is_err()
+                    );
+                }
+            }
+            for (first, second) in [
+                ("--limit", "--max-items"),
+                ("--max-items", "--limit"),
+                ("--limit", "--limit"),
+            ] {
+                assert!(
+                    parse_options(&args(&["file.py::item", first, "2", second, "3"]), command)
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            parse_options(
+                &args(&["file.py::item", "--limit", "2"]),
+                SemanticCommand::Hover
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn query_limit_uses_the_same_bounds_and_conflicts() {
+        for option in ["--limit", "--max-items"] {
+            assert_eq!(
+                parse_query_options(&args(&["--references", "file.py::item", option, "9"]))
+                    .unwrap()
+                    .max_items,
+                Some(9)
+            );
+            for value in ["0", "-2", "10001"] {
+                assert!(
+                    parse_query_options(&args(&["--references", "file.py::item", option, value]))
+                        .is_err()
+                );
+            }
+        }
+        assert!(
+            parse_query_options(&args(&[
+                "--references",
+                "file.py::item",
+                "--limit",
+                "3",
+                "--max-items",
+                "4"
+            ]))
+            .is_err()
+        );
     }
 }

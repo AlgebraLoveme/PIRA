@@ -82,6 +82,9 @@ struct Row {
 }
 
 pub fn run(store: &StoredResult, options: &TransformOptions) -> Result<Vec<String>, String> {
+    if store.metadata.timeline_truncated {
+        return Err("transform requires a complete line index; use raw --stdout/--stderr for retained stream bytes".into());
+    }
     if options.plan.is_none() {
         return stream_direct(store, options);
     }

@@ -11,7 +11,7 @@ USAGE
   pira_dec show ID [--json] [--store-dir PATH]
   pira_dec list [--since TIME] [--until TIME] [--limit N] [--json] [--store-dir PATH]
   pira_dec export --output FILE [--since TIME] [--until TIME] [--limit N] [--store-dir PATH]
-  pira_dec search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+  pira_dec search [QUERY | --field FIELD --regex PATTERN] [--since TIME] [--until TIME]
                        [--limit N] [--json] [--store-dir PATH]
   pira_dec forget EXACT_ID --yes [--store-dir PATH]
   pira_dec help [COMMAND]
@@ -30,7 +30,7 @@ FIELDS
   --context TEXT    Concise problem and decisive constraints; exactly once.
   --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
   --decision N      One-based index selecting one listed choice.
-  --maker VALUE     Decision authority: human or agent; human overrides agent if repeated.
+  --maker VALUE     Decision authority: human or agent; specify exactly once.
   --supersedes ID   Exact existing decision replaced by this decision; at most once.
   --related ID      Exact existing related decision; repeatable.
 
@@ -77,7 +77,7 @@ when supported and never overwritten.
 const SEARCH_HELP: &str = r#"pira_dec search — filter workspace decisions
 
 USAGE
-  pira_dec search [--field FIELD --regex PATTERN] [--since TIME] [--until TIME]
+  pira_dec search [QUERY | --field FIELD --regex PATTERN] [--since TIME] [--until TIME]
                        [--limit N] [--json] [--store-dir PATH]
 
 FIELDS
@@ -89,9 +89,13 @@ FIELDS
   relation   Superseded and related decision IDs.
   timestamp  RFC 3339 UTC timestamp.
 
+QUERY is a nonempty case-insensitive literal across context and all choices, including the selected
+choice. Each record appears once with a bounded matching excerpt. Do not combine QUERY with
+--field/--regex. Put options before `--` when QUERY starts with a dash.
+
 TIME is RFC 3339, `now`, or an age such as 30m, 24h, or 7d. --since includes records at or after its
-bound; --until excludes records at or after its bound. Use either a field/regex pair, a time bound,
-or both. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
+bound; --until excludes records at or after its bound. Use a query, a field/regex pair, a time bound,
+or combine either text search with time bounds. Regex matching is case-sensitive unless PATTERN enables a flag such as (?i). Results are
 newest first; --limit accepts 1..1000 and defaults to 20. Search skips unrelated invalid records,
 reports them with bounded warnings, and may omit a record published concurrently. Rows include ID,
 maker, and selected text; context/choice searches add match-local excerpts, without a separate
@@ -100,6 +104,7 @@ skipped-record details; has_more describes the result limit, not skipped-record 
 `decisions_matched=0` status and exits 1.
 
 EXAMPLES
+  pira_dec search cache --limit 5
   pira_dec search --since 7d --limit 20
   pira_dec search --field context --regex '(?i)cache' --since 30d
 "#;
@@ -415,6 +420,7 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
     if wants_help(args) {
         return simple(Command::Help(HelpTopic::Search), &[]);
     }
+    let mut query = None;
     let mut field = None;
     let mut pattern = None;
     let mut browse = BrowseArgs::default();
@@ -432,6 +438,15 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
                 }
                 set_once(&mut pattern, raw, "--regex")?;
             }
+            "--" => {
+                for raw in &args[index + 1..] {
+                    set_once(&mut query, raw.clone(), "QUERY")?;
+                }
+                break;
+            }
+            other if !other.starts_with('-') => {
+                set_once(&mut query, other.to_string(), "QUERY")?;
+            }
             other => {
                 if !parse_browse_option(args, &mut index, &mut browse)? {
                     return Err(format!("unknown search argument {other:?}"));
@@ -440,16 +455,26 @@ fn parse_search(args: &[String]) -> Result<Config, String> {
         }
         index += 1;
     }
+    if let Some(raw) = &query {
+        if raw.is_empty() || raw.len() > MAX_REGEX_BYTES {
+            return Err(format!(
+                "QUERY must contain 1..{MAX_REGEX_BYTES} UTF-8 bytes"
+            ));
+        }
+        if field.is_some() || pattern.is_some() {
+            return Err("QUERY cannot be combined with --field or --regex".into());
+        }
+    }
     if field.is_some() != pattern.is_some() {
         return Err("search requires --field and --regex together".into());
     }
-    if field.is_none() && browse.since.is_none() && browse.until.is_none() {
-        return Err("search requires --field with --regex, --since, or --until".into());
+    if query.is_none() && field.is_none() && browse.since.is_none() && browse.until.is_none() {
+        return Err("search requires QUERY, --field with --regex, --since, or --until".into());
     }
     Ok(Config {
         command: Command::Search {
             field,
-            pattern,
+            pattern: query.or(pattern),
             since: browse.since,
             until: browse.until,
             limit: browse.limit.unwrap_or(20),
@@ -736,6 +761,46 @@ mod tests {
         assert_eq!(since.as_deref(), Some("7d"));
         assert_eq!(until.as_deref(), Some("now"));
         assert_eq!(limit, 5);
+    }
+
+    #[test]
+    fn literal_search_accepts_filters_and_dash_prefixed_query() {
+        for argv in [
+            vec!["search", "Cache[1]", "--since", "7d", "--limit", "5"],
+            vec!["search", "--since", "7d", "--limit", "5", "--", "--help"],
+        ] {
+            let config = parse_args(&args(&argv)).unwrap();
+            let Command::Search {
+                field,
+                pattern,
+                since,
+                limit,
+                ..
+            } = config.command
+            else {
+                panic!("expected search command");
+            };
+            assert!(field.is_none());
+            assert!(pattern.is_some());
+            assert_eq!(since.as_deref(), Some("7d"));
+            assert_eq!(limit, 5);
+        }
+    }
+
+    #[test]
+    fn literal_search_rejects_ambiguous_or_invalid_input() {
+        for argv in [
+            vec!["search", ""],
+            vec!["search", "one", "two"],
+            vec!["search", "one", "--", "two"],
+            vec!["search", "one", "--field", "context"],
+            vec!["search", "one", "--regex", "x"],
+            vec!["search", "one", "--field", "context", "--regex", "x"],
+            vec!["search", "--unknown"],
+        ] {
+            assert!(parse_args(&args(&argv)).is_err(), "{argv:?}");
+        }
+        assert!(parse_args(&["search".into(), "a".repeat(MAX_REGEX_BYTES + 1)]).is_err());
     }
 
     #[test]

@@ -140,3 +140,103 @@ fn limits_are_disclosed_and_context_matches_are_visible() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["skipped_count"], 1);
 }
+
+#[test]
+fn literal_search_matches_all_choices_and_context_once_without_regex_semantics() {
+    let s = Sandbox::new();
+    for (context, selected, alternative) in [
+        ("Cache[1] rationale", "Use CACHE[1]", "Other"),
+        ("Choose storage", "Use disk", "Use cache[1]"),
+        ("Choose latency", "Use Cache[1]", "Use memory"),
+        ("Cache1 is not the literal", "Keep", "Drop"),
+    ] {
+        let out = run(
+            &s,
+            &[
+                "add",
+                "--context",
+                context,
+                "--choice",
+                selected,
+                "--choice",
+                alternative,
+                "--decision",
+                "1",
+                "--maker",
+                "agent",
+            ],
+        );
+        assert!(out.status.success(), "{:?}", out);
+    }
+    let out = run(&s, &["search", "cAcHe[1]", "--since", "1h"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().count(), 3, "{text}");
+    assert_eq!(text.matches("match=").count(), 3, "{text}");
+    assert!(!text.contains("Cache1"));
+    println!("literal cross-field output:\n{text}");
+
+    let out = run(&s, &["search", "cache[1]", "--limit", "2", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(json["has_more"], true);
+    let out = run(&s, &["search", "cache[1]", "--until", "1h"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "decisions_matched=0 complete=1\n"
+    );
+
+    // Existing field-specific regex remains case-sensitive and field-restricted.
+    let out = run(
+        &s,
+        &["search", "--field", "context", "--regex", "^Cache[1]"],
+    );
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("Cache1 is not the literal"), "{text}");
+}
+
+#[test]
+fn literal_search_has_bounded_unicode_evidence_and_no_match_status() {
+    let s = Sandbox::new();
+    let context = format!("{}ПРИВЕТ{}", "前".repeat(400), "後".repeat(400));
+    assert!(
+        run(
+            &s,
+            &[
+                "add",
+                "--context",
+                &context,
+                "--choice",
+                "Keep",
+                "--choice",
+                "Drop",
+                "--decision",
+                "1",
+                "--maker",
+                "agent"
+            ]
+        )
+        .status
+        .success()
+    );
+    let out = run(&s, &["search", "привет"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("ПРИВЕТ") && text.contains("match="), "{text}");
+    assert!(
+        text.len() < 1000,
+        "excerpt must stay bounded: {} bytes",
+        text.len()
+    );
+    println!("bounded Unicode output:\n{text}");
+    let out = run(&s, &["search", "missing"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "decisions_matched=0 complete=1\n"
+    );
+    assert!(out.stderr.is_empty());
+}

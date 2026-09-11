@@ -228,6 +228,44 @@ pub struct LiveOwnerLease {
     _file: File,
 }
 
+fn encode_live_manifest(manifest: &mut LiveManifest) -> Result<Vec<u8>, String> {
+    struct LimitedJson {
+        bytes: Vec<u8>,
+        overflow: bool,
+    }
+    impl Write for LimitedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_METADATA_BYTES as usize).saturating_sub(self.bytes.len()) {
+                self.overflow = true;
+                return Err(std::io::Error::other("live metadata byte limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    loop {
+        let mut output = LimitedJson {
+            bytes: Vec::new(),
+            overflow: false,
+        };
+        match serde_json::to_writer(&mut output, &manifest) {
+            Ok(()) => return Ok(output.bytes),
+            Err(error) if !output.overflow || manifest.metadata.line_timeline.is_empty() => {
+                return Err(error.to_string());
+            }
+            Err(_) => {
+                // Limit only this snapshot: final indexing and exact retained streams are unchanged.
+                let shorter = manifest.metadata.line_timeline.len() / 2;
+                manifest.metadata.line_timeline.truncate(shorter);
+                manifest.metadata.timeline_truncated = true;
+            }
+        }
+    }
+}
+
 fn live_owner_path(store_dir: &Path, result_id: &str) -> PathBuf {
     store_dir
         .join("live")
@@ -267,6 +305,7 @@ fn live_owner_is_active(store_dir: &Path, result_id: &str) -> bool {
 
 #[derive(Debug)]
 pub struct LiveCheckpoint<'a> {
+    pub redirected_stream: Option<StreamKind>,
     pub command: &'a [String],
     pub cwd: &'a str,
     pub start_ms: u128,
@@ -310,7 +349,12 @@ pub fn write_live_checkpoint(
     let filename = format!("{result_id}.live.json");
     let path = live_dir.join(&filename);
     let metadata = Metadata {
-        compat_version: FORMAT_VERSION,
+        redirected_stream: snapshot.redirected_stream,
+        compat_version: if snapshot.redirected_stream.is_some() {
+            5
+        } else {
+            FORMAT_VERSION
+        },
         tool_version: format!("pira_ctx-{}", env!("CARGO_PKG_VERSION")),
         command_argv: crate::util::redacted_argv(snapshot.command),
         original_command_argv: snapshot.command.to_vec(),
@@ -349,8 +393,12 @@ pub fn write_live_checkpoint(
         stderr_sha256: String::new(),
         timeline_truncated: snapshot.timeline_truncated,
     };
-    let manifest = LiveManifest {
-        schema: 1,
+    let mut manifest = LiveManifest {
+        schema: if snapshot.redirected_stream.is_some() {
+            2
+        } else {
+            1
+        },
         generation,
         checkpoint_unix_ms,
         stdout_path: snapshot.stdout_path.to_path_buf(),
@@ -358,10 +406,7 @@ pub fn write_live_checkpoint(
         owner_lock,
         metadata,
     };
-    let bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_METADATA_BYTES {
-        return Err("live checkpoint metadata is too large".into());
-    }
+    let bytes = encode_live_manifest(&mut manifest)?;
     let temporary = live_dir.join(format!(".{result_id}.{}.tmp", std::process::id()));
     write_private_file_relaxed(&temporary, &bytes)?;
     atomic_replace(&temporary, &path)
@@ -549,7 +594,12 @@ pub fn store_capture(
     let detected_paths = summarize::detected_paths(capture)?;
     let suggested_keywords = summarize::suggested_keywords(capture, command, keywords)?;
     let metadata = Metadata {
-        compat_version: FORMAT_VERSION,
+        redirected_stream: capture.redirected_stream,
+        compat_version: if capture.redirected_stream.is_some() {
+            5
+        } else {
+            FORMAT_VERSION
+        },
         tool_version: format!("pira_ctx-{}", env!("CARGO_PKG_VERSION")),
         command_argv: crate::util::redacted_argv(command),
         original_command_argv: command.to_vec(),
@@ -596,7 +646,9 @@ pub fn store_capture(
     let entry = ListedEntry::from_metadata(&metadata, path.clone());
     if let Err(error) = update_index(store_dir, &entry, &dirty) {
         let _ = fs::remove_file(store_dir.join("indexes").join(INDEX_COMPLETE));
-        eprintln!("pira_ctx: warning: stored result but could not update index: {error}");
+        crate::util::diagnostic_line(&format!(
+            "pira_ctx: warning: stored result but could not update index: {error}"
+        ));
     }
     if capture.live_id.is_some() {
         remove_live_checkpoint(store_dir, &result_id);
@@ -767,7 +819,13 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
     let bytes = crate::util::read_file_limited(path, MAX_METADATA_BYTES, "live checkpoint")?;
     let manifest: LiveManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid live checkpoint: {error}"))?;
-    if manifest.schema != 1 {
+    if manifest.schema
+        != if manifest.metadata.redirected_stream.is_some() {
+            2
+        } else {
+            1
+        }
+    {
         return Err("unsupported live checkpoint schema".into());
     }
     for stream_path in [&manifest.stdout_path, &manifest.stderr_path] {
@@ -1308,7 +1366,13 @@ fn read_v4(path: &Path, mut file: File, file_length: u64) -> Result<StoredResult
     }
     let mut metadata: Metadata = serde_json::from_slice(&metadata_bytes)
         .map_err(|e| format!("invalid result metadata: {e}"))?;
-    if metadata.compat_version != 4 {
+    if metadata.compat_version
+        != if metadata.redirected_stream.is_some() {
+            5
+        } else {
+            4
+        }
+    {
         return Err("unsupported metadata compatibility version".into());
     }
     let stdout_blocks = decode_block_table_v4(&stdout_table, metadata.stdout_bytes, stdout_length)?;
@@ -1822,7 +1886,147 @@ fn append_index(path: &Path, entry: &ListedEntry) -> Result<(), String> {
     file.write_all(b"\n").map_err(|error| error.to_string())
 }
 
+/// Reservations are never recycled by capture pruning: stale handles must not retarget.
+fn short_id_dir(store_dir: &Path) -> Result<PathBuf, String> {
+    let workspace = current_workspace_hash()?;
+    let scope = crate::events::current_scope(&workspace);
+    if !scope.detected {
+        return Err("short result IDs require a detected agent session; use the full ID".into());
+    }
+    Ok(store_dir.join("short-ids").join(workspace).join(scope.hash))
+}
+
+fn read_short_binding(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 128 {
+        return Err("invalid short result ID reservation".into());
+    }
+    let id = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("incomplete or invalid short result ID reservation; use the full ID".into());
+    }
+    Ok(id)
+}
+
+fn reserve_short_id(directory: &Path, id: &str) -> Result<String, String> {
+    if id.len() < 6 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("invalid full result ID".into());
+    }
+    for length in 6..id.len() {
+        let suffix = &id[id.len() - length..];
+        let path = directory.join(suffix);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(id.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                file.sync_all().map_err(|error| error.to_string())?;
+                return Ok(format!("@{suffix}"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_short_binding(&path).is_ok_and(|existing| existing == id) {
+                    return Ok(format!("@{suffix}"));
+                }
+                // Occupied or incomplete reservations remain occupied.
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(id.to_string())
+}
+
+/// Best-effort display shortening; storage/events always retain the full ID.
+pub fn display_result_id(store_dir: &Path, id: &str) -> String {
+    let reserve = || {
+        let directory = short_id_dir(store_dir)?;
+        ensure_private_dir(store_dir)?;
+        ensure_private_dir(&store_dir.join("short-ids"))?;
+        ensure_private_dir(directory.parent().expect("workspace directory"))?;
+        ensure_private_dir(&directory)?;
+        reserve_short_id(&directory, id)
+    };
+    reserve().unwrap_or_else(|_: String| id.to_string())
+}
+
 pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String> {
+    if let Some(suffix) = target.strip_prefix('@') {
+        if suffix.len() < 6
+            || suffix.len() > 127
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid short result ID; use the displayed @suffix or full ID".into());
+        }
+        let directory = short_id_dir(store_dir)?;
+        // Read-only resolution must not create stores or follow reservation-directory links.
+        for directory in [
+            store_dir.join("short-ids"),
+            directory.parent().unwrap().to_path_buf(),
+            directory.clone(),
+        ] {
+            let meta = fs::symlink_metadata(&directory).map_err(|_| {
+                "short result ID not found in this workspace/session; use the full ID".to_string()
+            })?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err("invalid short result ID directory".into());
+            }
+        }
+        let id = read_short_binding(&directory.join(suffix))?;
+        if !id.ends_with(suffix) {
+            return Err("short result ID reservation does not match its suffix".into());
+        }
+        let path = resolve_result(store_dir, &id)?;
+        let stored = read_result_path(&path)?;
+        let workspace = current_workspace_hash()?;
+        let scope = crate::events::current_scope(&workspace);
+        if stored.metadata.result_id != id
+            || stored.metadata.workspace_hash != workspace
+            || stored.metadata.scope_hash != scope.hash
+        {
+            return Err(
+                "short result ID no longer resolves to its original capture; use the full ID"
+                    .into(),
+            );
+        }
+        return Ok(path);
+    }
+    if let Some(offset) = target
+        .strip_prefix('-')
+        .and_then(|digits| digits.parse::<usize>().ok())
+    {
+        if offset == 0 {
+            return Err("relative result index must be negative and nonzero".into());
+        }
+        let workspace = current_workspace_hash()?;
+        let scope = crate::events::current_scope(&workspace);
+        if !scope.detected {
+            return Err(
+                "relative result IDs require a detected agent session; use an explicit result ID"
+                    .into(),
+            );
+        }
+        let mut remaining = offset;
+        for entry in scan_store(store_dir, Some(&workspace))? {
+            if entry.running {
+                continue;
+            }
+            let stored = read_result_path(&entry.path)?;
+            if stored.is_running() || stored.metadata.scope_hash != scope.hash {
+                continue;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return Ok(entry.path);
+            }
+        }
+        return Err(format!(
+            "no retained result at relative index -{offset} in the current workspace/session; use an explicit result ID"
+        ));
+    }
     if target == "--last" {
         let workspace = current_workspace_hash()?;
         return scan_store(store_dir, Some(&workspace))?
@@ -2124,6 +2328,43 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_id_reservations_extend_collisions_and_never_reassign() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-short-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let first = "20260101-120000-aaaaaa123456";
+        let second = "20260101-120001-bbbbbb123456";
+        assert_eq!(reserve_short_id(&dir, first).unwrap(), "@123456");
+        assert_eq!(reserve_short_id(&dir, second).unwrap(), "@b123456");
+        assert_eq!(reserve_short_id(&dir, first).unwrap(), "@123456");
+        assert_eq!(read_short_binding(&dir.join("123456")).unwrap(), first);
+        // Incomplete reservations (e.g. a crash before write) stay occupied.
+        fs::write(dir.join("abcdef"), "").unwrap();
+        assert_eq!(
+            reserve_short_id(&dir, "20260101-120002-999999abcdef").unwrap(),
+            "@9abcdef"
+        );
+        let handles: Vec<_> = (0..16)
+            .map(|n| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let id = format!("20260101-120003-{n:06x}654321");
+                    let handle = reserve_short_id(&dir, &id).unwrap();
+                    assert_eq!(read_short_binding(&dir.join(&handle[1..])).unwrap(), id);
+                    handle
+                })
+            })
+            .collect();
+        let handles: std::collections::BTreeSet<_> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(handles.len(), 16);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn line_index_rejects_impossible_count_and_oversized_varint() {

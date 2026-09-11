@@ -66,6 +66,7 @@ impl StructuralResolver {
             return Err(lsp_error(message));
         }
         let native_clean = parsed.syntax_defects == 0;
+        let symbols_truncated = native_clean && parsed.symbols_truncated;
         let native_symbols = parsed.symbols;
         let source = parsed.source;
         let mut symbols = self
@@ -91,7 +92,7 @@ impl StructuralResolver {
             symbols,
             backend: ParseBackend::Lsp,
             syntax_defects: 0,
-            symbols_truncated: false,
+            symbols_truncated,
         })
     }
 

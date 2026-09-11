@@ -82,6 +82,11 @@ pub fn prepare(
         .map_or(DEFAULT_MAX_EXEC_BYTES, |value| value.max(4 * 1024));
     let mut total_bytes = 0_u64;
     for (name, source) in sources {
+        if let Some(stream) = source.metadata.redirected_stream {
+            return Err(format!(
+                "input {name:?}: {stream} was redirected and not retained; use search/range or raw for the captured stream"
+            ));
+        }
         if source.metadata.timeline_truncated {
             return Err(format!(
                 "cannot construct merged text for input {name:?} with a truncated line index"

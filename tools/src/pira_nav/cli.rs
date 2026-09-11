@@ -514,7 +514,11 @@ fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String
     })
 }
 
-fn command_show(
+pub(crate) fn validate_query_show(args: &[String]) -> CommandResult {
+    parse_show_options(args).map(|_| ())
+}
+
+pub(crate) fn command_show(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
@@ -526,7 +530,7 @@ fn command_show(
     let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1 && options.targets[0].file_slice.is_some() {
         if options.max_items.is_some() {
-            return usage("show --max-items does not apply to a single --head/--tail target");
+            return usage("show --max-items does not apply to a single sliced target");
         }
         let target = &options.targets[0];
         let mut item = Vec::new();
@@ -617,7 +621,7 @@ fn command_show(
     {
         let path = absolute_lexical(Path::new(path_text), cwd);
         let mut item = Vec::new();
-        render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
+        render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
             && item.len() > max_bytes
         {
@@ -667,7 +671,7 @@ fn command_show(
     #[derive(Clone, Hash, Eq, PartialEq)]
     enum ShowIdentity {
         Entire(PathBuf),
-        Lines(PathBuf, usize, usize),
+        Lines(PathBuf, i64, i64),
         Head(PathBuf, usize),
         Tail(PathBuf, usize),
         Slice(String, ShowFileSlice),
@@ -683,6 +687,9 @@ fn command_show(
                 match file_slice {
                     ShowFileSlice::Head(n) => ShowIdentity::Head(path, n),
                     ShowFileSlice::Tail(n) => ShowIdentity::Tail(path, n),
+                    ShowFileSlice::Range(..) => {
+                        ShowIdentity::Slice(target.value.clone(), file_slice)
+                    }
                 }
             } else {
                 ShowIdentity::Slice(target.value.clone(), file_slice)
@@ -749,7 +756,7 @@ fn command_show(
             }
             let mut item = Vec::new();
             if let Err((code, message)) =
-                render_line_range(&path, start, end, cwd, options.glance, &mut item)
+                render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)
             {
                 identities.remove(&identity);
                 failures.record(target.value.clone(), code, message);
@@ -867,15 +874,7 @@ struct ShowTarget {
 enum ShowFileSlice {
     Head(usize),
     Tail(usize),
-}
-
-impl ShowFileSlice {
-    fn option_and_lines(self) -> (&'static str, usize) {
-        match self {
-            Self::Head(lines) => ("--head", lines),
-            Self::Tail(lines) => ("--tail", lines),
-        }
-    }
+    Range(i64, i64),
 }
 
 fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
@@ -901,7 +900,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
             index += 1;
         } else if matches!(
             option,
-            "--max-items" | "--max-bytes" | "--window" | "--head" | "--tail"
+            "--max-items" | "--max-bytes" | "--window" | "--head" | "--tail" | "--range"
         ) {
             let value = args
                 .get(index + 1)
@@ -915,6 +914,23 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                         .parse::<usize>()
                         .map_err(|_| (2, "--window requires a non-negative integer".into()))?,
                 );
+            } else if option == "--range" {
+                let (start, end) = value
+                    .split_once(':')
+                    .and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)))
+                    .ok_or_else(|| input_error("--range requires signed START:END"))?;
+                if start == 0 || end == 0 {
+                    return Err(input_error("range indices are 1-based; zero is invalid"));
+                }
+                let target = targets
+                    .last_mut()
+                    .ok_or_else(|| input_error("--range must follow its TARGET"))?;
+                if target.file_slice.is_some() {
+                    return Err(input_error(
+                        "only one of --range, --head, or --tail may follow each TARGET",
+                    ));
+                }
+                target.file_slice = Some(ShowFileSlice::Range(start, end));
             } else if matches!(option, "--head" | "--tail") {
                 let parsed = value
                     .parse::<usize>()
@@ -928,7 +944,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 if target.file_slice.is_some() {
                     return Err((
                         2,
-                        "--head and --tail may be specified at most once per bare FILE".into(),
+                        "only one of --range, --head, or --tail may follow each TARGET".into(),
                     ));
                 }
                 target.file_slice = Some(if option == "--head" {
@@ -969,7 +985,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
     if window.is_some() && targets.iter().any(|target| target.file_slice.is_some()) {
         return Err((
             2,
-            "--window cannot be combined with --head or --tail".into(),
+            "--window cannot be combined with --range, --head or --tail".into(),
         ));
     }
     Ok(ShowOptions {
@@ -1061,32 +1077,39 @@ fn resolve_show_target(
                 )
             })?
     } else if let Some((_, qualified)) = split_existing_symbol_target(target, cwd) {
-        let exact = parsed
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, symbol)| symbol.name_matches(&qualified))
-            .collect::<Vec<_>>();
-        let matches = if exact.is_empty() {
-            parsed
-                .symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, symbol)| symbol.name_suffix_matches(&qualified))
-                .collect::<Vec<_>>()
-        } else {
-            exact
-        };
+        if parsed.symbols_truncated {
+            return Err((
+                3,
+                format!(
+                    "cannot establish uniqueness of {qualified}: symbol inventory is truncated; use an exact line range or a freshness-checked selector"
+                ),
+            ));
+        }
+        let matches = crate::model::target_matches(&parsed.symbols, &qualified);
         match matches.as_slice() {
-            [] if parsed.symbols_truncated => {
-                return Err((
-                    3,
-                    format!(
-                        "item not found within the {MAX_DOCUMENT_SYMBOLS}-item structured-document limit: {qualified}; narrow the file with search or an exact line range"
-                    ),
-                ));
-            }
             [] => {
+                if parsed.language == Language::Markdown {
+                    let mut candidates = parsed.symbols.iter().filter(|symbol| {
+                        symbol.path.unquoted_names().as_deref() == Some(qualified.as_str())
+                            || symbol.path.last_name() == Some(qualified.as_str())
+                    });
+                    if let Some(candidate) = candidates.next()
+                        && candidates.next().is_none()
+                    {
+                        let canonical = format!(
+                            "{}::{}",
+                            display_path(&parsed.path, cwd),
+                            candidate.qualified_name
+                        );
+                        return Err((
+                            3,
+                            format!(
+                                "symbol not found: {qualified}; heading segments need bracket quoting; canonical target={} (shell-quote the target)",
+                                quote_metadata(&canonical)
+                            ),
+                        ));
+                    }
+                }
                 return Err((
                     3,
                     format!(
@@ -3386,7 +3409,7 @@ fn render_outline(
     let metadata_warning = possible_prompt_injection(&shown_path)
         || selected.iter().take(shown).any(|symbol| {
             let display_name = outline_display_name(parsed.language, symbol);
-            possible_prompt_injection(display_name)
+            possible_prompt_injection(&display_name)
                 || (*signatures
                     && symbol.signature != display_name
                     && possible_prompt_injection(&symbol.signature))
@@ -3442,7 +3465,7 @@ fn render_outline(
             output,
             "{indent}{} {} L{}:{}-{}:{}",
             symbol.kind,
-            sanitize_metadata(display_name),
+            sanitize_metadata(&display_name),
             symbol.start_row + 1,
             symbol.start_column + 1,
             symbol.end_row + 1,
@@ -3462,13 +3485,13 @@ fn render_outline(
     Ok(shown)
 }
 
-fn outline_display_name(language: Language, symbol: &Symbol) -> &str {
+fn outline_display_name(language: Language, symbol: &Symbol) -> String {
     if language == Language::Markdown && !symbol.signature.is_empty() {
         // Indentation already expresses Markdown ancestry. Repeating every ancestor
         // on every row makes long research-note outlines needlessly hard to scan.
-        &symbol.signature
+        crate::model::SymbolPath::from_names([symbol.signature.clone()]).canonical()
     } else {
-        &symbol.qualified_name
+        symbol.qualified_name.clone()
     }
 }
 
@@ -3571,9 +3594,7 @@ fn render_show_slice(
     if let Some((path, start, end)) = parse_line_range(&target.value) {
         let path = absolute_lexical(Path::new(path), cwd);
         let source = read_source(&path).map_err(input_error)?;
-        if start == 0 || end < start {
-            return usage("line range must satisfy 1 <= START <= END");
-        }
+        let (start, end) = resolve_relative_range(start, end, source_line_count(&source))?;
         let (_, selected) = select_line_range(&source, &path, start, end)?;
         return render_slice(&path, selected, start, slice, cwd, glance, output);
     }
@@ -3608,13 +3629,15 @@ fn render_slice(
     output: &mut dyn Write,
 ) -> CommandResult {
     let count = source_line_count(source);
-    let (_, n) = slice.option_and_lines();
-    if n == 0 || count == 0 {
+    if matches!(slice, ShowFileSlice::Head(0) | ShowFileSlice::Tail(0))
+        || (count == 0 && !matches!(slice, ShowFileSlice::Range(..)))
+    {
         return render_text_range(path, "", 0, 0, cwd, glance, output);
     }
     let (start, end) = match slice {
         ShowFileSlice::Head(n) => (1, n.min(count)),
         ShowFileSlice::Tail(n) => (count.saturating_sub(n) + 1, count),
+        ShowFileSlice::Range(start, end) => resolve_relative_range(start, end, count)?,
     };
     let (_, selected) = select_line_range(source, path, start, end)?;
     render_text_range(
@@ -3936,10 +3959,55 @@ fn target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     split_existing_symbol_target(target, cwd).map(|(path, _)| path)
 }
 
-fn parse_line_range(value: &str) -> Option<(&str, usize, usize)> {
+fn parse_line_range(value: &str) -> Option<(&str, i64, i64)> {
     let (path, range) = value.rsplit_once(':')?;
-    let (start, end) = range.split_once('-')?;
-    Some((path, start.parse().ok()?, end.parse().ok()?))
+    let separator = range
+        .char_indices()
+        .find(|(index, ch)| *index > 0 && *ch == '-')?
+        .0;
+    Some((
+        path,
+        range[..separator].parse().ok()?,
+        range[separator + 1..].parse().ok()?,
+    ))
+}
+
+fn resolve_relative_range(
+    start: i64,
+    end: i64,
+    count: usize,
+) -> Result<(usize, usize), (i32, String)> {
+    if start == 0 || end == 0 {
+        return Err(input_error("range indices are 1-based; zero is invalid"));
+    }
+    let resolve = |index: i64| {
+        if index < 0 {
+            count as i128 + index as i128 + 1
+        } else {
+            index as i128
+        }
+    };
+    let (start, end) = (resolve(start), resolve(end));
+    if start < 1 || start > count as i128 || end < start {
+        return Err(input_error(
+            "range is reversed or starts outside the specified content boundary",
+        ));
+    }
+    Ok((start as usize, end.min(count as i128) as usize))
+}
+
+fn render_relative_line_range(
+    path: &Path,
+    start: i64,
+    end: i64,
+    cwd: &Path,
+    glance: bool,
+    output: &mut dyn Write,
+) -> CommandResult {
+    let source = read_source(path).map_err(input_error)?;
+    let (start, end) = resolve_relative_range(start, end, source_line_count(&source))?;
+    let (_, selected) = select_line_range(&source, path, start, end)?;
+    render_text_range(path, selected, start, end, cwd, glance, output)
 }
 
 fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, String)> {
@@ -4104,7 +4172,7 @@ mod tests {
         .err()
         .expect("head and tail must conflict");
         assert_eq!(error.0, 2);
-        assert!(error.1.contains("at most once per bare FILE"));
+        assert!(error.1.contains("only one of --range, --head, or --tail"));
 
         let batch = parse_show_options(&[
             "setup.py".into(),
@@ -4240,6 +4308,7 @@ mod tests {
             qualified_name: "Workbook::[\"Research state\"]".into(),
             legacy_qualified_name: "Workbook > Research state".into(),
             signature: "Research state".into(),
+            name_position: None,
             start_byte: 0,
             end_byte: 1,
             start_row: 0,
@@ -4250,7 +4319,7 @@ mod tests {
         };
         assert_eq!(
             outline_display_name(Language::Markdown, &symbol),
-            "Research state"
+            "[\"Research state\"]"
         );
         assert_eq!(
             outline_display_name(Language::Rust, &symbol),

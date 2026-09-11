@@ -168,6 +168,7 @@ impl Drop for CapturedStream {
 
 #[derive(Debug)]
 pub struct CaptureResult {
+    pub redirected_stream: Option<StreamKind>,
     pub stdout: CapturedStream,
     pub stderr: CapturedStream,
     pub timeline: Vec<LineMeta>,
@@ -213,6 +214,8 @@ impl CaptureResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirected_stream: Option<StreamKind>,
     #[serde(default = "default_compat_version")]
     pub compat_version: u32,
     #[serde(default)]

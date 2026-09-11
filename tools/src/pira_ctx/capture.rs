@@ -84,6 +84,7 @@ pub fn capture_command(
     cmd: &[String],
     live_store_dir: Option<&Path>,
     announce_live: bool,
+    redirected_stream: Option<StreamKind>,
 ) -> Result<Result<CaptureResult, i32>, String> {
     if cmd.is_empty() {
         return Err(crate::cli::USAGE.to_string());
@@ -118,6 +119,7 @@ pub fn capture_command(
         let store_dir = live_store_dir.ok_or("live announcement requires capture storage")?;
         let (stdout_path, stderr_path) = live_spool_paths(&stdout_spool, &stderr_spool)?;
         let checkpoint = crate::storage::LiveCheckpoint {
+            redirected_stream,
             command: cmd,
             cwd: &cwd,
             start_ms,
@@ -137,16 +139,22 @@ pub fn capture_command(
     } else {
         (None, None)
     };
-    let mut tree = match ProcessTree::spawn_capture(cmd) {
+    let mut tree = match ProcessTree::spawn_capture(cmd, redirected_stream) {
         Ok(tree) => tree,
         Err(error) if error.starts_with("__EXIT127__ ") => {
             remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
-            eprintln!("pira_ctx: {}", error.trim_start_matches("__EXIT127__ "));
+            crate::util::diagnostic_line(&format!(
+                "pira_ctx: {}",
+                error.trim_start_matches("__EXIT127__ ")
+            ));
             return Ok(Err(127));
         }
         Err(error) if error.starts_with("__EXIT126__ ") => {
             remove_initial_checkpoint(live_store_dir, initial_live_id.as_deref());
-            eprintln!("pira_ctx: {}", error.trim_start_matches("__EXIT126__ "));
+            crate::util::diagnostic_line(&format!(
+                "pira_ctx: {}",
+                error.trim_start_matches("__EXIT126__ ")
+            ));
             return Ok(Err(126));
         }
         Err(error) => {
@@ -154,16 +162,16 @@ pub fn capture_command(
             return Err(error);
         }
     };
-    let child_stdout = tree
-        .child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture stdout".to_string())?;
-    let child_stderr = tree
-        .child
-        .stderr
-        .take()
-        .ok_or_else(|| "failed to capture stderr".to_string())?;
+    let child_stdout: Box<dyn Read + Send> = match tree.child.stdout.take() {
+        Some(stream) => Box::new(stream),
+        None if redirected_stream == Some(StreamKind::Stdout) => Box::new(io::empty()),
+        None => return Err("failed to capture stdout".into()),
+    };
+    let child_stderr: Box<dyn Read + Send> = match tree.child.stderr.take() {
+        Some(stream) => Box::new(stream),
+        None if redirected_stream == Some(StreamKind::Stderr) => Box::new(io::empty()),
+        None => return Err("failed to capture stderr".into()),
+    };
     let collected = Arc::new(Mutex::new(CollectedLines {
         timeline: Vec::new(),
         total: 0,
@@ -217,6 +225,7 @@ pub fn capture_command(
         let collected = Arc::clone(&collected);
         let shared_live_id = Arc::clone(&shared_live_id);
         thread::spawn(move || {
+            let mut live_owner = live_owner;
             let mut live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
             let mut generation = u64::from(live_id.is_some());
             let mut last_progress = None;
@@ -227,6 +236,7 @@ pub fn capture_command(
                 }
                 let snapshot = {
                     let Ok(state) = collected.lock() else {
+                        crate::util::diagnostic_line("pira_ctx: warning: live checkpointing stopped: capture state lock poisoned");
                         break;
                     };
                     let progress = (
@@ -242,8 +252,12 @@ pub fn capture_command(
                     state.clone()
                 };
                 let paths = live_spool_paths(&stdout_spool, &stderr_spool);
-                let Ok((stdout_path, stderr_path)) = paths else {
-                    break;
+                let (stdout_path, stderr_path) = match paths {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        crate::util::diagnostic_line(&format!("pira_ctx: warning: live checkpointing stopped: {error}"));
+                        break;
+                    }
                 };
                 generation = generation.saturating_add(1);
                 let mut timeline = snapshot.timeline.clone();
@@ -281,6 +295,7 @@ pub fn capture_command(
                     }
                 }
                 let checkpoint = crate::storage::LiveCheckpoint {
+                    redirected_stream,
                     command: &command,
                     cwd: &cwd,
                     start_ms,
@@ -295,23 +310,29 @@ pub fn capture_command(
                     timeline: &timeline,
                     timeline_truncated: snapshot.truncated,
                 };
-                match crate::storage::write_live_checkpoint(
-                    &store_dir,
-                    live_id.as_deref(),
-                    generation,
-                    announce_live,
-                    &checkpoint,
-                ) {
+                let published = if live_id.is_none() {
+                    crate::storage::begin_live_capture(&store_dir, &checkpoint).map(|(id, owner)| {
+                        live_owner = Some(owner);
+                        generation = 1;
+                        id
+                    })
+                } else {
+                    crate::storage::write_live_checkpoint(&store_dir, live_id.as_deref(), generation, true, &checkpoint)
+                };
+                match published {
                     Ok(id) => {
                         if let Ok(mut shared) = shared_live_id.lock() {
                             *shared = Some(id.clone());
                         }
                         live_id = Some(id);
                     }
-                    Err(_) => break,
+                    Err(error) => {
+                        crate::util::diagnostic_line(&format!("pira_ctx: warning: live checkpointing stopped; last snapshot may be stale: {error}"));
+                        break;
+                    }
                 }
             }
-            live_id
+            (live_id, live_owner)
         })
     });
     let mut live_announced = false;
@@ -322,7 +343,10 @@ pub fn capture_command(
             && elapsed.elapsed().as_millis() >= LIVE_ANNOUNCEMENT_DELAY_MS
             && let Some(result_id) = initial_live_id.as_deref()
         {
-            eprintln!("LIVE | result={result_id}");
+            let display_id = live_store_dir
+                .map(|dir| crate::storage::display_result_id(dir, result_id))
+                .unwrap_or_else(|| result_id.to_string());
+            eprintln!("LIVE | result={display_id}");
             live_announced = true;
         }
         let active_live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
@@ -340,9 +364,14 @@ pub fn capture_command(
         thread::sleep(Duration::from_millis(CAPTURE_CONTROL_POLL_MS));
     };
     let _ = checkpoint_stop.send(());
-    let live_id = checkpoint_handle
-        .and_then(|handle| handle.join().ok())
-        .flatten();
+    let (live_id, live_owner) = checkpoint_handle
+        .map(|handle| {
+            handle
+                .join()
+                .map_err(|_| "live checkpoint worker panicked".to_string())
+        })
+        .transpose()?
+        .unwrap_or((None, None));
     let end_ms = util::millis(SystemTime::now());
     let stdout_analysis = join_reader(stdout_handle, "stdout")?;
     let stderr_analysis = join_reader(stderr_handle, "stderr")?;
@@ -356,6 +385,7 @@ pub fn capture_command(
     let stderr = finish_spool(stderr_spool, stderr_analysis, "stderr")?;
     let exit_code = util::status_code(status);
     let capture = CaptureResult {
+        redirected_stream,
         stdout,
         stderr,
         timeline: collected.timeline,

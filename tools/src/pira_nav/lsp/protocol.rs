@@ -490,11 +490,22 @@ fn push_document_symbol(
     let qualified = qualify_lsp(parent, &name, language);
     let (start_byte, end_byte, start_row, start_column, end_row, end_column) =
         positions.range(required(value, "range")?)?;
+    let name_position = value
+        .get("selectionRange")
+        .map(|selection| {
+            let (selected_start, selected_end, row, column, _, _) = positions.range(selection)?;
+            if selected_start < start_byte || selected_end > end_byte {
+                return Err("LSP symbol selectionRange is outside its range".to_string());
+            }
+            Ok((row, column))
+        })
+        .transpose()?;
     output.push(Symbol {
         kind: symbol_kind(value.get("kind").and_then(Value::as_u64).unwrap_or(0)),
         path: qualified.path.clone(),
         qualified_name: qualified.path.canonical(),
         legacy_qualified_name: qualified.legacy.clone(),
+        name_position,
         signature: bounded_text(
             value.get("detail").and_then(Value::as_str).unwrap_or(&name),
             4 * 1024,
@@ -548,6 +559,7 @@ fn push_flat_symbol(
         path: qualified.path.clone(),
         qualified_name: qualified.path.canonical(),
         legacy_qualified_name: qualified.legacy,
+        name_position: None,
         signature: bounded_text(&name, 4 * 1024),
         start_byte,
         end_byte,
@@ -875,6 +887,30 @@ mod tests {
     fn file_uri_escapes_spaces_and_unicode() {
         let uri = file_uri(std::path::Path::new("/tmp/naïve file.rs")).unwrap();
         assert_eq!(uri, "file:///tmp/na%C3%AFve%20file.rs");
+    }
+
+    #[test]
+    fn symbol_name_positions_use_validated_selection_ranges() {
+        let source = "/*é*/ fn f() {}\n";
+        let mut value = serde_json::json!([{
+            "name": "f", "kind": 12,
+            "range": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 14}},
+            "selectionRange": {"start": {"line": 0, "character": 9}, "end": {"line": 0, "character": 10}}
+        }]);
+        let parse = |v: &serde_json::Value| {
+            parse_document_symbols(
+                v,
+                "file:///tmp/name.rs",
+                source,
+                Language::Rust,
+                PositionEncoding::Utf16,
+            )
+        };
+        assert_eq!(parse(&value).unwrap()[0].name_position, Some((0, 10)));
+        value[0]["selectionRange"]["start"]["character"] = serde_json::json!(0);
+        assert!(parse(&value).err().unwrap().contains("outside its range"));
+        value[0].as_object_mut().unwrap().remove("selectionRange");
+        assert_eq!(parse(&value).unwrap()[0].name_position, None);
     }
 
     #[test]

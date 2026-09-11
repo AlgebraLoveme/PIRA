@@ -243,8 +243,15 @@ fn run_search(
 ) -> Result<i32, String> {
     let expression = match (field, pattern) {
         (Some(field), Some(pattern)) => Some((
-            field,
+            Some(field),
             Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?,
+        )),
+        (None, Some(query)) => Some((
+            None,
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| format!("invalid query: {error}"))?,
         )),
         (None, None) => None,
         _ => return Err("search requires --field and --regex together".into()),
@@ -255,7 +262,9 @@ fn run_search(
             return Ok(false);
         }
         match expression.as_ref() {
-            Some((field, regex)) => record_matches(record, *field, regex),
+            Some((Some(field), regex)) => record_matches(record, *field, regex),
+            Some((None, regex)) => Ok(regex.is_match(&record.context)
+                || record.choices.iter().any(|choice| regex.is_match(choice))),
             None => Ok(true),
         }
     })?;
@@ -286,8 +295,14 @@ fn run_search(
         }
         for record in matches {
             let evidence = expression.as_ref().and_then(|(field, regex)| match field {
-                SearchField::Context => match_excerpt(&record.context, regex),
-                SearchField::Choice => record
+                None => match_excerpt(&record.context, regex).or_else(|| {
+                    record
+                        .choices
+                        .iter()
+                        .find_map(|choice| match_excerpt(choice, regex))
+                }),
+                Some(SearchField::Context) => match_excerpt(&record.context, regex),
+                Some(SearchField::Choice) => record
                     .choices
                     .iter()
                     .find_map(|choice| match_excerpt(choice, regex)),

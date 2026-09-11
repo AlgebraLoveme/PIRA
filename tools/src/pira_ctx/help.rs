@@ -1,15 +1,15 @@
-pub const GLOBAL: &str = r#"pira_ctx bounds command output and retains compacted output for exact local recovery.
+pub const GLOBAL: &str = r#"pira_ctx bounds command output and retains it for exact recovery.
 
 Choosing a command:
   Run a PROGRAM:
     auto       Default; name optional. Print short output or retain it and return a compact view.
-    check      Return only PASS/FAIL/CANCELLED and child status.
+    check      Return status; failed captures also include bounded diagnostic evidence.
     exact      Request original output; highly repetitive non-interactive output may be retained.
-    capture    Always retain output up to the configured space ceiling (`summary` is an alias).
+    capture    Always retain output up to the configured space ceiling.
     batch      Run several independent intent-tagged commands.
 
   Inspect a retained RESULT:
-    search     Locate wording; start here for targeted evidence.
+    search     Locate wording when the evidence location is unknown.
     range      Return the smallest sufficient exact line range.
     transform  Deterministic filtering, counting, aggregation, or slicing.
     exec       Custom Python over one or several labeled captures.
@@ -25,23 +25,26 @@ Choosing a command:
     prune / forget           Enforce retention or explicitly remove stored data/history.
 
 Common forms:
-  pira_ctx [auto] --intent TEXT [--interest REGEX] -- PROGRAM [ARG...]
-  pira_ctx exact|check|capture --intent TEXT -- PROGRAM [ARG...]
+  pira_ctx [auto|check|capture|exact] --intent TEXT -- PROGRAM [ARG...]
+  For auto/capture, add --interest REGEX before -- when relevant wording is known.
   pira_ctx search RESULT QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
-  pira_ctx range RESULT START_LINE END_LINE | RESULT START:END
-  pira_ctx transform RESULT OPERATION [ARGS...]
+  pira_ctx range RESULT START:END
   pira_ctx exec RESULT --code CODE [--intent TEXT]
-  pira_ctx exec --input NAME=RESULT [--input NAME=RESULT ...] --file - [--intent TEXT]
   pira_ctx watch --capture RESULT --deadline 2h [WATCH OPTIONS]
-  pira_ctx watch --deadline 2h [WATCH OPTIONS] -- PROBE [ARG...]
-  pira_ctx watch WATCH_ID --latest|--stop
   pira_ctx cancel RESULT|--current
   pira_ctx stats --brief RESULT...
   pira_ctx batch [--store-dir PATH] SPEC_FILE [--intent TEXT]
 
-RESULT is --last, an ID/prefix, a .piractx file, or a path. Prefer an explicit ID; --last means the
-latest completed capture in the current workspace. INTENT is a prospective single-line purpose of
-at most 256 UTF-8 bytes. `--store-dir PATH` is accepted by storage commands.
+RESULT is a displayed @suffix (current workspace/session), full ID/prefix, .piractx file, or path.
+Short handles reserve a full ID permanently; collisions lengthen new handles. Pruning never
+reassigns them. Use full IDs across sessions or for durable references; stats RESULT reveals them.
+Without a detected session or writable reservation store, output uses full IDs.
+INTENT is a prospective single-line purpose of at most 256 UTF-8 bytes.
+`--store-dir PATH` is accepted by storage commands.
+
+Auto/exact preserve each directly redirected PROGRAM stream exactly, without retaining it. The
+other piped stream still uses normal routing; reports go to that visible stream. Both redirected
+or a caller TTY streams unchanged. Explicit check/capture still return status/reports.
 
 Automatic routing does not hide output without a recovery path: output is either printed exactly or
 retained before a compact view and ID are printed. Hard ceilings use PIRA_CTX_MAX_RETAINED_BYTES and
@@ -51,7 +54,7 @@ unsanitized. Prefer the targeted commands above over raw for agent analysis.
 
 Non-interactive check/capture publish a discoverable live ID after a brief debounce when still running;
 automatic mode publishes a silent read-only checkpoint after about 30 seconds. Inspect an explicit ID without
-blocking; --last remains completed-only. Workspace identity is the nearest Git root, otherwise cwd;
+blocking. Workspace identity is the nearest Git root, otherwise cwd;
 the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
 
 SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--`, and every later
@@ -81,6 +84,11 @@ WHEN TO USE
   Use for most non-interactive external commands when output size and importance are unknown.
   Use check when only status matters, exact to request original output, or capture when retention is
   mandatory. `auto` may be omitted; both forms are equivalent.
+
+Directly redirected streams pass through unchanged: no compaction, retention, or counts. The other
+piped stream retains normal routing, including synopses. Mixed captures identify the unretained
+stream; retrieval covers captured output only. For redirection hidden behind a pipe, place it inside
+PROGRAM. Wrapper diagnostics never enter data files.
 
 USAGE
   pira_ctx [auto] [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
@@ -132,6 +140,12 @@ WHEN TO USE
   Non-interactive repetitive output may still auto-switch. If that happens and every byte must enter
   output, use the returned capture ID with raw. Use automatic mode otherwise.
 
+A directly redirected stream is inherited unchanged, without compaction, retention, or byte counts.
+The other piped stream retains normal routing; any synopsis is sent there, never into the data file.
+Both redirected streams pass through. Mixed captures identify the unretained stream; retrieval covers
+only captured output. Pipes cannot identify model vs file-writing consumers; place hidden redirection
+inside PROGRAM. Wrapper diagnostics never enter data files.
+
 USAGE
   pira_ctx exact [--store-dir PATH] --intent TEXT -- PROGRAM [ARG...]
 
@@ -148,10 +162,11 @@ EXAMPLES
   pira_ctx exact --intent "Run interactive debugger" -- rust-gdb target/debug/app
   pira_ctx raw CAPTURE_ID  # after an announced auto-switch, if complete output is still needed"#;
 
-const CHECK: &str = r#"pira_ctx check — retain a completed job and print only process status
+const CHECK: &str = r#"pira_ctx check — retain a completed job and report process status
 
 WHEN TO USE
-  Use for builds, tests, lint, compilation, or validation when the immediate decision is pass/fail.
+  Use for builds, tests, lint, compilation, or validation when success status suffices;
+  failures also expose bounded diagnostic evidence. Use auto when success output matters too.
 
 USAGE
   pira_ctx check [--store-dir PATH] --intent TEXT -- PROGRAM [ARG...]
@@ -159,11 +174,15 @@ USAGE
 OUTPUT AND STORAGE
   If a non-interactive invocation remains active after a brief debounce, it publishes
   `LIVE | result=ID` on wrapper stderr after its empty live checkpoint is discoverable. Every completed
-  child is retained. Final output is one line:
+  child is retained. Final status is:
     PASS|FAIL|CANCELLED | exit=CODE | duration=Nms | result=ID
   PASS/FAIL depends only on child exit status; CANCELLED records an accepted cancellation request.
   Labels do not independently verify the PROGRAM's claim.
-  Spawn failures print result=- and have no capture.
+  A failed, non-cancelled child with a capture adds the existing bounded synopsis (at most 16 KiB
+  after the status line), including structured JSON when applicable, content/retention warnings,
+  and retrieval hints only for omitted or clipped output. Exact bytes remain retained up to the
+  retention ceiling. Success and cancellation remain status-only. Spawn failures print result=-
+  and have no capture.
 
 EXIT STATUS
   Preserves the child status. Missing/non-executable commands use 127/126; wrapper failures use 125.
@@ -175,7 +194,7 @@ const CAPTURE: &str = r#"pira_ctx capture — always retain completed command ou
 
 WHEN TO USE
   Use when output retention is mandatory up to the configured space ceiling.
-  Use automatic mode when unconditional retention is unnecessary. `summary` is an alias.
+  Use automatic mode when unconditional retention is unnecessary.
 
 USAGE
   pira_ctx capture [--store-dir PATH] --intent TEXT [--keyword QUERY ...] [--interest REGEX] -- PROGRAM [ARG...]
@@ -306,7 +325,7 @@ USAGE
 OPTIONS AND OUTPUT
   Literal matching is Unicode case-insensitive. Only when it has no literal hits, a lexical fallback
   may return related lines. --regex uses Rust regex syntax and is case-sensitive unless the pattern
-  requests otherwise. -e/--query adds an independently ranked query, up to 16 total. --limit N
+  requests otherwise. -e adds an independently ranked query, up to 16 total. --limit N
   selects up to N hits per query (default 5, range 1..100). Rows contain line number, stream,
   and terminal-sanitized text, with query labels for multiple queries.
   Long matching lines show a match-local excerpt and receive a bounded length penalty. A warning
@@ -316,32 +335,42 @@ OPTIONS AND OUTPUT
   cap. Limit/byte omissions and incomplete coverage are reported. Complete lines up to 16 MiB
   are searched; larger lines are skipped with complete=0. Index/retention truncation is disclosed.
   Use range for exact unsanitized bytes, or exec for analysis beyond search coverage.
+  A mixed capture covers only its captured stream; stats reports the redirected/unretained stream.
 
 EXIT STATUS
   Returns 0 even with no hits; invalid queries, missing results, or wrapper failures use 125.
 
 EXAMPLE
-  pira_ctx search 20260712-052432 -e error -e failed --context 2"#;
+  pira_ctx search 20260712-052432 -e error -e failed --context 2
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const RANGE: &str = r#"pira_ctx range — retrieve a small exact range from a capture timeline
 
 WHEN TO USE
-  Use after search identifies relevant line numbers. Request the smallest sufficient range; use raw
+  Use when the needed line positions are known. Request the smallest sufficient range; use raw
   only when complete exact retained bytes are required.
 
 USAGE
-  pira_ctx range [--store-dir PATH] RESULT START_LINE END_LINE
   pira_ctx range [--store-dir PATH] RESULT START:END
 
 BEHAVIOR
   Lines are 1-based and inclusive in observed merged stdout/stderr timeline order. Negative numbers count
-  backward from the end; zero is invalid, and normalized start greater than end is an error.
+  backward from the end: -1 is the last line, -2 the previous line. Positive and negative bounds may
+  be mixed; zero is invalid, and normalized start greater than end is an error.
   Out-of-bounds ranges are clipped without a separate notice. Exact stored bytes are written without
   display sanitization or advisory warnings and remain untrusted PROGRAM data. A capture with a
   truncated index cannot use range.
 
 EXAMPLE
-  pira_ctx range 20260712-052432 118 126"#;
+  pira_ctx range RESULT 118:126
+  pira_ctx range @a1b2c3 -5:-1    # last five lines of this capture
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const RAW: &str = r#"pira_ctx raw — reconstruct retained capture bytes exactly
 
@@ -349,6 +378,8 @@ WHEN TO USE
   Use when complete exact bytes retained by a capture are required by the user or a downstream
   process. For agent analysis, prefer search, a narrow range, transform, or exec so the full capture
   does not re-enter active context.
+
+Mixed captures contain only the captured stream; requesting the redirected stream errors.
 
 USAGE
   pira_ctx raw [--store-dir PATH] RESULT [--stdout | --stderr]
@@ -362,21 +393,24 @@ BEHAVIOR
 
 EXAMPLES
   pira_ctx raw 20260712-052432 --stderr
-  pira_ctx raw 20260712-052432 --stdout >complete.stdout"#;
+  pira_ctx raw 20260712-052432 --stdout >complete.stdout
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const TRANSFORM: &str = r#"pira_ctx transform — deterministically process stored capture lines
 
 WHEN TO USE
   Use for filtering, deduplication, counting, grouping, sorting, numeric aggregation, JSONL fields,
   columns, streams, or bounded slicing. Use exec when custom Python or cross-line logic is clearer.
+  Requires a complete line index; for truncated indexes use raw --stdout/--stderr to read retained bytes.
 
 USAGE
   pira_ctx transform [--store-dir PATH] RESULT [--plan FILE] [--match REGEX ...]
                      [--exclude REGEX ...] [--unique] [--count] [--head N] [--tail N]
 
 DIRECT OPTIONS
-  Positional head N, tail N, count, and unique are aliases for the corresponding flags.
-  Aliases preserve the fixed operation order below, not argument order.
   Lines are replacement-decoded text with trailing CR/LF removed. Regexes use Rust syntax, are
   case-sensitive by default, and accept inline flags such as (?i). Repeated --match values are all
   required; any --exclude match removes a line. Operations apply as match, exclude, unique, head,
@@ -402,7 +436,11 @@ PLAN FILE
 EXAMPLES
   pira_ctx transform RESULT --match 'FAILED|ERROR' --count
   pira_ctx transform RESULT --plan analysis.json
-  analysis.json: {"steps":[{"op":"json_field","field":"value"},{"op":"sum"}]}"#;
+  analysis.json: {"steps":[{"op":"json_field","field":"value"},{"op":"sum"}]}
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const EXEC: &str = r#"pira_ctx exec — analyze a stored capture with explicit Python 3 code
 
@@ -411,6 +449,8 @@ WHEN TO USE
   needed for the current decision: aggregate large collections and prefer counts/coordinates over
   matching source text unless that text is itself the answer. Retrieve a narrow unresolved
   diagnostic afterward. Analysis output itself follows non-interactive automatic routing.
+
+Exec requires both streams retained; for mixed captures use search/range or raw on the captured stream.
 
 USAGE
   pira_ctx exec [--store-dir PATH] RESULT
@@ -449,11 +489,15 @@ BEHAVIOR
   sandboxed. --intent is an optional label because exec analyzes already captured data.
 
 EXAMPLES
-  pira_ctx exec --last --code 'print(MSG.count("FAILED"))'
+  pira_ctx exec @a1b2c3 --code 'print(MSG.count("FAILED"))'
   pira_ctx exec --input build=ID1 --input tests=ID2 --intent "Compare failures" --file - <<'PY'
   print({name: item["text"].count("FAILED") for name, item in CAPTURES.items()})
   PY
-  pira_ctx exec RESULT --intent "Extract errors" --file analysis.py"#;
+  pira_ctx exec RESULT --intent "Extract errors" --file analysis.py
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const RECAP: &str = r#"pira_ctx recap — restore recent same-thread command events after compaction
 
@@ -538,8 +582,12 @@ OUTPUT
 
 EXAMPLES
   pira_ctx stats
-  pira_ctx stats --last
-  pira_ctx stats --brief RESULT_A RESULT_B"#;
+  pira_ctx stats --id -1
+  pira_ctx stats --brief RESULT_A RESULT_B
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const COMMAND: &str = r#"pira_ctx command — retrieve the original invocation for a capture
 
@@ -556,7 +604,11 @@ SECURITY
   command only when invocation traceability is needed; list and stats remain redacted.
 
 EXAMPLE
-  pira_ctx command 20260712-052432"#;
+  pira_ctx command 20260712-052432
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const VERIFY: &str = r#"pira_ctx verify — verify a stored capture's structure and stream integrity
 
@@ -570,7 +622,11 @@ BEHAVIOR
   results, or wrapper failures use exit 125.
 
 EXAMPLE
-  pira_ctx verify 20260712-052432"#;
+  pira_ctx verify 20260712-052432
+
+RESULT
+  Use the displayed @suffix in this workspace/session; use the full ID across sessions.
+  Short handles never retarget. stats RESULT reveals the full ID."#;
 
 const LIST: &str = r#"pira_ctx list — list stored captures and watches
 
