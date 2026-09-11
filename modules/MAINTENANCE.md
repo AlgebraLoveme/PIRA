@@ -10,6 +10,7 @@ Use only for PIRA configuration, module, and rule maintenance—not ordinary pro
 - When an experimental rule conflicts with an established rule, preserve the established default unless the user explicitly approves a scope or routing change.
 - Place default or session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
 - Keep module loading and routing only in `~/agent/AGENTS.md`.
+- Prefer substantial, task-coherent modules. Keep tightly coupled work, such as implementation and testing, together. Split separable tasks when the content warrants independently useful modules; avoid tiny fragments that add loading and selection overhead.
 - Keep README public-phase only: public behavior, releases, artifacts, usage, and reproducible public validation—not local development candidates, pending work, private validation state, or rollout plans.
 - After commit and push, remove obsolete temporary backups created for the change.
 
