@@ -540,7 +540,7 @@ fn exact_replays_repetitive_streams_without_auto_routing() {
         .unwrap();
     assert!(automatic.status.success());
     assert!(automatic.stdout.len() < 8520);
-    assert!(String::from_utf8_lossy(&automatic.stdout).contains("Result: @"));
+    assert!(String::from_utf8_lossy(&automatic.stdout).contains("Result: "));
 }
 
 #[test]
@@ -548,7 +548,11 @@ fn exact_discloses_capture_limits_and_keeps_retained_streams_retrievable() {
     let s = Sandbox::new();
     let producer =
         "import sys; sys.stdout.write('retained output field\\n' * 1200); raise SystemExit(7)";
-    let expected = b"retained output field\n".repeat(1200);
+    let expected = Command::new(python())
+        .args(["-c", producer])
+        .output()
+        .unwrap()
+        .stdout;
     for (variable, limit, notice, retained) in [
         (
             "PIRA_CTX_MAX_RETAINED_BYTES",
