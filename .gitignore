@@ -43,3 +43,6 @@ tools/build/*
 # Local captures may be created outside the tool tree.
 *.piractx
 /pira_ctx/
+
+# Local ctx benchmark output
+/ctx_short_id_benchmark.json

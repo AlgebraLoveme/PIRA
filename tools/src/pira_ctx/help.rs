@@ -4,7 +4,7 @@ Choosing a command:
   Run a PROGRAM:
     auto       Default; name optional. Print short output or retain it and return a compact view.
     check      Return status; failed captures also include bounded diagnostic evidence.
-    exact      Request original output; highly repetitive non-interactive output may be retained.
+    exact      Replay original output without automatic compaction; capture limits still apply.
     capture    Always retain output up to the configured space ceiling.
     batch      Run several independent intent-tagged commands.
 
@@ -133,15 +133,14 @@ EXAMPLE
   pira_ctx --intent "Inspect repository status" -- git status --short
   pira_ctx --intent "Run tests" --interest '(?i)error|failed' -- cargo test"#;
 
-const EXACT: &str = r#"pira_ctx exact — request original output with a repetition guard
+const EXACT: &str = r#"pira_ctx exact — replay original output without automatic compaction
 
 WHEN TO USE
   Use when original file/output content is needed or the child requires interactive terminal I/O.
-  Non-interactive repetitive output may still auto-switch. If that happens and every byte must enter
-  output, use the returned capture ID with raw. Use automatic mode otherwise.
+  Repetitive output is not summarized. Use automatic mode when complete output is not needed.
 
 A directly redirected stream is inherited unchanged, without compaction, retention, or byte counts.
-The other piped stream retains normal routing; any synopsis is sent there, never into the data file.
+The other piped stream is replayed exactly; any limit/cancellation report goes there, never into the data file.
 Both redirected streams pass through. Mixed captures identify the unretained stream; retrieval covers
 only captured output. Pipes cannot identify model vs file-writing consumers; place hidden redirection
 inside PROGRAM. Wrapper diagnostics never enter data files.
@@ -151,16 +150,16 @@ USAGE
 
 BEHAVIOR
   pira_ctx does not allocate a terminal. With a caller-provided terminal, stdout/stderr stream
-  unchanged. Without one, output is buffered and replayed exactly unless textual output is both at
-  least 4 KiB and at least 40 eligible lines, with substantial repeated-form coverage and a dominant
-  repeated form. Retention or line-index truncation also forces an auto-switch so buffered exact
-  replay never silently drops retained bytes. An auto-switch stores retained streams, prints a
-  notice, synopsis, and capture ID, and preserves child status.
+  unchanged. Without one, output is buffered and replayed exactly regardless of repetition or size,
+  within capture limits. Cancellation or retention/index truncation instead stores retained streams
+  and prints an explicit report with a synopsis and capture ID, never a misleading partial exact
+  replay. Child status is preserved. After index truncation, raw --stdout/--stderr retrieves complete
+  retained streams; bytes beyond the retention ceiling cannot be recovered.
 
 EXAMPLES
   pira_ctx exact --intent "Read source for editing" -- sed -n '1,160p' src/main.rs
   pira_ctx exact --intent "Run interactive debugger" -- rust-gdb target/debug/app
-  pira_ctx raw CAPTURE_ID  # after an announced auto-switch, if complete output is still needed"#;
+  pira_ctx raw CAPTURE_ID --stdout  # retrieve a retained stream after an index-limit report"#;
 
 const CHECK: &str = r#"pira_ctx check — retain a completed job and report process status
 

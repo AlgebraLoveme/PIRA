@@ -23,8 +23,8 @@ use storage::{StoredResult, effective_store_dir};
 const AUTO_SUMMARY_THRESHOLD: u64 = 4 * 1024;
 const AUTO_DENSE_EXACT_MAX_BYTES: u64 = 16 * 1024;
 const AUTO_DENSE_EXACT_MAX_LINES: usize = 64;
-const EXACT_GUARD_MIN_LINES: usize = 40;
-const EXACT_GUARD_MAX_LINES: usize = 20_000;
+const REPETITION_MIN_LINES: usize = 40;
+const REPETITION_MAX_LINES: usize = 20_000;
 const MAX_IMPORTANT_LINES: usize = 10;
 const MAX_JSON_IMPORTANT_LINES: usize = 4;
 const MAX_JSON_SYNOPSIS_LINES: usize = 16;
@@ -157,7 +157,7 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    if should_guard_exact(&capture)? {
+    if capture.cancelled || capture.retention_truncated || capture.timeline_truncated {
         score_capture(config, &mut capture, &ranking)?;
         let store_dir = effective_store_dir(config.store_dir.as_ref())?;
         let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
@@ -172,20 +172,14 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             notice.line("Cancelled command: partial captured output retained.")?;
         } else if capture.retention_truncated {
             notice.line(&format!(
-                "Auto-switched exact -> retained report: kept {} of {} observed bytes after the output-space ceiling was reached.",
+                "Exact output incomplete: kept {} of {} observed bytes after the output-space ceiling was reached; retained output is available through raw.",
                 capture.total_bytes(),
                 capture.observed_bytes()
             ))?;
-        } else if capture.timeline_truncated {
-            notice.line(&format!(
-                "Auto-switched exact -> retained report: output exceeded the {}-line index ceiling; complete retained streams remain available through raw --stdout/--stderr.",
-                capture.timeline.len()
-            ))?;
         } else {
             notice.line(&format!(
-                "Auto-switched exact -> summary: non-interactive output was {} B/{} lines and highly repetitive; captured output retained.",
-                capture.total_bytes(),
-                capture.total_lines
+                "Exact replay unavailable: output exceeded the {}-line index ceiling; complete retained streams remain available through raw --stdout/--stderr.",
+                capture.timeline.len()
             ))?;
         }
         print_summary(&stored.metadata, &capture)?;
@@ -228,12 +222,9 @@ fn run_streaming_exact(config: &Config) -> Result<i32, String> {
     }
 }
 
-fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
-    if capture.cancelled || capture.retention_truncated || capture.timeline_truncated {
-        return Ok(true);
-    }
+fn capture_is_repetitive(capture: &CaptureResult) -> Result<bool, String> {
     if capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
-        || capture.total_lines < EXACT_GUARD_MIN_LINES
+        || capture.total_lines < REPETITION_MIN_LINES
         || capture.stdout.binary
         || capture.stderr.binary
         || capture.stdout.non_utf8
@@ -244,24 +235,24 @@ fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
     let mut readers = capture.readers()?;
     let mut counts = HashMap::<String, usize>::new();
     let mut eligible = 0_usize;
-    for line in capture.timeline.iter().take(EXACT_GUARD_MAX_LINES) {
+    for line in capture.timeline.iter().take(REPETITION_MAX_LINES) {
         if !(12..=4096).contains(&line.length) {
             continue;
         }
         let text = readers.read_display_line(line)?;
-        let Some(key) = exact_repetition_key(&text) else {
+        let Some(key) = repetition_key(&text) else {
             continue;
         };
         eligible += 1;
         *counts.entry(key).or_default() += 1;
     }
-    if eligible < EXACT_GUARD_MIN_LINES {
+    if eligible < REPETITION_MIN_LINES {
         return Ok(false);
     }
     Ok(is_highly_repetitive(&counts, eligible))
 }
 
-fn exact_repetition_key(text: &str) -> Option<String> {
+fn repetition_key(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.chars().count() < 12 {
         return None;
@@ -420,7 +411,7 @@ fn should_retain_output(capture: &CaptureResult) -> Result<bool, String> {
     let repetitive = capture.total_bytes() > AUTO_SUMMARY_THRESHOLD
         && capture.total_bytes() <= AUTO_DENSE_EXACT_MAX_BYTES
         && capture.total_lines <= AUTO_DENSE_EXACT_MAX_LINES
-        && should_guard_exact(capture)?;
+        && capture_is_repetitive(capture)?;
     Ok(retain_text_shape(
         capture.total_bytes(),
         capture.total_lines,
@@ -1887,20 +1878,20 @@ mod output_format_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        exact_repetition_key, is_highly_repetitive, parse_history_time, retain_text_shape,
+        is_highly_repetitive, parse_history_time, repetition_key, retain_text_shape,
         stream_description,
     };
     use std::collections::HashMap;
 
     #[test]
-    fn exact_repetition_key_normalizes_dynamic_log_fields() {
+    fn repetition_key_normalizes_dynamic_log_fields() {
         let first = r#"{"time":"2026-07-11T14:43:02.198528+08:00","level":"INFO","msg":"loading plugin","id":"alpha"}"#;
         let second = r#"{"time":"2026-07-12T09:04:51.777001+08:00","level":"INFO","msg":"loading plugin","id":"beta"}"#;
-        assert_eq!(exact_repetition_key(first), exact_repetition_key(second));
+        assert_eq!(repetition_key(first), repetition_key(second));
     }
 
     #[test]
-    fn exact_repetition_policy_requires_broad_and_dominant_repetition() {
+    fn automatic_repetition_policy_requires_broad_and_dominant_repetition() {
         let repetitive = HashMap::from([
             ("common".to_string(), 60),
             ("secondary".to_string(), 20),

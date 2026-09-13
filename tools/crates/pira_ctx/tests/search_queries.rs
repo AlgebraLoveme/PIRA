@@ -496,6 +496,111 @@ fn failed_check_discloses_retention_limits_and_handles_empty_output() {
 }
 
 #[test]
+fn exact_replays_repetitive_streams_without_auto_routing() {
+    let s = Sandbox::new();
+    for producer in [
+        "for i in range(60): print(f'row {i:03d}: ' + 'same diagnostic field ' * 6)",
+        "import os; os.write(1, b'alpha field ' * 12000); os.write(2, b'repeated warning field\\r\\n' * 100); raise SystemExit(7)",
+    ] {
+        let expected = Command::new(python())
+            .args(["-c", producer])
+            .output()
+            .unwrap();
+        let actual = Command::new(binary())
+            .args([
+                "exact",
+                "--intent",
+                "Verify complete repetitive output",
+                "--store-dir",
+            ])
+            .arg(s.path())
+            .args(["--", python(), "-c", producer])
+            .output()
+            .unwrap();
+        assert_eq!(actual.status.code(), expected.status.code());
+        assert_eq!(actual.stdout.len(), expected.stdout.len());
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+    }
+    let automatic = Command::new(binary())
+        .args([
+            "auto",
+            "--intent",
+            "Verify automatic compaction remains",
+            "--store-dir",
+        ])
+        .arg(s.path())
+        .args([
+            "--",
+            python(),
+            "-c",
+            "for i in range(60): print(f'row {i:03d}: ' + 'same diagnostic field ' * 6)",
+        ])
+        .output()
+        .unwrap();
+    assert!(automatic.status.success());
+    assert!(automatic.stdout.len() < 8520);
+    assert!(String::from_utf8_lossy(&automatic.stdout).contains("Result: @"));
+}
+
+#[test]
+fn exact_discloses_capture_limits_and_keeps_retained_streams_retrievable() {
+    let s = Sandbox::new();
+    let producer =
+        "import sys; sys.stdout.write('retained output field\\n' * 1200); raise SystemExit(7)";
+    let expected = b"retained output field\n".repeat(1200);
+    for (variable, limit, notice, retained) in [
+        (
+            "PIRA_CTX_MAX_RETAINED_BYTES",
+            "4096",
+            "Exact output incomplete:",
+            &expected[..4096],
+        ),
+        (
+            "PIRA_CTX_MAX_INDEXED_LINES",
+            "1000",
+            "Exact replay unavailable:",
+            expected.as_slice(),
+        ),
+    ] {
+        let result = Command::new(binary())
+            .args([
+                "exact",
+                "--intent",
+                "Verify capture limit disclosure",
+                "--store-dir",
+            ])
+            .arg(s.path())
+            .args(["--", python(), "-c", producer])
+            .env(variable, limit)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(7));
+        let report = String::from_utf8(result.stdout).unwrap();
+        assert!(report.contains(notice), "{report}");
+        let id = report
+            .lines()
+            .find_map(|line| line.strip_prefix("Result: "))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let raw = Command::new(binary())
+            .args(["raw", "--store-dir"])
+            .arg(s.path())
+            .args([id, "--stdout"])
+            .output()
+            .unwrap();
+        assert!(
+            raw.status.success(),
+            "{}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
+        assert_eq!(raw.stdout, retained);
+    }
+}
+
+#[test]
 fn direct_file_destinations_preserve_bytes_and_exit_in_auto_and_exact() {
     use std::process::Stdio;
     let s = Sandbox::new();
