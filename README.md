@@ -28,9 +28,17 @@ PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6-sol and G
 
 ## Quick start with Codex
 
-PIRA installs to `~/agent` by default. You can use the one-line command for the easiest setup, or the inspect-first path if you want to review every change before it happens.
+PIRA installs to `~/agent` by default. Ask Codex to install or update it with the prompt below, or use the command-line and inspect-first options that follow.
 
 Setup is safe to rerun: it preserves an existing `USER.md`, backs up user-level Codex files before changing them, and can preview or verify its work. Git is required. The setup helper checks for Python and can offer platform-specific installation help.
+
+### Install or update through Codex
+
+Launch Codex and enter:
+
+```text
+Install/Update PIRA including tools according to https://github.com/AlgebraLoveme/PIRA
+```
 
 ### Recommended one-line install or update
 
