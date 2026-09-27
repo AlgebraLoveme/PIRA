@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -52,7 +53,11 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(self.run_setup(), 0)
         self.assertEqual(self.run_setup("--verify"), 0)
         self.assertEqual(self.run_setup(), 0)
-        self.assertTrue(self.entry.is_symlink())
+        if os.name == "nt":
+            self.assertTrue(self.entry.is_file())
+            self.assertFalse(self.entry.is_symlink())
+        else:
+            self.assertTrue(self.entry.is_symlink())
         self.assertEqual(
             self.settings()["pluginConfigs"][setup.PLUGIN]["options"]["instructionFiles"],
             setup.MODE,
@@ -128,10 +133,11 @@ class ClaudeSetupTests(unittest.TestCase):
 
     def test_preexisting_identical_rule_requires_install_manifest(self) -> None:
         self.entry.parent.mkdir()
-        self.entry.symlink_to(self.agent / "AGENTS.md")
-        self.assertEqual(self.run_setup(), 1)
-        self.assertTrue(self.entry.is_symlink())
-        self.entry.unlink()
+        if os.name != "nt":
+            self.entry.symlink_to(self.agent / "AGENTS.md")
+            self.assertEqual(self.run_setup(), 1)
+            self.assertTrue(self.entry.is_symlink())
+            self.entry.unlink()
         self.entry.write_bytes((self.agent / "AGENTS.md").read_bytes())
         with self.assertRaisesRegex(RuntimeError, "no install manifest"):
             setup.install_entry(
@@ -143,6 +149,9 @@ class ClaudeSetupTests(unittest.TestCase):
         settings.write_text("{broken", encoding="utf-8")
         self.assertEqual(self.run_setup(), 1)
         settings.unlink()
+        if os.name == "nt":
+            self.assertFalse(self.entry.exists())
+            return
         settings.symlink_to(self.agent / "AGENTS.md")
         self.assertEqual(self.run_setup(), 1)
         self.assertFalse(self.entry.exists())
@@ -172,6 +181,7 @@ class ClaudeSetupTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not managed"):
             setup.install_entry(entry, self.agent / "AGENTS.md", manifest, dry_run=False, copy_policy=True)
 
+    @unittest.skipIf(os.name == "nt", "creating symlinks may require Windows privileges")
     def test_broken_manifest_and_profile_links_fail_before_install(self) -> None:
         manifest = self.claude / "pira" / setup.MANIFEST
         manifest.parent.mkdir()
@@ -193,6 +203,7 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(old.read_text(encoding="utf-8"), "old snapshot\n")
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "unrelated\n")
 
+    @unittest.skipIf(os.name == "nt", "creating symlinks may require Windows privileges")
     def test_symlinked_rules_directory_is_refused(self) -> None:
         (self.claude / "rules").symlink_to(self.agent)
         self.assertEqual(self.run_setup(), 1)
