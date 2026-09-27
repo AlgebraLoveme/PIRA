@@ -125,6 +125,8 @@ Claude shares PIRA policy, modules, and native tools with Codex. Its `~/.claude/
 
 The setup is safe to rerun. It refuses to take over any existing target rule without its install manifest, backs up changed user files, supports `--dry-run` and `--verify`, and can remove its rule and only the read permissions it added with `--uninstall` while preserving `USER.md`. It leaves old `~/.claude/pira/` policy snapshots untouched but inactive; review them separately before removal. On Windows, rerun setup after updating the source checkout to refresh the managed policy copy. Check `/context` in a new Claude session to confirm PIRA is loaded.
 
+For an optional authenticated smoke test without changing your real PIRA installation, run `python3 assets/scripts/smoke_pira_claude.py` from this checkout. It uses synthetic profiles, the current Claude login, and installer-generated `--settings` to check both project instruction formats and profile reads. Its output distinguishes skipped `Read` calls from permission denials. It does not verify global rule loading from an isolated Claude configuration.
+
 ## Setup options
 
 <details>
