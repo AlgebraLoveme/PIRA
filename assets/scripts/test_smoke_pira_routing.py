@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from smoke_pira_routing import SOURCE, claude_evidence, codex_evidence
+from assets.scripts.smoke_pira_routing import SOURCE, claude_evidence, codex_evidence
 
 
 class RoutingEvidenceTests(unittest.TestCase):
