@@ -71,6 +71,7 @@ Retrieve only the smallest relevant memory when the task depends on it; never pr
 - Compact only clearly stale/redundant material after an end-to-end read and concurrent-change check.
 
 ## Module Loading and Routing
+For every coding implementation, debugging, or review task, load both CODING_STYLE.md and RESEARCH_POLICY.md before doing the task; the research module remains required even when no external research is requested.
 Read on-demand PIRA instruction files exactly, using the native Read tool when available. Batch required reads with predictably necessary read-only inspections in the same execution round. Inspection targets, arguments, and scope must already be known and must not depend on unread instructions. Read the returned instructions before module-dependent decisions, further work, or writes; do not add speculative inspection merely to fill the batch.
 
 Load on demand (explicit or inferred):
