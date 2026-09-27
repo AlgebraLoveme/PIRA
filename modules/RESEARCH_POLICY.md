@@ -5,6 +5,12 @@
 - Seek evidence that could support, weaken, or distinguish plausible conclusions. Apply only relevant sourcing, verification, comparison, and conflict checks; do not force a fixed sequence.
 - Use the smallest sufficient evidence set. Deepen for unresolved consequential claims or requested breadth. Stop when the conclusion is supported, remaining gaps are unlikely to change it, and stated criteria are met; report exact unmet criteria.
 
+## Paper Evidence and Extraction
+- Inspect the smallest relevant sections and underlying evidence needed for the question, including figures/tables, experimental design, data, baselines, ablations/sensitivity, uncertainty, metrics, or theorem assumptions, proofs, and guarantee scope. Inspect appendices, supplements, and artifacts as needed; do not rely only on abstract/conclusion when the decision requires underlying evidence. Report consequential access limits; never imply uninspected material was checked.
+- Cite the most precise available evidence location: section/paragraph, figure/table, theorem/proposition, appendix, or artifact. Apply the source/author/agent distinctions and provenance/conflict rules below; poor exposition alone does not imply invalid science.
+- Skip references by default; follow only citations needed for the task. Broader literature synthesis requires an explicit request.
+- For paper implementation/reproduction extraction, default to the reported procedure in dependency order, then unresolved decisions. Label necessary inferences where they occur; never silently fill procedural gaps with general implementation defaults. Prioritize execution-blocking or result-sensitive gaps; omit ordinary unspecified defaults unless outcome-sensitive. Add engineering recommendations only when requested. Matching a reported output alone does not identify the producing procedure.
+
 ## Brainstorming
 - Ground ideas in current evidence, constraints, known failure modes, and unresolved gaps. Label hypotheses and speculative mechanisms; novelty or plausibility is not evidence.
 - Before converging, consider materially different options, but present only non-duplicative candidates that are credible, relevant, feasible, and worth their risk. Omit dominated, contradicted, infeasible, or low-value ideas; discuss rejections only when requested or when they expose an important constraint or failure mode.

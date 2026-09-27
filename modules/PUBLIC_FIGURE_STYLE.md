@@ -21,6 +21,8 @@ Use the applicable workflow plus the shared rules below.
 
 ## Visual Method
 - Match the established publication template and nearby public figures unless a new style is requested. Favor compact footprint, limited excess whitespace, balanced spacing, restrained typography, and clear hierarchy.
+- In diagrams, prefer regular-weight content labels and bold group headings; use additional emphasis selectively. Center panel labels independently of icons or badges, and keep badges clear of connectors.
+- Center arrow annotation blocks along their associated segment: vertically for vertical segments, horizontally for horizontal ones. Keep visible text-to-line gaps consistent, measuring from glyph bounds rather than baselines.
 - Preserve the data contract and scientific interpretation. Do not silently change values, scales, normalization, uncertainty, comparison baselines, or data-to-mark mapping; expose necessary transformations in the figure or caption.
 - Keep legends, annotations, ticks, and labels concise and attributable; remove decoration that competes with the scientific message.
 - Give each figure a distinct explanatory job. Remove or redesign a figure that merely repeats nearby prose or another visual unless the repetition enables a deliberate comparison.
@@ -31,7 +33,7 @@ Use the applicable workflow plus the shared rules below.
 - Ask for a style choice only when it materially changes the result and cannot be inferred. Otherwise use the closest convention and proceed; present at most two alternatives when needed.
 
 ## Public Integration and Release
-- Establish the target surfaces, containers, and final physical or pixel sizes before styling. Paper-column width, responsive article width, README rendering, slide projection, and downloadable release assets impose different constraints.
+- Establish the target surfaces, containers, and final physical or pixel sizes before styling. Set the font family and effective font/stroke sizes before spacing refinements. Distinguish venue requirements from design choices. Paper-column width, responsive article width, README rendering, slide projection, and downloadable release assets impose different constraints.
 - For responsive surfaces, inspect representative narrow, intermediate, and wide container widths. Wide figures must reflow, remain legible while scaling, or use an intentional scroll treatment with a visible cue, keyboard access, and both endpoints checked; never create page-wide overflow.
 - Provide explanatory context appropriate to the surface: a caption or nearby prose plus meaningful alt text for embedded web or documentation figures. A standalone SVG should include a concise `<title>` and `<desc>` and appropriate image semantics when the delivery path preserves them.
 - Keep text readable at final size and important distinctions available without color alone. Verify contrast, color-vision deficiency, grayscale when relevant, and both screen and print behavior for destinations that need them.
@@ -54,6 +56,7 @@ Use the applicable workflow plus the shared rules below.
 
 ## Color
 - Reuse the publication's palette when present. Otherwise choose by purpose, keep mappings consistent, and verify contrast, color-vision deficiency, and grayscale at final size. Add a non-color cue for important distinctions.
+- For light-background diagrams, default to near-white group fills such as `#FAFAFB` with subtle borders such as `#E2E5E9`; reserve stronger colors for meaningful content rather than large containers. These defaults yield to the publication palette.
 - Use these colors for categorical marks and concept or workflow diagrams. Ordered data require a perceptually uniform sequential, diverging, or cyclic map matched to meaning.
 
 - Contrastive: `#D95F68`, `#3E8FC4`, `#E3A72F`, `#49A781`, `#8A70B5`, `#7A858C`.
