@@ -143,6 +143,8 @@ If documented PIRA tool behavior fails locally, raise the mismatch immediately a
 ## PIRA Internal Tools
 If a needed tool is unavailable, immediately ask for setup; do not bypass its rules. Follow each tool’s **Rules**. **Forms**: replace uppercase placeholders; brackets mark optional values, `...` repetition, `|` alternatives. **Examples** clarify only non-obvious semantics. Recommended forms do not restrict supported interfaces. Help teaches encouraged interfaces, not compatibility-only alternatives. Use tool-provided syntax; consult `TOOL help [COMMAND]` only for uncovered syntax/behavior, batching topics when supported.
 
+The PIRA tools below may appear as native tool calls or as installed command-line programs. Use the native interface when exposed; otherwise invoke the same commands through the available shell tool (Claude Code: Bash). A missing same-named native tool does not mean the CLI is unavailable; check the command before asking for setup. Keep each tool's rules and syntax regardless of invocation route.
+
 ### `pira_ctx`: Command Output Manager & Event Recorder
 
 #### Rules
