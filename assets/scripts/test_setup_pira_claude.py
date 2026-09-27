@@ -70,6 +70,9 @@ class SetupPiraClaudeTests(unittest.TestCase):
         self.assertIn("one-time copy from Codex", README_MD)
         self.assertIn("compares the two SHA-256 hashes", README_MD)
         self.assertIn("must stop and ask rather than overwrite it", README_MD)
+        self.assertIn("Claude Code 2.1.277 and later", README_MD)
+        self.assertIn("does not disable Claude Code's default `AGENTS.md` fallback", README_MD)
+        self.assertIn("PIRA does not change that user preference", README_MD)
 
     def test_install_uninstall_preserves_user_bytes_exactly(self) -> None:
         contents = ["# Mine", "# Mine\n", "# Mine\n\n\n", "before\nafter\n"]

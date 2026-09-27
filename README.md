@@ -86,7 +86,11 @@ Setup is safe to rerun. It preserves `~/.claude/pira/USER.md`, backs up `~/.clau
 
 ### How the Claude Code bridge works
 
-Claude Code reads `CLAUDE.md`, not `AGENTS.md`. Setup copies `AGENTS.md` and `modules/` from the source checkout into `~/.claude/pira/`, validates them before replacement, and records their SHA-256 hashes and source commit in `install.json`. The user-level `~/.claude/CLAUDE.md` then receives one marked block containing only:
+Claude Code 2.1.277 and later can load a project's `AGENTS.md` through its built-in `agents-md` mod. PIRA still uses the user-level `~/.claude/CLAUDE.md` as its global entry point: unlike project `AGENTS.md` discovery, that file loads regardless of where the working directory is located. The user-level file does not disable Claude Code's default `AGENTS.md` fallback, so a project that has `AGENTS.md` but no project-level `CLAUDE.md` gets both PIRA and its project instructions without a shim.
+
+Claude Code's default mode prefers a project-level `CLAUDE.md` over project `AGENTS.md`. Users who intentionally keep both files in one project can select **Claude.md and AGENTS.md** under `/config` → **Project instructions**. PIRA does not change that user preference.
+
+Setup copies `AGENTS.md` and `modules/` from the source checkout into `~/.claude/pira/`, validates them before replacement, and records their SHA-256 hashes and source commit in `install.json`. The user-level `~/.claude/CLAUDE.md` then receives one marked block containing only:
 
 ```markdown
 @~/.claude/pira/AGENTS.md
