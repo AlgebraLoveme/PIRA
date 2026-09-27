@@ -22,9 +22,7 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6-sol and GPT-6 Astra**. Other models or agent platforms may work, but have not received the same level of testing.
-
-> **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. The instructions below install PIRA for Codex from `master`.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6-sol and GPT-6 Astra**. Claude Code v2.1.283 smoke tests confirmed global user-rule loading and project `AGENTS.md` loading alongside `CLAUDE.md`. In an Opus code-review control, a required module read was denied without a permission rule; with the narrow rule below, Claude read both coding and research modules. A separate explanation task read its explanation module. These are smoke tests, not proof of broad behavioral parity. Other models or agent platforms may work without equivalent testing.
 
 ## Quick start with Codex
 
@@ -100,6 +98,32 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 ```
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
+
+## Quick start with Claude Code
+
+Claude Code v2.1.281 or later can load PIRA without a `CLAUDE.md` bridge. Keep one `master` checkout at `~/agent`, even if you use Claude Code without Codex. If you do not already have the checkout, run `git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent` first. If Codex already uses that checkout, do not switch its branch: simply run the Claude adapter from it.
+
+On macOS or Linux:
+
+```bash
+python3 ~/agent/assets/scripts/setup_pira_claude.py --dry-run
+python3 ~/agent/assets/scripts/setup_pira_claude.py
+python3 ~/agent/assets/scripts/setup_pira_claude.py --verify
+```
+
+On Windows PowerShell, replace `python3` with `py -3`. If the shared native tools are already installed by Codex, pass `--skip-tools` to these commands. Use `--user-mode keep` if you do not want a separate Claude `USER.md` placeholder.
+
+The policy's module paths assume the checkout is at `~/agent`; `--agent-dir` is intended for controlled tests, not a second production policy location.
+
+The adapter makes three Claude-side changes:
+
+1. Links the [global user rule](https://code.claude.com/docs/en/memory#user-level-rules) `~/.claude/rules/pira.md` to `~/agent/AGENTS.md` on macOS/Linux, or installs a checked managed copy on Windows. Claude Code does **not** load `~/.claude/AGENTS.md` globally.
+2. Sets [Project instructions](https://code.claude.com/docs/en/memory#choose-which-instruction-files-load) to `claude-md-and-agents-md`, so each project's `AGENTS.md` and `CLAUDE.md` load together. Resolve any contradictory project rules.
+3. Adds only `Read(~/agent/modules/*.md)` to Claude's [allow rules](https://code.claude.com/docs/en/permissions#read-and-edit), so it can load PIRA modules from other projects without gaining edit access to `~/agent`. Existing rules are preserved; deny rules still take precedence.
+
+Claude shares PIRA policy, modules, and native tools with Codex. Its `~/.claude/pira/USER.md` stays private and independent; reading that profile may require a separate permission approval. The adapter preserves unrelated Claude settings and instructions, and removes only the old PIRA-managed `CLAUDE.md` import after the new rule is prepared.
+
+The setup is safe to rerun. It refuses to take over any existing target rule without its install manifest, backs up changed user files, supports `--dry-run` and `--verify`, and can remove its rule and only its added module-read permission with `--uninstall` while preserving `USER.md`. It leaves old `~/.claude/pira/` policy snapshots untouched but inactive; review them separately before removal. On Windows, rerun setup after updating the source checkout to refresh the managed policy copy. Check `/context` in a new Claude session to confirm PIRA is loaded.
 
 ## Setup options
 
