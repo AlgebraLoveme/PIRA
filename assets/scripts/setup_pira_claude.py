@@ -138,24 +138,34 @@ def settings_mode(data: dict[str, object]) -> tuple[bool, str | None]:
     return "instructionFiles" in options, value
 
 
-def module_read_rule(agent_dir: Path) -> str:
-    if any(any(char in part for char in "*?[]\n\r") for part in agent_dir.parts):
-        raise RuntimeError(f"cannot safely express module read path as a Claude permission rule: {agent_dir}")
+def permission_anchor(directory: Path) -> str:
+    if any(any(char in part for char in "*?[]\n\r") for part in directory.parts):
+        raise RuntimeError(f"cannot safely express Claude read path: {directory}")
     try:
-        relative = agent_dir.relative_to(Path.home())
+        relative = directory.relative_to(Path.home())
     except ValueError:
-        absolute = agent_dir.as_posix()
+        absolute = directory.as_posix()
         if os.name == "nt":
             if ":" not in absolute:
                 raise RuntimeError(
-                    f"network policy paths are not supported for Claude permissions: {agent_dir}"
+                    f"network paths are not supported for Claude permissions: {directory}"
                 )
             drive, rest = absolute.split(":", 1)
             absolute = f"/{drive.lower()}{rest}"
-        anchor = "//" + absolute.lstrip("/")
-    else:
-        anchor = "~/" + relative.as_posix()
-    return f"Read({anchor}/modules/*.md)"
+        return "//" + absolute.lstrip("/")
+    return "~/" + relative.as_posix()
+
+
+def module_read_rule(agent_dir: Path) -> str:
+    return f"Read({permission_anchor(agent_dir)}/modules/*.md)"
+
+
+def profile_read_rule(claude_dir: Path) -> str:
+    return f"Read({permission_anchor(claude_dir)}/pira/USER.md)"
+
+
+def shared_profile_read_rule(agent_dir: Path) -> str:
+    return f"Read({permission_anchor(agent_dir)}/USER.md)"
 
 
 def settings_allow(data: dict[str, object]) -> list[str]:
@@ -222,6 +232,15 @@ def read_manifest(path: Path) -> dict[str, object] | None:
                 or not isinstance(data.get("permissions_present"), bool)
                 or not isinstance(data.get("allow_present"), bool)):
             raise RuntimeError(f"invalid PIRA Claude install manifest: {path}")
+        for key in ("profile_read_rule", "shared_profile_read_rule"):
+            present = key in data
+            added_key = f"{key}_added"
+            if (present != (added_key in data)
+                    or (present and (
+                        not isinstance(data[key], str)
+                        or not isinstance(data[added_key], bool)
+                    ))):
+                raise RuntimeError(f"invalid PIRA Claude install manifest: {path}")
         if (not isinstance(data.get("policy_sha256"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", data["policy_sha256"])):
             raise RuntimeError(f"invalid PIRA Claude install manifest: {path}")
@@ -345,8 +364,12 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
     settings = read_object(settings_path, "Claude settings")
     prior_present, prior_mode = settings_mode(settings)
     read_rule = module_read_rule(agent_dir)
+    user_rule = profile_read_rule(claude_dir)
+    shared_user_rule = shared_profile_read_rule(agent_dir)
     allowed = settings_allow(settings)
     print(f"PIRA module read allowance: {read_rule}")
+    print(f"Claude private profile read allowance: {user_rule}")
+    print(f"Shared fallback profile read allowance: {shared_user_rule}")
     legacy = legacy_without_pira(legacy_path)
     if entry.exists() or entry.is_symlink():
         install_entry(entry, policy, manifest, dry_run=True, copy_policy=copy_policy)
@@ -362,6 +385,10 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
             "policy_path": str(policy),
             "module_read_rule": read_rule,
             "module_read_rule_added": read_rule not in allowed,
+            "profile_read_rule": user_rule,
+            "profile_read_rule_added": user_rule not in allowed,
+            "shared_profile_read_rule": shared_user_rule,
+            "shared_profile_read_rule_added": shared_user_rule not in allowed,
             "permissions_present": "permissions" in settings,
             "allow_present": "permissions" in settings and "allow" in settings["permissions"],
             "policy_sha256": sha256(policy.read_bytes()),
@@ -371,6 +398,13 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
             raise RuntimeError("PIRA policy path changed since Claude installation")
         if manifest["module_read_rule"] != read_rule:
             raise RuntimeError("PIRA source directory changed since Claude installation")
+        for key, rule in (("profile_read_rule", user_rule),
+                          ("shared_profile_read_rule", shared_user_rule)):
+            if key in manifest and manifest[key] != rule:
+                raise RuntimeError(f"Claude read permission path changed since installation: {key}")
+            if key not in manifest:
+                manifest[key] = rule
+                manifest[f"{key}_added"] = rule not in allowed
         if copy_policy:
             manifest["policy_sha256"] = sha256(policy.read_bytes())
     if args.verify:
@@ -378,6 +412,8 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
             "Claude PIRA user rule": verify_entry(entry, policy, copy_policy=copy_policy),
             "Claude both-files mode": prior_mode == MODE,
             "PIRA module read permission": read_rule in allowed,
+            "Claude private profile read permission": user_rule in allowed,
+            "Shared fallback profile read permission": shared_user_rule in allowed,
             "legacy PIRA CLAUDE.md bridge absent": legacy is None,
             "install manifest": manifest_path.is_file(),
         }
@@ -391,7 +427,9 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
     if not args.skip_tools:
         tools_setup(repo_root, verify=False, dry_run=args.dry_run)
     install_entry(entry, policy, read_manifest(manifest_path), dry_run=args.dry_run, copy_policy=copy_policy)
-    configured = set_module_rule(set_mode(settings, MODE), read_rule)
+    configured = set_mode(settings, MODE)
+    for rule in (read_rule, user_rule, shared_user_rule):
+        configured = set_module_rule(configured, rule)
     if configured != settings:
         write_bytes(settings_path, json_bytes(configured), dry_run=args.dry_run)
     if not profile_path.exists() and args.user_mode == "placeholder":
@@ -426,8 +464,12 @@ def uninstall(args: argparse.Namespace) -> None:
         raise RuntimeError("Claude instructionFiles setting changed since PIRA installation")
     prior_present = manifest["previous_mode_present"]
     restored = set_mode(settings, manifest["previous_mode"], remove=not prior_present)
-    if manifest["module_read_rule_added"]:
-        restored = set_module_rule(restored, manifest["module_read_rule"], remove=True)
+    removed_rule = False
+    for key in ("module_read_rule", "profile_read_rule", "shared_profile_read_rule"):
+        if manifest.get(f"{key}_added", False):
+            restored = set_module_rule(restored, manifest[key], remove=True)
+            removed_rule = True
+    if removed_rule:
         if manifest["allow_present"] and not settings_allow(restored):
             restored.setdefault("permissions", {})["allow"] = []
         elif manifest["permissions_present"] and "permissions" not in restored:

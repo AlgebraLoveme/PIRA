@@ -43,6 +43,10 @@ class ClaudeSetupTests(unittest.TestCase):
         return json.loads((self.claude / "settings.json").read_text(encoding="utf-8"))
 
     def test_fresh_install_verify_rerun_and_uninstall(self) -> None:
+        codex_config = self.claude.parent / ".codex" / "config.toml"
+        codex_config.parent.mkdir()
+        codex_config.write_bytes(b"model = 'existing-codex-setting'\n")
+        policy_before = (self.agent / "AGENTS.md").read_bytes()
         self.assertEqual(self.run_setup("--dry-run"), 0)
         self.assertFalse(self.entry.exists())
         self.assertEqual(self.run_setup(), 0)
@@ -55,13 +59,16 @@ class ClaudeSetupTests(unittest.TestCase):
         )
         self.assertEqual(
             self.settings()["permissions"]["allow"],
-            [setup.module_read_rule(self.agent)],
+            [setup.module_read_rule(self.agent), setup.profile_read_rule(self.claude),
+             setup.shared_profile_read_rule(self.agent)],
         )
         self.assertTrue((self.claude / "pira" / "USER.md").is_file())
         self.assertEqual(self.run_setup("--uninstall"), 0)
         self.assertFalse(self.entry.exists())
         self.assertFalse((self.claude / "settings.json").exists())
         self.assertTrue((self.claude / "pira" / "USER.md").exists())
+        self.assertEqual(codex_config.read_bytes(), b"model = 'existing-codex-setting'\n")
+        self.assertEqual((self.agent / "AGENTS.md").read_bytes(), policy_before)
 
     def test_preserves_unrelated_settings_and_legacy_instructions(self) -> None:
         settings = {
@@ -78,7 +85,8 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(self.run_setup("--user-mode", "keep"), 0)
         self.assertEqual(
             self.settings()["permissions"]["allow"],
-            ["Read(~/notes.md)", setup.module_read_rule(self.agent)],
+            ["Read(~/notes.md)", setup.module_read_rule(self.agent),
+             setup.profile_read_rule(self.claude), setup.shared_profile_read_rule(self.agent)],
         )
         self.assertEqual(
             (self.claude / "CLAUDE.md").read_text(encoding="utf-8"),
@@ -192,7 +200,9 @@ class ClaudeSetupTests(unittest.TestCase):
 
     def test_preexisting_module_rule_survives_uninstall(self) -> None:
         rule = setup.module_read_rule(self.agent)
-        settings = {"permissions": {"allow": [rule]}}
+        profile_rule = setup.profile_read_rule(self.claude)
+        shared_rule = setup.shared_profile_read_rule(self.agent)
+        settings = {"permissions": {"allow": [rule, profile_rule, shared_rule]}}
         (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
         self.assertEqual(self.run_setup(), 0)
         self.assertEqual(self.run_setup("--uninstall"), 0)
@@ -205,6 +215,49 @@ class ClaudeSetupTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
         self.assertEqual(self.run_setup("--verify"), 1)
 
+    def test_verify_detects_removed_private_profile_read_rule(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.profile_read_rule(self.claude))
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup("--verify"), 1)
+
+    def test_verify_detects_removed_shared_profile_read_rule(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.shared_profile_read_rule(self.agent))
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup("--verify"), 1)
+
+    def test_rerun_upgrades_previous_manifest_without_losing_user_rules(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("profile_read_rule")
+        manifest.pop("profile_read_rule_added")
+        manifest.pop("shared_profile_read_rule")
+        manifest.pop("shared_profile_read_rule_added")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.profile_read_rule(self.claude))
+        settings["permissions"]["allow"].remove(setup.shared_profile_read_rule(self.agent))
+        settings["permissions"]["allow"].append("Read(~/notes.md)")
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"]["allow"], ["Read(~/notes.md)"])
+
+    def test_partial_private_profile_manifest_is_refused(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("profile_read_rule_added")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        settings_before = (self.claude / "settings.json").read_bytes()
+        self.assertEqual(self.run_setup(), 1)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), settings_before)
+
     def test_malformed_permission_list_is_refused_before_install(self) -> None:
         (self.claude / "settings.json").write_text(
             json.dumps({"permissions": {"allow": "Read"}}), encoding="utf-8"
@@ -216,6 +269,14 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(
             setup.module_read_rule(Path.home() / "agent"),
             "Read(~/agent/modules/*.md)",
+        )
+        self.assertEqual(
+            setup.profile_read_rule(Path.home() / ".claude"),
+            "Read(~/.claude/pira/USER.md)",
+        )
+        self.assertEqual(
+            setup.shared_profile_read_rule(Path.home() / "agent"),
+            "Read(~/agent/USER.md)",
         )
 
     def test_uninstall_preserves_empty_permissions_shape(self) -> None:
