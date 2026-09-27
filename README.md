@@ -129,6 +129,8 @@ The setup is safe to rerun. It refuses to take over any existing target rule wit
 
 For an optional authenticated smoke test without changing your real PIRA installation, run `python3 assets/scripts/smoke_pira_claude.py` from this checkout. It uses synthetic profiles, the current Claude login, and installer-generated `--settings` to check both project instruction formats and profile reads. Its output distinguishes skipped `Read` calls from permission denials. It does not verify global rule loading from an isolated Claude configuration.
 
+To compare natural module loading on the same synthetic code-review task, run `python3 assets/scripts/smoke_pira_routing.py --client both --repeats 2`. It reuses your existing CLI logins, places the same shared policy in a temporary project's `AGENTS.md`, gives Claude temporary installer-generated read settings, and runs Codex read-only. Each JSON line reports observed code/module reads and completion. This checks project-policy routing, not Claude's global user rule or review quality. Existing user-level instructions may still affect either client, so treat the results as a smoke test rather than a controlled benchmark. This smoke does not request full access.
+
 ## Setup options
 
 <details>
