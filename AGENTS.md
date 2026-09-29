@@ -216,7 +216,8 @@ SEMANTIC includes `definition`, `references`, `callers`, `callees`, `hover`; OPE
 | `--files-with-matches` | search | Paths instead of snippets. |
 | `--max-depth N` | map | Traversal depth; 0 visits specified paths only. |
 | `--range START:END` | show, query-show | Slice preceding target. |
-| `--limit N` | search; symbols; outline; map; non-hover semantics/query | Snippet lines/query; symbol rows/query; items across files; representative file rows; semantic rows/target or request. |
+| `--limit N` | search; symbols; outline; map; non-hover semantics/query | Snippet lines/query (search: incompatible with `--files-with-matches` and `--count`); symbol rows/query; items across files; representative file rows; semantic rows/target or request. |
+| `--max-items N` | search | Total displayed lines/file rows; use with `--files-with-matches` or `--count` instead of `--limit`. |
 | `--max-bytes N` | search, show; hover, query | Shared source-block budget for search/show; per hover/query-show request. Shared caps may further limit search; oversized show blocks are omitted, not truncated. |
 
 No search matches succeeds. Query options with no applicable operation error.

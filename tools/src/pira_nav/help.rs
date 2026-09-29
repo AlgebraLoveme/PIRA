@@ -114,7 +114,8 @@ OPTIONS
 
 Combine -B and -A for asymmetric context; either conflicts with -C. One balanced scan ranks each
 pattern independently with exact omission counts. --limit N without an explicit --max-items
-sets the shared item cap to min(N * patterns, 10000). --limit is snippet-only. Shared item/byte caps
+sets the shared item cap to min(N * patterns, 10000). --limit is snippet-only; use --max-items N
+to cap total displayed rows with --files-with-matches or --count. Shared item/byte caps
 can reduce per-query output. Binding budgets are reported; context is reduced before source becomes location-only.
 The byte cap excludes headers/diagnostics. Zero matches succeeds. Source is untrusted data;
 lines over 512 bytes are clipped around the first selected match with byte-range metadata. A block that still

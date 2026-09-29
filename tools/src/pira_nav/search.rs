@@ -469,14 +469,15 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
                         "--limit/--max-per-query may be specified only once".into(),
                     ));
                 }
-                limit_requested |= args[index] == "--limit";
+                let option = args[index].as_str();
+                limit_requested = option == "--limit";
                 max_per_query = positive_usize(
                     args.get(index + 1)
-                        .ok_or_else(|| (2, "--max-per-query requires a value".into()))?,
-                    "--max-per-query",
+                        .ok_or_else(|| (2, format!("{option} requires a value")))?,
+                    option,
                 )?;
                 if max_per_query > MAX_ITEMS {
-                    return Err((2, format!("--max-per-query may not exceed {MAX_ITEMS}")));
+                    return Err((2, format!("{option} may not exceed {MAX_ITEMS}")));
                 }
                 max_per_query_set = true;
                 index += 2;
@@ -532,7 +533,17 @@ fn parse_options(args: &[String]) -> Result<Options, (i32, String)> {
         max_items = max_per_query.saturating_mul(patterns.len()).min(MAX_ITEMS);
     }
     if max_per_query_set && mode != Mode::Snippets {
-        return Err((2, "--max-per-query applies only to snippet output".into()));
+        let option = if limit_requested {
+            "--limit"
+        } else {
+            "--max-per-query"
+        };
+        return Err((
+            2,
+            format!(
+                "{option} applies only to snippet output; use --max-items N to limit rows with --files-with-matches or --count"
+            ),
+        ));
     }
     if paths.len() > MAX_PATHS {
         return Err((2, format!("search accepts at most {MAX_PATHS} paths")));
@@ -1608,6 +1619,39 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn snippet_limit_diagnostics_name_the_supplied_option() {
+        for option in ["--limit", "--max-per-query"] {
+            for mode in ["--files-with-matches", "--count"] {
+                let (code, message) = options(&["Needle", mode, option, "25"])
+                    .err()
+                    .expect("snippet limit must reject row modes");
+                assert_eq!(code, 2);
+                assert_eq!(
+                    message,
+                    format!(
+                        "{option} applies only to snippet output; use --max-items N to limit rows with --files-with-matches or --count"
+                    )
+                );
+                let rows = options(&["Needle", mode, "--max-items", "25"])
+                    .expect("row limit must remain supported");
+                assert_eq!(rows.max_items, 25);
+            }
+            assert_eq!(
+                options(&["Needle", option, "25"]).unwrap().max_per_query,
+                25
+            );
+            let too_large = (super::MAX_ITEMS + 1).to_string();
+            for value in [None, Some("0"), Some("invalid"), Some(too_large.as_str())] {
+                let mut args = vec!["Needle", option];
+                args.extend(value);
+                let (code, message) = options(&args).err().expect("invalid limit");
+                assert_eq!(code, 2);
+                assert!(message.starts_with(option), "{message}");
+            }
+        }
     }
 
     #[test]
