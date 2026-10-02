@@ -11,6 +11,11 @@ from tools.build import build_pira_ctx_platform_bins as builder
 
 
 class RustToolsTests(unittest.TestCase):
+    def test_configures_read_only_team_without_c_compiler(self) -> None:
+        builder.configure_tool("pira_team")
+        self.assertEqual(builder.TARGETS["windows-x64"].exe_name, "pira_team.exe")
+        self.assertFalse(builder.USES_C_COMPILER)
+
     def test_configures_pira_svg_check_workspace_tool(self) -> None:
         builder.configure_tool("pira_svg_check")
         self.assertEqual(builder.TOOL_NAME, "pira_svg_check")

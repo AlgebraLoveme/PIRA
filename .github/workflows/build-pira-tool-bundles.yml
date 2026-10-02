@@ -48,6 +48,9 @@ jobs:
           - tool: pira_nav
             script: tools/build/build_pira_nav_platform_bins.py
             needs_zig: true
+          - tool: pira_team
+            script: tools/build/build_pira_team_platform_bins.py
+            needs_zig: false
           - tool: pira_svg_check
             script: tools/build/build_pira_svg_check_platform_bins.py
             needs_zig: false
@@ -70,6 +73,10 @@ jobs:
             tools.build.test_package_github_release
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
           cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
+          if [[ "${TOOL}" == "pira_team" ]]; then
+            cargo build --manifest-path tools/Cargo.toml --locked --package pira_team
+            PIRA_TEAM_BIN="$PWD/tools/target/debug/pira_team" python3 tools/crates/pira_team/tests/test_team.py
+          fi
 
       - name: Install Windows cross-linker
         run: |

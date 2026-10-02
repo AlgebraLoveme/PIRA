@@ -162,11 +162,11 @@ py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
 py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
 ```
 
-The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, or `svg=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
+The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, `svg=VERSION`, or `team=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup and `pira_team` model calls need network access; the other tools operate locally. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 ### Maintainer release procedure
 
-PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all four tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
+PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all five tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -225,7 +225,7 @@ Information moves upward only when its lasting value increases. Activity stays i
 
 ## PIRA Internal Tools
 
-PIRA includes four small native tools for agent continuity, repository work, and figure validation. Built-in command help provides exact syntax.
+PIRA includes five native tools for agent continuity, repository work, figure validation, and delegation. Built-in command help provides exact syntax.
 
 | Tool | What problem it solves |
 |---|---|
@@ -233,6 +233,98 @@ PIRA includes four small native tools for agent continuity, repository work, and
 | `pira_dec` | Records important choices in a consistent, searchable form. |
 | `pira_nav` | Provides portable lexical, structural, dependency, and optional IDE-semantic repository navigation. |
 | `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
+| `pira_team` | Runs fresh Codex workers, read-only by default, and returns validated internal artifacts for the main agent to consume. |
+
+`pira_team run --task 'TASK'` launches one worker. Independent
+calls can run concurrently. Add `--code-review` for correctness and maintainability
+review guidance, including overengineering and unnecessary abstractions; resume retains this mode.
+Add `--allow-fix` to review first and then fix in the same conversation, or call
+`resume RUN_ID --allow-fix` after a completed review. Fixing uses the shared workspace;
+assign disjoint files to concurrent workers and validate integration. Delegate only local, well-scoped fixes. Workers must stop affected work when significant design decisions arise and return questions for the main agent to answer through `resume RUN_ID --task TEXT`. No automatic
+merge or rollback is provided, and interrupted/failed fixes may leave partial edits.
+Subsequent resumes retain write permission. Review and fix each have their own timeout;
+only the final receipt/answer is printed, while both artifacts remain accessible.
+The launcher directly injects phase-specific review/fix policies; workers need not read them.
+Model and reasoning effort default to the current Codex
+session's latest recorded turn settings; `--model` and `--effort` independently
+override them. If the profile cannot be resolved, Team requires explicit values
+rather than guessing or falling back to global configuration. Workers receive minimal permission/no-secrets guidance
+and the canonical `pira_nav` usage instructions without the full PIRA policy or automatic `AGENTS.md`
+injection. Keep `pira_nav` available on PATH. The launcher uses an isolated
+Codex home, temporarily links file-based authentication, and retains only worker
+session state for continuation after detaching that link.
+By default stdout is a JSON receipt with a `run_id`, artifact path, format, logs,
+repair count and reported token usage. Use `pira_team read RUN_ID` to read the
+deliverable without copying an absolute path, or `pira_team path RUN_ID` to obtain
+its path for scripts. Add a relative filename, such as `manifest.json` or
+`repair/validation.json`, to access diagnostics. These commands do not launch workers. The main agent reads or processes the artifact, then
+communicates key findings; nothing is automatically published into the workspace.
+Use `--output answer` for the artifact content directly. Workers may choose Markdown,
+text, JSON or CSV; `--format` enforces a format, `--schema` adds JSON Schema constraints,
+and `--columns` checks CSV headers. JSON is parsed; CSV checks row shape, not strict
+quoting. Markdown/text receive nonempty-text checks. Validation never establishes
+factual correctness. Invalid output gets one read-only format-repair attempt within
+the original timeout. Candidates, diagnostics and full logs remain in private run
+storage, with successful files under `artifacts/`. Use `--store DIR` when artifacts
+and logs must survive temporary-directory cleanup. `PIRA_TEAM_DIR` is an optional
+storage-root override; `--store` takes precedence. Use the same root for every command.
+`resume RUN_ID [--task TASK]` continues the same worker conversation, retaining its profile
+and output contract. `steer RUN_ID --task TASK` redirects an active turn;
+`interrupt RUN_ID` stops it without discarding context. Run/resume block and print
+the run ID and active-turn readiness on stderr; send controls from another command.
+A control receipt acknowledges acceptance, not completion—await the original command.
+Steering is unavailable during startup or format repair. Each resume preserves prior
+artifacts under immutable revisions; default `read` requires the latest revision to
+be complete. Earlier artifacts remain accessible by relative path. Legacy ephemeral
+runs cannot resume, and orphaned running state fails closed.
+`--task-file FILE` reads an input task description for run/resume/steer, never an output destination. Secret avoidance is
+instruction-level. Codex enforces read-only command permissions by default and workspace-write permissions for authorized fixes. Assigned-file ownership within the workspace is instruction-level, not separately sandboxed.
+The current backend requires a PATH-visible `codex` executable (tested with 0.159.3),
+network access, and file-backed Codex login or `CODEX_API_KEY`.
+App and IDE-extension users can keep their usual UI; the executable must be available
+on the agent's execution host, and the caller must permit launching it. GUI-only
+installation does not establish that requirement. If session-profile inheritance is
+unavailable, supply explicit `--model` and `--effort`.
+When Team is selected, normal tool setup reuses an available Codex executable.
+If missing, it downloads the latest stable official `openai/codex` release package
+for the host platform, verifies the published SHA-256, and installs its complete
+runtime under `INSTALL_DIR/.pira-codex`. No npm/Homebrew or remote installer script
+is required. The managed `bin` directory is added to the existing PIRA PATH setup;
+restart the shell/agent to inherit it. `--no-path` leaves PATH configuration to you.
+Existing installations are not replaced; an outdated/incompatible executable
+fails with [upgrade guidance](https://learn.chatgpt.com/docs/cli).
+Setup checks stable version >= 0.159.0 and required app-server flags before accepting
+the runtime. `--verify` never installs; `--dry-run` only describes a missing-runtime
+installation. Download, checksum or compatibility failures stop setup. An existing
+managed package is reused, not automatically upgraded. These checks cannot guarantee
+full compatibility with every later release.
+Setup also checks Team-compatible authentication. An existing file-backed cache is
+checked through Codex's `login status`; an explicit `CODEX_API_KEY` avoids login.
+If missing, normal setup starts official ChatGPT login automatically: browser login
+when stdin is a terminal, otherwise a device link/code displayed directly by Codex.
+Both setup scripts accept `--codex-login auto|browser|device|skip`; use `skip` for
+unattended setup (missing authentication then fails rather than reporting readiness).
+`--verify` checks but never logs in; `--dry-run` only describes the check.
+The new login uses file storage under `CODEX_HOME/auth.json` (default
+`~/.codex/auth.json`) because Team cannot reuse keyring-only credentials. Setup
+discloses this before login and does not rewrite global credential-storage settings
+or bypass admin requirements. Protect that credential file like a password.
+Codex's login output is streamed, not retained by PIRA setup; run setup directly in a
+terminal if an agent wrapper buffers the link/code. Login waits at most five minutes,
+can be cancelled, and is rechecked afterward. Device login requires enabling it in
+ChatGPT security/workspace settings; use `--codex-login browser` locally if disabled.
+This is a cached-login readiness check, not a paid `codex exec` test: it does not
+prove token validity, model entitlement, or quota, and API keys are not remotely validated.
+Existing file-backed login is reused on run and resume without re-authentication;
+the temporary auth link is detached afterward. Codex may instead store credentials
+in an OS keyring ([authentication documentation](https://learn.chatgpt.com/docs/auth)).
+The CLI and IDE extension share cached credentials; a ChatGPT app login alone does
+not guarantee an accessible Codex file cache. Installing the CLI does not transfer
+app/browser sessions or solve keyring-only login.
+Keyring-only authentication and custom provider configuration are not inherited by
+the isolated launcher. Team does not extract keyring tokens.
+The caller must permit launcher writes, model-network access, and worker sandbox
+initialization. Restrictive parent sandboxes can prevent this nested launch.
 
 ### Agent-level evaluation
 
@@ -545,7 +637,9 @@ PIRA can run with full system permissions, but full-permission mode is not a san
 - avoid destructive commands without explicit permission;
 - keep temporary artifacts in the platform temp directory unless the user wants them preserved.
 
-Codex subagents load the same policy as the main agent. This behavior has not been equally tested on other agent platforms.
+Built-in Codex subagents can inherit the main agent's policy. `pira_team` instead
+starts fresh workers with its own minimal permission/no-secrets policy. Behavior on
+other agent platforms has not been equally tested.
 
 </details>
 
@@ -563,9 +657,10 @@ Codex subagents load the same policy as the main agent. This behavior has not be
 - `tools/build/build_pira_dec_platform_bins.py` — package-isolated release entry point for `pira_dec`
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
 - `tools/build/build_pira_svg_check_platform_bins.py` — package-isolated release entry point for `pira_svg_check`
-- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all four tools, builds every platform twice, and publishes direct GitHub Release assets
+- `tools/build/build_pira_team_platform_bins.py` — package-isolated release entry point for `pira_team`
+- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all five tools, builds every platform twice, and publishes direct GitHub Release assets
 - `tools/build/package_github_release.py` — validates build archives and produces the versioned release assets and checksum index consumed by setup
-- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, and `tools/src/pira_svg_check/` — public Rust implementations
+- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, `tools/src/pira_svg_check/`, and `tools/src/pira_team/` — public Rust implementations
 - GitHub Releases — published platform executables; generated binaries are not stored on a second branch or in the source tree
 - `PIRA_Voice/Samantha/` — default audio clips for optional Codex notifications
 
