@@ -44,6 +44,14 @@ PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
 PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
 
 Creating a sandbox requires explicit user approval. Prefer fully cleaning a stale task sandbox and reusing it; never use the global `sbx reset` command for routine cleanup. For sandbox tests, copy only the explicit source, configuration, and test files required for the run; never recursively copy a repository/tool root or any build, cache, or artifact tree. Remove task-local temporary test artifacts after each run.
+
+## Tool file tracking
+
+Follow the existing tools by file purpose, not merely by extension or directory name.
+- Commit production source and required runtime policies, Cargo manifests/lockfile, deterministic regression tests and necessary fixtures under the tool crate, public usage documentation, and setup/build/release integration with its tests.
+- Keep local development/benchmark harnesses, paid live-run utilities, generated reports/logs/session stores, exploratory design/review notes, build outputs/toolchains/caches, credentials, personal profiles, and workbooks untracked and ignored. Do not add tool-specific tracking exceptions for a purpose other tools leave local.
+- Keep CI dependent only on committed inputs; place maintainable regression tests in the existing crate test layout rather than tracking an entire development tree. A distinct new file purpose requires explicit justification.
+- Keep this generated guard ignored; edit its setup template and regenerate it, rather than committing or manually editing the generated file.
 """
 
 
@@ -512,6 +520,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
+    parser.add_argument("--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
+                        help="Missing Team authentication: auto selects browser or device flow; "
+                             "skip disables login. Verify/dry-run never start login.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument(
         "--tools-version",
@@ -542,11 +553,12 @@ def configure_tools(
     versions: list[str] | None,
     *,
     verify_only: bool,
+    codex_login: str = "auto",
 ) -> None:
     script = state.repo_root / "assets" / "scripts" / "setup_pira_tools.py"
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
-    command = [sys.executable, str(script)]
+    command = [sys.executable, str(script), "--codex-login", codex_login]
     if install_dir:
         command.extend(["--install-dir", str(expand_path(install_dir))])
     for version in versions or []:
@@ -584,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.tools_install_dir,
                     args.tools_version,
                     verify_only=False,
+                    codex_login=args.codex_login,
                 )
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
@@ -595,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.tools_install_dir,
                     args.tools_version,
                     verify_only=True,
+                    codex_login=args.codex_login,
                 )
     except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
