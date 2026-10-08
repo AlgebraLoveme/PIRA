@@ -37,6 +37,8 @@ class Migration:
     inventories: dict[Path, dict[str, Entry]]
     files: dict[str, tuple[Path, Entry]]
     applied: bool = False
+    completed_only: bool = False
+    excluded_records: frozenset[str] = frozenset()
 
 
 def checked_path(path: Path) -> None:
@@ -150,7 +152,11 @@ def event_cache(name: str) -> bool:
         or (len(parts) == 4 and parts[-1] == ".catalog.piraidx")))
 
 
-def copied(tool: str, name: str) -> bool:
+def copied(tool: str, name: str, completed_only: bool = False, excluded_records: frozenset[str] = frozenset()) -> bool:
+    if tool == "pira_ctx" and name in excluded_records:
+        return False
+    if tool == "pira_ctx" and completed_only and name.startswith(("live/", "watch/")):
+        return False
     # Rebuildable Ctx indexes/journals must not collide with durable records.
     return not is_lease(tool, name) and not (
         tool == "pira_ctx" and (name.startswith("indexes/") or event_cache(name)))
@@ -243,11 +249,13 @@ def lease(path: Path):
         yield
 
 
-def check_idle(tool: str, root: Path, entries: dict[str, Entry]) -> None:
+def check_idle(tool: str, root: Path, entries: dict[str, Entry], completed_only: bool = False) -> None:
     if tool == "pira_ctx":
         if "indexes/.index.lock" in entries:
             raise RuntimeError(f"Legacy Ctx index lock requires explicit recovery: {root}")
         for name in entries:
+            if completed_only and name.startswith(("live/", "watch/")):
+                continue  # Explicit maintenance mode leaves operational state at source.
             if name.startswith("live/") and name.endswith(".live.json"):
                 raise RuntimeError(f"Unfinished capture requires recovery before migration: {root / name}")
             if name.startswith("watch/state/") and name.endswith(".json"):
@@ -874,10 +882,15 @@ def apply_team_migrations(plans: list[TeamMigration], *, dry_run=False, verify=F
             team_lineage(plan, read_team_state(plan))
 
 
-def plan_migration(tool: str, sources: list[Path], destination: Path) -> Migration:
+def plan_migration(tool: str, sources: list[Path], destination: Path, *, completed_only: bool = False, excluded_records: frozenset[str] = frozenset()) -> Migration:
     """Read-only merge/collision/idle preflight; no configuration changes."""
     if tool not in ("pira_ctx", "pira_dec"):
         raise RuntimeError("Team retained native relocation blocked pending backend adapter validation")
+    if any(not name.endswith(".piractx") or name in (".piractx",)
+           or any(c in name for c in ("/", "\\", "\x00")) for name in excluded_records):
+        raise RuntimeError("Excluded Ctx records must be individual .piractx filenames")
+    if excluded_records and tool != "pira_ctx":
+        raise RuntimeError("Record exclusions apply only to Ctx")
     roots = tuple(sorted(set(sources) - {destination}))
     for source in roots:
         if any(source in other.parents for other in roots):
@@ -889,14 +902,14 @@ def plan_migration(tool: str, sources: list[Path], destination: Path) -> Migrati
     identities: dict[str, tuple[Path, Entry]] = {}
     with ExitStack() as locks:
         for root, entries in snapshots.items():
-            check_idle(tool, root, entries)
+            check_idle(tool, root, entries, completed_only)
             for name in sorted(entries):
                 if is_lease(tool, name):
                     locks.enter_context(lease(root / name))
             if inventory(root, tool=tool) != entries:
                 raise RuntimeError(f"Store changed during preflight: {root}")
             for name, entry in entries.items():
-                if not copied(tool, name):
+                if not copied(tool, name, completed_only, excluded_records):
                     continue
                 previous = identities.get(name)
                 if previous and not same_data(previous[1], entry):
@@ -911,7 +924,7 @@ def plan_migration(tool: str, sources: list[Path], destination: Path) -> Migrati
     for name in identities:
         if any(parent.as_posix() in identities for parent in Path(name).parents if parent != Path(".")):
             raise RuntimeError(f"File/directory collision: {name}")
-    return Migration(tool, roots, destination, snapshots, files)
+    return Migration(tool, roots, destination, snapshots, files, completed_only=completed_only, excluded_records=frozenset(excluded_records))
 
 
 def private_parents(path: Path, template: Path | None = None) -> None:
@@ -934,7 +947,7 @@ def verify_sources(plan: Migration) -> None:
 def verify_destination(plan: Migration) -> None:
     current = inventory(plan.destination, tool=plan.tool)
     for name, entry in plan.inventories[plan.destination].items():
-        if copied(plan.tool, name) and (name not in current or not same_data(entry, current[name])):
+        if copied(plan.tool, name, plan.completed_only, plan.excluded_records) and (name not in current or not same_data(entry, current[name])):
             raise RuntimeError(f"Existing destination changed: {name}")
     for name, (_, entry) in plan.files.items():
         if name not in current or not same_data(entry, current[name]):
@@ -960,7 +973,7 @@ def apply_migrations(plans: list[Migration], *, dry_run: bool = False, verify: b
             for root, entries in plan.inventories.items():
                 if not (plan.applied and root == plan.destination) and inventory(root, tool=plan.tool) != entries:
                     raise RuntimeError(f"Store changed after migration preflight: {root}")
-                check_idle(plan.tool, root, entries)
+                check_idle(plan.tool, root, entries, plan.completed_only)
                 for name in sorted(entries):
                     if is_lease(plan.tool, name):
                         locks.enter_context(lease(root / name))
@@ -1032,12 +1045,15 @@ def apply_migrations(plans: list[Migration], *, dry_run: bool = False, verify: b
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tool", action="append", choices=("pira_ctx", "pira_dec", "pira_team"))
+    import setup_pira_stores as setup
+    setup.add_migration_arguments(parser)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="copy verified data then update shell configuration")
     mode.add_argument("--verify", action="store_true", help="read-only verification")
     args = parser.parse_args()
-    import setup_pira_stores as setup
-    plan = setup.plan_store_environment(args.tool or ["pira_ctx", "pira_dec"])
+    plan = setup.plan_store_environment(args.tool or ["pira_ctx", "pira_dec"],
+        completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team,
+        exclude_ctx_records=args.exclude_ctx_record)
     setup.apply_store_environment(plan, dry_run=not args.apply, verify=args.verify)
     return 0
 

@@ -516,6 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Install or refresh cloud-built PIRA tools for this user."
     )
+    stores.add_migration_arguments(parser)
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
     parser.add_argument("--no-team", action="store_true", help="Exclude Team and its backend/login setup; preserve existing binaries and configuration.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
@@ -1079,7 +1080,9 @@ def main(argv: list[str] | None = None) -> int:
     # Preparation can install a managed backend outside PATH. Pass that exact
     # selection to retained-history preflight before publishing any store paths.
     codex_binary = selected_codex_binary(install_dir) if "pira_team" in tools else None
-    store_plan = (stores.plan_store_environment(tools, codex_binary=codex_binary)
+    store_plan = (stores.plan_store_environment(tools, codex_binary=codex_binary,
+                  completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team,
+                  exclude_ctx_records=args.exclude_ctx_record)
                   if not args.no_path else stores.StorePlan())
     if "pira_team" in tools:
         ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,

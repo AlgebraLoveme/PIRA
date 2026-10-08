@@ -35,6 +35,15 @@ class StorePlan:
     team_migrations: list[migration.TeamMigration] = field(default_factory=list)
 
 
+def add_migration_arguments(parser) -> None:
+    parser.add_argument("--completed-ctx-only", action="store_true",
+                        help="Idle maintenance: migrate completed Ctx captures and history; leave live/watch state at source. Existing owner locks are still checked.")
+    parser.add_argument("--exclude-ctx-record", action="append", default=[], metavar="FILENAME",
+                        help="Leave this explicitly rejected .piractx record at source; repeatable. No deletion or repair.")
+    parser.add_argument("--fresh-team", action="store_true",
+                        help="Use the selected Team store without importing historical default runs; preserve old stores.")
+
+
 def physical_store_path(value: str | Path) -> Path:
     """Resolve directory aliases without creating stores or touching their records."""
     if not str(value):
@@ -340,6 +349,8 @@ def profile_store_context(text: str, source: Path) -> tuple[dict[str, list[str]]
 def plan_store_environment(
     tools: list[str], *, profile_paths: list[Path] | None = None,
     codex_text: str | None = None, codex_binary: str | Path | None = None,
+    completed_ctx_only: bool = False, fresh_team: bool = False,
+    exclude_ctx_records: list[str] | tuple[str, ...] = (),
 ) -> StorePlan:
     """Preflight selected stores; keep unrelated shell content opaque and unchanged."""
     configuration_toml()
@@ -446,6 +457,9 @@ def plan_store_environment(
             continue
         destination = Path(stores[key])
         if tool == "pira_team":
+            if fresh_team:
+                notices.append("MIGRATION: historical Team stores left untouched (--fresh-team)")
+                continue
             if stores[key] == defaults.get(key) or tool in codex_legacy:
                 destination = Path(defaults[key])
                 sources = [path for path in historical_store_paths(tool) if path != destination and path.exists()]
@@ -455,7 +469,14 @@ def plan_store_environment(
             destination = Path(defaults[key])
             sources = [path for path in historical_store_paths(tool) if path != destination and path.exists()]
             if sources:
-                relocations.append(migration.plan_migration(tool, sources, destination))
+                if (completed_ctx_only or exclude_ctx_records) and tool == "pira_ctx":
+                    relocations.append(migration.plan_migration(tool, sources, destination, completed_only=completed_ctx_only, excluded_records=frozenset(exclude_ctx_records)))
+                    if completed_ctx_only:
+                        notices.append("MIGRATION: Ctx live/watch state left untouched at historical sources (--completed-ctx-only)")
+                    for name in sorted(set(exclude_ctx_records)):
+                        notices.append(f"MIGRATION: rejected Ctx record left at source: {name}")
+                else:
+                    relocations.append(migration.plan_migration(tool, sources, destination))
     if sys.platform != "win32" and any("\n" in value or "\r" in value for value in stores.values()):
         raise RuntimeError("Shell store paths must be single-line; choose a path without newline characters")
     updates: dict[Path, tuple[str, str]] = {}

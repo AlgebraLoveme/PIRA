@@ -176,6 +176,58 @@ class MigrationTests(unittest.TestCase):
                 self.assertFalse(self.destination.exists())
                 lock.unlink()
 
+    def test_completed_ctx_only_preserves_unfinished_state_and_reruns(self):
+        self.put(self.source, "live/pending.live.json", b"{}")
+        self.put(self.source, "watch/state/paused.json", b'{"monitor":"paused"}')
+        self.put(self.source, "record.piractx")
+        self.put(self.source, "short-ids/workspace/session/reservation", b"record")
+        original = migration.inventory(self.source)
+        plan = migration.plan_migration("pira_ctx", [self.source], self.destination, completed_only=True)
+        migration.apply_migrations([plan])
+        self.assertEqual(set(migration.inventory(self.destination)),
+                         {"record.piractx", "short-ids/workspace/session/reservation"})
+        self.assertEqual(migration.inventory(self.source), original)
+        self.put(self.destination, "later.piractx", b"destination-only")
+        rerun = migration.plan_migration("pira_ctx", [self.source], self.destination, completed_only=True)
+        migration.apply_migrations([rerun])
+        self.assertEqual((self.destination / "later.piractx").read_bytes(), b"destination-only")
+        if os.name != "nt":
+            import fcntl
+            lock = self.put(self.source, "live/owners/pending.lock", b"")
+            with lock.open("rb") as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(RuntimeError, "Active"):
+                    migration.plan_migration("pira_ctx", [self.source], self.destination, completed_only=True)
+
+    def test_rejected_capture_exclusion_is_explicit_preserved_and_path_scoped(self):
+        self.put(self.source, "valid.piractx")
+        bad = self.put(self.source, "damaged.piractx", b"bad")
+        plan = migration.plan_migration("pira_ctx", [self.source], self.destination,
+                                        excluded_records=frozenset({bad.name}))
+        migration.apply_migrations([plan])
+        self.assertEqual(bad.read_bytes(), b"bad")
+        self.assertFalse((self.destination / bad.name).exists())
+        self.assertTrue((self.destination / "valid.piractx").exists())
+        for name in ("../bad.piractx", "nested/bad.piractx", "nested\\bad.piractx", "records", ".piractx"):
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                migration.plan_migration("pira_ctx", [self.source], self.destination,
+                                         excluded_records=frozenset({name}))
+
+    def test_explicit_setup_modes_route_without_inspecting_old_team(self):
+        import setup_pira
+        import setup_pira_tools
+        for parser in (setup_pira.build_parser(), setup_pira_tools.build_parser()):
+            args = parser.parse_args(["--completed-ctx-only", "--fresh-team"])
+            self.assertTrue(args.completed_ctx_only and args.fresh_team)
+        with patch.dict(os.environ, {"HOME": str(self.root), "LOCALAPPDATA": str(self.root)}, clear=True), \
+             patch.object(setup, "historical_store_paths", return_value=[self.source]), \
+             patch.object(migration, "preflight_team_relocation", side_effect=AssertionError("must not inspect")):
+            self.put(self.source, "live/pending.live.json", b"{}")
+            plan = setup.plan_store_environment(["pira_ctx", "pira_team"], profile_paths=[],
+                                               completed_ctx_only=True, fresh_team=True)
+            self.assertTrue(plan.migrations[0].completed_only)
+            self.assertEqual(plan.team_migrations, [])
+
     def test_ctx_states_and_derived_indexes_do_not_hide_merged_records(self):
         state = self.put(self.source, "watch/state/id.json", b'{"monitor":"active"}')
         with self.assertRaisesRegex(RuntimeError, "watch"):

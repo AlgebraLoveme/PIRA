@@ -66,6 +66,9 @@ class SetupState:
     dry_run: bool
     yes: bool
     team_enabled: bool = True
+    completed_ctx_only: bool = False
+    fresh_team: bool = False
+    exclude_ctx_records: tuple[str, ...] = ()
     changed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     verification: list[tuple[str, bool, str]] = field(default_factory=list)
@@ -532,7 +535,7 @@ def plan_codex_configuration(
         stores.codex_store_configuration(new_text, store_tools(state))
         return new_text, policy_path, policy
     if store_paths is None:
-        store_paths = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state)).stores
+        store_paths = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state), completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records).stores
     new_text = stores.codex_store_configuration(new_text, store_tools(state), store_paths)
     return new_text, policy_path, policy
 
@@ -545,7 +548,7 @@ def configure_codex(
 ) -> None:
     if plan is None:
         existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-        store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state))
+        store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state), completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records)
         plan = plan_codex_configuration(state, config_path, execution_mode, replace_permissions, store_plan.stores)
         stores.apply_store_migrations(store_plan, dry_run=state.dry_run)
     # A supplied plan has already crossed the migration barrier in main.
@@ -655,7 +658,7 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary:
             add("Codex config exists", False, display_path(config_path))
         else:
             text = config_path.read_text(encoding="utf-8")
-            defaults = stores.plan_store_environment(store_tools(state), codex_text=text, codex_binary=codex_binary).stores
+            defaults = stores.plan_store_environment(store_tools(state), codex_text=text, codex_binary=codex_binary, completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records).stores
             add("Codex physical store paths", stores.codex_store_configuration(text, store_tools(state), defaults) == text, display_path(config_path))
             keys = top_level_keys(text)
             expected_instructions = toml_string(config_path_string(instructions_path(state, config_path)))
@@ -671,6 +674,7 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
+    stores.add_migration_arguments(parser)
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
@@ -715,6 +719,12 @@ def configure_tools(
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
     command = [sys.executable, str(script), "--codex-login", codex_login]
+    for name in state.exclude_ctx_records:
+        command.extend(["--exclude-ctx-record", name])
+    if state.completed_ctx_only:
+        command.append("--completed-ctx-only")
+    if state.fresh_team:
+        command.append("--fresh-team")
     if not state.team_enabled:
         command.append("--no-team")
     if install_dir:
@@ -731,7 +741,7 @@ def configure_tools(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
-    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, team_enabled=not args.no_team)
+    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, team_enabled=not args.no_team, completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team, exclude_ctx_records=tuple(args.exclude_ctx_record))
     config_path = expand_path(args.codex_config)
     audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
 
@@ -751,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
                                                      args.replace_permissions, include_stores=False)
             codex_binary = migration_codex_binary(state, args.tools_install_dir,
                                                  prepare_missing=not args.skip_tools and not state.dry_run)
-            store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=codex_binary)
+            store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=codex_binary, completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records)
             store_paths = store_plan.stores
             if codex_plan is not None:
                 text, policy_path, policy = codex_plan
