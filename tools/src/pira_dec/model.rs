@@ -301,7 +301,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
     let mut context = None;
     let mut choices = Vec::new();
     let mut decision = None;
-    let mut makers = Vec::new();
+    let mut maker = None;
     let mut supersedes = None;
     let mut related = Vec::new();
     let mut position = 0;
@@ -336,7 +336,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
             5 if decision.is_none() && value.len() == 4 => {
                 decision = Some(u32::from_le_bytes(value.try_into().unwrap()));
             }
-            6 if value.len() == 1 => makers.push(Maker::from_byte(value[0])?),
+            6 if value.len() == 1 => {
+                let next = Maker::from_byte(value[0])?;
+                // Legacy records can repeat maker tags; human authority is sticky.
+                if maker != Some(Maker::Human) {
+                    maker = Some(next);
+                }
+            }
             7 if supersedes.is_none() => {
                 supersedes = Some(parse_string(value, MAX_ID_BYTES, "supersedes")?);
             }
@@ -345,13 +351,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecisionRecord, String> {
             _ => return Err("unknown decision TLV tag".into()),
         }
     }
-    let maker = if makers.contains(&Maker::Human) {
-        Maker::Human
-    } else if makers.contains(&Maker::Agent) {
-        Maker::Agent
-    } else {
-        return Err("missing decision maker".into());
-    };
+    let maker = maker.ok_or_else(|| "missing decision maker".to_string())?;
     let record = DecisionRecord {
         id: id.ok_or_else(|| "missing decision id".to_string())?,
         timestamp_ms: timestamp_ms.ok_or_else(|| "missing decision timestamp".to_string())?,

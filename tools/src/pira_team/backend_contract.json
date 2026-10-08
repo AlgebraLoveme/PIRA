@@ -1,9 +1,7 @@
 {
   "config": [
-    "sandbox_mode=\"workspace-write\"",
     "developer_instructions=\"\"",
     "project_doc_max_bytes=0",
-    "approval_policy=\"never\"",
     "agents.enabled=false",
     "features.multi_agent=false",
     "features.memories=false",
@@ -32,7 +30,8 @@
           "approvalPolicy",
           "baseInstructions",
           "developerInstructions",
-          "ephemeral"
+          "ephemeral",
+          "config"
         ],
         "thread/resume": [
           "threadId",
@@ -41,7 +40,8 @@
           "sandbox",
           "approvalPolicy",
           "baseInstructions",
-          "developerInstructions"
+          "developerInstructions",
+          "config"
         ],
         "thread/inject_items": [
           "threadId",
@@ -83,6 +83,9 @@
             "networkAccess",
             "excludeTmpdirEnvVar",
             "excludeSlashTmp"
+          ],
+          "dangerFullAccess": [
+            "type"
           ]
         },
         "UserInput": {

@@ -82,13 +82,20 @@ pub fn read_source(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-    String::from_utf8(bytes.to_vec()).map_err(|error| {
+    decode_source(bytes).map_err(|error| {
         format!(
             "source is not valid UTF-8 or cannot be read: {}: {error}",
             path.display()
         )
     })
+}
+
+/// Decode source text, removing one leading UTF-8 BOM and reusing the read buffer.
+pub(crate) fn decode_source(mut bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+    }
+    String::from_utf8(bytes)
 }
 
 pub fn identity_path(path: &Path, cwd: &Path) -> String {

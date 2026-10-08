@@ -952,3 +952,78 @@ fn rust_module_declarations_accept_server_identity_across_module_layouts() {
         }
     }
 }
+
+#[test]
+fn source_reading_strips_only_one_leading_bom() {
+    let s = Sandbox::new();
+    let source = "αlpha\u{feff}\r\nβeta";
+    for (input, expected) in [
+        (source.to_string(), source.to_string()),
+        (format!("\u{feff}{source}"), source.to_string()),
+        (
+            format!("\u{feff}\u{feff}{source}"),
+            format!("\u{feff}{source}"),
+        ),
+    ] {
+        s.write("source.txt", &input);
+        let shown = s.text(&["show", "source.txt"]);
+        let body = shown.split_once("--- begin ---\n").unwrap().1;
+        assert_eq!(body, format!("{expected}\n--- end ---\n"));
+        let searched = s.text(&["search", "βeta", "source.txt"]);
+        assert!(searched.contains("hits=\"L2:1[q1]\""), "{searched}");
+        assert!(
+            searched.contains(expected.split_once("\r\n").unwrap().0),
+            "{searched}"
+        );
+        assert!(searched.contains("βeta"), "{searched}");
+        assert!(!searched.contains("changed_files="), "{searched}");
+    }
+}
+
+#[test]
+fn source_reading_accepts_empty_and_bom_only_files() {
+    let s = Sandbox::new();
+    for input in ["", "\u{feff}"] {
+        s.write("source.txt", input);
+        let shown = s.text(&["show", "source.txt"]);
+        assert!(shown.contains("range=empty"), "{shown}");
+        assert!(shown.ends_with("--- begin ---\n\n--- end ---\n"), "{shown}");
+        let searched = s.text(&["search", "alpha", "source.txt"]);
+        assert!(searched.contains("matched_files=0"), "{searched}");
+        assert!(!searched.contains("complete=0"), "{searched}");
+    }
+}
+
+#[test]
+fn source_reading_preserves_invalid_utf8_diagnostics_after_bom() {
+    let s = Sandbox::new();
+    for prefix in [b"".as_slice(), b"\xef\xbb\xbf".as_slice()] {
+        let mut input = prefix.to_vec();
+        input.extend_from_slice(b"ab\xff");
+        fs::write(s.0.join("source.txt"), input).unwrap();
+        let shown = s.run(&["show", "source.txt"]);
+        assert_eq!(shown.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&shown.stderr);
+        assert!(
+            error.contains("invalid utf-8 sequence of 1 bytes from index 2"),
+            "{error}"
+        );
+        let searched = s.text(&["search", "ab", "source.txt"]);
+        assert!(searched.contains("non_utf8=1"), "{searched}");
+        assert!(searched.contains("complete=0"), "{searched}");
+    }
+}
+
+#[test]
+fn source_reading_rejects_nul_before_decoding() {
+    let s = Sandbox::new();
+    fs::write(s.0.join("source.txt"), b"\xef\xbb\xbfab\0\xff").unwrap();
+    let shown = s.run(&["show", "source.txt"]);
+    assert_eq!(shown.status.code(), Some(2));
+    let error = String::from_utf8_lossy(&shown.stderr);
+    assert!(error.contains("source contains NUL bytes"), "{error}");
+    assert!(!error.contains("not valid UTF-8"), "{error}");
+    let searched = s.text(&["search", "ab", "source.txt"]);
+    assert!(searched.contains("binary=1"), "{searched}");
+    assert!(!searched.contains("non_utf8="), "{searched}");
+}

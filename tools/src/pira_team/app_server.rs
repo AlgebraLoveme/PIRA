@@ -498,6 +498,10 @@ pub fn turn(
     guidance: (bool, bool),
 ) -> Result<Turn, String> {
     let build_roots = crate::build_roots::configured()?;
+    for root in &build_roots {
+        options.execution.require_writable(root)?;
+    }
+    options.execution.require_writable(handoff)?;
     manifest["build_roots"] = json!(build_roots);
     let repair = manifest["repairs"].as_u64().ok_or("missing repair state")? > 0;
     let mut server = Server::new(options, run, dir, handoff)?;
@@ -505,7 +509,7 @@ pub fn turn(
         .map_err(|e| format!("native Codex strict-config stdio initialization failed: {e}; inspect stderr.log and update Codex/Team to compatible builds. This is separate from the interactive shared daemon"))?;
     server.send(json!({"method":"initialized"}))?;
     let policy = fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?;
-    let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":"workspace-write",
+    let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
         "approvalPolicy":"never","baseInstructions":policy,"developerInstructions":""});
     let thread = if let Some(id) = manifest["thread_id"].as_str() {
         params["threadId"] = json!(id);
@@ -518,10 +522,10 @@ pub fn turn(
         params["ephemeral"] = json!(false);
         server.request("thread/start", params)?
     };
-    if thread["sandbox"]["type"] != "workspaceWrite" || thread["approvalPolicy"] != "never" {
+    if thread["sandbox"] != options.execution.sandbox || thread["approvalPolicy"] != "never" {
         return Err(format!(
-            "Codex did not confirm {}/approval-never permissions",
-            "workspace-write"
+            "Codex did not confirm {}/approval-never exact caller permissions",
+            options.execution.mode
         ));
     }
     let thread_id = thread["thread"]["id"]
@@ -546,28 +550,11 @@ pub fn turn(
     manifest["inject_review"] = json!(guidance.0);
     manifest["inject_implement"] = json!(guidance.1);
     lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    let mut roots = vec![
-        options.cwd.clone(),
-        handoff
-            .parent()
-            .ok_or("missing artifact directory")?
-            .to_owned(),
-        run.join("scratch"),
-        options.ctx_store.clone(),
-        options.dec_store.clone(),
-    ];
-    for root in build_roots {
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    }
-    let sandbox = json!({"type":"workspaceWrite","writableRoots":roots,"networkAccess":false,
-        "excludeTmpdirEnvVar":true,"excludeSlashTmp":true});
     let started = server.request(
         "turn/start",
         json!({"threadId":thread_id,"input":[{"type":"text","text":task}],
         "model":options.model,"effort":options.effort,"cwd":options.cwd,"approvalPolicy":"never",
-        "sandboxPolicy":sandbox}),
+        "sandboxPolicy":options.execution.sandbox}),
     )?;
     let turn_id = started["turn"]["id"]
         .as_str()

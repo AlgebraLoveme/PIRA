@@ -888,9 +888,15 @@ impl Utf8Validator {
         if self.invalid {
             return;
         }
-        let mut bytes = std::mem::take(&mut self.tail);
-        bytes.extend_from_slice(chunk);
-        match std::str::from_utf8(&bytes) {
+        let mut pending = std::mem::take(&mut self.tail);
+        // Only copy when a UTF-8 character spans reads.
+        let bytes = if pending.is_empty() {
+            chunk
+        } else {
+            pending.extend_from_slice(chunk);
+            &pending
+        };
+        match std::str::from_utf8(bytes) {
             Ok(_) => {}
             Err(error) if error.error_len().is_some() => self.invalid = true,
             Err(error) => self.tail.extend_from_slice(&bytes[error.valid_up_to()..]),

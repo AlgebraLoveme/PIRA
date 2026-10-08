@@ -771,10 +771,7 @@ fn read_text(path: &Path) -> Result<TextFile, SkipKind> {
         return Err(SkipKind::Binary);
     }
     let raw_hash = hash16(&raw);
-    let logical = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw);
-    let source = std::str::from_utf8(logical)
-        .map_err(|_| SkipKind::NonUtf8)?
-        .to_owned();
+    let source = crate::util::decode_source(raw).map_err(|_| SkipKind::NonUtf8)?;
     Ok(TextFile { source, raw_hash })
 }
 

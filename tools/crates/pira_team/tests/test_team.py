@@ -32,6 +32,7 @@ class TeamTests(unittest.TestCase):
         fake = self.root / "codex"
         fake.write_text(Path(__file__).with_name("fake_codex.py").read_text())
         fake.chmod(0o700)
+        self.parent([{}])
 
     def launch(self, task: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -39,6 +40,34 @@ class TeamTests(unittest.TestCase):
              "--store", str(self.root / "logs"), "--cwd", str(self.root), *extra, "--task", task],
             env=self.env, capture_output=True, text=True, timeout=10,
         )
+
+    def fail_startup(self, proc: subprocess.Popen[str], reason: str, consumed_stderr: str = "") -> None:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            stdout, stderr = proc.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=5)
+        self.fail(f"{reason}; launcher exit={proc.returncode}\nstdout:\n{stdout}\nstderr:\n{consumed_stderr}{stderr}")
+
+    def assert_worker_ready(self, proc: subprocess.Popen[str], read_fd: int) -> None:
+        import select
+        if not select.select([read_fd], [], [], 5)[0]:
+            self.fail_startup(proc, "worker readiness timed out")
+        ready = os.read(read_fd, 1)
+        if ready != b"1":
+            self.fail_startup(proc, f"worker readiness returned {ready!r}, expected b'1'")
+
+    def wait_stderr_notice(self, proc: subprocess.Popen[str], notice: str) -> str:
+        consumed = []
+        while True:
+            line = proc.stderr.readline()
+            if not line:
+                self.fail_startup(proc, f"launcher exited before {notice}", "".join(consumed))
+            consumed.append(line)
+            if notice in line:
+                return line
 
     def metadata(self, receipt: dict) -> dict:
         self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
@@ -61,7 +90,7 @@ class TeamTests(unittest.TestCase):
         file = self.root / "followup task.txt"; file.write_text("recall")
         self.assertEqual(self.access("resume", receipt["run_id"], "--task-file", str(file)).returncode, 0)
         equal = subprocess.run([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-            "--store", str(self.root / "logs"), "--task=--literal=value"], env=self.env,
+            "--store", str(self.root / "logs"), "--cwd", str(self.root), "--task=--literal=value"], env=self.env,
             capture_output=True, text=True, timeout=5)
         self.assertEqual(equal.returncode, 0, equal.stderr)
         self.assertEqual(Path(json.loads(equal.stdout)["handoff_path"]).read_text(), "ANSWER --literal=value")
@@ -96,6 +125,11 @@ class TeamTests(unittest.TestCase):
                     self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
         self.assertNotEqual(self.access("interrupt", receipt["run_id"], "--task", "invalid").returncode, 0)
 
+    def permission_context(self) -> dict:
+        return {"cwd":str(self.root), "approval_policy":"never", "sandbox_policy":{
+            "type":"workspace-write", "writable_roots":[], "network_access":False,
+            "exclude_tmpdir_env_var":True, "exclude_slash_tmp":True}}
+
     def parent(self, contexts: list[dict], *, identity: str = "parent-session") -> Path:
         self.env["CODEX_THREAD_ID"] = "parent-session"
         directory = self.root / "original-home/sessions/2026/10/01"
@@ -103,11 +137,155 @@ class TeamTests(unittest.TestCase):
         path = directory / "rollout-2026-10-01-parent-session.jsonl"
         events = [{"type":"session_meta", "payload":{"id":identity}},
                   {"type":"response_item", "payload":{"text":"PARENT_TRANSCRIPT_MUST_NOT_BE_FORWARDED"}}]
-        events += [{"type":"turn_context", "payload":c} for c in contexts]
+        events += [{"type":"turn_context", "payload":{**self.permission_context(), **c}} for c in contexts]
         path.write_text("".join(json.dumps(e)+"\n" for e in events))
         # A sibling session must not be read; its content is deliberately invalid JSON.
         (directory / "rollout-other-session.jsonl").write_text("unrelated private conversation")
         return path
+
+    @unittest.skipUnless(os.name == "posix", "POSIX fixture readiness")
+    def test_startup_diagnostics_expose_scope_rejection(self) -> None:
+        outside = self.root.parent
+        for synchronization in ("ready", "notice"):
+            with self.subTest(synchronization=synchronization):
+                read_fd, write_fd = os.pipe()
+                proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Fixture diagnostics",
+                    "--model", "test-model", "--effort", "high", "--cwd", str(outside),
+                    "--store", str(self.root / "logs"), "--task", "must not launch"],
+                    env=self.env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                os.close(write_fd)
+                try:
+                    with self.assertRaisesRegex(AssertionError, "caller permissions do not allow required Team write path"):
+                        if synchronization == "ready":
+                            self.assert_worker_ready(proc, read_fd)
+                        else:
+                            self.wait_stderr_notice(proc, "pira_team run_id:")
+                    self.assertEqual(proc.returncode, 1)
+                    self.assertFalse((self.root / "logs").exists())
+                finally:
+                    os.close(read_fd)
+                    if proc.poll() is None:
+                        proc.terminate(); proc.communicate(timeout=8)
+
+    def test_full_access_network_and_request_configuration(self) -> None:
+        self.parent([{"sandbox_policy":{"type":"danger-full-access"},
+                      "permission_profile":{"type":"disabled"}}])
+        result = self.launch("full access")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        run = Path(receipt["run_root"])
+        manifest = self.metadata(receipt)
+        self.assertEqual(manifest["execution_permissions"]["sandbox_policy"], {"type":"dangerFullAccess"})
+        self.assertEqual(manifest["execution_permissions"]["source"], "verified-caller-turn-context")
+        requests = [json.loads(line) for line in (run / "requests.jsonl").read_text().splitlines()]
+        thread = next(r["params"] for r in requests if r["method"] == "thread/start")
+        turn = next(r["params"] for r in requests if r["method"] == "turn/start")
+        self.assertEqual((thread["sandbox"], thread["config"], turn["sandboxPolicy"]),
+                         ("danger-full-access", {}, {"type":"dangerFullAccess"}))
+        self.assertIn('Safety:', (run / "policy.md").read_text().split('## Safety')[1].split('## Handoff')[0])
+        self.assertNotIn('Safety:', (run / "phase.md").read_text().split('Latest assignment contract')[0])
+
+    def test_resume_replaces_full_access_with_current_restricted_policy(self) -> None:
+        self.parent([{"sandbox_policy":{"type":"danger-full-access"}}])
+        first = self.launch("first")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        self.parent([{}])
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        manifest = self.metadata(json.loads(resumed.stdout))
+        self.assertEqual(manifest["sandbox"], "workspace-write")
+        latest = Path(receipt["run_root"]) / "revisions/000002"
+        requests = [json.loads(line) for line in (latest / "requests.jsonl").read_text().splitlines()]
+        thread = next(r["params"] for r in requests if r["method"] == "thread/resume")
+        turn = next(r["params"] for r in requests if r["method"] == "turn/start")
+        expected = {"type":"workspaceWrite", "writableRoots":[str(self.root)],
+                    "networkAccess":False, "excludeTmpdirEnvVar":True, "excludeSlashTmp":True}
+        self.assertEqual(thread["sandbox"], "workspace-write")
+        self.assertEqual(thread["config"]["sandbox_workspace_write"]["network_access"], False)
+        self.assertEqual(turn["sandboxPolicy"], expected)
+        self.assertEqual(manifest["execution_permissions"]["sandbox_policy"], expected)
+        previous = json.loads((Path(receipt["run_root"]) / "revisions/000001/manifest.json").read_text())
+        self.assertEqual(previous["sandbox"], "danger-full-access")
+
+    def test_workspace_network_flags_and_roots_are_inherited_exactly(self) -> None:
+        extra = self.root / "extra"; extra.mkdir()
+        context = self.permission_context()
+        context["sandbox_policy"].update(writable_roots=[str(extra)], network_access=True,
+                                         exclude_tmpdir_env_var=False, exclude_slash_tmp=False)
+        self.parent([context])
+        result = self.launch("network enabled")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.metadata(json.loads(result.stdout))
+        expected = {"type":"workspaceWrite", "writableRoots":[str(self.root),str(extra)],
+                    "networkAccess":True, "excludeTmpdirEnvVar":False, "excludeSlashTmp":False}
+        self.assertEqual(manifest["execution_permissions"]["sandbox_policy"], expected)
+
+    def test_missing_unknown_unrepresentable_and_approval_context_fail_closed(self) -> None:
+        cases = [
+            ({"sandbox_policy":None}, "sandbox_policy"),
+            ({"sandbox_policy":{"type":"future"}}, "unsupported"),
+            ({"sandbox_policy":{"type":"external-sandbox", "network_access":"enabled"}}, "unsupported"),
+            ({"sandbox_policy":{"type":"read-only"}}, "read-only"),
+            ({"approval_policy":None}, "approval"),
+            ({"approval_policy":"on-request"}, "interactive"),
+            ({"approval_policy":{"granular":{}}}, "interactive"),
+            ({"permission_profile":{"type":"managed", "file_system":{"type":"restricted", "entries":[]}, "network":"restricted"}}, "permission_profile"),
+            ({"file_system_sandbox_policy":{"type":"restricted"}}, "file_system_sandbox_policy"),
+        ]
+        malformed = self.permission_context()["sandbox_policy"]
+        for key, value in [("network_access", "false"), ("exclude_slash_tmp", None), ("writable_roots", "all")]:
+            cases.append(({"sandbox_policy":{**malformed,key:value}}, "malformed"))
+        for context, error in cases:
+            with self.subTest(context=context):
+                self.parent([context])
+                result = self.launch("must not start")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+                self.assertFalse((self.root / "logs").exists())
+        self.env.pop("CODEX_THREAD_ID")
+        self.assertNotEqual(self.launch("explicit settings still require caller").returncode, 0)
+        self.assertFalse((self.root / "logs").exists())
+
+    def test_missing_latest_permissions_do_not_backfill_or_mutate_resume(self) -> None:
+        receipt = json.loads(self.launch("first").stdout)
+        manifest = Path(receipt["run_root"]) / "manifest.json"
+        original = manifest.read_bytes()
+        self.parent([{}, {"sandbox_policy":None}])
+        result = self.access("resume", receipt["run_id"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(manifest.read_bytes(), original)
+        self.assertFalse((Path(receipt["run_root"]) / "revisions/000002").exists())
+
+    def test_managed_and_build_write_roots_do_not_expand_caller_scope(self) -> None:
+        permitted = self.root / "permitted"; permitted.mkdir()
+        self.parent([{"cwd":str(permitted)}])
+        result = self.launch("out of caller scope")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no extra write root", result.stderr)
+        self.assertFalse((self.root / "logs").exists())
+        self.parent([{}])
+        outside = tempfile.TemporaryDirectory(prefix="team-outside-")
+        self.addCleanup(outside.cleanup)
+        self.env["PIRA_TEAM_BUILD_ROOTS"] = json.dumps([str(Path(outside.name).resolve())])
+        result = self.launch("outside build root")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no extra write root", result.stderr)
+        self.assertFalse(list((self.root / "logs").glob("*/requests.jsonl")))
+
+    def test_version_twelve_safety_migration_is_injected_once(self) -> None:
+        receipt = json.loads(self.launch("first").stdout)
+        run = Path(receipt["run_root"])
+        manifest = run / "manifest.json"
+        state = json.loads(manifest.read_text()); state["worker_policy_version"] = 12
+        manifest.write_text(json.dumps(state))
+        prefix = (run / "policy.md").read_bytes()
+        for revision in (2,3):
+            result = self.access("resume", receipt["run_id"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            phase = (run / f"revisions/{revision:06}/phase.md").read_text()
+            self.assertEqual('exact prefix `Safety:`' in phase, revision == 2)
+            self.assertEqual((run / "policy.md").read_bytes(), prefix)
 
     def launch_inherited(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--store", str(self.root / "logs"),
@@ -160,8 +338,8 @@ class TeamTests(unittest.TestCase):
         other = path.with_name("rollout-duplicate-parent-session.jsonl")
         other.write_text(path.read_text())
         self.assertNotEqual(self.launch_inherited().returncode, 0)
-        # Explicit settings require no parent-session access even when discovery is broken.
-        self.assertEqual(self.launch_inherited("--model","explicit","--effort","low").returncode, 0)
+        # Explicit model/effort never bypass execution permission verification.
+        self.assertNotEqual(self.launch_inherited("--model","explicit","--effort","low").returncode, 0)
 
     @unittest.skipUnless(os.name == "posix", "symlink support")
     def test_parent_lookup_does_not_follow_symlinks(self) -> None:
@@ -225,7 +403,7 @@ class TeamTests(unittest.TestCase):
     def test_environment_store_and_explicit_store_precedence(self) -> None:
         store = self.root / "environment store"
         self.env["PIRA_TEAM_DIR"] = str(store)
-        result = subprocess.run([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high", "review"],
+        result = subprocess.run([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high", "--cwd", str(self.root), "review"],
             env=self.env, capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
@@ -825,7 +1003,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 12)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 13)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -874,7 +1052,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 12)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 13)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
@@ -983,6 +1161,30 @@ class TeamTests(unittest.TestCase):
         result = self.launch("extract", "--format", "csv", "--columns", '["a","b"]')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(json.loads(result.stdout)["handoff_path"]).read_text(), 'a,b\n1,2\n')
+
+    def test_csv_preserves_quoted_multiline_and_varying_size_rows(self) -> None:
+        content = 'a,b\n"long, quoted field","line one\nline two"\nx,λ\n"","escaped ""quote"""\n'
+        self.env["TEAM_CANDIDATE"] = self.candidate(content, "table.csv", "csv")
+        result = self.launch("extract", "--format", "csv", "--columns", '["a","b"]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(self.metadata(receipt)["repairs"], 0)
+        self.assertEqual(Path(receipt["handoff_path"]).read_bytes(), content.encode())
+
+    def test_csv_rejects_late_row_width_mismatch(self) -> None:
+        for row in ["3", "3,4,5"]:
+            with self.subTest(row=row):
+                content = f"a,b\n1,2\n{row}\n"
+                self.env["TEAM_CANDIDATE"] = self.candidate(content, "table.csv", "csv")
+                self.env["TEAM_REPAIRED"] = self.env["TEAM_CANDIDATE"]
+                result = self.launch("extract", "--format", "csv", "--columns", '["a","b"]')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                run_id = next(line.split(": ", 1)[1] for line in result.stderr.splitlines()
+                              if line.startswith("pira_team run_id:"))
+                diagnostics = self.access("read", run_id, "repair/validation.json")
+                self.assertEqual(diagnostics.returncode, 0, diagnostics.stderr)
+                self.assertIn("CSV row:", json.loads(diagnostics.stdout)["error"])
 
     def test_invalid_contract_rejected_before_model(self) -> None:
         external = self.root / "external-schema.json"
@@ -1171,6 +1373,9 @@ class TeamTests(unittest.TestCase):
         cache = tempfile.TemporaryDirectory(prefix="team-cache-")
         self.addCleanup(cache.cleanup)
         cache_root = Path(cache.name).resolve()
+        context = self.permission_context()
+        context["sandbox_policy"]["writable_roots"] = [str(cache_root)]
+        self.parent([context])
         roots = []
         for key in ("CARGO_HOME", "CARGO_TARGET_DIR", "UV_CACHE_DIR", "npm_config_cache", "GOCACHE", "GRADLE_USER_HOME"):
             directory = cache_root / key
@@ -1249,6 +1454,8 @@ class TeamTests(unittest.TestCase):
         source.parent.mkdir(parents=True)
         original = b'{"synthetic": "not-a-real-credential"}'
         source.write_bytes(original)
+        import shutil
+        shutil.copytree(self.root / "original-home/sessions", home / ".codex/sessions")
         self.env.update(CODEX_HOME="", HOME=str(home), USERPROFILE=str(home),
                         TEAM_TEST_AUTH_SOURCE=str(source), TEAM_BAD_PERMISSION="1")
         # Permission rejection is intentional: validate startup/auth without a paid turn
@@ -1301,13 +1508,11 @@ class TeamTests(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         self.env["TEAM_READY_FD"] = str(write_fd)
         proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-            "--store", str(self.root / "logs"), "interrupt"],
+            "--store", str(self.root / "logs"), "--cwd", str(self.root), "interrupt"],
             env=self.env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         os.close(write_fd)
         try:
-            import select
-            self.assertTrue(select.select([read_fd], [], [], 5)[0], "worker readiness timed out")
-            self.assertEqual(os.read(read_fd, 1), b"1")
+            self.assert_worker_ready(proc, read_fd)
             proc.terminate()
             stdout, _ = proc.communicate(timeout=5)
             self.assertNotEqual(proc.returncode, 0)
@@ -1360,18 +1565,16 @@ class TeamTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX signal lifecycle")
     def test_signal_cancels_blocked_request_write(self) -> None:
-        import select
         read_fd, write_fd = os.pipe()
         self.env.update(TEAM_READY_FD=str(write_fd), TEAM_BLOCK_INPUT="1")
         task = self.root / "large-task.txt"
         task.write_text("read-only inspection " * 50000)
         proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-            "--store", str(self.root / "logs"), "--task-file", str(task)],
+            "--store", str(self.root / "logs"), "--cwd", str(self.root), "--task-file", str(task)],
             env=self.env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         os.close(write_fd)
         try:
-            self.assertTrue(select.select([read_fd], [], [], 5)[0])
-            self.assertEqual(os.read(read_fd, 1), b"1")
+            self.assert_worker_ready(proc, read_fd)
             import time
             run = next((self.root / "logs").iterdir())
             deadline = time.monotonic() + 3
@@ -1395,14 +1598,11 @@ class TeamTests(unittest.TestCase):
         self.env["TEAM_CANDIDATE"] = self.candidate("[")
         self.env["TEAM_REPAIR_WAIT"] = "1"
         proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-            "--store", str(self.root / "logs"), "review"],
+            "--store", str(self.root / "logs"), "--cwd", str(self.root), "review"],
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            run_id = proc.stderr.readline().strip().split(": ", 1)[1]
-            while True:
-                line = proc.stderr.readline()
-                self.assertTrue(line, "worker exited before repair became active")
-                if "repair=true" in line: break
+            run_id = self.wait_stderr_notice(proc, "pira_team run_id:").strip().split(": ", 1)[1]
+            self.wait_stderr_notice(proc, "repair=true")
             self.assertIn("steering unavailable", self.access("steer", run_id, "change evidence").stderr)
             self.assertEqual(self.access("interrupt", run_id).returncode, 0)
             out, err = proc.communicate(timeout=5)
@@ -1417,22 +1617,16 @@ class TeamTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX lifecycle fixture")
     def test_stalled_cancellation_is_bounded_and_resumable(self) -> None:
-        import select
         read_fd, write_fd = os.pipe()
         self.env["TEAM_READY_FD"] = str(write_fd)
         self.env["TEAM_IGNORE_INTERRUPT"] = "1"
         proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-            "--store", str(self.root / "logs"), "--task", "interrupt"],
+            "--store", str(self.root / "logs"), "--cwd", str(self.root), "--task", "interrupt"],
             env=self.env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         os.close(write_fd)
         try:
-            self.assertTrue(select.select([read_fd], [], [], 5)[0])
-            os.read(read_fd, 1)
-            while True:
-                line = proc.stderr.readline()
-                self.assertTrue(line, "launcher exited before active notice")
-                if "pira_team active:" in line:
-                    break
+            self.assert_worker_ready(proc, read_fd)
+            self.wait_stderr_notice(proc, "pira_team active:")
             run = next((self.root / "logs").iterdir())
             control = subprocess.run([str(self.bin), "interrupt", run.name,
                 "--store", str(self.root / "logs")], env=self.env,
@@ -1502,7 +1696,7 @@ class TeamTests(unittest.TestCase):
         self.assertIn("legacy ephemeral", self.access("resume", receipt["run_id"]).stderr)
         self.assertEqual(self.access("read", receipt["run_id"]).stdout, "ANSWER review")
 
-    def test_runtime_must_confirm_read_only(self) -> None:
+    def test_runtime_must_confirm_exact_caller_permissions(self) -> None:
         self.env["TEAM_BAD_PERMISSION"] = "1"
         result = self.launch("review")
         self.assertNotEqual(result.returncode, 0)
@@ -1721,25 +1915,27 @@ class TeamTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX lifecycle fixture")
     def test_active_steer_interrupt_and_exclusive_resume(self) -> None:
         import socket
-        import select
         for operation in ("steer", "interrupt"):
             read_fd, write_fd = os.pipe()
             self.env["TEAM_READY_FD"] = str(write_fd)
             proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-                "--store", str(self.root / "logs"), "steerable"],
+                "--store", str(self.root / "logs"), "--cwd", str(self.root), "steerable"],
                 env=self.env, pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             os.close(write_fd)
             try:
-                self.assertTrue(select.select([read_fd], [], [], 5)[0])
-                self.assertEqual(os.read(read_fd, 1), b"1")
+                self.assert_worker_ready(proc, read_fd)
                 # Read the launcher's advertised ID, then synchronize with endpoint creation.
-                run_id = proc.stderr.readline().strip().split(": ", 1)[1]
+                run_id = self.wait_stderr_notice(proc, "pira_team run_id:").strip().split(": ", 1)[1]
                 run = self.root / "logs" / run_id
-                # A native response precedes endpoint creation; bounded retry is test synchronization only.
+                # A native response precedes endpoint creation; keep the wait bounded.
                 import time
                 deadline = time.monotonic() + 3
                 while not (run / "control.json").exists() and time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        self.wait_stderr_notice(proc, "pira_team active:")
                     time.sleep(.01)
+                if not (run / "control.json").exists():
+                    self.fail_startup(proc, "control endpoint readiness timed out")
                 endpoint = json.loads((run / "control.json").read_text())
                 self.assertIn("active owner", self.access("resume", run_id, "collision").stderr)
                 self.assertNotEqual(self.access("read", run_id, "control.json").returncode, 0)

@@ -87,11 +87,19 @@ fn owner(run: &Path) -> Result<File, String> {
 const FIX_TASK: &str = "Apply verified findings from your completed review within the original assignment. Follow the injected coding policy and return the fix report through the existing output contract.";
 
 pub fn launch(options: Options) -> Result<(), String> {
+    for path in [
+        &options.store,
+        &options.cwd,
+        &options.ctx_store,
+        &options.dec_store,
+    ] {
+        options.execution.require_writable(path)?;
+    }
     let run = crate::prepare_store(&options.store)?;
     let _owner = owner(&run)?;
     let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
         "revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
-        "sandbox":"workspace-write","pira_instructions":false});
+        "sandbox":options.execution.mode,"pira_instructions":false});
     revision(&options, &run, &mut manifest)
 }
 
@@ -198,6 +206,9 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         println!("{receipt}");
         return Ok(());
     }
+    let parent =
+        profile::load().map_err(|e| format!("cannot inherit verified caller execution: {e}"))?;
+    profile::Execution::from_context(&parent)?.require_writable(&run)?;
     let _owner = owner(&run)?;
     let mut manifest = read_json(&run.join("manifest.json"))?;
     if manifest["transport"] != "app-server" || manifest["thread_id"].as_str().is_none() {
@@ -229,9 +240,10 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     };
     let sources = json!({"model":if model.is_some() {"explicit"} else {"run"},
         "effort":if effort.is_some() {"explicit"} else {"run"}});
-    let (model, effort, _) = profile::resolve(
+    let (model, effort, _, execution) = profile::resolve(
         Some(model.unwrap_or(text("model")?)),
         Some(effort.unwrap_or(text("effort")?)),
+        parent,
     )?;
     let output = output.unwrap_or(text("output")?);
     if !["artifact", "answer"].contains(&output.as_str()) {
@@ -256,12 +268,16 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| crate::tool_store("dec", &cwd))?;
+    for path in [&run, &cwd, &ctx_store, &dec_store] {
+        execution.require_writable(path)?;
+    }
     let options = Options {
         cwd,
         store: root,
         model,
         effort,
         profile_sources: sources,
+        execution,
         task,
         output,
         navigation: text("navigation")?,
@@ -346,7 +362,7 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     for (key,value) in json!({"status":"running","model":options.model,"effort":options.effort,
         "profile_sources":options.profile_sources,"cwd":options.cwd,"task":options.task,
         "contract":options.contract.description(),"navigation":options.navigation,"completion_gate":options.completion_gate,"ctx_store":options.ctx_store,"dec_store":options.dec_store,"output":options.output,
-        "sandbox":"workspace-write","timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
+        "sandbox":options.execution.mode,"execution_permissions":{"source":"verified-caller-turn-context","caller_thread_id":options.execution.caller_thread_id,"sandbox_policy":options.execution.sandbox,"approval_policy":"never"},"timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
         manifest[key] = value.clone();
     }
     save_json(&run.join("manifest.json"), manifest)?;
@@ -529,7 +545,8 @@ fn generate_stage(
             json!({"workspace":options.cwd,"handoff_path":handoff,"scratch":scratch,
                 "completion_gate":manifest["completion_gate"],"output_contract":options.contract.description(),
                 "stage":manifest["stage"],"review_checkpoint":manifest["review_checkpoint"],
-                "ctx_store":options.ctx_store,"dec_store":options.dec_store}),
+                "ctx_store":options.ctx_store,"dec_store":options.dec_store,
+                "execution_permissions":manifest["execution_permissions"]}),
             if index > 0 {
                 "Format repair only: edit the handoff, not project files. Preserve the substantive outcome."
             } else if review_stage {

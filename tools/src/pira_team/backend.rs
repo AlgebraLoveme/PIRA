@@ -100,7 +100,7 @@ pub fn validate_request(validator: &jsonschema::Validator, request: &Value) -> R
 
 fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Result<(), String> {
     let id = "00000000-0000-0000-0000-000000000001";
-    let mut thread = json!({"model":options.model,"cwd":options.cwd,"sandbox":"workspace-write",
+    let mut thread = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
         "approvalPolicy":"never","baseInstructions":"probe","developerInstructions":""});
     let text = json!([{"type":"text","text":"probe"}]);
     let mut examples = vec![
@@ -115,8 +115,7 @@ fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Re
         (
             "turn/start",
             json!({"threadId":id,"input":text,"model":options.model,"effort":options.effort,
-            "cwd":options.cwd,"approvalPolicy":"never","sandboxPolicy":{"type":"workspaceWrite",
-                "writableRoots":[options.cwd],"networkAccess":false,"excludeTmpdirEnvVar":true,"excludeSlashTmp":true}}),
+            "cwd":options.cwd,"approvalPolicy":"never","sandboxPolicy":options.execution.sandbox}),
         ),
         (
             "turn/steer",
@@ -238,7 +237,23 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("codex-home")).unwrap();
-        let options = crate::parse(
+        let options = options_for_schema(&root);
+        let validator = preflight(&options, &root, &root).unwrap();
+        for network in [false, true] {
+            let mut options = options_for_schema(&root);
+            options.execution = crate::profile::Execution::from_context(&json!({
+                "approval_policy":"never", "cwd":root,
+                "sandbox_policy":{"type":"workspace-write","writable_roots":[],
+                    "network_access":network,"exclude_tmpdir_env_var":true,"exclude_slash_tmp":true}
+            }))
+            .unwrap();
+            validate_examples(&validator, &options).unwrap();
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn options_for_schema(root: &Path) -> Options {
+        crate::parse_using(
             &[
                 "run",
                 "--model",
@@ -255,11 +270,9 @@ mod tests {
                 root.to_str().unwrap(),
             ]
             .map(str::to_owned),
+            || Ok(json!({"approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"permission_profile":{"type":"disabled"}})),
         )
-        .unwrap();
-        let result = preflight(&options, &root, &root);
-        fs::remove_dir_all(&root).unwrap();
-        assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
+        .unwrap()
     }
 
     #[test]

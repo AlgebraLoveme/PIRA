@@ -1,5 +1,6 @@
 #![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -250,6 +251,92 @@ fn repeated_makers_keep_human_precedence() {
             .unwrap()
             .contains("Repeats are accepted")
     );
+}
+
+fn show_legacy_makers(makers: &[&[u8]]) -> std::process::Output {
+    let sandbox = Sandbox::new();
+    let added = add(sandbox.path(), &[]);
+    assert!(added.status.success(), "{added:?}");
+    let text = String::from_utf8(added.stdout).unwrap();
+    let id = text.split(" | ").next().unwrap();
+    let workspace = fs::read_dir(sandbox.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = workspace.join("records").join(format!("{id}.piradec"));
+    let encoded = fs::read(&path).unwrap();
+    let body_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+    let mut body = encoded[12..12 + body_len].to_vec();
+    // This fixture has no relationships, so its last TLV is the human maker.
+    assert_eq!(&body[body.len() - 6..], &[6, 1, 0, 0, 0, 1]);
+    body.truncate(body.len() - 6);
+    for value in makers {
+        body.push(6);
+        body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        body.extend_from_slice(value);
+    }
+    let mut legacy = encoded[..8].to_vec();
+    legacy.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    legacy.extend_from_slice(&body);
+    legacy.extend_from_slice(&Sha256::digest(&body));
+    fs::write(path, legacy).unwrap();
+    Command::new(binary())
+        .args([
+            "show",
+            id,
+            "--json",
+            "--store-dir",
+            sandbox.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn legacy_maker_tags_keep_human_precedence_in_either_order() {
+    let cases: &[(&[&[u8]], &str)] = &[
+        (&[&[2], &[2]], "agent"),
+        (&[&[1], &[2]], "human"),
+        (&[&[2], &[1]], "human"),
+    ];
+    for (makers, expected) in cases {
+        let output = show_legacy_makers(makers);
+        assert!(output.status.success(), "{output:?}");
+        let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(record["maker"], *expected);
+    }
+}
+
+#[test]
+fn legacy_record_requires_a_maker() {
+    let output = show_legacy_makers(&[]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stderr, b"pira_dec: missing decision maker\n");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn legacy_unknown_maker_is_rejected_even_after_human_authority() {
+    let cases: &[&[&[u8]]] = &[&[&[0], &[1]], &[&[1], &[0]]];
+    for makers in cases {
+        let output = show_legacy_makers(makers);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stderr, b"pira_dec: unknown maker value\n");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn legacy_malformed_maker_is_rejected_even_after_human_authority() {
+    let output = show_legacy_makers(&[&[1], &[2, 2]]);
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        output.stderr,
+        b"pira_dec: duplicate or malformed singleton decision field\n"
+    );
+    assert!(output.stdout.is_empty());
 }
 
 #[test]

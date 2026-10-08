@@ -635,25 +635,13 @@ fn stroke_intrusion_warnings(
         )?;
         ensure_same_size(final_image, &without_candidate)?;
         for region in nearby {
-            let visible = visible_stroke_points(
+            if let Some(reason) = stroke_intrusion_reason(
                 &stroke,
                 final_image,
                 &without_candidate,
-                region.protected_bounds,
-            );
-            if visible.is_empty() {
-                continue;
-            }
-            let direct = visible
-                .iter()
-                .any(|&(x, y)| alpha_at(&region.mask, x, y) >= region.core_threshold);
-            let crossing = crosses_text_block(&visible, region.glyph_bounds, config.crossing_ratio);
-            if direct || crossing {
-                let reason = if direct {
-                    "intersects glyph-core pixels"
-                } else {
-                    "traverses the protected text block"
-                };
+                region,
+                config.crossing_ratio,
+            ) {
                 warnings.push(warning(
                     "stroke-intrusion",
                     &format!("A visible stroked element {reason}."),
@@ -667,13 +655,15 @@ fn stroke_intrusion_warnings(
     Ok(warnings)
 }
 
-fn visible_stroke_points(
+fn stroke_intrusion_reason(
     stroke: &Pixmap,
     final_image: &Pixmap,
     without_candidate: &Pixmap,
-    bounds: Bounds,
-) -> Vec<(u32, u32)> {
-    let mut points = Vec::new();
+    region: &TextRegion,
+    crossing_ratio: f64,
+) -> Option<&'static str> {
+    let bounds = region.protected_bounds;
+    let mut visible_bounds: Option<Bounds> = None;
     for y in bounds.y0..bounds.y1 {
         for x in bounds.x0..bounds.x1 {
             if alpha_at(stroke, x, y) < 24 {
@@ -687,23 +677,29 @@ fn visible_stroke_points(
                 .map(|(left, right)| left.abs_diff(right))
                 .max()
                 .unwrap_or(0);
-            if delta >= 8 {
-                points.push((x, y));
+            if delta < 8 {
+                continue;
             }
+            // Glyph contact wins over block traversal, regardless of scan order.
+            if alpha_at(&region.mask, x, y) >= region.core_threshold {
+                return Some("intersects glyph-core pixels");
+            }
+            let visible = visible_bounds.get_or_insert(Bounds {
+                x0: x,
+                y0: y,
+                x1: x + 1,
+                y1: y + 1,
+            });
+            visible.x0 = visible.x0.min(x);
+            visible.y0 = visible.y0.min(y);
+            visible.x1 = visible.x1.max(x + 1);
+            visible.y1 = visible.y1.max(y + 1);
         }
     }
-    points
-}
-
-fn crosses_text_block(points: &[(u32, u32)], glyphs: Bounds, ratio: f64) -> bool {
-    let min_x = points.iter().map(|point| point.0).min().unwrap_or(0);
-    let max_x = points.iter().map(|point| point.0).max().unwrap_or(0);
-    let min_y = points.iter().map(|point| point.1).min().unwrap_or(0);
-    let max_y = points.iter().map(|point| point.1).max().unwrap_or(0);
-    let span_x = max_x.saturating_sub(min_x) + 1;
-    let span_y = max_y.saturating_sub(min_y) + 1;
-    f64::from(span_x) >= f64::from(glyphs.width()) * ratio
-        || f64::from(span_y) >= f64::from(glyphs.height()) * ratio
+    let visible = visible_bounds?;
+    (f64::from(visible.width()) >= f64::from(region.glyph_bounds.width()) * crossing_ratio
+        || f64::from(visible.height()) >= f64::from(region.glyph_bounds.height()) * crossing_ratio)
+        .then_some("traverses the protected text block")
 }
 
 fn text_overlap_warnings(regions: &[TextRegion]) -> Vec<GuardWarning> {

@@ -60,8 +60,14 @@ if os.environ.get("TEAM_ASSERT_TEMP"):
         if Path(shell).is_file():
             subprocess.run([shell, "-c", "cat >/dev/null <<'END'\n" + "x" * 32768 + "\nEND\n"],
                            check=True, timeout=5, capture_output=True)
-assert sandbox == "workspace-write"
-sandbox_type = "readOnly" if sandbox == "read-only" else "workspaceWrite"
+assert sandbox in ("workspace-write", "danger-full-access")
+sandbox_type = "dangerFullAccess" if sandbox == "danger-full-access" else "workspaceWrite"
+config = {a.split("=",1)[0]:json.loads(a.split("=",1)[1]) for a in args if a.startswith("sandbox_workspace_write.")}
+expected_sandbox = ({"type":"dangerFullAccess"} if sandbox == "danger-full-access" else {
+    "type":"workspaceWrite", "writableRoots":config["sandbox_workspace_write.writable_roots"],
+    "networkAccess":config["sandbox_workspace_write.network_access"],
+    "excludeTmpdirEnvVar":config["sandbox_workspace_write.exclude_tmpdir_env_var"],
+    "excludeSlashTmp":config["sandbox_workspace_write.exclude_slash_tmp"]})
 assert "project_doc_max_bytes=0" in args
 assert "CODEX_THREAD_ID" not in os.environ
 assert 'approval_policy="never"' in args
@@ -153,7 +159,8 @@ while True:
             assert params["threadId"] == state["thread"] and state_path.exists()
         if os.environ.get("TEAM_EXPECT_MODEL"):
             assert params["model"] == os.environ["TEAM_EXPECT_MODEL"]
-        result = {"thread":{"id":state["thread"]}, "sandbox":{"type":sandbox_type}, "approvalPolicy":"never"}
+        assert params["config"] == ({"sandbox_workspace_write":{k.split(".")[1]:v for k,v in config.items()}} if config else {})
+        result = {"thread":{"id":state["thread"]}, "sandbox":dict(expected_sandbox), "approvalPolicy":"never"}
         if os.environ.get("TEAM_BAD_PERMISSION"):
             result["sandbox"]["type"] = "dangerFullAccess"
         state_path.write_text(json.dumps(state))
@@ -168,23 +175,23 @@ while True:
         assert params["approvalPolicy"] == "never" and params["sandboxPolicy"]["type"] == sandbox_type
         if os.environ.get("TEAM_EXPECT_EFFORT"):
             assert params["effort"] == os.environ["TEAM_EXPECT_EFFORT"]
+        assert params["sandboxPolicy"] == expected_sandbox
         if sandbox == "workspace-write":
             roots = params["sandboxPolicy"]["writableRoots"]
-            assert params["cwd"] in roots and str(handoff.parent) in roots
+            assert any(Path(params["cwd"]).is_relative_to(Path(r)) for r in roots)
+            assert any(handoff.parent.is_relative_to(Path(r)) for r in roots)
             assert str(home) not in roots
-            assert str(scratch) in roots
+            assert any(scratch.is_relative_to(Path(r)) for r in roots)
             for expected in json.loads(os.environ.get("TEAM_EXPECT_BUILD_ROOTS", "[]")):
-                assert roots.count(expected) == 1, (expected, roots)
+                assert any(Path(expected).is_relative_to(Path(r)) for r in roots), (expected, roots)
             for forbidden in json.loads(os.environ.get("TEAM_FORBIDDEN_BUILD_ROOTS", "[]")):
                 assert forbidden not in roots
             for forbidden in json.loads(os.environ.get("TEAM_FORBIDDEN_TEMP_ROOTS", "[]")):
                 assert forbidden not in roots
             for key in ("PIRA_CTX_STORE_DIR", "PIRA_DEC_STORE_DIR"):
                 prefix = f"shell_environment_policy.set.{key}="
-                assert json.loads(next(a[len(prefix):] for a in args if a.startswith(prefix))) in roots
-            assert params["sandboxPolicy"]["networkAccess"] is False
-            assert params["sandboxPolicy"]["excludeTmpdirEnvVar"] is True
-            assert params["sandboxPolicy"]["excludeSlashTmp"] is True
+                assert any(Path(json.loads(next(a[len(prefix):] for a in args if a.startswith(prefix)))).is_relative_to(Path(r)) for r in roots)
+
         task = params["input"][0]["text"]
         repair = task.startswith("Repair only the output format")
         if repair and os.environ.get("TEAM_REPAIR_CRASH"): sys.exit(8)

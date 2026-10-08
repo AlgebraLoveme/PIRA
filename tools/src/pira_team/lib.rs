@@ -22,7 +22,7 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-const WORKER_POLICY_VERSION: u64 = 12;
+const WORKER_POLICY_VERSION: u64 = 13;
 
 pub const POLICY: &str = include_str!("main.md");
 const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
@@ -50,7 +50,7 @@ same thread only after a successful internal checkpoint. Neither flag grants edi
 Resume continues the retained stage; standalone runs do not retroactively become staged.
 Resume retains guidance and adds
 only missing selections without replacing the cached base prefix. Native subagents and
-global/project PIRA loading are disabled. All phases use workspace-write; REVIEW assignments protect
+global/project PIRA loading are disabled. All phases inherit verified caller execution permissions; REVIEW assignments protect
 project artifacts, including tests, configuration, docs, lockfiles and expected outputs, by instruction.
 Build/test outputs, authorized cache updates, scratch and managed handoffs remain permitted;
 commands rewriting protected artifacts require check-only mode or a disposable copy. IMPLEMENTATION assignments authorize only their owned files. Fixes are implementation.
@@ -83,7 +83,7 @@ Explicit formats assign a matching extension. --schema requires json; --columns 
 and a JSON array of ordered headers. External schema references are disabled. Validation
 checks file delivery and format only, not findings or the completion gate. Decision/incomplete
 outcomes bypass the report schema/columns. One file-format repair at most, preserving context
-and substantive work; failure exits nonzero with diagnostic paths. Repair stays workspace-write
+and substantive work; failure exits nonzero with diagnostic paths. Repair keeps current caller permissions
 but is instructed to edit only the handoff. Invalid file candidates are retained in repair logs.
 
 Run/resume block without an execution deadline. Stream stderr for run_id and active-turn
@@ -95,6 +95,13 @@ Legacy retained runs need an explicit completion gate on first migration; their 
 The original base prefix is retained; current worker instructions are directly injected on
 migration, and current handoff/gate are supplied each turn. Cache hits are not guaranteed.
 
+Execution permissions always inherit the matching caller session's latest recorded context,
+including on resume; explicit model/effort do not bypass permission verification. Missing,
+malformed or unrepresentable policies fail closed. Only approval-never is supported; Team
+cannot handle interactive approvals. Read-only callers cannot supply required managed writes.
+Fine-grained restricted permission profiles are unsupported by this native API. Workspace-write
+callers must place managed Team/tool stores and configured build roots within their writable scope;
+Team does not add filesystem/network authority. Full access does not expand task ownership.
 Model/effort inherit the main's latest recorded profile; resume retains them. Explicit flags
 independently override them. If inheritance is unavailable/ambiguous, supply explicit values.
 Requires native Codex app-server with the published Team protocol and strict-config support,
@@ -109,7 +116,7 @@ authentication sockets and named credential patterns. Team supplies its own hand
 Unknown variables pass through; this is not a secret detector. Existing absolute directories in
 CARGO_HOME, CARGO_TARGET_DIR, PIP_CACHE_DIR, UV_CACHE_DIR, PYTHONPYCACHEPREFIX, MYPY_CACHE_DIR,
 npm_config_cache, NPM_CONFIG_CACHE, YARN_CACHE_FOLDER, GOCACHE, GOMODCACHE, GRADLE_USER_HOME,
-CCACHE_DIR, SCCACHE_DIR and XDG_CACHE_HOME automatically grant build/cache writes without prompts.
+CCACHE_DIR, SCCACHE_DIR and XDG_CACHE_HOME are used for build/cache writes only within caller writable scope.
 PIRA_TEAM_BUILD_ROOTS adds a JSON array of existing absolute directories for other build systems.
 Invalid explicit roots fail; unusable ambient roots grant nothing. Filesystem roots are excluded;
 physical paths are deduplicated. Run/resume/repair use current invoking configuration and record
@@ -123,6 +130,7 @@ struct Options {
     model: String,
     effort: String,
     profile_sources: Value,
+    execution: profile::Execution,
     task: String,
     output: String,
     navigation: String,
@@ -183,6 +191,13 @@ fn task_input(
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
+    parse_using(args, profile::load)
+}
+
+fn parse_using(
+    args: &[String],
+    parent: impl FnOnce() -> Result<Value, String>,
+) -> Result<Options, String> {
     if args.first().map(String::as_str) != Some("run") {
         return Err("expected run; use pira_team help".into());
     }
@@ -270,7 +285,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
     }
     let completion_gate = completion_gate(gate)?;
     let task = task_input(task, task_file, None)?;
-    let (model, effort, profile_sources) = profile::resolve(model, effort)?;
+    let (model, effort, profile_sources, execution) = profile::resolve(
+        model,
+        effort,
+        parent().map_err(|e| format!("cannot inherit verified caller execution/profile: {e}"))?,
+    )?;
     if task.trim().is_empty() {
         return Err("task must be nonempty".into());
     }
@@ -294,6 +313,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         model,
         effort,
         profile_sources,
+        execution,
         task,
         output,
         navigation,
@@ -443,7 +463,14 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     for setting in backend::contract()["config"].as_array().unwrap() {
         cmd.arg("-c").arg(setting.as_str().unwrap());
     }
+    for (key, value) in options.execution.config().as_object().unwrap() {
+        for (name, value) in value.as_object().unwrap() {
+            cmd.arg("-c").arg(format!("{key}.{name}={value}"));
+        }
+    }
     for setting in [
+        format!("sandbox_mode={}", json!(options.execution.mode)),
+        "approval_policy=\"never\"".to_owned(),
         format!("model={}", json!(options.model)),
         format!("model_reasoning_effort={}", json!(options.effort)),
         format!("model_instructions_file={}", json!(dir.join("policy.md"))),
@@ -616,8 +643,41 @@ mod tests {
             "Fixture complete",
         ];
         args.extend(extra);
-        parse(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+        parse_using(
+            &args.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+            || {
+                Ok(json!({
+            "approval_policy":"never", "cwd":std::env::current_dir().unwrap(),
+            "sandbox_policy":{"type":"workspace-write","writable_roots":[],"network_access":false,"exclude_tmpdir_env_var":true,"exclude_slash_tmp":true}}))
+            },
+        )
     }
+    #[test]
+    fn safety_review_is_always_injected_independent_of_implementation_guidance() {
+        let safety = POLICY
+            .split("## Safety")
+            .nth(1)
+            .unwrap()
+            .split("## Handoff")
+            .next()
+            .unwrap();
+        for expected in [
+            "task start",
+            "before high-impact actions",
+            "exact prefix `Safety:`",
+            "scope/blast radius",
+            "destructive risk",
+            "secrets/privacy",
+            "rollback",
+            "needs_decision to the main",
+            "does not authorize unrelated actions",
+        ] {
+            assert!(safety.contains(expected), "{expected}");
+        }
+        assert_eq!(WORKER_POLICY_VERSION, 13);
+        assert!(!IMPLEMENTATION_POLICY.contains("exact prefix `Safety:`"));
+    }
+
     #[test]
     fn rejects_ambiguous_and_write_interfaces() {
         for args in [

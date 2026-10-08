@@ -198,10 +198,7 @@ impl Contract {
                 let mut reader = csv::ReaderBuilder::new()
                     .flexible(false)
                     .from_reader(content.as_bytes());
-                let header = reader
-                    .headers()
-                    .map_err(|e| format!("CSV header: {e}"))?
-                    .clone();
+                let header = reader.headers().map_err(|e| format!("CSV header: {e}"))?;
                 if header.is_empty() {
                     return Err("CSV requires a header".into());
                 }
@@ -213,9 +210,11 @@ impl Contract {
                 {
                     return Err("CSV header does not match --columns in order".into());
                 }
-                for record in reader.records() {
-                    record.map_err(|e| format!("CSV row: {e}"))?;
-                }
+                let mut record = csv::StringRecord::new();
+                while reader
+                    .read_record(&mut record)
+                    .map_err(|e| format!("CSV row: {e}"))?
+                {}
             }
             _ => {} // Markdown and text have no general syntax-validity criterion.
         }
