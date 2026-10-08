@@ -71,10 +71,11 @@ Retrieve only the smallest relevant memory when the task depends on it; never pr
 - Compact only clearly stale/redundant material after an end-to-end read and concurrent-change check.
 
 ## Module Loading and Routing
-Read on-demand PIRA instruction files exactly, batching required reads with predictably necessary read-only inspections in the same execution round. Inspection targets, arguments, and scope must already be known and must not depend on unread instructions. Read the returned instructions before module-dependent decisions, further work, or writes; do not add speculative inspection merely to fill the batch.
+For every coding implementation, debugging, or review task, load both CODING_STYLE.md and RESEARCH_POLICY.md before doing the task; the research module remains required even when no external research is requested.
+Read on-demand PIRA instruction files exactly, using the native Read tool when available. Batch required reads with predictably necessary read-only inspections in the same execution round. Inspection targets, arguments, and scope must already be known and must not depend on unread instructions. Read the returned instructions before module-dependent decisions, further work, or writes; do not add speculative inspection merely to fill the batch.
 
 Load on demand (explicit or inferred):
-- `user_profile`: `~/agent/USER.md` when user background, learning needs, communication preferences, or acting on the user’s behalf may materially affect the response. Skip ordinary factual/coding/research tasks needing no personalization.
+- `user_profile`: In Claude Code, use `~/.claude/pira/USER.md` when it exists; otherwise use `~/agent/USER.md`. In Codex, use `~/agent/USER.md`. Load it when user background, learning needs, communication preferences, or acting on the user’s behalf may materially affect the response. Skip ordinary factual/coding/research tasks needing no personalization.
 - `research`: `~/agent/modules/RESEARCH_POLICY.md` for factual analysis, online verification, evidence-based reporting, structured execution, or paper reading, summary, critique, or extraction.
 - `coding`: `~/agent/modules/CODING_STYLE.md` for implementation, debugging, or review.
 - `writing`: `~/agent/modules/SCIENTIFIC_WRITING.md` for scientific/technical prose, including polishing, drafting, rebuttals, and public-facing research writing.
@@ -100,7 +101,7 @@ Do not reload unchanged in-context modules unless the user asks or relevant cont
 
 ### Tool Selection
 - Use the lightest reliable tool first and deterministic, non-interactive commands when available.
-- Set cwd with the execution tool's working-directory option, not in-command `cd`.
+- Set cwd with the execution tool's working-directory option when available. Otherwise use the program's directory option (such as `git -C DIR`) or a subshell; never use a bare `cd` that persists across calls.
 - Repeated/reusable workflow → project script, not one-off shell. After creation, ask whether to standardize; review usability/generality.
 - Extend a compatible existing tool before creating another.
 
@@ -143,10 +144,12 @@ If documented PIRA tool behavior fails locally, raise the mismatch immediately a
 ## PIRA Internal Tools
 If a needed tool is unavailable, immediately ask for setup; do not bypass its rules. Follow each tool’s **Rules**. **Forms**: replace uppercase placeholders; brackets mark optional values, `...` repetition, `|` alternatives. **Examples** clarify only non-obvious semantics. Recommended forms do not restrict supported interfaces. Help teaches encouraged interfaces, not compatibility-only alternatives. Use tool-provided syntax; consult `TOOL help [COMMAND]` only for uncovered syntax/behavior, batching topics when supported.
 
+The PIRA tools below may appear as native tool calls or as installed command-line programs. Use the native interface when exposed; otherwise invoke the same commands through the available shell tool (Claude Code: Bash). A missing same-named native tool does not mean the CLI is unavailable; check the command before asking for setup. Keep each tool's rules and syntax regardless of invocation route.
+
 ### `pira_ctx`: Command Output Manager & Event Recorder
 
 #### Rules
-- Wrap every shell/exec invocation in `pira_ctx`, except PIRA internal-tool invocations and commands that only load PIRA modules.
+- In Codex, wrap every shell/exec invocation in `pira_ctx`, except PIRA internal-tool invocations and commands that only load PIRA modules. In Claude Code, run ordinary shell commands with native Bash so its permission rules see the actual command; use `pira_ctx` for long-running, large, or evidence-bearing output that needs retention or targeted retrieval. Use the native Read tool to load PIRA modules when available.
 - Default to auto unless the full result is needed; then use `exact`, including for handwritten script output or mandatory file reads that require the complete content. Do not substitute an auto/capture synopsis for required full output. Also use `exact` for necessary original content or interactive terminal I/O. Use `check` when success status suffices (failures also show bounded diagnostics); `capture` for mandatory retention or a bounded synopsis when full output is not needed. Exit status does not verify output or coverage.
 - For auto/capture, use `--interest REGEX` before `--` when the task suggests decision-relevant wording, including contrary outcomes; omit arbitrary guesses. It ranks synopsis evidence; it does not filter output or cap replay. If a synopsis selects a nonmatching line and reports no retention/index truncation, no omitted indexed line matches. Never extend this guarantee to unretained or unindexed output.
 - Request enough evidence to avoid predictable follow-ups; stop when it answers the question. Search unknown locations; use known ranges directly. Use `range`/`transform` for missing detail or necessary exact content, `exec` only for custom analysis, and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.
