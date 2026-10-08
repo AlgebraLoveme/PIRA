@@ -1,0 +1,179 @@
+{
+  "config": [
+    "sandbox_mode=\"workspace-write\"",
+    "developer_instructions=\"\"",
+    "project_doc_max_bytes=0",
+    "approval_policy=\"never\"",
+    "agents.enabled=false",
+    "features.multi_agent=false",
+    "features.memories=false",
+    "features.apps=false",
+    "features.plugins=false",
+    "features.hooks=false",
+    "features.skip_host_skill_discovery=true",
+    "features.image_generation=false",
+    "features.browser_use=false",
+    "features.computer_use=false",
+    "web_search=\"disabled\"",
+    "shell_environment_policy.inherit=\"all\"",
+    "shell_environment_policy.set.PIRA_TEAM_CHILD=\"1\""
+  ],
+  "schemas": {
+    "ClientRequest.json": {
+      "methods": {
+        "initialize": [
+          "clientInfo",
+          "capabilities"
+        ],
+        "thread/start": [
+          "model",
+          "cwd",
+          "sandbox",
+          "approvalPolicy",
+          "baseInstructions",
+          "developerInstructions",
+          "ephemeral"
+        ],
+        "thread/resume": [
+          "threadId",
+          "model",
+          "cwd",
+          "sandbox",
+          "approvalPolicy",
+          "baseInstructions",
+          "developerInstructions"
+        ],
+        "thread/inject_items": [
+          "threadId",
+          "items"
+        ],
+        "turn/start": [
+          "threadId",
+          "input",
+          "model",
+          "effort",
+          "cwd",
+          "approvalPolicy",
+          "sandboxPolicy"
+        ],
+        "turn/steer": [
+          "threadId",
+          "expectedTurnId",
+          "input"
+        ],
+        "turn/interrupt": [
+          "threadId",
+          "turnId"
+        ]
+      },
+      "definitions": {
+        "ClientInfo": [
+          "name",
+          "version"
+        ],
+        "InitializeCapabilities": [
+          "experimentalApi"
+        ]
+      },
+      "variants": {
+        "SandboxPolicy": {
+          "workspaceWrite": [
+            "type",
+            "writableRoots",
+            "networkAccess",
+            "excludeTmpdirEnvVar",
+            "excludeSlashTmp"
+          ]
+        },
+        "UserInput": {
+          "text": [
+            "type",
+            "text"
+          ]
+        }
+      }
+    },
+    "ServerNotification.json": {
+      "methods": {
+        "item/completed": [
+          "threadId",
+          "turnId",
+          "item"
+        ],
+        "turn/completed": [
+          "threadId",
+          "turn"
+        ],
+        "thread/tokenUsage/updated": [
+          "threadId",
+          "tokenUsage"
+        ]
+      },
+      "definitions": {
+        "Turn": [
+          "id",
+          "status",
+          "error"
+        ],
+        "ThreadTokenUsage": [
+          "total"
+        ]
+      },
+      "variants": {
+        "ThreadItem": {
+          "agentMessage": [
+            "type",
+            "text",
+            "phase"
+          ]
+        }
+      }
+    },
+    "v2/ThreadStartResponse.json": {
+      "fields": [
+        "thread",
+        "sandbox",
+        "approvalPolicy"
+      ],
+      "definitions": {
+        "Thread": [
+          "id"
+        ]
+      }
+    },
+    "v2/ThreadResumeResponse.json": {
+      "fields": [
+        "thread",
+        "sandbox",
+        "approvalPolicy"
+      ],
+      "definitions": {
+        "Thread": [
+          "id"
+        ]
+      }
+    },
+    "v2/TurnStartResponse.json": {
+      "fields": [
+        "turn"
+      ],
+      "definitions": {
+        "Turn": [
+          "id"
+        ]
+      }
+    },
+    "v2/TurnSteerResponse.json": {
+      "fields": [
+        "turnId"
+      ]
+    },
+    "v2/ThreadInjectItemsResponse.json": {},
+    "v2/TurnInterruptResponse.json": {},
+    "ClientNotification.json": {
+      "signals": [
+        "initialized"
+      ]
+    }
+  }
+}

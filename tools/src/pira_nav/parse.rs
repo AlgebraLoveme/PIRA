@@ -22,7 +22,6 @@ pub struct ParsedFile {
 }
 
 pub struct ParsedSyntax {
-    pub path: PathBuf,
     pub language: Language,
     pub source: String,
     pub tree: Tree,
@@ -47,7 +46,14 @@ impl ParsedFile {
 }
 
 pub fn parse_file(path: &Path, language: Language) -> Result<ParsedFile, String> {
-    let source = read_source(path)?;
+    parse_file_source(path, language, read_source(path)?)
+}
+
+pub fn parse_file_source(
+    path: &Path,
+    language: Language,
+    source: String,
+) -> Result<ParsedFile, String> {
     let (symbols, syntax_defects, symbols_truncated) =
         parse_source_symbols_state(path, language, &source)?;
     Ok(ParsedFile {
@@ -151,7 +157,6 @@ fn parse_native(path: &Path, language: Language) -> Result<(ParsedSyntax, usize)
     })?;
     Ok((
         ParsedSyntax {
-            path: path.to_path_buf(),
             language,
             source,
             tree,
@@ -2320,8 +2325,22 @@ fn walk_rust(
         "enum_item" => Some("enum"),
         "trait_item" => Some("trait"),
         "type_item" => Some("type"),
-        "function_item" if parent.is_some() => Some("method"),
-        "function_item" => Some("function"),
+        "function_item" | "function_signature_item" => {
+            let owner = node.parent().and_then(|body| {
+                if body.kind() == "declaration_list" {
+                    body.parent()
+                } else {
+                    Some(body)
+                }
+            });
+            Some(
+                if owner.is_some_and(|owner| matches!(owner.kind(), "impl_item" | "trait_item")) {
+                    "method"
+                } else {
+                    "function"
+                },
+            )
+        }
         "const_item" => Some("const"),
         "static_item" => Some("static"),
         "mod_item" => Some("module"),
@@ -2356,7 +2375,7 @@ fn walk_rust(
                 end_column: node.end_position().column,
                 depth,
             });
-            if !matches!(node.kind(), "function_item") {
+            if !matches!(node.kind(), "function_item" | "function_signature_item") {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     if child.id() != name_node.id() {

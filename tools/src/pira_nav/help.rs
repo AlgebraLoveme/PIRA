@@ -12,7 +12,7 @@ COMMANDS
   symbols QUERY [PATH...]        Declarations, keys, or headings.
   outline FILE...                Declarations or document paths without bodies.
   show TARGET...                 Exact items, position windows, or line ranges.
-  imports | dependents | deps    Conservative syntax-level file relationships.
+  imports | dependents | deps    Server-resolved import references (requires LSP).
   definition | implementation | type-definition | references
                                   LSP symbol locations.
   callers | callees | supertypes | subtypes
@@ -24,7 +24,8 @@ COMMANDS
 BACKENDS
   Bundled parsers handle clean source plus JSON/JSONC/YAML/TOML/Markdown. Dirty code uses a server
   discovered on PATH or selected by --lsp. --native requires a clean bundled parse. Semantic
-  commands apply only to code and always require an LSP.
+  commands apply only to code and always require an LSP. Imports/dependents/deps also require
+  a server advertising definitionProvider; no filename guesses establish dependency identity.
 
 COMMON OPTIONS
   --language LANGUAGE       Override language inference for ambiguous paths.
@@ -34,7 +35,11 @@ COMMON OPTIONS
   --                        End options; later arguments are positional where supported.
 
 Read-only: never edits, builds, or executes repository code. Untrusted source/hover is framed; bounded
-partial results identify omissions. Detailed syntax: `pira_nav COMMAND --help`; several topics:
+partial results identify omissions. Structural operands reject symlink components (not a guarantee
+against concurrent directory replacement). LSP input queues fail nonblockingly above 256 pending
+messages or 32 MiB of queued JSON payloads, plus at most one frame being decoded; this is not an RSS
+limit. Owned LSP process groups/jobs are terminated during cleanup, including remaining descendants.
+Detailed syntax: `pira_nav COMMAND --help`; several topics:
 `pira_nav help COMMAND...`."#;
 
 const LSP_OPTIONS: &str = r#"  --language LANGUAGE
@@ -219,32 +224,52 @@ EXAMPLES
   pira_nav show README.md LICENSE --range 1:20
   pira_nav show src/parser.rs:120-160
   pira_nav show generated.json:1-20 --glance"#),
-        "imports" => r#"pira_nav imports — syntax-level file imports
+        "imports" => format!(r#"pira_nav imports — server-resolved import references
 
 USAGE
-  pira_nav imports FILE... [--language LANGUAGE] [--max-items N]
+  pira_nav imports FILE... [--language LANGUAGE] [--max-items N] [LSP OPTIONS]
 
-Parses import/include syntax and conservatively resolves local paths inside the workspace. External,
-unresolved, and blocked edges remain explicit. It never invokes a package manager or build system.
-`--max-items` bounds rows per file (default 128, maximum 10000)."#.into(),
-        "dependents" => r#"pira_nav dependents — reverse local import lookup
+Extracts import/include reference positions with bundled syntax parsers and resolves them through
+actual LSP definitions. Requires definitionProvider, even for empty import inventories. Missing servers
+fail with setup guidance. No module-directory, package-root or extension-order guesses establish edges.
+`coverage=syntax-references` is not a runtime/build graph. Rows count module/member references, not
+necessarily statements. Dynamic operands/wildcards remain unsupported; null definitions unresolved;
+multiple file identities ambiguous; non-file/missing/self definitions unsupported; escaped-root or
+symlink targets blocked. All non-resolved states contribute to unresolved counts. External stays zero.
+Only existing local files with server-established identity become traversable edges. Sources must be
+inside cwd and --lsp-root. Other languages require clean syntax; Lean scans only its module header.
+`--max-items` bounds rows per file (default 128, maximum 10000). Extraction fails above 10000 references;
+statement labels are capped at 1024 source bytes (ellipsis marks truncation).
+
+LSP OPTIONS
+{LSP_OPTIONS}"#),
+        "dependents" => format!(r#"pira_nav dependents — reverse local import lookup
 
 USAGE
-  pira_nav dependents FILE [--root ROOT] [--language LANGUAGE] [--max-items N]
+  pira_nav dependents FILE [--root ROOT] [--language LANGUAGE] [--max-items N] [LSP OPTIONS]
 
 ROOT defaults to the current directory. FILE is resolved from the current directory, then ROOT when
 the first path does not exist, and must lie within ROOT. Every eligible file is scanned; syntax failures
 and unresolved relationships are accounted separately. Rows default to 128 and may be bounded up to
-10000 with `--max-items`."#.into(),
-        "deps" => r#"pira_nav deps — bounded local dependency traversal
+10000 with `--max-items`. Requires a definition-capable LSP; only server-resolved import references
+establish edges. Scans the target language family, not an exhaustive build graph. Unresolved includes
+unsupported/ambiguous/blocked references; count=0 with uncertainty is not proof of no dependencies.
+
+LSP OPTIONS
+{LSP_OPTIONS}"#),
+        "deps" => format!(r#"pira_nav deps — bounded local dependency traversal
 
 USAGE
   pira_nav deps FILE [--root ROOT] [--direction imports|dependents|both] [--depth N]
-      [--language LANGUAGE] [--max-items N]
+      [--language LANGUAGE] [--max-items N] [LSP OPTIONS]
 
 FILE is resolved from the current directory, then ROOT when the first path does not exist, and must lie
-within ROOT. Traverses only conservatively resolved local syntax edges. This is not a build graph.
-Defaults: direction=both, depth=2, max-items=128. Depth is 0..256; max-items is at most 10000."#.into(),
+within ROOT. Requires a definition-capable LSP and traverses only server-resolved local import
+references. Unsupported/unresolved references and file failures remain explicit. This is not a build graph.
+Defaults: direction=both, depth=2, max-items=128. Depth is 0..256; max-items is at most 10000.
+
+LSP OPTIONS
+{LSP_OPTIONS}"#),
         "definition" | "implementation" | "type-definition" | "references" | "callers"
         | "callees" | "supertypes" | "subtypes" => {
             let extra = if name == "references" {

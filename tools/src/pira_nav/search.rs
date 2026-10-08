@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashSet};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -753,7 +752,7 @@ fn discover_text_files(
 }
 
 fn read_text(path: &Path) -> Result<TextFile, SkipKind> {
-    let file = File::open(path).map_err(|_| SkipKind::Unreadable)?;
+    let file = crate::util::open_regular_file(path).map_err(|_| SkipKind::Unreadable)?;
     let metadata = file.metadata().map_err(|_| SkipKind::Unreadable)?;
     if !metadata.is_file() {
         return Err(SkipKind::Unreadable);
@@ -1306,7 +1305,7 @@ impl Snippet {
         }
         let owners = symbols
             .iter()
-            .filter(|s| s.start_row <= hit.row && s.end_row >= hit.row)
+            .filter(|s| s.contains_line(hit.row + 1))
             .min_by_key(|s| s.end_byte.saturating_sub(s.start_byte))
             .map(|s| s.qualified_name.clone())
             .into_iter()
@@ -1619,6 +1618,29 @@ mod tests {
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readers_reject_replaced_leaf_links_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+        let sandbox = Sandbox::new("replaced-leaf");
+        let path = sandbox.path().join("script");
+        fs::write(&path, "#!/usr/bin/env python3\n").unwrap();
+        assert!(super::read_text(&path).is_ok());
+        assert_eq!(
+            crate::language::Language::infer(&path).unwrap(),
+            crate::language::Language::Python
+        );
+        fs::rename(&path, sandbox.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", &path).unwrap();
+        assert!(super::read_text(&path).is_err());
+        assert!(crate::language::Language::infer(&path).is_err());
+        fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(super::read_text(&path).is_err());
+        assert!(crate::language::Language::infer(&path).is_err());
     }
 
     #[test]

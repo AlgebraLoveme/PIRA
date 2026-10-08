@@ -112,6 +112,7 @@ pub struct Config {
     pub search_limit: usize,
     pub live_only: bool,
     pub regex: bool,
+    pub approximate: bool,
     pub history_scope: HistoryScope,
     pub history_details: bool,
     pub context: usize,
@@ -174,6 +175,7 @@ impl Default for Config {
             search_limit: 5,
             live_only: false,
             regex: false,
+            approximate: false,
             history_scope: HistoryScope::Current,
             history_details: false,
             context: 0,
@@ -981,6 +983,10 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
                 p += 1;
                 c.search_queries.push(take(args, &mut p, "QUERY")?.into());
             }
+            "--approximate" => {
+                c.approximate = true;
+                p += 1;
+            }
             "--regex" => {
                 c.regex = true;
                 p += 1
@@ -998,7 +1004,7 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown search option {:?}; use -e QUERY, --regex, --context N, or --limit N",
+                    "unknown search option {:?}; use -e QUERY, --regex, --approximate, --context N, or --limit N",
                     args[p]
                 ));
             }
@@ -1023,6 +1029,9 @@ fn parse_search(c: &mut Config, args: &[String]) -> Result<(), String> {
         return Err(format!(
             "--context is limited to {MAX_SEARCH_CONTEXT} lines"
         ));
+    }
+    if c.regex && c.approximate {
+        return Err("--approximate and --regex cannot be combined".into());
     }
     Ok(())
 }

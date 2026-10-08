@@ -14,6 +14,7 @@ use crate::deps;
 use crate::discovery::{DiscoverySelection, discover_files, discover_files_many};
 use crate::document::MAX_DOCUMENT_SYMBOLS;
 use crate::language::Language;
+use crate::lsp::LspService;
 use crate::lsp_options::{self, LspOptions};
 use crate::model::{ImportEdge, ParseBackend, Symbol};
 use crate::parse::{ParsedFile, parse_file};
@@ -120,22 +121,6 @@ impl FailureCollector {
     fn first_code(&self) -> i32 {
         self.first_code
             .expect("a non-empty failure collector has a first code")
-    }
-
-    fn merge_sorted(mut self, other: Self) -> Self {
-        self.total += other.total;
-        if self.first_code.is_none() {
-            self.first_code = other.first_code;
-        }
-        self.shown.extend(other.shown);
-        self.shown.sort_by(|left, right| {
-            left.subject
-                .cmp(&right.subject)
-                .then_with(|| left.code.cmp(&right.code))
-                .then_with(|| left.message.cmp(&right.message))
-        });
-        self.shown.truncate(MAX_REPORTED_FAILURES);
-        self
     }
 }
 
@@ -257,9 +242,9 @@ where
         "callees" => semantic::callees(&values, explicit_language, &cwd, &lsp, &mut output),
         "supertypes" => semantic::supertypes(&values, explicit_language, &cwd, &lsp, &mut output),
         "subtypes" => semantic::subtypes(&values, explicit_language, &cwd, &lsp, &mut output),
-        "imports" => command_imports(&values, explicit_language, &cwd, &mut output),
-        "dependents" => command_dependents(&values, explicit_language, &cwd, &mut output),
-        "deps" => command_deps(&values, explicit_language, &cwd, &mut output),
+        "imports" => command_imports(&values, explicit_language, &cwd, &lsp, &mut output),
+        "dependents" => command_dependents(&values, explicit_language, &cwd, &lsp, &mut output),
+        "deps" => command_deps(&values, explicit_language, &cwd, &lsp, &mut output),
         other => Err((2, unknown_command(other))),
     };
     finish_output(result, &mut output)
@@ -283,10 +268,68 @@ pub(crate) fn unknown_command(value: &str) -> String {
     )
 }
 
+// Arity shared by global preprocessors; operands must never become global flags.
+pub(crate) fn option_takes_value(value: &str) -> bool {
+    matches!(
+        value,
+        "--language"
+            | "--lsp"
+            | "--lsp-arg"
+            | "--lsp-root"
+            | "--lsp-init"
+            | "--lsp-settings"
+            | "--depth"
+            | "--direction"
+            | "--glob"
+            | "--head"
+            | "--kind"
+            | "--limit"
+            | "--match"
+            | "--max-bytes"
+            | "--max-depth"
+            | "--max-files"
+            | "--max-items"
+            | "--query"
+            | "--range"
+            | "--root"
+            | "--tail"
+            | "--window"
+            | "-e"
+            | "-g"
+            | "--after-context"
+            | "--before-context"
+            | "--context"
+            | "--max-per-query"
+            | "--max-results"
+            | "--pattern"
+            | "-A"
+            | "-B"
+            | "-C"
+            | "--show"
+            | "--definition"
+            | "--implementation"
+            | "--type-definition"
+            | "--references"
+            | "--hover"
+            | "--callers"
+            | "--callees"
+            | "--supertypes"
+            | "--subtypes"
+    )
+}
+
 fn help_requested(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|value| value.as_str() != "--")
-        .any(|value| matches!(value.as_str(), "--help" | "-h"))
+    let mut index = 0;
+    while let Some(value) = args.get(index) {
+        if value == "--" {
+            break;
+        }
+        if matches!(value.as_str(), "--help" | "-h") {
+            return true;
+        }
+        index += if option_takes_value(value) { 2 } else { 1 };
+    }
+    false
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -341,10 +384,28 @@ fn extract_language_option(
             })?);
         } else {
             remaining.push(value.clone());
+            if option_takes_value(value)
+                && let Some(operand) = args.get(index + 1)
+            {
+                remaining.push(operand.clone());
+                index += 1;
+            }
         }
         index += 1;
     }
     Ok((remaining, language))
+}
+
+fn parse_structural_input(
+    path: &Path,
+    language: Language,
+    options: &LspOptions,
+) -> Result<ParsedFile, String> {
+    if options.forces_language(language) {
+        StructuralResolver::load_for_lsp(path, language)
+    } else {
+        parse_file(path, language)
+    }
 }
 
 fn structural_resolver(
@@ -954,10 +1015,13 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 });
             } else {
                 let parsed = positive_usize(value, option)?;
-                if option == "--max-items" {
-                    max_items = Some(parsed);
+                let slot = if option == "--max-items" {
+                    &mut max_items
                 } else {
-                    max_bytes = Some(parsed);
+                    &mut max_bytes
+                };
+                if slot.replace(parsed).is_some() {
+                    return Err((2, format!("{option} may be specified only once")));
                 }
             }
             index += 2;
@@ -1333,7 +1397,7 @@ fn command_map(
             .par_iter()
             .map(|(path, language)| {
                 (!is_broad_map_fixture(path, &root, language.is_document()))
-                    .then(|| parse_file(path, *language))
+                    .then(|| parse_structural_input(path, *language, lsp))
             })
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(parsed) {
@@ -1582,6 +1646,14 @@ struct SymbolRow {
     backend: ParseBackend,
     symbol: Symbol,
     selector: Option<String>,
+    source_hash: String,
+}
+
+fn unchanged_symbol_source<'a>(row: &SymbolRow, source: &'a str) -> Option<&'a str> {
+    if hash16(source.as_bytes()) != row.source_hash {
+        return None;
+    }
+    source.get(row.symbol.start_byte..row.symbol.end_byte)
 }
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
@@ -1824,7 +1896,7 @@ fn command_symbols(
     for batch in parse_batches(&discovery.files) {
         let parsed = batch
             .par_iter()
-            .map(|(path, language)| parse_file(path, *language))
+            .map(|(path, language)| parse_structural_input(path, *language, lsp))
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(parsed) {
             let parsed = match result {
@@ -1847,7 +1919,7 @@ fn command_symbols(
             if parsed.symbols_truncated {
                 truncated_files += 1;
             }
-            let shown_path = display_path(&parsed.path, cwd);
+            let source_hash = hash16(parsed.source.as_bytes());
             for symbol in &parsed.symbols {
                 if options
                     .kind
@@ -1865,9 +1937,10 @@ fn command_symbols(
                         language: parsed.language,
                         backend: parsed.backend,
                         symbol: symbol.clone(),
-                        selector: options
-                            .selectors
-                            .then(|| parsed.selector(symbol, &shown_path)),
+                        source_hash: source_hash.clone(),
+                        selector: options.selectors.then(|| {
+                            parsed.selector(symbol, &crate::util::identity_path(&parsed.path, cwd))
+                        }),
                     };
                     let rank = symbol_rank(query, &row);
                     buckets[query_index].record(class, row, rank, options.max_items);
@@ -2064,11 +2137,22 @@ fn command_symbols(
                     .map_err(output_error)?;
                     continue;
                 }
+                let snapshot = read_source(&row.path).map_err(input_error)?;
+                let Some(selected) = unchanged_symbol_source(&row, &snapshot) else {
+                    writeln!(
+                        output,
+                        "source_omitted query={} reason=changed-source complete=0",
+                        query_index + 1
+                    )
+                    .map_err(output_error)?;
+                    continue;
+                };
                 let mut source = Vec::new();
-                render_line_range(
+                render_text_range(
                     &row.path,
+                    selected,
                     row.symbol.start_row + 1,
-                    row.symbol.end_row + 1,
+                    row.symbol.end_row + usize::from(row.symbol.end_column > 0),
                     cwd,
                     false,
                     &mut source,
@@ -2570,6 +2654,7 @@ fn command_imports(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_import_options(args)?;
@@ -2577,13 +2662,14 @@ fn command_imports(
         return usage("imports requires at least one file");
     }
     let total = options.paths.len();
+    let mut service = LspService::new(lsp.config(cwd)?);
     let mut failures = FailureCollector::default();
     for value in &options.paths {
         let path = absolute_lexical(Path::new(value), cwd);
         let result = (|| {
             validate_regular_file(&path, cwd, "imports")?;
             let language = language_for(&path, explicit)?;
-            let edges = deps::imports_from_path(&path, language, cwd).map_err(input_error)?;
+            let edges = deps::imports_from_path(&path, language, cwd, lsp.root(cwd), &mut service)?;
             let shown = edges.len().min(options.max_items);
             let local = edges.iter().filter(|edge| edge.target.is_some()).count();
             let external = edges
@@ -2593,7 +2679,7 @@ fn command_imports(
             let unresolved = edges.len().saturating_sub(local + external);
             write!(
                 output,
-                "# pira_nav imports file={} imports={} local={} external={} unresolved={}",
+                "# pira_nav imports coverage=syntax-references file={} imports={} local={} external={} unresolved={}",
                 quote_metadata(&display_path(&path, cwd)),
                 edges.len(),
                 local,
@@ -2719,20 +2805,28 @@ fn command_dependents(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_rooted_target(args, cwd, "dependents")?;
     validate_directory(&options.root, cwd, "dependents", "root")?;
     let target = resolve_dependency_target(&options.target, &options.root, cwd, "dependents")?;
     let target_language = language_for(&target, explicit)?;
+    if !target.starts_with(lsp.root(&options.root)) {
+        return Err(input_error("dependency target must be inside --lsp-root"));
+    }
     let discovery = discover_files(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let mut extracted =
-        extract_dependencies(&discovery.files, &options.root, Some(&target), |edge| {
-            (edge.target.as_deref() == Some(target.as_path())).then_some(edge)
-        });
+    let mut extracted = extract_dependencies(
+        &discovery.files,
+        &options.root,
+        Some(&target),
+        target_language,
+        lsp,
+        |edge| (edge.target.as_deref() == Some(target.as_path())).then_some(edge),
+    )?;
     for error in &discovery.walk_errors {
         extracted
             .failures
@@ -2750,7 +2844,7 @@ fn command_dependents(
     let shown = edges.len().min(options.max_items);
     write!(
         output,
-        "# pira_nav dependents target={} root={} scanned={} parsed_imports={} local={} external={} unresolved={} count={}",
+        "# pira_nav dependents coverage=syntax-references target={} root={} scanned={} parsed_imports={} local={} external={} unresolved={} count={}",
         quote_metadata(&display_path(&target, &options.root)),
         quote_metadata(&display_path(&options.root, cwd)),
         extracted.scanned,
@@ -2877,6 +2971,7 @@ fn resolve_dependency_target(
     cwd: &Path,
     command: &str,
 ) -> Result<PathBuf, (i32, String)> {
+    crate::util::reject_symlink_components(root).map_err(input_error)?;
     let cwd_candidate = absolute_lexical(Path::new(value), cwd);
     let target = if cwd_candidate.is_file() {
         cwd_candidate
@@ -2901,6 +2996,7 @@ fn resolve_dependency_target(
             return Err(input_error(message));
         }
     };
+    crate::util::reject_symlink_components(&target).map_err(input_error)?;
     if !target.starts_with(root) {
         return Err(input_error(format!(
             "{command} target must be inside --root: {}; selected root is `{}`",
@@ -2965,69 +3061,53 @@ fn extract_dependencies<T, F>(
     files: &[(PathBuf, Language)],
     root: &Path,
     skip: Option<&Path>,
+    language: Language,
+    lsp: &LspOptions,
     map_edge: F,
-) -> DependencyExtraction<T>
+) -> Result<DependencyExtraction<T>, CommandError>
 where
-    T: Send,
-    F: Fn(ImportEdge) -> Option<T> + Sync,
+    F: Fn(ImportEdge) -> Option<T>,
 {
-    files
-        .par_iter()
+    if language.is_document() {
+        return Err(input_error("documents do not support dependency semantics"));
+    }
+    let mut service = LspService::new(lsp.config(root)?);
+    service
+        .require_definitions(language)
+        .map_err(crate::command::lsp_error)?;
+    let mut output = DependencyExtraction {
+        scanned: 0,
+        parsed_imports: 0,
+        resolved: 0,
+        external: 0,
+        unresolved: 0,
+        failures: FailureCollector::default(),
+        edges: Vec::new(),
+    };
+    // One client per configured language, reused across the scan. Do not start a server per worker.
+    for (path, language) in files
+        .iter()
         .filter(|(path, _)| skip != Some(path.as_path()))
-        .fold(
-            || DependencyExtraction {
-                scanned: 0,
-                parsed_imports: 0,
-                resolved: 0,
-                external: 0,
-                unresolved: 0,
-                failures: FailureCollector::default(),
-                edges: Vec::new(),
-            },
-            |mut output, (path, language)| {
-                output.scanned += 1;
-                match deps::imports_from_path(path, *language, root) {
-                    Ok(imports) => {
-                        output.parsed_imports += imports.len();
-                        for edge in imports {
-                            if edge.target.is_some() {
-                                output.resolved += 1;
-                            } else if edge.resolution == "external" {
-                                output.external += 1;
-                            } else {
-                                output.unresolved += 1;
-                            }
-                            output.edges.extend(map_edge(edge));
-                        }
+    {
+        output.scanned += 1;
+        match deps::imports_from_path(path, *language, root, lsp.root(root), &mut service) {
+            Ok(imports) => {
+                output.parsed_imports += imports.len();
+                for edge in imports {
+                    if edge.target.is_some() {
+                        output.resolved += 1;
+                    } else {
+                        output.unresolved += 1;
                     }
-                    Err(message) => {
-                        output.failures.record(display_path(path, root), 2, message);
-                    }
+                    output.edges.extend(map_edge(edge));
                 }
-                output
-            },
-        )
-        .reduce(
-            || DependencyExtraction {
-                scanned: 0,
-                parsed_imports: 0,
-                resolved: 0,
-                external: 0,
-                unresolved: 0,
-                failures: FailureCollector::default(),
-                edges: Vec::new(),
-            },
-            |mut left, mut right| {
-                left.scanned += right.scanned;
-                left.parsed_imports += right.parsed_imports;
-                left.resolved += right.resolved;
-                left.external += right.external;
-                left.unresolved += right.unresolved;
-                left.failures = left.failures.merge_sorted(right.failures);
-                left.edges.append(&mut right.edges);
-                left
-            },
-        )
+            }
+            Err((code, message)) => output
+                .failures
+                .record(display_path(path, root), code, message),
+        }
+    }
+    Ok(output)
 }
 
 struct DependencyGraph<'a> {
@@ -3068,6 +3148,7 @@ fn command_deps(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_dependency_options(args, cwd)?;
@@ -3087,17 +3168,31 @@ fn command_deps(
         }
     };
     let target_language = language_for(&target, explicit)?;
-    let discovery = discover_files(
+    if !target.starts_with(lsp.root(&options.root)) {
+        return Err(input_error("dependency target must be inside --lsp-root"));
+    }
+    let mut discovery = discover_files(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let mut extracted = extract_dependencies(&discovery.files, &options.root, None, |edge| {
-        edge.target.map(|target| LocalDependencyEdge {
-            source: edge.source,
-            target,
-            line: edge.line,
-        })
-    });
+    // An explicit start node is not subject to broad ignore/suffix discovery.
+    discovery.files.retain(|(path, _)| path != &target);
+    discovery.files.push((target.clone(), target_language));
+    discovery.files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut extracted = extract_dependencies(
+        &discovery.files,
+        &options.root,
+        None,
+        target_language,
+        lsp,
+        |edge| {
+            edge.target.map(|target| LocalDependencyEdge {
+                source: edge.source,
+                target,
+                line: edge.line,
+            })
+        },
+    )?;
     for error in &discovery.walk_errors {
         extracted
             .failures
@@ -3155,7 +3250,7 @@ fn command_deps(
     let shown = traversed.len();
     write!(
         output,
-        "# pira_nav deps target={} root={} direction={} depth={} files={} parsed_imports={} local={} external={} unresolved={} edges={}",
+        "# pira_nav deps coverage=syntax-references target={} root={} direction={} depth={} files={} parsed_imports={} local={} external={} unresolved={} edges={}",
         quote_metadata(&display_path(&target, &options.root)),
         quote_metadata(&display_path(&options.root, cwd)),
         options.direction.as_str(),
@@ -3477,8 +3572,12 @@ fn render_outline(
                 .map_err(output_error)?;
         }
         if *selectors {
-            write!(output, " selector={}", parsed.selector(symbol, &shown_path))
-                .map_err(output_error)?;
+            write!(
+                output,
+                " selector={}",
+                parsed.selector(symbol, &crate::util::identity_path(&parsed.path, cwd))
+            )
+            .map_err(output_error)?;
         }
         writeln!(output).map_err(output_error)?;
     }
@@ -3961,6 +4060,9 @@ fn target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
 
 fn parse_line_range(value: &str) -> Option<(&str, i64, i64)> {
     let (path, range) = value.rsplit_once(':')?;
+    if path.ends_with(':') {
+        return None;
+    }
     let separator = range
         .char_indices()
         .find(|(index, ch)| *index > 0 && *ch == '-')?

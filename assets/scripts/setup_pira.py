@@ -9,6 +9,7 @@ keeps all writes explicit, backed up, and verifiable.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import platform
 import re
@@ -19,6 +20,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Literal
+
+import setup_pira_stores as stores
+import setup_pira_tools as tool_setup
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
@@ -61,6 +65,7 @@ class SetupState:
     agent_dir: Path
     dry_run: bool
     yes: bool
+    team_enabled: bool = True
     changed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     verification: list[tuple[str, bool, str]] = field(default_factory=list)
@@ -361,12 +366,109 @@ def disable_auto_recap(text: str) -> str:
     return upsert_top_level(text, {"tui.auto_recap": "false"})
 
 
-def configure_codex(
+def disable_multi_agent_hint(text: str) -> str:
+    """Suppress the mode hint, preserving unrelated TOML text and settings."""
+    target = ("features", "multi_agent_v2", "multi_agent_mode_hint_text")
+    # PIRA: multiline strings require a full TOML editor to locate keys safely.
+    if '"""' in text or "'''" in text:
+        raise RuntimeError("Team hint setup cannot safely edit multiline TOML strings; use single-line strings before setup")
+
+    def parts(key: str) -> tuple[str, ...]:
+        token = r'''(?:[A-Za-z0-9_-]+|"[^"\\]*"|'[^']*')'''
+        if not re.fullmatch(rf"\s*{token}(?:\s*\.\s*{token})*\s*", key):
+            return ("<other key>",)
+        return tuple(part.strip("\"'") for part in re.findall(token, key))
+
+    lines = text.splitlines(keepends=True)
+    section: tuple[str, ...] = ()
+    insert_at = 0
+    insert_key = ".".join(target)
+    insert_depth = 0
+    for index, line in enumerate(lines):
+        header = re.fullmatch(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?", line.strip())
+        if header:
+            section = parts(header.group(1))
+            if section == target[:len(section)] and insert_depth <= len(section) < len(target):
+                insert_at = index + 1
+                insert_key = ".".join(target[len(section):])
+                insert_depth = len(section)
+            continue
+        if line.lstrip().startswith("["):
+            section = ("<other table>",)
+        assignment = re.match(r"^(\s*)([^=#]+?)\s*=\s*(.*)$", line.rstrip("\r\n"))
+        if not assignment:
+            continue
+        path = section + parts(assignment.group(2))
+        if path == target:
+            lines[index] = f'{assignment.group(1)}{assignment.group(2)} = ""\n'
+            return "".join(lines)
+        if path == target[:len(path)]:
+            # PIRA: fail closed on inline tables rather than rewrite user settings.
+            raise RuntimeError("Team feature uses an inline table or scalar; expand it to [features.multi_agent_v2] before setup")
+    lines.insert(insert_at, f'{insert_key} = ""\n')
+    if insert_at and not lines[insert_at - 1].endswith("\n"):
+        lines[insert_at - 1] += "\n"
+    return "".join(lines)
+
+
+def instructions_path(state: SetupState, config_path: Path) -> Path:
+    return (state.agent_dir / "AGENTS.md" if state.team_enabled
+            else config_path.parent / "pira" / "AGENTS.md")
+
+
+def without_team_instructions(text: str) -> str:
+    """Remove Team's tool section while retaining other policy and module paths."""
+    result: list[str] = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        if re.match(r"^### `pira_team`:", line):
+            skipping = True
+            continue
+        if skipping and re.match(r"^#{1,3} ", line):
+            skipping = False
+        if not skipping:
+            result.append(line.replace(" (e.g., login required for `pira_team`)", ""))
+    return "".join(result)
+
+
+def project_agents_guard(state: SetupState, config_path: Path) -> str:
+    if state.team_enabled:
+        return PROJECT_AGENTS_GUARD
+    return PROJECT_AGENTS_GUARD.replace("`AGENTS.md`", f"`{config_path_string(instructions_path(state, config_path))}`")
+
+
+def store_tools(state: SetupState) -> list[str]:
+    return ["pira_ctx", "pira_dec", *(["pira_team"] if state.team_enabled else [])]
+
+
+def migration_codex_binary(state: SetupState, install_dir: str | None = None, *, prepare_missing: bool = False) -> str | None:
+    """Select/check a backend; only full mutating tools setup may prepare a missing one."""
+    if not state.team_enabled:
+        return None
+    directory = expand_path(install_dir) if install_dir else tool_setup.default_install_dir()
+    binary = tool_setup.selected_codex_binary(directory)
+    if binary is None and prepare_missing:
+        tool_setup.prepare_team_runtime(["pira_team"], directory,
+                                        tool_setup.load_selector().current_platform(),
+                                        verify=False, dry_run=False)
+        binary = tool_setup.selected_codex_binary(directory)
+        if binary is None:
+            raise RuntimeError("Prepared Codex backend is not available for retained-store migration")
+        return binary  # The preparer already checked it; authentication remains in tools setup.
+    if binary:
+        tool_setup.check_team_runtime(["pira_team"], binary)
+    return binary
+
+
+def plan_codex_configuration(
     state: SetupState,
     config_path: Path,
     execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
     replace_permissions: bool,
-) -> None:
+    store_paths: dict[str, str] | None = None,
+    *, include_stores: bool = True,
+) -> tuple[str, Path, str | None]:
+    stores.configuration_toml()
     if execution_mode == "ask":
         if state.yes or not sys.stdin.isatty():
             execution_mode = "keep"
@@ -380,9 +482,10 @@ def configure_codex(
             execution_mode = {"": "safe", "1": "safe", "2": "soft-safe", "3": "keep"}.get(choice, "safe")  # type: ignore[assignment]
 
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    keys = top_level_keys(existing)
-    instructions_path = state.agent_dir / "AGENTS.md"
-    instructions_ref = config_path_string(instructions_path)
+    parsed = stores.parse_configuration(existing)
+    keys = parsed
+    policy_path = instructions_path(state, config_path)
+    instructions_ref = config_path_string(policy_path)
     updates = {
         "model_instructions_file": toml_string(instructions_ref),
         "project_doc_max_bytes": DEFAULT_PROJECT_DOC_MAX_BYTES,
@@ -403,18 +506,64 @@ def configure_codex(
         else:
             remove_keys.append("default_permissions")
 
+    expected = copy.deepcopy(parsed)
+    for key in remove_keys:
+        expected.pop(key, None)
+    expected.update({key: stores.parse_configuration("v = " + value)["v"] for key, value in updates.items()})
+    if not isinstance(expected.setdefault("tui", {}), dict):
+        raise RuntimeError("Codex tui must be a table")
+    expected["tui"]["auto_recap"] = False
     new_text = disable_auto_recap(upsert_top_level(existing, updates, remove_keys=remove_keys))
+    policy = None
+    if state.team_enabled:
+        new_text = disable_multi_agent_hint(new_text)
+        features = expected.setdefault("features", {})
+        if not isinstance(features, dict) or not isinstance(features.setdefault("multi_agent_v2", {}), dict):
+            raise RuntimeError("Codex features.multi_agent_v2 must be a table")
+        features["multi_agent_v2"]["multi_agent_mode_hint_text"] = ""
+    else:
+        if same_location(policy_path, state.agent_dir / "AGENTS.md"):
+            raise RuntimeError("Team-free instructions path aliases canonical AGENTS.md; move that alias before setup")
+        policy = without_team_instructions((pira_source_root(state) / "AGENTS.md").read_text(encoding="utf-8"))
+    if stores.parse_configuration(new_text) != expected:
+        raise RuntimeError("Cannot safely preserve Codex settings with this TOML layout; use ordinary table/key syntax before setup")
+    if not include_stores:
+        # Validate existing store scopes without adding defaults before actual planning.
+        stores.codex_store_configuration(new_text, store_tools(state))
+        return new_text, policy_path, policy
+    if store_paths is None:
+        store_paths = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state)).stores
+    new_text = stores.codex_store_configuration(new_text, store_tools(state), store_paths)
+    return new_text, policy_path, policy
+
+
+def configure_codex(
+    state: SetupState, config_path: Path,
+    execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
+    replace_permissions: bool,
+    *, plan: tuple[str, Path, str | None] | None = None,
+) -> None:
+    if plan is None:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state))
+        plan = plan_codex_configuration(state, config_path, execution_mode, replace_permissions, store_plan.stores)
+        stores.apply_store_migrations(store_plan, dry_run=state.dry_run)
+    # A supplied plan has already crossed the migration barrier in main.
+    new_text, policy_path, policy = plan
+    if policy is not None:
+        write_text(state, policy_path, policy, "Team-free PIRA instructions")
+        print("OK: Team disabled; existing Team binaries and hint settings are left unchanged")
     write_text(state, config_path, new_text, "Codex config.toml")
-    ensure_project_agents_guard(state)
-    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)
+    ensure_project_agents_guard(state, config_path)
+    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", state.agent_dir / "AGENTS.md")
 
 
-def ensure_project_agents_guard(state: SetupState) -> None:
+def ensure_project_agents_guard(state: SetupState, config_path: Path) -> None:
     """Prevent the configured global policy from being rediscovered in the PIRA repo."""
     write_text(
         state,
         state.agent_dir / "AGENTS.override.md",
-        PROJECT_AGENTS_GUARD,
+        project_agents_guard(state, config_path),
         "local PIRA repository AGENTS guard",
         backup=False,
     )
@@ -486,7 +635,7 @@ def sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
-def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
+def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary: str | None = None) -> None:
     def add(name: str, passed: bool, detail: str) -> None:
         state.verification.append((name, passed, detail))
         label = "PASS" if passed else "FAIL"
@@ -506,12 +655,18 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
             add("Codex config exists", False, display_path(config_path))
         else:
             text = config_path.read_text(encoding="utf-8")
+            defaults = stores.plan_store_environment(store_tools(state), codex_text=text, codex_binary=codex_binary).stores
+            add("Codex physical store paths", stores.codex_store_configuration(text, store_tools(state), defaults) == text, display_path(config_path))
             keys = top_level_keys(text)
-            expected_instructions = toml_string(config_path_string(state.agent_dir / "AGENTS.md"))
+            expected_instructions = toml_string(config_path_string(instructions_path(state, config_path)))
             add("Codex config points to PIRA", keys.get("model_instructions_file") == expected_instructions, f"{display_path(config_path)} -> {expected_instructions}")
             add("Codex project_doc_max_bytes", keys.get("project_doc_max_bytes") == DEFAULT_PROJECT_DOC_MAX_BYTES, keys.get("project_doc_max_bytes", "missing"))
             guard = state.agent_dir / "AGENTS.override.md"
-            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == PROJECT_AGENTS_GUARD, display_path(guard))
+            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == project_agents_guard(state, config_path), display_path(guard))
+            if not state.team_enabled:
+                policy = instructions_path(state, config_path)
+                expected = without_team_instructions(agents.read_text(encoding="utf-8")) if agents.exists() else None
+                add("Team-free instructions", policy.exists() and policy.read_text(encoding="utf-8") == expected, display_path(policy))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -520,6 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
+    parser.add_argument("--no-team", action="store_true", help="Skip Team install/backend/login and hint override; generate Team-free Codex instructions. Existing binaries/settings are preserved; --skip-codex leaves instructions unchanged.")
     parser.add_argument("--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
                         help="Missing Team authentication: auto selects browser or device flow; "
                              "skip disables login. Verify/dry-run never start login.")
@@ -530,7 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or "
-            "svg=VERSION; repeatable."
+            "svg=VERSION or team=VERSION; repeatable."
         ),
     )
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
@@ -559,6 +715,8 @@ def configure_tools(
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
     command = [sys.executable, str(script), "--codex-login", codex_login]
+    if not state.team_enabled:
+        command.append("--no-team")
     if install_dir:
         command.extend(["--install-dir", str(expand_path(install_dir))])
     for version in versions or []:
@@ -573,7 +731,7 @@ def configure_tools(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
-    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes)
+    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, team_enabled=not args.no_team)
     config_path = expand_path(args.codex_config)
     audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
 
@@ -583,12 +741,32 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry run:    {state.dry_run}")
 
     try:
+        codex_plan = None
+        codex_binary = None
+        if not args.skip_codex or not args.skip_tools:
+            stores.configuration_toml()
+            existing = config_path.read_text(encoding="utf-8") if not args.skip_codex and config_path.exists() else None
+            if not args.skip_codex and not args.verify:
+                codex_plan = plan_codex_configuration(state, config_path, args.execution_mode,
+                                                     args.replace_permissions, include_stores=False)
+            codex_binary = migration_codex_binary(state, args.tools_install_dir,
+                                                 prepare_missing=not args.skip_tools and not state.dry_run)
+            store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=codex_binary)
+            store_paths = store_plan.stores
+            if codex_plan is not None:
+                text, policy_path, policy = codex_plan
+                codex_plan = (stores.codex_store_configuration(text, store_tools(state), store_paths),
+                              policy_path, policy)
+            for notice in store_plan.notices:
+                print(notice)
+            # Includes --skip-tools: Codex must not point at uncopied historical data.
+            stores.apply_store_migrations(store_plan, dry_run=state.dry_run, verify=args.verify)
         if not args.verify:
             ensure_agent_dir(state, force_agent_link=args.force_agent_link)
             ensure_user_md(state, args.user_mode)
             remove_legacy_files(state, args.legacy)
             if not args.skip_codex:
-                configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
+                configure_codex(state, config_path, args.execution_mode, args.replace_permissions, plan=codex_plan)
             configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
             if not args.skip_tools:
                 configure_tools(
@@ -601,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
-            verify(state, config_path, skip_codex=args.skip_codex)
+            verify(state, config_path, skip_codex=args.skip_codex, codex_binary=codex_binary)
             if args.verify and not args.skip_tools:
                 configure_tools(
                     state,

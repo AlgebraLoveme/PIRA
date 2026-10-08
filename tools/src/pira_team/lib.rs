@@ -1,5 +1,7 @@
 mod app_server;
 mod artifact;
+mod backend;
+mod build_roots;
 mod lifecycle;
 mod profile;
 mod storage;
@@ -10,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -20,86 +22,99 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-pub const POLICY: &str = include_str!("policy.md");
-const CODE_FIX_POLICY: &str = include_str!("code_fix.md");
-const CODE_REVIEW_POLICY: &str = include_str!("code_review.md");
-const NAV_POLICY: &str = include_str!("nav_policy.md");
-const HELP: &str = r#"pira_team — retained Codex workers; read-only by default
-Usage: pira_team run [--model MODEL] [--effort EFFORT] [--cwd DIR]
-       [--store DIR] [--timeout SECONDS] [--output artifact|answer]
-       [--code-review [--allow-fix]] [--navigation nav|shell] [--format auto|markdown|text|json|csv]
-       [--schema FILE] [--columns JSON_ARRAY] --task TASK
-       pira_team run [--model MODEL] [--effort EFFORT] [OPTIONS] --task-file FILE
-       pira_team resume RUN_ID [--allow-fix] [--task TASK] [--model MODEL] [--effort EFFORT]
-       [--timeout SECONDS] [--output artifact|answer] [--store DIR]
-       pira_team steer RUN_ID --task TASK [--store DIR]
+const WORKER_POLICY_VERSION: u64 = 12;
+
+pub const POLICY: &str = include_str!("main.md");
+const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
+const REVIEW_POLICY: &str = include_str!("review.md");
+const HELP: &str = r#"pira_team — retained technical artifact workers for review and implementation
+Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inject-implement] [OPTIONS]
+       pira_team resume RUN_ID [--task TASK --completion-gate TEXT] [OPTIONS]
+       pira_team steer RUN_ID --task TASK --completion-gate TEXT [--store DIR]
        pira_team interrupt RUN_ID [--store DIR]
-       pira_team read RUN_ID [RELATIVE_FILE] [--store DIR]
-       pira_team path RUN_ID [RELATIVE_FILE] [--store DIR]
-       pira_team help | --version
+       pira_team read|path RUN_ID [RELATIVE_FILE] [--store DIR]
 
---task TEXT supplies one quoted task argument on run/resume/steer; --task=TEXT is also accepted.
---task-file FILE instead reads the INPUT task; output files are launcher-managed.
-Legacy positional tasks remain accepted. Duplicate or mixed task sources are rejected.
-Default stdout: JSON receipt with run_id, validated artifact path, format, logs, repair count
-revision and cumulative reported usage (including repair). --output answer prints exact artifact bytes.
-The main agent reads/processes artifacts; no automatic workspace publication.
-Worker chooses a safe basename; only the launcher writes deliverable files. UTF-8 formats only.
---format defaults to auto. --schema requires json; external schema refs are disabled.
---columns requires csv and is an ordered JSON array of header names.
-JSON syntax/schema are checked. CSV checks comma-delimited header/row shape, not
-strict quoting syntax. Markdown/text have nonempty-text checks, not syntax checks.
-No validation of factual correctness. One automatic format-repair attempt at most,
-within each run/resume timeout (default 900s; resume retains its prior limit). Invalid candidates and diagnostics remain
-in logs; exhausted repair or worker failure exits nonzero with empty stdout.
+Use one quoted --task (also --task=TEXT) or --task-file FILE; the file is INPUT.
+Run options: --cwd DIR --store DIR --model MODEL --effort EFFORT
+             --format auto|markdown|text|json|csv --schema FILE --columns JSON_ARRAY
+             --output artifact|answer
+Resume can override model/effort/output. Taskless resume retains the assignment's gate.
+A replacement task or steer requires its dedicated --completion-gate; no semantic gate
+validation is performed. Completed means the worker reports the gate satisfied.
+Needs_decision and incomplete are distinct outcomes, not accepted completion.
 
-Private logs include manifest.json, policy.md, task.txt, events.jsonl, stderr.log,
-candidate.txt and validation.json on invalid output; repair/ holds the second attempt.
-Validated deliverables live under artifacts/. Read RUN_ID for the completed artifact;
-read RUN_ID manifest.json or repair/validation.json for diagnostics, even after failure.
-path RUN_ID returns the artifact path for scripts; path RUN_ID . returns its run directory.
-Lookups do not start workers, inherit profiles, create storage, or modify any files.
-resume continues the same conversation after completion/interruption/failure, retaining
-profile, cwd, navigation, code-review mode and output contract. TASK defaults to continuing the assignment.
-Explicit model/effort/output/timeout override their own fields. Prior artifacts are
-immutable; later outputs live under revisions/NNNNNN/. Root manifest.json describes
-the latest revision; earlier snapshots are revisions/NNNNNN/manifest.json.
-read without a filename requires the latest revision to be completed.
-Run/resume block and advertise their run_id on stderr. Once "active" is printed, a
-second command can steer or interrupt that exact turn. Controls only acknowledge
-acceptance; await the original invocation for completion. Steering cannot change
-configuration and is rejected during format repair. Never blindly retry a control
-with unknown delivery outcome. No automatic restart on idle/stale controls.
-A per-run lock rejects competing resumes. Orphaned running state fails closed.
-Legacy ephemeral runs remain readable but cannot resume their discarded conversation.
-Worker session data stays private in the store; authentication is detached on exit.
-Logs also include requests.jsonl and controls.jsonl; managed lookup excludes session
-state and control capabilities. Normal interrupt/timeout keeps context for resume.
-Store selection: --store DIR > PIRA_TEAM_DIR > OS temp/pira-team-UID on Unix
-(OS temp/pira-team elsewhere). Use the same store for every command. No variable setup
-is needed for the default store. Receipts retain absolute paths for compatibility;
-run IDs and relative artifact names avoid copying those paths for ordinary access.
---code-review adds focused correctness and maintainability review guidance on run; resume retains it.
---allow-fix on run requires --code-review: finish a read-only review, then resume the
-same worker in workspace-write mode with fix guidance. Only the final receipt/answer
-is printed; the original review remains in revision 1. Each phase has its own timeout
-and at most one format repair. Failed review never advances automatically.
-resume RUN_ID --allow-fix enables fixing after a completed code review. Later resumes
-retain write permission. Format repair is always read-only, including after fixing.
-Fixes happen in the shared cwd, not a worktree; no rollback or merge is automatic.
-Assign disjoint files to concurrent fix workers and validate their integration.
-Failure or interruption may leave partial edits. Policies are injected directly;
-workers need not read policy files. Global/project PIRA instructions stay disabled.
-Navigation defaults to nav; keep pira_nav on PATH. shell omits nav guidance/use.
-Requires native Codex app-server (tested with 0.159.3), file-based login or
-CODEX_API_KEY. Omitted model/effort inherit the current Codex session's latest recorded
-turn settings. Each explicit flag overrides its own field. Inheritance uses
-CODEX_THREAD_ID and CODEX_HOME (default ~/.codex); no parent messages are forwarded.
-If unavailable/ambiguous, supply explicit values; there is no global/default fallback.
-Parent logs are bounded at 256 MiB and 16 MiB per record. An incomplete record fails
-closed. The manifest records effective model/effort and each setting's source.
-No global PIRA injection or nested delegation. Worker writes require --allow-fix. Secret avoidance is an
-instructional rule, not a filesystem secrecy boundary. Full logs are ordinary files.
+Workers always receive main guidance including ctx/nav/dec.
+--inject-review and --inject-implement independently add task guidance on run/resume.
+Combined launches review first, then automatically append implementation guidance in the
+same thread only after a successful internal checkpoint. Neither flag grants edit authority.
+Resume continues the retained stage; standalone runs do not retroactively become staged.
+Resume retains guidance and adds
+only missing selections without replacing the cached base prefix. Native subagents and
+global/project PIRA loading are disabled. All phases use workspace-write; REVIEW assignments protect
+project artifacts, including tests, configuration, docs, lockfiles and expected outputs, by instruction.
+Build/test outputs, authorized cache updates, scratch and managed handoffs remain permitted;
+commands rewriting protected artifacts require check-only mode or a disposable copy. IMPLEMENTATION assignments authorize only their owned files. Fixes are implementation.
+Secrets exclusion and file ownership are instructional, not hard read/file-level boundaries.
+No rollback/merge is automatic; failure/interruption may leave partial edits.
+--code-review and --allow-fix are deprecated aliases with no permission/eligibility gate;
+explicit task instructions prevail. --navigation nav remains accepted; shell is deprecated.
+
+The launcher gives the worker a direct file path in artifacts/ for its handoff. Each resume
+has a new immutable-by-contract revision artifact. Default stdout is a JSON receipt with
+only run_id, status, run_root and handoff_path. --output answer prints exact
+handoff bytes. Nothing is automatically published into the project workspace.
+read RUN_ID manifest.json retrieves usage, revisions, repairs, format, completion gate and
+artifact/log references; path RUN_ID manifest.json returns its path. Earlier revision metadata
+is available at revisions/NNNNNN/manifest.json. Repair and incomplete-accounting warnings
+remain on stderr; routine diagnostic metadata stays in manifests.
+path RUN_ID returns the handoff; path RUN_ID . returns the run root for scripts.
+read/path allow safe relative diagnostic/artifact files and exclude backend credentials/state.
+read without a relative filename requires a completed, needs_decision or incomplete outcome.
+Store: --store > PIRA_TEAM_DIR > persistent PIRA parent/team.
+Parent: macOS HOME/Library/Application Support/PIRA; Linux absolute, nonempty
+XDG_DATA_HOME/pira or HOME/.local/share/pira; Windows LOCALAPPDATA/PIRA. Ctx and Dec default to ctx and
+decision under the same parent; their explicit environment overrides remain supported.
+Older temporary-store runs require --store OLD_STORE or PIRA_TEAM_DIR until explicitly
+migrated. Retained runs embed absolute paths: do not simply move/merge run directories.
+Use the same store across commands. Read/path never launch a worker.
+
+--format auto lets the worker declare markdown/text/json/csv for its extensionless handoff.
+Explicit formats assign a matching extension. --schema requires json; --columns requires csv
+and a JSON array of ordered headers. External schema references are disabled. Validation
+checks file delivery and format only, not findings or the completion gate. Decision/incomplete
+outcomes bypass the report schema/columns. One file-format repair at most, preserving context
+and substantive work; failure exits nonzero with diagnostic paths. Repair stays workspace-write
+but is instructed to edit only the handoff. Invalid file candidates are retained in repair logs.
+
+Run/resume block without an execution deadline. Stream stderr for run_id and active-turn
+notice; await the original invocation, not log polling. A live hung worker can be interrupted.
+Controls acknowledge acceptance, not completion; never blindly retry unknown delivery.
+Steering is unavailable during startup/repair. Normal interruption retains the conversation.
+Concurrent resumes and orphaned running state fail closed. Legacy ephemeral runs cannot resume.
+Legacy retained runs need an explicit completion gate on first migration; their history is kept.
+The original base prefix is retained; current worker instructions are directly injected on
+migration, and current handoff/gate are supplied each turn. Cache hits are not guaranteed.
+
+Model/effort inherit the main's latest recorded profile; resume retains them. Explicit flags
+independently override them. If inheritance is unavailable/ambiguous, supply explicit values.
+Requires native Codex app-server with the published Team protocol and strict-config support,
+plus existing local file auth or CODEX_API_KEY. Preflight generates native schemas (10s limit);
+missing API fields/methods fail before model work. Sent requests are schema-validated.
+Direct stdio is separate from the interactive shared daemon; its version/features are not
+Team compatibility evidence. This checks published API inventory and outgoing request shapes,
+not model access, notification semantics or actual shell sandbox behavior. Authentication
+is launcher-managed and detached after each invocation. All raw logs remain tool-managed.
+Worker shells inherit the invoking environment on launch/resume, except session/store identity,
+authentication sockets and named credential patterns. Team supplies its own handoff/guard/stores.
+Unknown variables pass through; this is not a secret detector. Existing absolute directories in
+CARGO_HOME, CARGO_TARGET_DIR, PIP_CACHE_DIR, UV_CACHE_DIR, PYTHONPYCACHEPREFIX, MYPY_CACHE_DIR,
+npm_config_cache, NPM_CONFIG_CACHE, YARN_CACHE_FOLDER, GOCACHE, GOMODCACHE, GRADLE_USER_HOME,
+CCACHE_DIR, SCCACHE_DIR and XDG_CACHE_HOME automatically grant build/cache writes without prompts.
+PIRA_TEAM_BUILD_ROOTS adds a JSON array of existing absolute directories for other build systems.
+Invalid explicit roots fail; unusable ambient roots grant nothing. Filesystem roots are excluded;
+physical paths are deduplicated. Run/resume/repair use current invoking configuration and record
+build_roots in manifests. Other inherited variables grant no extra writes. No cache deletion is
+authorized; task/ownership constraints still apply. Unix cancellation excludes detached descendants.
 "#;
 
 struct Options {
@@ -109,44 +124,34 @@ struct Options {
     effort: String,
     profile_sources: Value,
     task: String,
-    timeout: Duration,
     output: String,
     navigation: String,
-    code_review: bool,
-    allow_fix: bool,
-    mode: Mode,
+    completion_gate: String,
+    inject_review: bool,
+    inject_implement: bool,
+    ctx_store: PathBuf,
+    dec_store: PathBuf,
     contract: artifact::Contract,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    ReadOnly,
-    Fix,
+fn completion_gate(value: Option<String>) -> Result<String, String> {
+    value
+        .filter(|s| !s.trim().is_empty() && !s.contains('\0'))
+        .ok_or_else(|| "provide a nonempty --completion-gate for the assignment".into())
 }
 
-impl Mode {
-    fn sandbox(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::Fix => "workspace-write",
-        }
-    }
-    fn sandbox_type(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "readOnly",
-            Self::Fix => "workspaceWrite",
-        }
-    }
-    fn instructions(self) -> &'static str {
-        match self {
-            Self::ReadOnly => {
-                "You are a read-only worker. Do not write, create, or delete files. Complete the assigned task and return the deliverable in your final answer; the launcher handles storage."
-            }
-            Self::Fix => {
-                "You are in the authorized fix phase. You may edit assigned code and tests within the working directory. Return the deliverable in your final answer; the launcher handles its storage."
-            }
-        }
-    }
+fn tool_store(kind: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let key = if kind == "ctx" {
+        "PIRA_CTX_STORE_DIR"
+    } else {
+        "PIRA_DEC_STORE_DIR"
+    };
+    let path = storage::configured_root(key, if kind == "ctx" { "ctx" } else { "decision" })?;
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), String> {
@@ -182,13 +187,15 @@ fn parse(args: &[String]) -> Result<Options, String> {
         return Err("expected run; use pira_team help".into());
     }
     let mut cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let mut store = storage::default_root();
+    let mut store = None;
     let (mut model, mut effort, mut task, mut task_file) = (None, None, None, None);
-    let mut timeout = 900;
     let mut output = "artifact".to_string();
     let mut format = "auto".to_string();
     let (mut schema, mut columns) = (None, None);
     let mut navigation = "nav".to_string();
+    let mut gate = None;
+    let mut inject_review = None;
+    let mut inject_implement = None;
     let mut code_review = None;
     let mut allow_fix = None;
     let mut args = args[1..].iter();
@@ -209,6 +216,18 @@ fn parse(args: &[String]) -> Result<Options, String> {
             set_once(&mut task, value.to_owned(), "task")?;
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--completion-gate=") {
+            set_once(&mut gate, value.to_owned(), "--completion-gate")?;
+            continue;
+        }
+        if arg == "--inject-review" {
+            set_once(&mut inject_review, true, "--inject-review")?;
+            continue;
+        }
+        if arg == "--inject-implement" {
+            set_once(&mut inject_implement, true, "--inject-implement")?;
+            continue;
+        }
         if arg == "--allow-fix" {
             set_once(&mut allow_fix, true, "--allow-fix")?;
             continue;
@@ -221,13 +240,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
             .next()
             .ok_or_else(|| format!("missing value for {arg}"))?;
         match arg.as_str() {
+            "--completion-gate" => set_once(&mut gate, value.clone(), "--completion-gate")?,
             "--cwd" => cwd = PathBuf::from(value),
-            "--store" => store = PathBuf::from(value),
+            "--store" => store = Some(PathBuf::from(value)),
             "--model" => model = Some(value.clone()),
             "--effort" => effort = Some(value.clone()),
             "--task" => set_once(&mut task, value.clone(), "task")?,
             "--task-file" => set_once(&mut task_file, PathBuf::from(value), "--task-file")?,
-            "--timeout" => timeout = value.parse::<u64>().map_err(|_| "invalid timeout")?,
+            "--timeout" => {
+                return Err("--timeout is no longer supported; use interrupt to stop a run".into());
+            }
             "--output" => output = value.clone(),
             "--navigation" => navigation = value.clone(),
             "--format" => format = value.clone(),
@@ -236,13 +258,21 @@ fn parse(args: &[String]) -> Result<Options, String> {
             _ => return Err(format!("unknown option {arg}")),
         }
     }
-    if allow_fix.unwrap_or(false) && !code_review.unwrap_or(false) {
-        return Err("--allow-fix requires --code-review on run".into());
+    if allow_fix.is_some() || code_review.is_some() {
+        eprintln!(
+            "pira_team: --code-review/--allow-fix are deprecated; task instructions control review or implementation"
+        );
     }
+    if navigation == "shell" {
+        eprintln!(
+            "pira_team: --navigation shell is deprecated; normal ctx/nav/dec guidance is always injected"
+        );
+    }
+    let completion_gate = completion_gate(gate)?;
     let task = task_input(task, task_file, None)?;
     let (model, effort, profile_sources) = profile::resolve(model, effort)?;
-    if timeout == 0 || task.trim().is_empty() {
-        return Err("timeout and task must be nonempty".into());
+    if task.trim().is_empty() {
+        return Err("task must be nonempty".into());
     }
     if !["answer", "artifact"].contains(&output.as_str()) {
         return Err("--output must be answer or artifact".into());
@@ -257,18 +287,19 @@ fn parse(args: &[String]) -> Result<Options, String> {
         return Err("working directory is not a directory".into());
     }
     Ok(Options {
+        ctx_store: tool_store("ctx", &cwd)?,
+        dec_store: tool_store("dec", &cwd)?,
         cwd,
-        store,
+        store: store.map(Ok).unwrap_or_else(storage::default_root)?,
         model,
         effort,
         profile_sources,
         task,
-        timeout: Duration::from_secs(timeout),
         output,
         navigation,
-        code_review: code_review.unwrap_or(false),
-        allow_fix: allow_fix.unwrap_or(false),
-        mode: Mode::ReadOnly,
+        completion_gate,
+        inject_review: inject_review.unwrap_or(false),
+        inject_implement: inject_implement.unwrap_or(false),
         contract: artifact::Contract::new(format, schema.as_deref(), columns.as_deref())?,
     })
 }
@@ -367,6 +398,7 @@ impl IsolatedHome {
             return Ok(home);
         }
         let source = std::env::var_os("CODEX_HOME")
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME")
@@ -405,44 +437,98 @@ impl Drop for IsolatedHome {
     }
 }
 
-fn command(options: &Options, run: &Path, dir: &Path, mode: Mode) -> Command {
+fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command {
     let mut cmd = Command::new("codex");
     cmd.args(["app-server", "--strict-config", "--stdio"]);
+    for setting in backend::contract()["config"].as_array().unwrap() {
+        cmd.arg("-c").arg(setting.as_str().unwrap());
+    }
     for setting in [
         format!("model={}", json!(options.model)),
         format!("model_reasoning_effort={}", json!(options.effort)),
-        format!("sandbox_mode={}", json!(mode.sandbox())),
         format!("model_instructions_file={}", json!(dir.join("policy.md"))),
-        "developer_instructions=\"\"".into(),
-        "project_doc_max_bytes=0".into(),
-        "approval_policy=\"never\"".into(),
-        "features.multi_agent=false".into(),
-        "features.memories=false".into(),
-        "features.apps=false".into(),
-        "features.plugins=false".into(),
-        "features.hooks=false".into(),
-        "features.skip_host_skill_discovery=true".into(),
-        "features.image_generation=false".into(),
-        "features.browser_use=false".into(),
-        "features.computer_use=false".into(),
         format!(
             "projects.{}.trust_level=\"untrusted\"",
             json!(options.cwd.to_string_lossy())
         ),
-        "web_search=\"disabled\"".into(),
-        "shell_environment_policy.inherit=\"core\"".into(),
-        "shell_environment_policy.set.PIRA_TEAM_CHILD=\"1\"".into(),
     ] {
         cmd.arg("-c").arg(setting);
     }
-    cmd.env("PIRA_TEAM_CHILD", "1")
-        .env_remove("CODEX_THREAD_ID");
+    for (key, value) in [
+        ("PIRA_CTX_STORE_DIR", &options.ctx_store),
+        ("PIRA_DEC_STORE_DIR", &options.dec_store),
+    ] {
+        cmd.arg("-c").arg(format!(
+            "shell_environment_policy.set.{key}={}",
+            json!(value)
+        ));
+    }
+    cmd.arg("-c").arg(format!(
+        "shell_environment_policy.set.PIRA_TEAM_HANDOFF={}",
+        json!(handoff)
+    ));
+    // Keep unknown task configuration without serializing its values into argv/logs.
+    // Backend authentication remains available to Codex, not to worker shells.
+    cmd.arg("-c")
+        .arg("shell_environment_policy.ignore_default_excludes=true");
+    cmd.arg("-c").arg(format!(
+        "shell_environment_policy.exclude={}",
+        json!([
+            "CODEX_HOME",
+            "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ID",
+            "PIRA_CTX_THREAD_ID",
+            "PIRA_TEAM_DIR",
+            "PIRA_TEAM_HANDOFF",
+            "PIRA_TEAM_CHILD",
+            "PIRA_CTX_STORE_DIR",
+            "PIRA_DEC_STORE_DIR",
+            "CODEX_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_ADMIN_KEY",
+            "*_API_KEY",
+            "*_TOKEN",
+            "*_SECRET",
+            "*_SECRET_KEY",
+            "*_PASSWORD",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+        ])
+    ));
+    for key in [
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "PIRA_CTX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        cmd.env_remove(key);
+    }
+    // Worker temporary defaults must match the managed writable root, not ambient host paths.
+    let scratch = run.join("scratch");
+    for (key, path) in [
+        ("TMPDIR", scratch.clone()),
+        ("TMP", scratch.clone()),
+        ("TEMP", scratch.clone()),
+        // zsh uses TMPPREFIX rather than TMPDIR for heredocs.
+        ("TMPPREFIX", scratch.join("zsh")),
+    ] {
+        cmd.env(key, &path);
+        cmd.arg("-c").arg(format!(
+            "shell_environment_policy.set.{key}={}",
+            json!(path)
+        ));
+    }
+    cmd.env("PIRA_TEAM_CHILD", "1");
     cmd.env("CODEX_HOME", run.join("codex-home"));
     cmd.current_dir(dir).stdin(Stdio::piped());
     cmd
 }
 
-// Reused from the archived Team app-server transport: isolate/terminate the whole process tree.
+// Unix cancellation isolates/terminates the owned process group, excluding detached descendants.
 #[cfg(unix)]
 fn isolate(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -520,7 +606,15 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
     fn options(extra: &[&str]) -> Result<Options, String> {
-        let mut args = vec!["run", "--model", "test-model", "--effort", "high"];
+        let mut args = vec![
+            "run",
+            "--model",
+            "test-model",
+            "--effort",
+            "high",
+            "--completion-gate",
+            "Fixture complete",
+        ];
         args.extend(extra);
         parse(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
     }
@@ -545,7 +639,7 @@ mod tests {
         let opt = options(&["review"]).unwrap();
         let run = Path::new("/tmp/worker run");
         for dir in [run.to_owned(), run.join("revisions/000002/repair")] {
-            let cmd = command(&opt, run, &dir, Mode::ReadOnly);
+            let cmd = command(&opt, run, &dir, &dir.join("artifacts/handoff"));
             let home = cmd
                 .get_envs()
                 .find(|(key, _)| *key == "CODEX_HOME")
@@ -553,6 +647,22 @@ mod tests {
                 .1
                 .unwrap();
             assert_eq!(home, run.join("codex-home").as_os_str());
+            for key in ["TMPDIR", "TMP", "TEMP", "TMPPREFIX"] {
+                let path = if key == "TMPPREFIX" {
+                    // Match native component separators in the raw environment value;
+                    // joining "scratch/zsh" retains the slash on Windows.
+                    run.join("scratch").join("zsh")
+                } else {
+                    run.join("scratch")
+                };
+                let actual = cmd
+                    .get_envs()
+                    .find(|(name, _)| *name == key)
+                    .and_then(|(_, value)| value);
+                assert_eq!(actual, Some(path.as_os_str()), "backend environment {key}");
+                let setting = format!("shell_environment_policy.set.{key}={}", json!(path));
+                assert!(cmd.get_args().any(|arg| arg == setting.as_str()));
+            }
             assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
             let policy = format!("model_instructions_file={}", json!(dir.join("policy.md")));
             assert!(cmd.get_args().any(|arg| arg == policy.as_str()));
@@ -566,7 +676,7 @@ mod tests {
             &opt,
             Path::new("/tmp/worker run"),
             Path::new("/tmp/policy run"),
-            Mode::ReadOnly,
+            Path::new("/tmp/policy run/artifacts/handoff"),
         );
         let args: Vec<_> = cmd
             .get_args()
@@ -575,13 +685,18 @@ mod tests {
         for expected in [
             "app-server",
             "--strict-config",
-            "sandbox_mode=\"read-only\"",
+            "sandbox_mode=\"workspace-write\"",
             "project_doc_max_bytes=0",
             "approval_policy=\"never\"",
+            "agents.enabled=false",
             "features.multi_agent=false",
+            "shell_environment_policy.set.PIRA_TEAM_CHILD=\"1\"",
         ] {
             assert!(args.iter().any(|a| a == expected), "{expected}");
         }
+        assert!(cmd.get_envs().any(
+            |(key, value)| key == "PIRA_TEAM_CHILD" && value == Some(std::ffi::OsStr::new("1"))
+        ));
         assert!(
             !args
                 .iter()

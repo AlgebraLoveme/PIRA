@@ -140,11 +140,15 @@ impl SymbolPath {
         let mut segments = Vec::new();
         let mut expect_name = true;
         while index < bytes.len() {
-            if !expect_name && bytes[index] == b'[' {
+            if (!expect_name || segments.is_empty())
+                && bytes[index] == b'['
+                && bytes.get(index + 1) != Some(&b'"')
+            {
                 let end = value[index + 1..].find(']')? + index + 1;
                 let raw = &value[index + 1..end];
                 if raw.bytes().all(|byte| byte.is_ascii_digit()) && !raw.is_empty() {
                     segments.push(SymbolPathSegment::Index(raw.parse().ok()?));
+                    expect_name = false;
                     index = end + 1;
                     if index == bytes.len() {
                         break;
@@ -276,7 +280,7 @@ impl Symbol {
 
     pub fn contains_line(&self, one_based_line: usize) -> bool {
         let start = self.start_row + 1;
-        let end = self.end_row + 1;
+        let end = self.end_row + usize::from(self.end_column > 0);
         one_based_line >= start && one_based_line <= end
     }
 
@@ -338,8 +342,29 @@ mod tests {
 
     #[test]
     fn canonical_parser_rejects_incomplete_or_malformed_paths() {
-        for value in ["::name", "name::", "name:::child", "[\"unterminated\"]x"] {
+        for value in [
+            "::name",
+            "name::",
+            "name:::child",
+            "[\"unterminated\"]x",
+            "[]",
+            "[0]::",
+            "name::[0]",
+            "[0]x",
+        ] {
             assert!(SymbolPath::parse_canonical(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn root_array_paths_round_trip() {
+        let root = SymbolPath::default().child_index(0);
+        for path in [
+            root.clone(),
+            root.child_index(1).child_name("x"),
+            root.child_name("a.b"),
+        ] {
+            assert_eq!(SymbolPath::parse_canonical(&path.canonical()), Some(path));
         }
     }
 

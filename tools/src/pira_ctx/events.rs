@@ -278,7 +278,13 @@ pub fn record(
         let _ = fs::remove_file(&state_path);
         return Err(error);
     }
-    if let Err(error) = atomic_write(&records_dir.join(&name), &encode_event(&event)?) {
+    if let Err(error) = publish_event(&records_dir.join(&name), &encode_event(&event)?) {
+        if records_dir.join(&name).exists() {
+            // Publication may have succeeded before directory sync failed. Rebuild from records,
+            // rather than hiding an authoritative record behind a rolled-back journal entry.
+            let _ = fs::remove_file(&state_path);
+            return Err(error);
+        }
         remove_retention_entry(&mut retention, scope.directory_name(), &name);
         let rollback = RetentionRemoval {
             scope_name: scope.directory_name().to_string(),
@@ -975,6 +981,11 @@ fn remove_retention_record(workspace_dir: &Path, removal: &RetentionRemoval) -> 
         return Err("invalid event retention entry".into());
     }
     let scope_dir = workspace_dir.join(&removal.scope_name);
+    if !real_directory(&scope_dir, "event scope")?
+        || !real_directory(&scope_dir.join("records"), "event records")?
+    {
+        return Ok(());
+    }
     let path = scope_dir.join("records").join(&removal.record.record_name);
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -1621,6 +1632,28 @@ fn take_array<const N: usize>(bytes: &[u8], position: &mut usize) -> Result<[u8;
     Ok(value)
 }
 
+fn publish_event(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary =
+        path.with_extension(format!("tmp-{}-{:016x}", std::process::id(), short_nonce()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        drop(file);
+        storage::publish_immutable(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomic_write_with_durability(path, bytes, true)
 }
@@ -1756,6 +1789,45 @@ fn short_nonce() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_deletion_rejects_foreign_scope_and_records_links() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ctx-retention-links-{}", std::process::id()));
+        let workspace = dir.join("workspace");
+        let foreign = dir.join("foreign");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(foreign.join("records")).unwrap();
+        let record = foreign.join("records/1-test.piraevt");
+        fs::write(&record, b"keep").unwrap();
+        let removal = RetentionRemoval {
+            scope_name: ".unscoped".into(),
+            record: RetentionRecord {
+                timestamp_ms: 1,
+                record_name: "1-test.piraevt".into(),
+                summary: None,
+            },
+        };
+        let scope = workspace.join(".unscoped");
+        symlink(&foreign, &scope).unwrap();
+        assert!(remove_retention_record(&workspace, &removal).is_err());
+        assert_eq!(fs::read(&record).unwrap(), b"keep");
+        fs::remove_file(&scope).unwrap();
+        fs::create_dir(&scope).unwrap();
+        symlink(foreign.join("records"), scope.join("records")).unwrap();
+        assert!(remove_retention_record(&workspace, &removal).is_err());
+        assert!(record.exists());
+        fs::remove_file(scope.join("records")).unwrap();
+        fs::create_dir(scope.join("records")).unwrap();
+        let local = scope.join("records/1-test.piraevt");
+        fs::write(&local, b"remove").unwrap();
+        remove_retention_record(&workspace, &removal).unwrap();
+        remove_retention_record(&workspace, &removal).unwrap();
+        assert!(!local.exists());
+        assert!(record.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn sample_event() -> Event {
         Event {

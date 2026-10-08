@@ -51,9 +51,28 @@ struct MarkdownHeading {
 }
 
 pub fn collect_markdown(source: &str) -> DocumentSymbols {
-    let mut headings = markdown_headings(source);
+    let headings = markdown_headings(source);
     let truncated = headings.len() > MAX_DOCUMENT_SYMBOLS;
-    headings.truncate(MAX_DOCUMENT_SYMBOLS.saturating_add(1));
+    // Determine boundaries before applying the output inventory limit.
+    let mut ends = vec![source.len(); headings.len()];
+    let mut open = Vec::<usize>::new();
+    for (index, heading) in headings.iter().enumerate() {
+        while open
+            .last()
+            .is_some_and(|previous| headings[*previous].level >= heading.level)
+        {
+            ends[open.pop().unwrap()] = heading.start_byte;
+        }
+        open.push(index);
+    }
+    let line_starts: Vec<_> = std::iter::once(0)
+        .chain(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n').then_some(i + 1)),
+        )
+        .collect();
     let mut hierarchy = Vec::<(usize, String)>::new();
     let mut symbols = Vec::with_capacity(headings.len().min(MAX_DOCUMENT_SYMBOLS));
     for (index, heading) in headings.iter().take(MAX_DOCUMENT_SYMBOLS).enumerate() {
@@ -71,12 +90,9 @@ pub fn collect_markdown(source: &str) -> DocumentSymbols {
             .map(|(_, title)| title.as_str())
             .collect::<Vec<_>>()
             .join(" > ");
-        let next_start = headings[index + 1..]
-            .iter()
-            .find(|candidate| candidate.level <= heading.level)
-            .map_or(source.len(), |candidate| candidate.start_byte);
-        let end_byte = trim_markdown_section_end(source, heading.heading_end_byte, next_start);
-        let (end_row, end_column) = markdown_point(source, end_byte);
+        let end_byte = trim_markdown_section_end(source, heading.heading_end_byte, ends[index]);
+        let end_row = line_starts.partition_point(|start| *start <= end_byte) - 1;
+        let end_column = end_byte - line_starts[end_row];
         symbols.push(Symbol {
             kind: match heading.level {
                 1 => "heading1",
@@ -245,15 +261,6 @@ fn trim_markdown_section_end(source: &str, minimum: usize, end: usize) -> usize 
         result -= 1;
     }
     result.max(minimum)
-}
-
-fn markdown_point(source: &str, byte: usize) -> (usize, usize) {
-    let prefix = &source[..byte.min(source.len())];
-    let row = prefix.bytes().filter(|value| *value == b'\n').count();
-    let column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.len(), |(_, line)| line.len());
-    (row, column)
 }
 
 struct Collector<'a> {
@@ -463,7 +470,18 @@ fn walk_toml_document(root: Node<'_>, output: &mut Collector<'_>) {
                 let Some(segments) = toml_key_segments(key_node, output.source) else {
                     continue;
                 };
-                let base = root_path.extend_names(segments);
+                let mut base = root_path.clone();
+                let mut segments = segments.into_iter().peekable();
+                while let Some(segment) = segments.next() {
+                    base = base.child_name(segment);
+                    // Subtables belong to the latest occurrence of each array ancestor.
+                    // Including those indices also scopes nested array counters correctly.
+                    if segments.peek().is_some()
+                        && let Some(count) = table_arrays.get(&base.canonical())
+                    {
+                        base = base.child_index(count - 1);
+                    }
+                }
                 let (path, kind) = if child.kind() == "table_array_element" {
                     let index = table_arrays.entry(base.canonical()).or_default();
                     let path = base.child_index(*index);
@@ -585,6 +603,7 @@ fn normalize_jsonc_trailing_commas(source: &str) -> Cow<'_, str> {
     let mut escaped = false;
     let mut line_comment = false;
     let mut block_comment = false;
+    let mut previous = None;
     while index < bytes.len() {
         let byte = bytes[index];
         if line_comment {
@@ -603,6 +622,7 @@ fn normalize_jsonc_trailing_commas(source: &str) -> Cow<'_, str> {
                 escaped = true;
             } else if byte == b'"' {
                 string = false;
+                previous = Some(b'"');
             }
         } else if byte == b'"' {
             string = true;
@@ -613,9 +633,13 @@ fn normalize_jsonc_trailing_commas(source: &str) -> Cow<'_, str> {
             block_comment = true;
             index += 1;
         } else if byte == b','
+            && previous.is_some_and(|token| !matches!(token, b'[' | b'{' | b':' | b','))
             && next_jsonc_token(bytes, index + 1).is_some_and(|next| matches!(next, b'}' | b']'))
         {
             normalized.get_or_insert_with(|| bytes.to_vec())[index] = b' ';
+            previous = Some(byte);
+        } else if !byte.is_ascii_whitespace() {
+            previous = Some(byte);
         }
         index += 1;
     }
@@ -725,6 +749,21 @@ mod tests {
         assert!(section.contains("### Verify"));
         assert!(!section.contains("Configuration"));
         assert!(!parsed.truncated);
+    }
+
+    #[test]
+    fn markdown_boundaries_survive_inventory_truncation() {
+        let mut source = String::from("# A\n");
+        source.push_str(&"## nested\n".repeat(MAX_DOCUMENT_SYMBOLS));
+        let boundary = source.len();
+        source.push_str("# B\nUNRELATED\n");
+        let parsed = collect_markdown(&source);
+        assert!(parsed.truncated);
+        assert_eq!(parsed.symbols.len(), MAX_DOCUMENT_SYMBOLS);
+        let section = &parsed.symbols[0];
+        assert_eq!(section.end_byte, boundary - 1);
+        assert_eq!(section.end_row, MAX_DOCUMENT_SYMBOLS);
+        assert!(!source[..section.end_byte].contains("UNRELATED"));
     }
 
     #[test]

@@ -118,7 +118,7 @@ pub fn prepare(
             "stderr_path": stderr_path.to_string_lossy(),
             "id": source.metadata.result_id,
             "exit": if source.is_running() { serde_json::Value::Null } else { serde_json::json!(source.metadata.exit_code) },
-            "state": if source.is_running() { "running" } else { "complete" },
+            "state": source.state(),
             "generation": source.live_generation().unwrap_or_default(),
         }));
     }
@@ -199,7 +199,11 @@ fn resolve_python(config: &Config) -> Result<Vec<String>, String> {
         return Ok(candidate);
     }
     if let Some(program) = std::env::var_os("PIRA_CTX_PYTHON") {
-        let candidate = vec![program.to_string_lossy().into_owned()];
+        let program = program.into_string().map_err(|_| {
+            "invalid PIRA_CTX_PYTHON: path must be valid Unicode; no interpreter was launched"
+                .to_string()
+        })?;
+        let candidate = vec![program];
         probe_python(&candidate).map_err(|error| format!("invalid PIRA_CTX_PYTHON: {error}"))?;
         return Ok(candidate);
     }

@@ -38,6 +38,10 @@ tools/build/*
 !tools/build/test_build_pira_ctx_platform_bins.py
 !tools/build/package_github_release.py
 !tools/build/test_package_github_release.py
+!tools/build/private_ci.py
+!tools/build/private_ci_workflow.yml
+!tools/build/test_private_ci.py
+!tools/build/PRIVATE_CI.md
 !tools/src/
 !tools/src/**
 

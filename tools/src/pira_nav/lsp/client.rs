@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,11 +23,47 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 const MAX_MESSAGES_PER_REQUEST: usize = 10_000;
+const MAX_PENDING_MESSAGES: usize = 256;
+const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SERVER_STDERR_BYTES: usize = 16 * 1024;
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const LSP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type WriteRequest = (Vec<u8>, mpsc::SyncSender<Result<(), String>>);
+type InboundMessage = (Result<Value, String>, usize);
+
+#[derive(Default)]
+struct InboundBudget {
+    bytes: AtomicUsize,
+    overflow: AtomicBool,
+}
+
+impl InboundBudget {
+    fn enqueue(&self, sender: &mpsc::SyncSender<InboundMessage>, message: InboundMessage) -> bool {
+        let size = message.1;
+        if self
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(size)
+                    .filter(|total| *total <= MAX_PENDING_BYTES)
+            })
+            .is_err()
+        {
+            self.overflow.store(true, Ordering::Release);
+            return false;
+        }
+        match sender.try_send(message) {
+            Ok(()) => true,
+            Err(error) => {
+                self.bytes.fetch_sub(size, Ordering::AcqRel);
+                if matches!(error, mpsc::TrySendError::Full(_)) {
+                    self.overflow.store(true, Ordering::Release);
+                }
+                false
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ServerCapabilities {
@@ -51,7 +88,8 @@ struct DocumentPosition<'a> {
 pub(super) struct LspClient {
     child: Child,
     input: Option<mpsc::Sender<WriteRequest>>,
-    output: mpsc::Receiver<Result<Value, String>>,
+    output: mpsc::Receiver<InboundMessage>,
+    inbound: Arc<InboundBudget>,
     input_thread: Option<JoinHandle<()>>,
     output_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
@@ -65,6 +103,7 @@ pub(super) struct LspClient {
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
     unusable: bool,
+    tree_terminated: bool,
     request_timeout: Duration,
 }
 
@@ -132,13 +171,19 @@ impl LspClient {
                 }
             }
         });
-        let (output_sender, output_receiver) = mpsc::channel();
+        let (output_sender, output_receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        let inbound = Arc::new(InboundBudget::default());
+        let reader_budget = Arc::clone(&inbound);
         let output_thread = thread::spawn(move || {
             let mut output = BufReader::new(output);
             loop {
-                let message = read_message(&mut output);
+                let (message, size) = match read_message(&mut output) {
+                    Ok((message, size)) => (Ok(message), size),
+                    Err(error) => (Err(error), 0),
+                };
                 let failed = message.is_err();
-                if output_sender.send(message).is_err() || failed {
+                // Never block the reader while the peer is waiting for us to finish a write.
+                if !reader_budget.enqueue(&output_sender, (message, size)) || failed {
                     break;
                 }
             }
@@ -147,6 +192,7 @@ impl LspClient {
             child,
             input: Some(input_sender),
             output: output_receiver,
+            inbound,
             input_thread: Some(input_thread),
             output_thread: Some(output_thread),
             stderr: captured,
@@ -160,6 +206,7 @@ impl LspClient {
             #[cfg(windows)]
             job,
             unusable: false,
+            tree_terminated: false,
             request_timeout: LSP_REQUEST_TIMEOUT,
         };
         let root_uri = file_uri(&config.root)?;
@@ -245,6 +292,13 @@ impl LspClient {
         );
         self.close_document(&uri);
         parse_document_symbols(&result?, &uri, source, language, self.encoding)
+    }
+
+    pub(super) fn require_definitions(&self) -> Result<(), String> {
+        self.require_capability(
+            self.capabilities.definition,
+            "definition (required for imports; configure a server with definitionProvider)",
+        )
     }
 
     pub(super) fn definition(
@@ -644,6 +698,7 @@ impl LspClient {
     }
 
     fn send(&mut self, message: &Value) -> Result<(), String> {
+        self.check_inbound_budget()?;
         if self.unusable {
             return Err("LSP client is unavailable after a previous I/O failure".into());
         }
@@ -663,7 +718,9 @@ impl LspClient {
             .ok_or_else(|| "LSP writer is closed".to_string())?
             .send((framed, reply))
             .map_err(|_| "LSP writer stopped unexpectedly".to_string())?;
-        match result.recv_timeout(LSP_WRITE_TIMEOUT) {
+        let written = result.recv_timeout(LSP_WRITE_TIMEOUT);
+        self.check_inbound_budget()?;
+        match written {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(self.io_error("write", io::Error::other(error))),
             Err(_) => {
@@ -679,8 +736,14 @@ impl LspClient {
     }
 
     fn read(&mut self, deadline: Instant) -> Result<Value, String> {
+        self.check_inbound_budget()?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match self.output.recv_timeout(remaining) {
+        let received = self.output.recv_timeout(remaining);
+        if let Ok((_, size)) = &received {
+            self.inbound.bytes.fetch_sub(*size, Ordering::AcqRel);
+        }
+        self.check_inbound_budget()?;
+        match received.map(|(message, _)| message) {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(self.io_error("read", io::Error::other(error))),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -698,7 +761,21 @@ impl LspClient {
         }
     }
 
+    fn check_inbound_budget(&mut self) -> Result<(), String> {
+        if self.inbound.overflow.load(Ordering::Acquire) {
+            self.unusable = true;
+            self.terminate_tree();
+            return Err("LSP unsolicited message queue exceeds the safety limit".into());
+        }
+        Ok(())
+    }
+
     fn terminate_tree(&mut self) {
+        if self.tree_terminated {
+            return;
+        }
+        // Terminate before reaping the leader so its PID/process-group ID cannot be reused.
+        self.tree_terminated = true;
         #[cfg(unix)]
         {
             let group = self.child.id().min(i32::MAX as u32) as i32;
@@ -736,12 +813,15 @@ impl LspClient {
     }
 }
 
-fn read_message(output: &mut BufReader<ChildStdout>) -> Result<Value, String> {
+fn read_message(output: &mut impl BufRead) -> Result<(Value, usize), String> {
     let mut content_length = None;
     let mut header_bytes = 0usize;
     loop {
         let mut line = Vec::new();
+        let allowance = MAX_HEADER_LINE_BYTES.min(MAX_HEADER_BYTES - header_bytes);
         let count = output
+            .by_ref()
+            .take(allowance as u64 + 1)
             .read_until(b'\n', &mut line)
             .map_err(|error| format!("cannot read LSP message: {error}"))?;
         if count == 0 {
@@ -786,7 +866,7 @@ fn read_message(output: &mut BufReader<ChildStdout>) -> Result<Value, String> {
     if !value.is_object() {
         return Err("LSP message must be a JSON object".into());
     }
-    Ok(value)
+    Ok((value, length))
 }
 
 impl LspClient {
@@ -821,15 +901,8 @@ impl Drop for LspClient {
             let _ = self.notify("exit", Value::Null);
         }
         self.input.take();
-        for _ in 0..100 {
-            if self.child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
-        if self.child.try_wait().ok().flatten().is_none() {
-            self.terminate_tree();
-        }
+        // Pipes may still be held by descendants after the leader has exited.
+        self.terminate_tree();
         let _ = self.child.wait();
         if let Some(thread) = self.input_thread.take() {
             let _ = thread.join();
@@ -925,9 +998,65 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{LspClient, LspConfig, configuration_section};
+    use super::{
+        InboundBudget, LspClient, LspConfig, MAX_HEADER_BYTES, MAX_HEADER_LINE_BYTES,
+        MAX_PENDING_BYTES, MAX_PENDING_MESSAGES, Value, configuration_section, mpsc, read_message,
+    };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn header_limits_apply_before_reading_past_the_sentinel() {
+        let bytes = vec![b'x'; MAX_HEADER_LINE_BYTES + 100];
+        let mut reader = std::io::Cursor::new(bytes);
+        assert!(
+            read_message(&mut reader)
+                .unwrap_err()
+                .contains("headers exceed")
+        );
+        assert_eq!(reader.position() as usize, MAX_HEADER_LINE_BYTES + 1);
+
+        let line = format!("X:{}\n", "x".repeat(MAX_HEADER_LINE_BYTES - 3));
+        let mut reader = std::io::Cursor::new(line.repeat(MAX_HEADER_BYTES / line.len() + 1));
+        assert!(
+            read_message(&mut reader)
+                .unwrap_err()
+                .contains("headers exceed")
+        );
+        assert_eq!(reader.position() as usize, MAX_HEADER_BYTES + 1);
+        let mut reader = std::io::Cursor::new(b"Content-Length: 2\r\n\r\n{}");
+        assert_eq!(read_message(&mut reader).unwrap(), (json!({}), 2));
+    }
+
+    #[test]
+    fn unsolicited_queue_fails_without_blocking_at_item_limit() {
+        let budget = InboundBudget::default();
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
+        for _ in 0..MAX_PENDING_MESSAGES {
+            assert!(budget.enqueue(&sender, (Ok(Value::Null), 4)));
+        }
+        assert!(!budget.enqueue(&sender, (Ok(Value::Null), 4)));
+        assert!(budget.overflow.load(Ordering::Acquire));
+        assert_eq!(
+            budget.bytes.load(Ordering::Acquire),
+            MAX_PENDING_MESSAGES * 4
+        );
+        assert_eq!(receiver.try_iter().count(), MAX_PENDING_MESSAGES);
+    }
+
+    #[test]
+    fn unsolicited_queue_respects_byte_budget_and_released_capacity() {
+        let budget = InboundBudget::default();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        // Exercise accounting without allocating a maximum-size frame.
+        assert!(budget.enqueue(&sender, (Ok(Value::Null), MAX_PENDING_BYTES)));
+        let (_, size) = receiver.recv().unwrap();
+        budget.bytes.fetch_sub(size, Ordering::AcqRel);
+        assert!(budget.enqueue(&sender, (Ok(Value::Null), MAX_PENDING_BYTES)));
+        assert!(!budget.enqueue(&sender, (Ok(Value::Null), 1)));
+        assert!(budget.overflow.load(Ordering::Acquire));
+        assert_eq!(budget.bytes.load(Ordering::Acquire), MAX_PENDING_BYTES);
+    }
 
     #[test]
     fn configuration_sections_support_whole_and_dotted_settings() {

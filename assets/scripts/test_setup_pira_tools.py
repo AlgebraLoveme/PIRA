@@ -5,10 +5,13 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import runpy
 import sys
 import subprocess
 import tempfile
 import tarfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +22,147 @@ assert SPEC is not None and SPEC.loader is not None
 setup = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
+
+
+class TeamInitializeProcessTests(unittest.TestCase):
+    PEER = r"""
+import json, sys, threading, time
+request = json.loads(sys.stdin.readline())
+assert request["method"] == "initialize"
+eof = threading.Event()
+def read_eof():
+    assert sys.stdin.read() == ""
+    eof.set()
+threading.Thread(target=read_eof, daemon=True).start()
+mode = sys.argv[1]
+if mode in ("reply", "stubborn", "bad_exit", "final_eof"):
+    # An EOF-sensitive server drops pending initialization, like native Codex.
+    if eof.wait(0.1):
+        sys.exit(0)
+    print("", flush=True)
+    print(json.dumps({"id": 2, "result": None}), flush=True)
+    print(json.dumps({"method": "notice"}), flush=True)
+    print(json.dumps({"id": request["id"], "result": {"userAgent": "fixture"}}),
+          end="" if mode == "final_eof" else "\n", flush=True)
+    if mode == "final_eof":
+        sys.exit(0)
+    if mode == "stubborn":
+        time.sleep(30)
+    if not eof.wait(5):
+        sys.exit(9)
+    if mode == "bad_exit":
+        sys.exit(3)
+elif mode == "eof":
+    sys.exit(0)
+else:
+    if mode == "error":
+        print(json.dumps({"id": 1, "error": {"code": -1}}), flush=True)
+    if mode == "oversize":
+        print("x" * 65537, flush=True)
+    if mode == "malformed":
+        print("not json", flush=True)
+    if mode == "partial":
+        print('{"id":1', end="", flush=True)
+    time.sleep(30)
+"""
+
+    def probe(self, mode: str, *, timeout: float = 1) -> None:
+        real_popen = subprocess.Popen
+        children = []
+        streams = []
+        def launch(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            streams.extend(stream for stream in (kwargs["stdout"], kwargs["stderr"])
+                           if hasattr(stream, "closed"))
+            return child
+        started = time.monotonic()
+        try:
+            with patch.object(setup.subprocess, "Popen", side_effect=launch):
+                setup.check_team_initialize([sys.executable, "-u", "-c", self.PEER, mode],
+                                            dict(os.environ), timeout=timeout)
+        finally:
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].returncode, "probe must reap its child")
+            self.assertTrue(children[0].stdin.closed)
+            self.assertTrue(all(stream.closed for stream in streams))
+            self.assertTrue(all(not Path(stream.name).exists() for stream in streams))
+            self.assertLess(time.monotonic() - started, timeout + 3)
+
+    def test_newly_prepared_backend_is_selected_before_retained_store_planning(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = setup.executable_path(root / setup.CODEX_PACKAGE_DIR / "bin", "codex")
+            events = []
+            def install(*args):
+                events.append("installed")
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b"fake package, never executed")
+                return binary
+            def checked(tools, executable):
+                events.append("checked")
+                self.assertEqual(Path(executable).resolve(), binary.resolve())
+                return "codex-cli 0.161.0"
+            def planned(tools, **kwargs):
+                events.append("planned")
+                self.assertEqual(kwargs["codex_binary"], str(binary.resolve()))
+                raise RuntimeError("fixture preflight")
+            with patch.object(setup, "release_index", return_value={"tools": {"pira_team": {}}}), \
+                 patch.object(setup.shutil, "which", return_value=None), \
+                 patch.object(setup, "install_codex", side_effect=install), \
+                 patch.object(setup, "check_team_runtime", side_effect=checked), \
+                 patch.object(setup.stores, "plan_store_environment", side_effect=planned), \
+                 patch.object(setup, "ensure_team_auth") as auth:
+                with self.assertRaisesRegex(RuntimeError, "fixture preflight"):
+                    setup.main(["--install-dir", str(root)])
+                self.assertEqual(events, ["installed", "checked", "planned"])
+                auth.assert_not_called()
+
+    def test_prepared_managed_backend_outside_path_is_used_for_store_preflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = setup.executable_path(root / setup.CODEX_PACKAGE_DIR / "bin", "codex")
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"fixture, never executed")
+            for flags in ([], ["--dry-run"], ["--verify"]):
+                events = []
+                def checked(tools, executable):
+                    events.append("checked")
+                    self.assertEqual(executable, str(binary.resolve()))
+                    return "codex-cli 0.161.0"
+                def planned(tools, **kwargs):
+                    events.append("planned")
+                    self.assertEqual(kwargs["codex_binary"], str(binary.resolve()))
+                    raise RuntimeError("fixture preflight")
+                with self.subTest(flags=flags), \
+                     patch.object(setup, "release_index", return_value={"tools": {"pira_team": {}}}), \
+                     patch.object(setup.shutil, "which", return_value=None), \
+                     patch.object(setup, "check_team_runtime", side_effect=checked), \
+                     patch.object(setup, "install_codex") as install, \
+                     patch.object(setup, "ensure_team_auth") as auth, \
+                     patch.object(setup.stores, "plan_store_environment", side_effect=planned), \
+                     patch.object(setup.stores, "apply_store_environment") as publish:
+                    with self.assertRaisesRegex(RuntimeError, "fixture preflight"):
+                        setup.main(["--install-dir", str(root), *flags])
+                    self.assertEqual(events, ["checked", "planned"])
+                    install.assert_not_called()
+                    auth.assert_not_called()
+                    publish.assert_not_called()
+
+    def test_initialize_keeps_stdin_open_until_matching_response(self):
+        for mode in ("reply", "stubborn", "final_eof"):
+            with self.subTest(mode=mode):
+                self.probe(mode)
+
+    def test_initialize_error_and_early_eof_reap_the_child(self):
+        for mode in ("error", "malformed", "eof", "bad_exit", "oversize"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.probe(mode)
+
+    def test_initialize_deadline_covers_silent_and_partial_output(self):
+        for mode in ("silent", "partial"):
+            with self.subTest(mode=mode), self.assertRaises(subprocess.TimeoutExpired):
+                self.probe(mode, timeout=0.25)
 
 
 class TeamAuthTests(unittest.TestCase):
@@ -130,6 +274,149 @@ class TeamAuthTests(unittest.TestCase):
 
 
 class SetupPiraToolsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        environment = patch.dict(setup.os.environ, {"HOME": home.name, "LOCALAPPDATA": home.name, "USERPROFILE": home.name, "SHELL": "/bin/sh"}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        # Native file operations stay real; registry persistence uses a private test double.
+        if setup.os.name == "nt":
+            from unittest.mock import MagicMock
+            values = {}
+            registry = MagicMock()
+            registry.REG_SZ, registry.REG_EXPAND_SZ = 1, 2
+            def query(handle, key):
+                if key not in values:
+                    raise FileNotFoundError(key)
+                return values[key], registry.REG_SZ
+            registry.QueryValueEx.side_effect = query
+            registry.SetValueEx.side_effect = lambda handle, key, reserved, kind, value: values.__setitem__(key, value)
+            mocked = patch.dict(sys.modules, {"winreg": registry})
+            mocked.start()
+            self.addCleanup(mocked.stop)
+            notification = patch.object(setup.stores, "notify_windows_environment")
+            notification.start()
+            self.addCleanup(notification.stop)
+        # Each network test must supply its own response; fixture mistakes must
+        # fail locally rather than downloading from a real release endpoint.
+        network = patch.object(setup, "urlopen", side_effect=AssertionError("unmocked setup network request"))
+        network.start()
+        self.addCleanup(network.stop)
+
+    def test_no_path_skips_all_environment_persistence_and_verification(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        binary = setup.executable_path(root / "bin", "pira_ctx")
+        binary.parent.mkdir()
+        binary.write_bytes(b"binary")
+        selector = setup.load_selector()
+        platform_key = selector.current_platform()
+        for mode in ([], ["--verify"], ["--dry-run"]):
+            with self.subTest(mode=mode), patch.object(setup, "release_index", return_value=self.index(platform_key)), \
+                 patch.object(setup, "load_selector", return_value=selector), \
+                 patch.object(selector, "current_platform", return_value=platform_key), \
+                 patch.object(setup, "download_binary") as fetch, \
+                 patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
+                 patch.object(setup.stores, "plan_store_environment") as stores, patch.object(setup, "ensure_path") as path:
+                self.assertEqual(setup.main(["--no-path", "--no-team", "--install-dir", str(binary.parent), *mode]), 0)
+                fetch.assert_not_called()
+                stores.assert_not_called()
+                path.assert_not_called()
+        self.assertEqual(list(root.iterdir()), [binary.parent])
+
+    @unittest.skipIf(sys.platform == "win32", "Windows Ctx default did not relocate")
+    def test_standalone_migration_barrier_precedes_profile_and_path_switch(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        source = setup.stores.historical_store_paths("pira_ctx")[0]
+        destination = Path(setup.stores.selected_store_paths(["pira_ctx"])["PIRA_CTX_STORE_DIR"])
+        (source / "records").mkdir(parents=True)
+        record = source / "records/synthetic.json"
+        record.write_bytes(b'{"id":"synthetic"}\n')
+        binary = setup.executable_path(root / "bin", "pira_ctx")
+        binary.parent.mkdir()
+        binary.write_bytes(b"binary")
+        platform = setup.load_selector().current_platform()
+        args = ["--install-dir", str(binary.parent), "--no-team", "--tool", "pira_ctx"]
+        profiles = setup.stores.shell_profiles()
+        with patch.object(setup, "release_index", return_value=self.index(platform)), \
+             patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
+             patch.object(setup, "ensure_path") as path:
+            self.assertEqual(setup.main([*args, "--no-path"]), 0)
+            self.assertFalse(destination.exists())
+            path.assert_not_called()
+            self.assertEqual(setup.main([*args, "--dry-run"]), 0)
+            self.assertFalse(destination.exists())
+            self.assertTrue(all(not profile.exists() for profile in profiles))
+            path.reset_mock()
+            with patch.object(setup.stores.migration, "verify_destination", side_effect=RuntimeError("verification failed")):
+                with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                    setup.main(args)
+            path.assert_not_called()
+            self.assertTrue(all(not profile.exists() for profile in profiles))
+            self.assertEqual(record.read_bytes(), b'{"id":"synthetic"}\n')
+            self.assertEqual(setup.main(args), 0)
+            self.assertEqual((destination / "records/synthetic.json").read_bytes(), record.read_bytes())
+            self.assertTrue(all(str(destination) in profile.read_text() for profile in profiles))
+            before = [profile.read_bytes() for profile in profiles]
+            self.assertEqual(setup.main(args), 0)
+            self.assertEqual([profile.read_bytes() for profile in profiles], before)
+
+    def test_no_team_selection_and_conflicts(self) -> None:
+        index = self.index()
+        index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
+        self.assertIn("pira_team", setup.selected_tools(index, None))
+        self.assertEqual(setup.selected_tools(index, None, no_team=True), ["pira_ctx"])
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            setup.selected_tools(index, ["pira_team"], no_team=True)
+        with patch.object(setup, "release_index", return_value=index), \
+             patch.object(setup, "prepare_team_runtime") as runtime:
+            with self.assertRaisesRegex(RuntimeError, "excluded"):
+                setup.main(["--no-team", "--version", "team=0.2.0"])
+            runtime.assert_not_called()
+
+    def test_no_team_install_verify_and_dry_run_skip_backend_and_preserve_binary(self) -> None:
+        selector = setup.load_selector()
+        platform_key = selector.current_platform()
+        index = self.index(platform_key)
+        index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
+        for mode in ([], ["--verify"], ["--dry-run"]):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                team = setup.executable_path(root, "pira_team")
+                team.write_bytes(b"preexisting team")
+                ctx = setup.executable_path(root, "pira_ctx")
+                if mode:
+                    ctx.write_bytes(b"binary")
+                def download(tag, selection, directory):
+                    self.assertEqual(selection.name, "pira_ctx")
+                    path = directory / selection.asset.removesuffix(".gz")
+                    path.write_bytes(b"binary")
+                    return path
+                with patch.object(setup, "release_index", return_value=index), \
+                     patch.object(setup, "load_selector", return_value=selector), \
+                     patch.object(selector, "current_platform", return_value=platform_key), \
+                     patch.object(setup, "prepare_team_runtime") as runtime, \
+                     patch.object(setup, "ensure_team_auth") as auth, \
+                     patch.object(setup, "download_binary", side_effect=download) as fetch, \
+                     patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
+                     patch.object(setup, "ensure_path") as path, \
+                     patch.object(setup, "path_is_configured", return_value=True):
+                    if "--verify" in mode:
+                        setup.stores.apply_store_environment(setup.stores.plan_store_environment(["pira_ctx"]), dry_run=False)
+                    self.assertEqual(setup.main(["--no-team", "--install-dir", str(root), *mode]), 0)
+                    runtime.assert_not_called()
+                    auth.assert_not_called()
+                    if mode:
+                        fetch.assert_not_called()
+                    else:
+                        fetch.assert_called_once()
+                    if "--verify" in mode:
+                        path.assert_not_called()
+                    else:
+                        self.assertFalse(path.call_args.kwargs["include_codex"])
+                self.assertEqual(team.read_bytes(), b"preexisting team")
+                self.assertEqual(ctx.read_bytes(), b"binary")
+
     def test_team_preflight_skips_other_tools_and_rejects_missing_backend(self) -> None:
         with patch.object(setup.shutil, "which", return_value=None) as which:
             self.assertIsNone(setup.check_team_runtime(["pira_ctx", "pira_nav"]))
@@ -143,8 +430,10 @@ class SetupPiraToolsTests(unittest.TestCase):
         with patch.object(setup.shutil, "which", return_value="/test/codex"):
             for version in ("codex-cli 0.159.0", "codex-cli 0.160.1"):
                 with patch.object(setup.subprocess, "run", side_effect=[
-                    result(version), result("--stdio\n--strict-config")]) as run:
+                    result(version), result("--stdio\n--strict-config")]) as run, \
+                     patch.object(setup, "check_team_protocol") as protocol:
                     self.assertEqual(setup.check_team_runtime(["pira_team"]), version)
+                    protocol.assert_called_once_with("/test/codex")
                     self.assertEqual([c.args[0][1:] for c in run.call_args_list],
                                      [["--version"], ["app-server", "--help"]])
                     self.assertTrue(all(c.kwargs["timeout"] == 10 for c in run.call_args_list))
@@ -165,11 +454,45 @@ class SetupPiraToolsTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "failed"):
                     setup.check_team_runtime(["pira_team"])
 
+    def test_team_protocol_checks_native_inventory_before_direct_initialize(self):
+        contract = json.loads((setup.REPO_ROOT / "tools/src/pira_team/backend_contract.json").read_text())
+        fixture = runpy.run_path(str(setup.REPO_ROOT / "tools/crates/pira_team/tests/backend_fixture.py"))
+        for fault in ("", "method", "field"):
+            def run(command, **kwargs):
+                self.assertEqual(kwargs["timeout"], 10)
+                self.assertNotIn("--strict-config", command)
+                fixture["write_schemas"](command[command.index("--out") + 1], contract, fault)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            def initialize(command, env):
+                self.assertNotIn("daemon", command)
+                self.assertIn("--strict-config", command)
+                self.assertIn("--stdio", command)
+                self.assertTrue(Path(env["CODEX_HOME"]).is_dir())
+                self.assertNotIn("CODEX_API_KEY", env)
+            with self.subTest(fault=fault), patch.object(setup.subprocess, "run", side_effect=run), \
+                 patch.object(setup, "check_team_initialize", side_effect=initialize) as probe:
+                if fault:
+                    with self.assertRaises(ValueError): setup.check_team_protocol("/fixture/codex")
+                    probe.assert_not_called()
+                else:
+                    setup.check_team_protocol("/fixture/codex")
+                    probe.assert_called_once()
+
+    def test_team_protocol_failures_are_actionable(self):
+        results = [subprocess.CompletedProcess([], 0, "codex-cli 0.160.1", ""),
+                   subprocess.CompletedProcess([], 0, "--stdio --strict-config", "")]
+        for failure in (ValueError("missing method"), subprocess.TimeoutExpired("codex", 10)):
+            with patch.object(setup.subprocess, "run", side_effect=results), \
+                 patch.object(setup, "check_team_protocol", side_effect=failure):
+                with self.assertRaisesRegex(RuntimeError, "Unsupported native Codex backend"):
+                    setup.check_team_runtime(["pira_team"], "/fixture/codex")
+
     def test_team_preflight_blocks_install_verify_and_dry_run_before_writes(self) -> None:
         index = self.index()
         index["tools"]["pira_team"] = {"version":"0.2.0", "binaries":{}}
         for mode in ([], ["--verify"], ["--dry-run"]):
-            with patch.object(setup, "release_index", return_value=index), \
+            with patch.dict(setup.os.environ, {"PIRA_TEAM_DIR": str(Path(setup.os.environ["HOME"]) / "custom-team")}), \
+                 patch.object(setup, "release_index", return_value=index), \
                  patch.object(setup, "prepare_team_runtime", side_effect=RuntimeError("backend unavailable")) as check, \
                  patch.object(setup, "download_binary") as download, \
                  patch.object(setup, "ensure_path") as path:
@@ -182,7 +505,8 @@ class SetupPiraToolsTests(unittest.TestCase):
     def test_setup_checks_auth_before_installing_team(self) -> None:
         index = self.index()
         index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
-        with patch.object(setup, "release_index", return_value=index), \
+        with patch.dict(setup.os.environ, {"PIRA_TEAM_DIR": str(Path(setup.os.environ["HOME"]) / "custom-team")}), \
+             patch.object(setup, "release_index", return_value=index), \
              patch.object(setup, "prepare_team_runtime", return_value="codex-cli 0.159.3"), \
              patch.object(setup, "ensure_team_auth", side_effect=RuntimeError("login missing")) as auth, \
              patch.object(setup, "download_binary") as download:
@@ -253,7 +577,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                          patch.object(setup, "check_team_runtime", return_value="valid") as check:
                         setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=False)
                         install.assert_not_called()
-                        check.assert_called_once_with(["pira_team"], str(installed))
+                        check.assert_called_once_with(["pira_team"], str(installed.resolve()))
 
     def test_codex_package_rejects_unsafe_archives_and_corrupt_downloads(self) -> None:
         entries = []
@@ -304,27 +628,151 @@ class SetupPiraToolsTests(unittest.TestCase):
             binary = root / "bin" / setup.CODEX_PACKAGE_DIR / "bin" / "codex"
             binary.parent.mkdir(parents=True)
             binary.write_text("fixture")
-            with patch.object(setup, "shell_profiles", return_value=[profile]):
+            with patch.object(setup.stores, "shell_profiles", return_value=[profile]):
                 setup.ensure_path(root / "bin", True)
                 self.assertFalse(profile.exists())
                 setup.ensure_path(root / "bin", False)
-                self.assertIn(setup.shell_path_line(binary.parent), profile.read_text())
+                self.assertIn(setup.stores.shell_path_line(binary.parent), profile.read_text())
                 self.assertTrue(setup.path_is_configured(binary.parent))
                 self.assertFalse(setup.ensure_path(root / "bin", False))
+
+    @unittest.skipIf(setup.os.name == "nt", "POSIX executable selection")
+    def test_codex_profile_keeps_selected_backend_and_managed_fallback(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        install = root / "bin"
+        managed = install / setup.CODEX_PACKAGE_DIR / "bin"
+        external = root / "external"
+        profile = root / "profile"
+        original = "# unrelated user configuration\n"
+        for directory, marker in ((managed, "managed"), (external, "external")):
+            directory.mkdir(parents=True)
+            binary = directory / "codex"
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' " + marker + "\n")
+            binary.chmod(0o755)
+        package_bytes = (managed / "codex").read_bytes()
+        with patch.object(setup.stores, "shell_profiles", return_value=[profile]):
+            for include in (True, False):  # Team install and subsequent non-Team setup.
+                for path, expected in ((str(external), "external"), ("/usr/bin:/bin", "managed"),
+                                       (str(managed) + ":" + str(external), "managed")):
+                    with self.subTest(include_codex=include, selected=expected, path=path), \
+                         patch.dict(setup.os.environ, {"PATH": path}):
+                        # Migrate the old generated block, not just a fresh profile.
+                        profile.write_text(original + setup.stores.BLOCK_START + "\n"
+                                           + setup.stores.shell_path_line(managed) + "\n"
+                                           + setup.stores.BLOCK_END + "\n")
+                        before = profile.read_bytes()
+                        setup.ensure_path(install, True, include_codex=include)
+                        self.assertEqual(profile.read_bytes(), before)
+                        setup.ensure_path(install, False, include_codex=include)
+                        self.assertTrue(profile.read_text().startswith(original))
+                        if expected == "managed":
+                            self.assertTrue(setup.path_is_configured(managed))
+                        self.assertFalse(setup.ensure_path(install, False, include_codex=include))
+                        result = subprocess.run(
+                            ["/bin/sh", "-c", '. "$1"; . "$1"; codex', "sh", str(profile)],
+                            env={"PATH": path}, check=True, capture_output=True, text=True,
+                        )
+                        self.assertEqual(result.stdout.strip(), expected)
+                        # New PATH syntax must remain compatible with store inference.
+                        with profile.open("a") as stream:
+                            stream.write("export PIRA_CTX_STORE_DIR=" + str(root / "ctx") + "\n")
+                        self.assertEqual(setup.stores.plan_store_environment(["pira_ctx"]).stores,
+                                         {"PIRA_CTX_STORE_DIR": str((root / "ctx").resolve())})
+        self.assertEqual((managed / "codex").read_bytes(), package_bytes)
+
+    def test_windows_codex_path_preserves_external_backend_priority(self) -> None:
+        from unittest.mock import MagicMock
+        root = Path(setup.os.environ["HOME"])
+        managed = root / "bin" / setup.CODEX_PACKAGE_DIR / "bin"
+        external = str(root / "external")
+        registry = MagicMock()
+        registry.REG_EXPAND_SZ = 2
+        # A prior setup may already have placed the retained package first.
+        for current in (external, str(managed) + ";" + external):
+            with self.subTest(current=current):
+                registry.QueryValueEx.return_value = (current, 2)
+                registry.SetValueEx.reset_mock()
+                with patch.dict(sys.modules, {"winreg": registry}), \
+                     patch.object(setup.stores, "notify_windows_environment"):
+                    self.assertTrue(setup.windows_user_path(managed, True, append=True))
+                    registry.SetValueEx.assert_not_called()
+                    self.assertTrue(setup.windows_user_path(managed, False, append=True))
+                    updated = registry.SetValueEx.call_args.args[-1]
+                    self.assertEqual(updated, external + ";" + str(managed))
+                    registry.QueryValueEx.return_value = (updated, 2)
+                    self.assertFalse(setup.windows_user_path(managed, False, append=True))
+
+    def test_windows_path_identity_resolves_both_registry_and_requested_aliases(self) -> None:
+        from unittest.mock import MagicMock
+        root = Path(setup.os.environ["HOME"])
+        real = root / "long directory" / "bin"
+        real.mkdir(parents=True)
+        alias = root / "alias"
+        alias.symlink_to(real.parent, target_is_directory=True)
+        aliased = alias / "bin"
+        external = str(root / "external")
+        registry = MagicMock()
+        registry.REG_SZ, registry.REG_EXPAND_SZ = 1, 2
+        expanded = "%PIRA_TEST_BIN%" if setup.os.name == "nt" else "$PIRA_TEST_BIN"
+        for current_entry, requested in ((str(aliased), real), (str(real), aliased), (expanded, real)):
+            with self.subTest(current=current_entry, requested=requested), \
+                 patch.dict(setup.os.environ, {"PIRA_TEST_BIN": str(aliased)}), \
+                 patch.dict(sys.modules, {"winreg": registry}), \
+                 patch.object(setup.stores, "notify_windows_environment"):
+                registry.QueryValueEx.return_value = (current_entry + ";" + external, 2)
+                registry.SetValueEx.reset_mock()
+                self.assertFalse(setup.windows_user_path(requested, False))
+                registry.SetValueEx.assert_not_called()
+                self.assertTrue(setup.windows_user_path(requested, True, append=True))
+                registry.SetValueEx.assert_not_called()
+                self.assertTrue(setup.windows_user_path(requested, False, append=True))
+                updated = registry.SetValueEx.call_args.args[-1]
+                self.assertEqual(updated, external + ";" + str(requested))
+                registry.QueryValueEx.return_value = (updated, 2)
+                registry.SetValueEx.reset_mock()
+                self.assertFalse(setup.windows_user_path(requested, False, append=True))
+                registry.SetValueEx.assert_not_called()
+        for current, requested in ((real, aliased), (aliased, real)):
+            with patch.dict(setup.os.environ, {"PATH": str(current)}):
+                self.assertTrue(setup.path_is_configured(requested))
+            registry.QueryValueEx.return_value = (str(current), 2)
+            with patch.dict(setup.os.environ, {"PATH": ""}), \
+                 patch.dict(sys.modules, {"winreg": registry}), \
+                 patch.object(setup, "Path", type(real)), patch.object(setup.os, "name", "nt"):
+                self.assertTrue(setup.path_is_configured(requested))
+        if setup.os.name != "nt":
+            profile = root / "profile"
+            profile.write_text(setup.stores.BLOCK_START + "\n" + setup.stores.shell_path_line(aliased) + "\n")
+            with patch.dict(setup.os.environ, {"PATH": ""}), \
+                 patch.object(setup.stores, "shell_profiles", return_value=[profile]):
+                self.assertTrue(setup.path_is_configured(aliased))
+
+    def test_windows_path_uses_fallback_only_for_external_codex(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        managed = root / setup.CODEX_PACKAGE_DIR / "bin"
+        for selected, append in ((str(root / "external" / "codex.exe"), True),
+                                  (str(managed / "codex.exe"), False), (None, False)):
+            with self.subTest(selected=selected), patch.object(setup.os, "name", "nt"), \
+                 patch.object(setup.shutil, "which", return_value=selected), \
+                 patch.object(setup, "windows_user_path", return_value=False) as persist:
+                setup.ensure_path(root, False, include_codex=True)
+                self.assertEqual(persist.call_args.args, (managed, False))
+                self.assertEqual(persist.call_args.kwargs, {"append": append})
 
     @unittest.skipIf(setup.os.name == "nt", "POSIX shell quoting")
     def test_shell_path_line_preserves_literal_paths_and_is_idempotent(self) -> None:
         for directory in (Path("/tmp/simple/bin"), Path("/tmp/space quote' $dollar/bin")):
-            script = setup.shell_path_line(directory)
+            script = setup.stores.shell_path_line(directory)
             result = subprocess.run(["/bin/sh", "-c", script + "; " + script + '; printf %s "$PATH"'],
                                     env={"PATH": "/usr/bin:/bin"}, check=True, text=True, capture_output=True)
             self.assertEqual(result.stdout, str(directory) + ":/usr/bin:/bin")
 
-    def index(self) -> dict[str, object]:
+    def index(self, platform_key: str = "linux-x64") -> dict[str, object]:
         data = b"binary"
         compressed = gzip.compress(data, mtime=0)
+        suffix = ".exe" if platform_key.startswith("windows-") else ""
         record = {
-            "asset": "pira_ctx-1.6.0-linux-x64.gz",
+            "asset": f"pira_ctx-1.6.0-{platform_key}{suffix}.gz",
             "compression": "gzip",
             "asset_sha256": hashlib.sha256(compressed).hexdigest(),
             "asset_size": len(compressed),
@@ -339,7 +787,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             "tools": {
                 "pira_ctx": {
                     "version": "1.6.0",
-                    "binaries": {"linux-x64": record},
+                    "binaries": {platform_key: record},
                 }
             },
         }

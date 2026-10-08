@@ -1,0 +1,148 @@
+name: Private PIRA snapshot tests
+on: [push]
+permissions:
+  contents: read
+jobs:
+  test:
+    if: github.event.repository.private == true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        crate: [pira_ctx, pira_dec, pira_nav, pira_svg_check, pira_team]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@@CHECKOUT@
+        with:
+          persist-credentials: false
+      - name: Verify snapshot hashes
+        shell: bash
+        run: sha256sum --check SOURCE_SHA256SUMS
+      - name: Toolchain prerequisites
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          python --version
+          git --version
+      - name: Task-local Linux font inventory
+        if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_svg_check'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'pira-fonts'
+          root.mkdir()
+          subprocess.run(['apt-get', 'download', 'fonts-dejavu-core'], cwd=root, check=True)
+          packages = list(root.glob('fonts-dejavu-core_*.deb'))
+          if len(packages) != 1:
+              raise SystemExit('Expected one downloaded font package')
+          subprocess.run(['dpkg-deb', '--extract', str(packages[0]), str(root / 'unpacked')], check=True)
+          fonts = root / 'unpacked/usr/share/fonts/truetype/dejavu'
+          if not list(fonts.glob('*.ttf')):
+              raise SystemExit('Missing extracted DejaVu fonts')
+          fixture = pathlib.Path('tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf')
+          config = root / 'fonts.conf'
+          from xml.sax.saxutils import escape
+          config.write_text(fixture.read_text().replace('/usr/share/fonts/truetype/dejavu', escape(str(fonts))))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('FONTCONFIG_FILE=' + str(config) + chr(10))
+          PY
+      - name: Locked crate tests
+        run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}
+      - name: Build fake-backend test binary (Linux only)
+        if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team
+      - name: Fake-backend contracts (no model calls; POSIX fixture)
+        if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
+        shell: bash
+        run: PIRA_TEAM_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_team" python tools/crates/pira_team/tests/test_team.py
+  setup:
+    if: github.event.repository.private == true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@@CHECKOUT@
+        with:
+          persist-credentials: false
+      - name: Verify snapshot hashes
+        shell: bash
+        run: sha256sum --check SOURCE_SHA256SUMS
+      - name: Build source Ctx for required native migration regression
+        run: cargo build --locked --manifest-path tools/Cargo.toml --target-dir tools/target -p pira_ctx
+      - name: Native synthetic setup and store tests (no login or installation)
+        shell: bash
+        run: |
+          python -B - <<'PY'
+          import os, pathlib, sys, tempfile, unittest
+          if sys.version_info < (3, 11):
+              raise SystemExit('Setup tests require Python 3.11+')
+          ctx_binary = (pathlib.Path('tools/target/debug') /
+                        ('pira_ctx.exe' if sys.platform == 'win32' else 'pira_ctx')).resolve(strict=True)
+          if not ctx_binary.is_file():
+              raise SystemExit('Required source-built Ctx executable missing')
+          required_test = 'test_migrate_pira_stores.MigrationTests.test_native_ctx_event_merge_and_post_use_rerun'
+          class RequiredNativeResult(unittest.TextTestResult):
+              native_succeeded = False
+              def addSuccess(self, test):
+                  super().addSuccess(test)
+                  if test.id() == required_test:
+                      self.native_succeeded = True
+          with tempfile.TemporaryDirectory(prefix='pira-setup-ci-') as temporary:
+              # Retain only OS execution necessities, never runner auth/config values.
+              environment = {key: value for key, value in os.environ.items()
+                             if key.upper() in {'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT'}}
+              os.environ.clear()
+              os.environ.update(environment, HOME=temporary, USERPROFILE=temporary,
+                                LOCALAPPDATA=temporary, TMP=temporary, TEMP=temporary,
+                                TMPDIR=temporary, SHELL='/bin/sh',
+                                PIRA_TEST_CTX_BINARY=str(ctx_binary))
+              tempfile.tempdir = temporary  # Initial TemporaryDirectory populated the old cache.
+              # Registry behavior must use explicit test doubles, not the runner's HKCU.
+              sys.modules['winreg'] = None
+              sys.path.insert(0, str(pathlib.Path('assets/scripts').resolve()))
+              suite = unittest.defaultTestLoader.discover('assets/scripts', pattern='test_*.py')
+              result = unittest.TextTestRunner(verbosity=2, resultclass=RequiredNativeResult).run(suite)
+              if not result.native_succeeded:
+                  raise SystemExit('Required native Ctx migration regression did not execute successfully: ' + required_test)
+              if not result.testsRun:
+                  raise SystemExit('No staged setup tests discovered')
+              if not result.wasSuccessful():
+                  raise SystemExit(1)
+          PY
+  native_relocation:
+    if: github.event.repository.private == true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@@CHECKOUT@
+        with:
+          persist-credentials: false
+      - name: Verify snapshot hashes
+        shell: bash
+        run: sha256sum --check SOURCE_SHA256SUMS
+      - name: Provision hash-pinned Codex 0.161.0 in runner-local storage
+        shell: bash
+        run: python -B tools/build/private_ci.py provision-codex --directory "$RUNNER_TEMP/pira-relocation-codex"
+      - name: Required deterministic and native completed-turn relocation validation
+        shell: bash
+        run: |
+          binary="$RUNNER_TEMP/pira-relocation-codex/codex"
+          if [ "$RUNNER_OS" = "Windows" ]; then binary="$RUNNER_TEMP/pira-relocation-codex/codex-x86_64-pc-windows-msvc.exe"; fi
+          python -B tools/build/private_ci.py native-relocation --directory "$RUNNER_TEMP/pira-relocation-evidence" --binary "$binary"

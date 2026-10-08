@@ -55,7 +55,7 @@ unsanitized. Prefer the targeted commands above over raw for agent analysis.
 Non-interactive check/capture publish a discoverable live ID after a brief debounce when still running;
 automatic mode publishes a silent read-only checkpoint after about 30 seconds. Inspect an explicit ID without
 blocking. Workspace identity is the nearest Git root, otherwise cwd;
-the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform user-cache default.
+the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform persistent-data default.
 
 SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--`, and every later
 argument belongs to PROGRAM unchanged. pira_ctx adds no timeout, preserves child status unless the
@@ -66,7 +66,10 @@ const CANCEL: &str = r#"pira_ctx cancel — safely terminate one active capture
 
 WHEN TO USE
   Use when a retained PROGRAM is still running but should stop. Cancellation terminates the isolated
-  process tree, retains partial output, and stores the completed capture with state `cancelled`.
+  Unix process group (detached descendants excluded), retains partial output, and stores the capture
+  with state `cancelled`. After direct-child exit, pipe draining is bounded at one second.
+  Drain expiry is reported as incomplete output, with observed byte counts only lower bounds.
+  Windows launches suspended, assigns a Job, then resumes; isolation failure aborts launch.
 
 USAGE
   pira_ctx cancel [--store-dir PATH] RESULT|--current
@@ -116,11 +119,10 @@ OUTPUT AND STORAGE
   instead of direct automatic replay. Stored bytes remain authoritative up to the configured retention
   ceiling. Use capture when completed output must be persisted.
 
-  --interest changes only ranking: the existing line weights still order matching lines among
-  themselves and nonmatching lines among themselves. If the bounded synopsis contains any
-  nonmatching selected line, no omitted indexed line matches REGEX. Retention or line-index
-  truncation is reported explicitly; this guarantee cannot cover output that was not retained or
-  indexed.
+  --interest changes only ranking; existing weights order each matching/nonmatching group.
+  If a synopsis selects a nonmatching line, no omitted indexed line matches REGEX. Retention and
+  index truncation are reported; the guarantee excludes unretained or unindexed output.
+  Matching scans full retained indexed lines; transient memory scales with the longest line.
 
   A PROGRAM active for about 30 seconds gets a silent read-only checkpoint visible in list.
   Inspection uses a consistent snapshot without waiting for completion. Override the interval with
@@ -245,9 +247,8 @@ CREATE
   pira_ctx watch [--store-dir PATH] --capture RESULT --deadline DURATION [OPTIONS]
   pira_ctx watch [--store-dir PATH] --deadline DURATION [OPTIONS] -- PROBE [ARG...]
 
-  --current requires exactly one live capture in the automatically detected current agent thread;
-  zero or multiple candidates fail rather than choosing implicitly. A capture watch observes new
-  bytes, a bounded terminal-rendered view, and final child status. A probe repeats executable argv:
+  --current requires exactly one live capture in the detected thread; zero/multiple matches fail.
+  Captures expose bounded raw/rendered output and child status. Probes repeat executable argv:
   exit 0 means job success, 2 means job failure, 75 means
   pending by default, and every other status is monitor failure. The first sample runs immediately;
   later samples use --sample-every (default 30s; 1s minimum for process-backed probes/analyzers).
@@ -255,6 +256,8 @@ CREATE
   in the creation directory and inherit the owner's environment; analyzers are unsandboxed.
 
 PROGRESS AND ATTENTION
+  VT text: 20x80 cells, native LF, 32 KiB replay/stream; no resize. Old watch states rejected.
+  Unreliable/clipped state requests attention, never conclusive unchanged output.
   --sample-every DURATION        Sampling cadence; default 30s.
   --inactive-after DURATION|off  Attention when no raw output bytes arrive, or clear this threshold.
   --unchanged-after DURATION|off Attention when the rendered visible state does not change, or clear.
@@ -307,7 +310,6 @@ OUTPUT AND EXIT STATUS
 
 EXAMPLES
   pira_ctx watch --current --deadline 2h --unchanged-after 10m
-  pira_ctx watch --capture CAPTURE_ID --deadline 1h --unchanged-after 5m
   pira_ctx watch --deadline 2h --sample-every 30s -- check-remote-job 123
   pira_ctx watch WATCH_ID --latest"#;
 
@@ -318,12 +320,13 @@ WHEN TO USE
   needed. Use transform for systematic processing or exec for custom analysis.
 
 USAGE
-  pira_ctx search [--store-dir PATH] RESULT QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
-  pira_ctx search [--store-dir PATH] RESULT -e QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
+  pira_ctx search [--store-dir PATH] RESULT QUERY [-e QUERY ...] [--regex | --approximate] [--context N] [--limit N]
+  pira_ctx search [--store-dir PATH] RESULT -e QUERY [-e QUERY ...] [--regex | --approximate] [--context N] [--limit N]
 
 OPTIONS AND OUTPUT
-  Literal matching is Unicode case-insensitive. Only when it has no literal hits, a lexical fallback
-  may return related lines. --regex uses Rust regex syntax and is case-sensitive unless the pattern
+  Default matching is Unicode case-insensitive literal-only. --approximate explicitly enables
+  labeled lexical fallback for queries without literal hits; it cannot combine with --regex.
+  --regex uses Rust regex syntax and is case-sensitive unless the pattern
   requests otherwise. -e adds an independently ranked query, up to 16 total. --limit N
   selects up to N hits per query (default 5, range 1..100). Rows contain line number, stream,
   and terminal-sanitized text, with query labels for multiple queries.
@@ -416,8 +419,11 @@ DIRECT OPTIONS
   tail, then count. unique compares resulting text and keeps first occurrence; count prints one
   decimal integer. Text derived from capture rows remains untrusted PROGRAM data. Direct processing
   streams where possible, display-sanitizes output, and caps returned text at 64 KiB.
+  Direct unique retains at most 100,000 distinct values and 128 MiB of distinct text bytes.
 
 PLAN FILE
+  count, group_count, sum, min, max and mean are terminal: any following plan step is rejected.
+  Direct flags run before the plan; --count cannot precede a nonempty plan.
   JSON object {"steps":[STEP,...]}; steps run in order after CLI filters. Valid STEP objects:
     {"op":"match|exclude","regex":"..."}
     {"op":"context","regex":"...","before":N,"after":N}
@@ -471,7 +477,7 @@ BINDINGS
   MSG_STDERR_PATH     Private temporary exact-stderr path.
   MSG_ID              Resolved source capture ID.
   MSG_EXIT            Source command exit code, or None for a running checkpoint.
-  MSG_STATE           `running` or `complete`.
+  MSG_STATE           `running`, `complete`, or `cancelled`.
   MSG_GENERATION      Live checkpoint generation, or 0 for a completed capture.
 
 BEHAVIOR
@@ -594,9 +600,11 @@ USAGE
   pira_ctx command [--store-dir PATH] RESULT
 
 OUTPUT
-  Prints one JSON object with argv, cwd, and exact. New captures retain the original argument vector
-  and report exact=true. Older captures fall back to their redacted argument vector and report
-  exact=false. Running checkpoints are supported.
+  Prints one JSON object with argv, display cwd, cwd_native, and exact. cwd_native is null for legacy
+  captures, or {"encoding":"utf8"|"unix_bytes"|"windows_wide","value":string|array} for new captures.
+  exact=true means text argv/cwd suffice for reconstruction. Native-only paths require cwd_native
+  and report exact=false, as do redacted legacy argv or absent/ambiguous legacy cwd (U+FFFD).
+  Native units must only be interpreted on their matching platform. Running checkpoints work.
 
 SECURITY
   argv and cwd are returned exactly and may contain secrets or private paths. Use this targeted
@@ -634,7 +642,7 @@ USAGE
 
 OUTPUT
   Prints up to 20 newest-first rows with ID, kind, state, timestamp, exit status, bytes, lines, and a
-  redacted command clipped to 256 bytes. Capture states are running/complete. Watch states are
+  redacted command clipped to 256 bytes. Capture states are running/complete/cancelled. Watch states are
   active, interrupted, paused, stopped, succeeded, job-failed, deadline, or monitor-failed. Active
   entries use `-` as exit status. --limit accepts 0..100. Without --workspace current, entries from
   every workspace in the selected store are considered. --live keeps only running captures

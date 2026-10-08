@@ -76,6 +76,8 @@ pub struct WatchState {
     pub source: Vec<String>,
     #[serde(default)]
     pub source_cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cwd_native: Option<crate::native_path::NativePath>,
     #[serde(default)]
     pub capture_path: Option<PathBuf>,
     pub intent: Option<String>,

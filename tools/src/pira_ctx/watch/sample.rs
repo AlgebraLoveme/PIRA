@@ -42,8 +42,8 @@ fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, St
         storage::resolve_result(store, target)?
     };
     let stored = storage::read_result_path(&path)?;
-    let growth =
-        stored.read_stream_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
+    let (stored, growth) =
+        stored.sample_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
     let activity =
         growth.stdout_total > state.stdout_offset || growth.stderr_total > state.stderr_offset;
     state.stdout_offset = growth.stdout_total;
@@ -65,7 +65,9 @@ fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, St
         } else {
             "capture sampled".into()
         },
-        reliable: !growth.truncated,
+        reliable: !growth.truncated
+            && !stored.metadata.drain_truncated
+            && !stored.metadata.retention_truncated,
     })
 }
 
@@ -74,13 +76,16 @@ fn probe(
     attempt_timeout_ms: u64,
     stop: impl Fn() -> bool,
 ) -> Result<Sample, String> {
-    let mut command = Command::new(&state.source[0]);
+    let mut command = Command::new(state.source.first().ok_or("watch source is empty")?);
     command
         .args(&state.source[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.current_dir(&state.source_cwd);
+    command.current_dir(crate::native_path::resolve(
+        state.source_cwd_native.as_ref(),
+        &state.source_cwd,
+    )?);
     let mut tree = ProcessTree::spawn(&mut command, "probe")?;
     let stdout = tree.child.stdout.take().ok_or("probe stdout unavailable")?;
     let stderr = tree.child.stderr.take().ok_or("probe stderr unavailable")?;
@@ -105,8 +110,8 @@ fn probe(
         thread::sleep(Duration::from_millis(50));
     };
     let drain_deadline = Instant::now() + Duration::from_secs(1);
-    let stdout = receive_reader(out, drain_deadline, "probe stdout")?;
-    let stderr = receive_reader(err, drain_deadline, "probe stderr")?;
+    let (stdout, stdout_complete) = receive_reader(out, drain_deadline, "probe stdout")?;
+    let (stderr, stderr_complete) = receive_reader(err, drain_deadline, "probe stderr")?;
     if status.1 {
         return Err("watch stop requested".into());
     }
@@ -130,7 +135,7 @@ fn probe(
         stdout,
         stderr,
         detail: format!("probe exit {code}"),
-        reliable: true,
+        reliable: stdout_complete && stderr_complete,
     })
 }
 
@@ -154,7 +159,7 @@ fn receive_reader<T>(
         .map_err(|_| format!("{label} did not close after process-tree cleanup"))?
 }
 
-fn read_tail<R: Read>(mut reader: R) -> Result<Vec<u8>, String> {
+fn read_tail<R: Read>(mut reader: R) -> Result<(Vec<u8>, bool), String> {
     let mut tail = Vec::new();
     let mut total = 0usize;
     let mut buf = [0u8; 8192];
@@ -172,7 +177,7 @@ fn read_tail<R: Read>(mut reader: R) -> Result<Vec<u8>, String> {
             tail.drain(..tail.len() - MAX_TAIL);
         }
     }
-    Ok(tail)
+    Ok((tail, total <= MAX_TAIL))
 }
 
 pub fn hash(parts: &[&[u8]]) -> String {
@@ -190,7 +195,7 @@ mod tests {
     fn probe_state(command: Vec<String>) -> WatchState {
         let mut state: WatchState = serde_json::from_str(
             r#"{
-            "schema": 1,
+            "schema": 2,
             "id": "watch-1",
             "workspace_hash": "workspace",
             "created_ms": 0,
@@ -222,8 +227,8 @@ mod tests {
             "raw_stderr": [],
             "visible_stdout": "",
             "visible_stderr": "",
-            "stdout_view": {"lines": [], "column": 0, "escape": false, "csi": [], "reliable": true},
-            "stderr_view": {"lines": [], "column": 0, "escape": false, "csi": [], "reliable": true},
+            "stdout_view": {"engine":"vt100-0.16.2-20x80-v1","transcript":[],"reliable":true,"failure":null},
+            "stderr_view": {"engine":"vt100-0.16.2-20x80-v1","transcript":[],"reliable":true,"failure":null},
             "raw_hash": "",
             "visible_hash": "",
             "progress_hash": "",
@@ -242,6 +247,117 @@ mod tests {
         .unwrap();
         state.source = command;
         state
+    }
+
+    #[test]
+    fn clipped_terminal_prefix_remains_unreliable_for_capture_attention() {
+        assert!(read_tail(&b"ok"[..]).unwrap().1);
+        assert!(!read_tail(&vec![b'x'; MAX_TAIL + 1][..]).unwrap().1);
+        let mut state = probe_state(vec!["true".into()]);
+        state.source_kind = SourceKind::Capture;
+        state.unchanged_after_ms = Some(1);
+        for reliable in [false, true] {
+            super::super::incorporate_sample(
+                &mut state,
+                Sample {
+                    job: JobStatus::Pending,
+                    stdout: b"same".to_vec(),
+                    stderr: vec![],
+                    activity: true,
+                    detail: String::new(),
+                    reliable,
+                },
+                std::path::Path::new("."),
+                false,
+                100,
+            )
+            .unwrap();
+            assert!(!state.rendered_reliable);
+            super::super::evaluate_attention(&mut state, None, reliable);
+            assert!(
+                state
+                    .attention_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("unreliable")
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_observation_blocks_inactivity_and_analyzer_stall_claims() {
+        for analyzer in [false, true] {
+            let mut state = probe_state(vec!["true".into()]);
+            if analyzer {
+                state.no_progress_after_ms = Some(1);
+            } else {
+                state.inactive_after_ms = Some(1);
+            }
+            super::super::evaluate_attention(&mut state, None, false);
+            assert!(
+                state
+                    .attention_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("sample output is incomplete")
+            );
+            // Complete silent samples still support the original configured attention.
+            super::super::evaluate_attention(&mut state, None, true);
+            assert_eq!(
+                state.attention_reason.as_deref(),
+                Some(if analyzer {
+                    "analyzer progress unchanged"
+                } else {
+                    "no raw activity observed"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn empty_probe_source_is_rejected_before_sampling() {
+        let state = probe_state(vec![]);
+        assert!(
+            probe(&state, 100, || false)
+                .err()
+                .unwrap()
+                .contains("source is empty")
+        );
+        assert!(
+            super::super::validate(&state, &state.id)
+                .unwrap_err()
+                .contains("source is empty")
+        );
+    }
+
+    #[test]
+    fn visible_change_tracks_stream_boundaries_not_concatenation() {
+        let mut state = probe_state(vec!["true".into()]);
+        for (out, err, changed) in [
+            ("ab", "c", true),
+            ("a", "bc", true),
+            ("a", "bc", false),
+            ("", "abc", true),
+        ] {
+            state.last_visible_change_ms = Some(0);
+            let sample = Sample {
+                stdout: out.as_bytes().to_vec(),
+                stderr: err.as_bytes().to_vec(),
+                job: JobStatus::Pending,
+                detail: String::new(),
+                activity: true,
+                reliable: true,
+            };
+            super::super::incorporate_sample(
+                &mut state,
+                sample,
+                std::path::Path::new("."),
+                false,
+                100,
+            )
+            .unwrap();
+            assert_eq!(state.last_visible_change_ms != Some(0), changed);
+        }
     }
 
     #[test]

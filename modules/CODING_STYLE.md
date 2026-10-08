@@ -11,7 +11,7 @@ Executed checks bound claims that code works; report exact gaps. Other coding ta
 - When a confirmed design clearly no longer fits current requirements or circumstances and a clearly better alternative exists, immediately propose that change rather than accumulating compensating fixes. Explain the mismatch, benefits, and tradeoffs; obtain user confirmation before changing the design.
 - When context clearly shows the user is developing a system or component and design choices need recording, draft a workspace Markdown design rather than presenting it in full in conversation. Keep it minimal but sufficient for agent implementation and human understanding; omit stale, superseded, or unnecessary details. Distinguish proposals from confirmed decisions; give the path and direct the user to read it.
 - The agent owns technical decisions, using best-expert knowledge and sufficiently clarified goals and constraints. Do not ask the user to select implementation details when design intent is clear.
-- Among routes that satisfy the clarified requirements and safety constraints, always prefer, in order:
+- Among routes that reliably satisfy the clarified behavior requirements and safety constraints, always prefer, in order:
   1. Simpler implementation, judged by expected implementation difficulty, then expected code length, then the expected number of code files requiring edits.
   2. Greater capability or scalability when the simplicity criteria above are similar.
   3. Fewer dependencies when the first two criteria are similar.
@@ -26,6 +26,7 @@ Executed checks bound claims that code works; report exact gaps. Other coding ta
 Before non-trivial refactoring, protect moved behavior with the smallest check. Refactor only for in-scope readability, required extensibility, reduced current-change risk or duplication, clearer boundaries, or materially easier testing. **Optimize** must prefer proportionate, behavior-preserving readability and extensibility refactoring; behavior changes require explicit user authorization. Do not add complexity for marginal gains unless explicitly requested. Optimize performance only with profiling, measurement, or clear workload evidence; stop when evidence is unconvincing. Briefly note non-obvious tradeoffs.
 
 ## Change Discipline
+- Preserve compatibility when it is straightforward and low-cost. When retaining it would have serious consequences or substantially complicate runtime logic, move the compatibility transition into explicit setup or migration scripts instead. Preserve data and make ambiguous or unsafe migrations fail visibly; this does not authorize unrelated breaking changes.
 - Use this global style unless trusted repository-local instructions specify otherwise; explicit user instructions override both.
 - Avoid unrequested abstractions, boilerplate, future scaffolding, and configuration for constants.
 - Keep data flow explicit, side effects narrow, and one abstraction level per function. Extract only to name a real idea, remove duplication, or expose a boundary.
@@ -37,7 +38,7 @@ Before non-trivial refactoring, protect moved behavior with the smallest check. 
 ## Names, Types, and Dependencies
 - Use type hints when appropriate, especially in function/method signatures.
 - Names reveal intent, domain meaning, units, and important distinctions. Use one word per concept, not misleading near-synonyms. Stay concise unless expansion removes ambiguity; propose one best name by default.
-- Evaluate dependencies under the decision order above; add one only for clear material benefit over owning the code. Between otherwise comparable standard-library/platform options, choose better edge-case correctness.
+- Prioritize useful, reliable behavior over minimizing dependencies. When the promised functionality requires a dependency for reliable execution, require it rather than maintain a partial substitute solely to avoid that dependency. If unavailable, report the requirement and an actionable setup path; offer reduced functionality only as a separately defined, explicitly selected contract. Among approaches meeting the same contract, apply the decision order above; between otherwise comparable standard-library/platform options, choose better edge-case correctness.
 - For large, likely open-source features, survey high-quality online implementations and raise promising options. Confirm design-level tradeoffs under the ownership rules; choose technical details independently.
 
 ## Contracts, Failures, and Security
@@ -54,9 +55,12 @@ Before non-trivial refactoring, protect moved behavior with the smallest check. 
 - For new stochastic Python workflows without a project convention, default to adding centralized `seed_everything(seed)`. Otherwise follow language or project convention. Add no further reproducibility metadata unless requested.
 
 ## Verification
-- Non-trivial new logic needs the smallest runnable check that fails if it breaks; trivial one-liners need no tests.
-- Write only meaningful tests necessary to verify the implementation. Do not write implementation-mirroring tests for reversible, low-impact changes. Tests must be readable, independent, fast, and focused on observable behavior, not implementation shape.
-- For medium- or high-level behavior, include the smallest diverse boundary-test set providing most assurance. Prefer cases exercising multiple boundaries at once.
+- Verification is part of implementation even when not explicitly requested; new tests are not automatic. Use the smallest sufficient runnable checks for changed behavior, required contracts and consequential plausible failures. Add or update tests only when existing checks leave a consequential coverage gap; each must provide distinct assurance. Preserve explicitly required checks. Trivial, low-risk changes may rely on existing checks; source length alone does not determine risk.
+- Prioritize boundary cases over repeated normal inputs exercising equivalent behavior. Preserve representative success coverage for distinct required behaviors; add meaningful limits, invalid inputs, state transitions and relevant interactions according to risk.
+- Test one coherent behavior per case. Parameterize equivalent cases when clearer and independently reported. Keep unrelated rejection conditions separate so one cannot mask another; combine conditions when their interaction is the intended test.
+- Use the smallest adequate test scope. Avoid unnecessary infrastructure and duplicated detailed coverage across levels; retain integration checks for contracts requiring real component, process or platform interaction. Assert observable results and relevant side effects, not merely successful execution.
+- Keep tests readable, independent, fast and deterministic, with small isolated fixtures and explicit inputs and expectations. Reuse simple setup when helpful; prefer readable duplication to elaborate helpers or assertions reproducing implementation logic. Use deterministic synchronization, bounded waits, and the least data and concurrency that reliably exercise the risk.
+- Use fault injection, process-death, stress or combinatorial tests when simpler checks cannot adequately verify an important contract or concrete risk. Avoid exhaustive theoretical failure enumeration and oversized fixtures without a concrete purpose.
 - Run change-appropriate tests and complete required checks. Run user-specified tests first; otherwise start with minimal fast checks (e.g., syntax, grammar, static sanity, focused smoke test).
-- After appropriate tests and required checks pass, broaden or repeat only when justified by new changes, failures, or unresolved concerns; otherwise continue toward completion.
+- After required checks and affected regressions pass, broaden or repeat only for changed behavior, a new failure or a specifically identified consequential coverage gap. Report material unverified requirements. Test counts, source-line counts and coverage percentages alone do not establish sufficiency.
 - Once relevant checks pass and the implementation appears production-quality against the user's stated goals (e.g., extensibility, reliability, security, performance), ask whether they want an independent third-party adversarial agent review. Do not ask while known production-quality gaps remain.

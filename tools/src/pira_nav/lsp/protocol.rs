@@ -349,10 +349,12 @@ fn parse_protocol_range(value: &Value) -> Result<LspRange, String> {
 fn parse_protocol_position(value: &Value) -> Result<LspPosition, String> {
     let line = required(value, "line")?
         .as_u64()
+        .filter(|value| *value <= i32::MAX as u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| "LSP position line is not a valid integer".to_string())?;
     let character = required(value, "character")?
         .as_u64()
+        .filter(|value| *value <= i32::MAX as u64)
         .and_then(|value| usize::try_from(value).ok())
         .ok_or_else(|| "LSP position character is not a valid integer".to_string())?;
     Ok(LspPosition { line, character })
@@ -626,15 +628,7 @@ impl<'a> SourcePositions<'a> {
     }
 
     fn position(&self, value: &Value) -> Result<(usize, usize, usize), String> {
-        let line = required(value, "line")?
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| "LSP position line is not a valid integer".to_string())?;
-        let character = required(value, "character")?
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| "LSP position character is not a valid integer".to_string())?;
-        self.protocol_position(LspPosition { line, character })
+        self.protocol_position(parse_protocol_position(value)?)
     }
 
     fn protocol_position(&self, value: LspPosition) -> Result<(usize, usize, usize), String> {
@@ -844,7 +838,11 @@ pub(super) fn file_uri(path: &Path) -> Result<String, String> {
     let mut path = path
         .to_str()
         .ok_or_else(|| format!("LSP path is not valid UTF-8: {}", path.display()))?
-        .replace('\\', "/");
+        .to_owned();
+    #[cfg(windows)]
+    {
+        path = path.replace('\\', "/");
+    }
     if cfg!(windows) && !path.starts_with('/') {
         path.insert(0, '/');
     }
@@ -865,6 +863,35 @@ pub(super) fn file_uri(path: &Path) -> Result<String, String> {
 mod tests {
     use super::{PositionEncoding, SourcePositions, file_uri, parse_document_symbols};
     use crate::language::Language;
+
+    #[test]
+    fn protocol_positions_reject_out_of_domain_integers() {
+        for field in ["line", "character"] {
+            for number in [
+                serde_json::json!(-1),
+                serde_json::json!(2147483648u64),
+                serde_json::json!(u64::MAX),
+            ] {
+                let mut point = serde_json::json!({"line":0,"character":0});
+                point[field] = number;
+                assert!(
+                    super::parse_protocol_position(&point)
+                        .unwrap_err()
+                        .contains("valid integer")
+                );
+                assert!(
+                    super::SourcePositions::new("x", super::PositionEncoding::Utf8)
+                        .position(&point)
+                        .unwrap_err()
+                        .contains("valid integer")
+                );
+            }
+        }
+        for number in [0, i32::MAX] {
+            let point = serde_json::json!({"line":number,"character":number});
+            assert!(super::parse_protocol_position(&point).is_ok());
+        }
+    }
 
     #[test]
     fn utf16_positions_map_to_utf8_byte_columns() {

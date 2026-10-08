@@ -154,7 +154,7 @@ fn contains_reserved_role_or_wrapper_marker(value: &str) -> bool {
 }
 
 pub fn has_unsafe_display_controls(value: &str) -> bool {
-    value.chars().take(MAX_SCAN_CHARS).any(|character| {
+    value.chars().any(|character| {
         character == '\u{1b}'
             || character == '\r'
             || (character.is_control() && !matches!(character, '\n' | '\t'))

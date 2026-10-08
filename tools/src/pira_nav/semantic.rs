@@ -13,7 +13,6 @@ use crate::lsp::{
     normalize_range,
 };
 use crate::lsp_options::LspOptions;
-use crate::parse::parse_file;
 use crate::security::possible_prompt_injection;
 use crate::structural::StructuralResolver;
 use crate::util::{
@@ -103,22 +102,32 @@ fn parse_semantic_target(
     };
     ensure_semantic_file(&path, cwd)?;
     let path = ensure_target_root(&path, lsp.root(cwd), cwd)?;
-    let language = language_for(&path, explicit)?;
+    let language = if let Some(language) = expected_language {
+        if explicit.is_some_and(|value| value != language) {
+            return Err((
+                2,
+                "language mismatch between explicit language and selector".into(),
+            ));
+        }
+        language
+    } else {
+        language_for(&path, explicit)?
+    };
     reject_document_semantics(language)?;
-    if expected_language.is_some_and(|expected| expected != language) {
-        return Err((2, "selector language does not match the target file".into()));
+    if dirty_resolver.is_none() {
+        let (all, languages) = lsp.forced_lsp();
+        *dirty_resolver = Some(StructuralResolver::new(
+            lsp.config(cwd)?,
+            false,
+            all,
+            languages,
+        ));
     }
     let source = cached_source(&path, sources)?;
-    let mut parsed = parse_file(&path, language).map_err(input_error)?;
-    if parsed.syntax_defects > 0 {
-        if dirty_resolver.is_none() {
-            *dirty_resolver = Some(StructuralResolver::lsp_only(lsp.config(cwd)?));
-        }
-        parsed = dirty_resolver
-            .as_mut()
-            .expect("dirty resolver was initialized")
-            .resolve_parsed(parsed)?;
-    }
+    let parsed = dirty_resolver
+        .as_mut()
+        .expect("resolver initialized")
+        .resolve_source(&path, language, source.to_string())?;
     if parsed.symbols_truncated {
         return Err((
             2,
@@ -127,23 +136,44 @@ fn parse_semantic_target(
             ),
         ));
     }
-    let matches = crate::model::target_matches(&parsed.symbols, &name)
-        .into_iter()
-        .map(|(_, symbol)| symbol)
-        .filter(|symbol| {
-            expected_kind
-                .as_ref()
-                .is_none_or(|kind| symbol.kind == *kind)
-        })
-        .collect::<Vec<_>>();
+    // A selector identifies a source version, not just a possibly overloaded name.
+    // Match its exact name/kind/hash together; name-only targets retain suffix lookup.
+    let matches = if let Some(expected) = &expected_hash {
+        parsed
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.name_matches(&name)
+                    && expected_kind
+                        .as_ref()
+                        .is_none_or(|kind| symbol.kind == *kind)
+                    && parsed
+                        .source
+                        .get(symbol.start_byte..symbol.end_byte)
+                        .is_some_and(|source| hash16(source.as_bytes()) == *expected)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        crate::model::target_matches(&parsed.symbols, &name)
+            .into_iter()
+            .map(|(_, symbol)| symbol)
+            .collect::<Vec<_>>()
+    };
     if matches.is_empty() {
-        return Err((
-            2,
-            format!(
-                "symbol not found: {name}; run `pira_nav outline {}` to inspect available items",
-                display_path(&path, cwd)
-            ),
-        ));
+        return Err(if expected_hash.is_some() {
+            (
+                4,
+                format!("stale selector: symbol or source version no longer exists: {name}"),
+            )
+        } else {
+            (
+                2,
+                format!(
+                    "symbol not found: {name}; run `pira_nav outline {}` to inspect available items",
+                    display_path(&path, cwd)
+                ),
+            )
+        });
     }
     if matches.len() > 1 {
         let candidates = matches
@@ -158,19 +188,6 @@ fn parse_semantic_target(
         ));
     }
     let symbol = matches[0];
-    if let Some(expected) = expected_hash {
-        let actual = parsed
-            .source
-            .get(symbol.start_byte..symbol.end_byte)
-            .map(|item| hash16(item.as_bytes()))
-            .unwrap_or_default();
-        if actual != expected {
-            return Err((
-                2,
-                "selector is stale because the selected source changed".into(),
-            ));
-        }
-    }
     let (row, byte_column) = symbol.name_position.ok_or_else(|| {
         (
             2,
@@ -224,6 +241,8 @@ fn reject_document_semantics(language: Language) -> Result<(), (i32, String)> {
 }
 
 fn ensure_target_root(path: &Path, root: &Path, cwd: &Path) -> Result<PathBuf, (i32, String)> {
+    crate::util::reject_symlink_components(root).map_err(input_error)?;
+    crate::util::reject_symlink_components(path).map_err(input_error)?;
     let canonical_root = std::fs::canonicalize(root).map_err(|error| {
         (
             2,
@@ -326,7 +345,7 @@ fn parse_selector_target(value: &str, cwd: &Path) -> Result<SelectorTarget, (i32
         Some(language),
         Some(kind),
         name,
-        Some(hash.to_string()),
+        Some(hash.to_ascii_lowercase()),
     ))
 }
 
@@ -337,6 +356,7 @@ fn semantic_service(
     _command: &str,
 ) -> Result<LspService, (i32, String)> {
     let configured_root = options.root(cwd);
+    crate::util::reject_symlink_components(configured_root).map_err(input_error)?;
     let root = std::fs::canonicalize(configured_root).map_err(|error| {
         (
             2,
@@ -1746,7 +1766,7 @@ mod tests {
         let link = root.join("linked.py");
         symlink(&outside, &link).unwrap();
         let error = ensure_target_root(&link, &root, &root).unwrap_err();
-        assert!(error.1.contains("outside the selected LSP root"));
+        assert!(error.1.contains("does not follow symlinks"));
         fs::remove_dir_all(root).unwrap();
         fs::remove_file(outside).unwrap();
     }

@@ -50,6 +50,9 @@ pub fn positive_usize(value: &str, option: &str) -> Result<usize, CommandError> 
 
 pub fn parse_location(value: &str) -> Option<(&str, usize, Option<usize>)> {
     let (prefix, last) = value.rsplit_once(':')?;
+    if prefix.ends_with(':') {
+        return None;
+    }
     let last_number = last.parse::<usize>().ok()?;
     if let Some((path, line)) = prefix.rsplit_once(':')
         && let Ok(line) = line.parse::<usize>()

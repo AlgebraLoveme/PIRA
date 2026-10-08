@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,8 +18,137 @@ const DEFAULT_MAX_INDEXED_LINES: usize = 1_000_000;
 const HARD_MAX_INDEXED_LINES: usize = 2_000_000;
 const DEFAULT_LIVE_CHECKPOINT_MS: u64 = 30_000;
 const LIVE_ANNOUNCEMENT_DELAY_MS: u128 = 250;
+fn live_announcement_due(elapsed_ms: u128, child_running: bool) -> bool {
+    child_running && elapsed_ms >= LIVE_ANNOUNCEMENT_DELAY_MS
+}
+
 const CAPTURE_CONTROL_POLL_MS: u64 = 25;
 const MEMORY_SPOOL_BYTES: usize = 64 * 1024;
+
+const POST_EXIT_DRAIN: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct DrainControl {
+    deadline: Mutex<Option<Instant>>,
+    truncated: AtomicBool,
+}
+
+#[cfg(any(unix, windows))]
+struct DrainReader<T> {
+    pipe: T,
+    control: Arc<DrainControl>,
+}
+
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsRawFd> Read for DrainReader<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let deadline = *self
+                .control
+                .deadline
+                .lock()
+                .map_err(|_| io::Error::other("drain state poisoned"))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.control.truncated.store(true, Ordering::Release);
+                return Ok(0);
+            }
+            let mut descriptor = libc::pollfd {
+                fd: self.pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialized descriptor; only this reader consumes this pipe.
+            let result = unsafe { libc::poll(&mut descriptor, 1, 25) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result > 0 {
+                return self.pipe.read(bytes);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_reader<T: Read + std::os::fd::AsRawFd + Send + 'static>(
+    pipe: T,
+    control: &Arc<DrainControl>,
+) -> Box<dyn Read + Send> {
+    Box::new(DrainReader {
+        pipe,
+        control: Arc::clone(control),
+    })
+}
+
+#[cfg(windows)]
+impl<T: Read + std::os::windows::io::AsRawHandle> Read for DrainReader<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED};
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let deadline = *self
+                .control
+                .deadline
+                .lock()
+                .map_err(|_| io::Error::other("drain state poisoned"))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.control.truncated.store(true, Ordering::Release);
+                return Ok(0);
+            }
+            let mut available = 0;
+            // SAFETY: live pipe, initialized output; this is the only reader.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    self.pipe.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(code) if code == ERROR_BROKEN_PIPE as i32 || code == ERROR_PIPE_NOT_CONNECTED as i32)
+                {
+                    return Ok(0);
+                }
+                return Err(error);
+            }
+            if available > 0 {
+                let length = bytes.len().min(available as usize);
+                return self.pipe.read(&mut bytes[..length]);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn drain_reader<T: Read + std::os::windows::io::AsRawHandle + Send + 'static>(
+    pipe: T,
+    control: &Arc<DrainControl>,
+) -> Box<dyn Read + Send> {
+    Box::new(DrainReader {
+        pipe,
+        control: Arc::clone(control),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn drain_reader<T: Read + Send + 'static>(
+    pipe: T,
+    _control: &Arc<DrainControl>,
+) -> Box<dyn Read + Send> {
+    Box::new(pipe)
+}
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -49,6 +178,8 @@ struct CollectedLines {
     truncated: bool,
     stdout_bytes: u64,
     stderr_bytes: u64,
+    observed_stdout_bytes: u64,
+    observed_stderr_bytes: u64,
     stdout_line_start: u64,
     stderr_line_start: u64,
 }
@@ -90,11 +221,9 @@ pub fn capture_command(
         return Err(crate::cli::USAGE.to_string());
     }
     let cwd_path = std::env::current_dir().map_err(|error| error.to_string())?;
-    let cwd = cwd_path
-        .canonicalize()
-        .unwrap_or(cwd_path)
-        .display()
-        .to_string();
+    let cwd_path = cwd_path.canonicalize().unwrap_or(cwd_path);
+    let cwd = cwd_path.display().to_string();
+    let cwd_native = crate::native_path::NativePath::from_path(&cwd_path);
     let start = SystemTime::now();
     let elapsed = Instant::now();
     let start_ms = util::millis(start);
@@ -122,12 +251,15 @@ pub fn capture_command(
             redirected_stream,
             command: cmd,
             cwd: &cwd,
+            cwd_native: &cwd_native,
             start_ms,
             duration_ms: 0,
             stdout_path: &stdout_path,
             stderr_path: &stderr_path,
             stdout_bytes: 0,
             stderr_bytes: 0,
+            observed_stdout_bytes: 0,
+            observed_stderr_bytes: 0,
             stdout_lines: 0,
             stderr_lines: 0,
             total_lines: 0,
@@ -162,13 +294,14 @@ pub fn capture_command(
             return Err(error);
         }
     };
+    let drain = Arc::new(DrainControl::default());
     let child_stdout: Box<dyn Read + Send> = match tree.child.stdout.take() {
-        Some(stream) => Box::new(stream),
+        Some(stream) => drain_reader(stream, &drain),
         None if redirected_stream == Some(StreamKind::Stdout) => Box::new(io::empty()),
         None => return Err("failed to capture stdout".into()),
     };
     let child_stderr: Box<dyn Read + Send> = match tree.child.stderr.take() {
-        Some(stream) => Box::new(stream),
+        Some(stream) => drain_reader(stream, &drain),
         None if redirected_stream == Some(StreamKind::Stderr) => Box::new(io::empty()),
         None => return Err("failed to capture stderr".into()),
     };
@@ -180,6 +313,8 @@ pub fn capture_command(
         truncated: false,
         stdout_bytes: 0,
         stderr_bytes: 0,
+        observed_stdout_bytes: 0,
+        observed_stderr_bytes: 0,
         stdout_line_start: 0,
         stderr_line_start: 0,
     }));
@@ -220,6 +355,7 @@ pub fn capture_command(
         let store_dir = store_dir.to_path_buf();
         let command = cmd.to_vec();
         let cwd = cwd.clone();
+        let cwd_native = cwd_native.clone();
         let stdout_spool = Arc::clone(&stdout_spool);
         let stderr_spool = Arc::clone(&stderr_spool);
         let collected = Arc::clone(&collected);
@@ -242,6 +378,8 @@ pub fn capture_command(
                     let progress = (
                         state.stdout_bytes,
                         state.stderr_bytes,
+                        state.observed_stdout_bytes,
+                        state.observed_stderr_bytes,
                         state.total,
                         state.truncated,
                     );
@@ -298,12 +436,15 @@ pub fn capture_command(
                     redirected_stream,
                     command: &command,
                     cwd: &cwd,
+                    cwd_native: &cwd_native,
                     start_ms,
                     duration_ms: elapsed.elapsed().as_millis(),
                     stdout_path: &stdout_path,
                     stderr_path: &stderr_path,
                     stdout_bytes: snapshot.stdout_bytes,
                     stderr_bytes: snapshot.stderr_bytes,
+                    observed_stdout_bytes: snapshot.observed_stdout_bytes,
+                    observed_stderr_bytes: snapshot.observed_stderr_bytes,
                     stdout_lines,
                     stderr_lines,
                     total_lines,
@@ -338,17 +479,6 @@ pub fn capture_command(
     let mut live_announced = false;
     let mut cancelled = false;
     let status = loop {
-        if announce_live
-            && !live_announced
-            && elapsed.elapsed().as_millis() >= LIVE_ANNOUNCEMENT_DELAY_MS
-            && let Some(result_id) = initial_live_id.as_deref()
-        {
-            let display_id = live_store_dir
-                .map(|dir| crate::storage::display_result_id(dir, result_id))
-                .unwrap_or_else(|| result_id.to_string());
-            eprintln!("LIVE | result={display_id}");
-            live_announced = true;
-        }
         let active_live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
         if let (Some(store_dir), Some(result_id)) = (live_store_dir, active_live_id.as_deref())
             && crate::storage::cancellation_requested(store_dir, result_id)
@@ -357,12 +487,28 @@ pub fn capture_command(
             tree.terminate_tree();
             break tree.child.wait().map_err(|error| error.to_string())?;
         }
-        if let Some(status) = tree.child.try_wait().map_err(|error| error.to_string())? {
+        // Observe completion before announcing; setup/scheduling may consume the delay
+        // even when the child has already exited. Cancellation retains priority.
+        let child_status = tree.child.try_wait().map_err(|error| error.to_string())?;
+        if announce_live
+            && !live_announced
+            && live_announcement_due(elapsed.elapsed().as_millis(), child_status.is_none())
+            && let Some(result_id) = initial_live_id.as_deref()
+        {
+            let display_id = live_store_dir
+                .map(|dir| crate::storage::display_result_id(dir, result_id))
+                .unwrap_or_else(|| result_id.to_string());
+            eprintln!("LIVE | result={display_id}");
+            live_announced = true;
+        }
+        if let Some(status) = child_status {
             tree.terminate_tree();
             break status;
         }
         thread::sleep(Duration::from_millis(CAPTURE_CONTROL_POLL_MS));
     };
+    *drain.deadline.lock().map_err(|_| "drain state poisoned")? =
+        Some(Instant::now() + POST_EXIT_DRAIN);
     let _ = checkpoint_stop.send(());
     let (live_id, live_owner) = checkpoint_handle
         .map(|handle| {
@@ -379,6 +525,12 @@ pub fn capture_command(
         .lock()
         .map_err(|_| "capture state lock poisoned".to_string())?
         .clone();
+    let drain_truncated = drain.truncated.load(Ordering::Acquire);
+    if drain_truncated {
+        crate::util::diagnostic_line(
+            "pira_ctx: post-exit pipe drain expired; retained output is incomplete (detached descendants are not contained)",
+        );
+    }
     let retention_truncated = stdout_analysis.observed_length > stdout_analysis.length
         || stderr_analysis.observed_length > stderr_analysis.length;
     let stdout = finish_spool(stdout_spool, stdout_analysis, "stdout")?;
@@ -392,14 +544,16 @@ pub fn capture_command(
         total_lines: collected.total,
         stdout_lines: collected.stdout,
         stderr_lines: collected.stderr,
-        timeline_truncated: collected.truncated || retention_truncated,
+        timeline_truncated: collected.truncated || retention_truncated || drain_truncated,
         retention_truncated,
+        drain_truncated,
         cancelled,
         exit_code,
         start_ms,
         end_ms,
         duration_ms: elapsed.elapsed().as_millis(),
         cwd,
+        cwd_native,
         live_id,
         live_store_dir: live_store_dir.map(Path::to_path_buf),
         _live_owner: live_owner,
@@ -589,15 +743,15 @@ fn read_stream<R: Read>(
     let mut controls = 0_u64;
     let mut validator = Utf8Validator::default();
     loop {
-        let count = input.read(&mut buffer)?;
+        let count = match input.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if count == 0 {
             break;
         }
         observed = observed.saturating_add(count as u64);
         let retained = budget.reserve(count);
-        if retained == 0 {
-            continue;
-        }
         let chunk = &buffer[..retained];
         output
             .lock()
@@ -624,10 +778,12 @@ fn read_stream<R: Read>(
             }
         }
         offset += retained as u64;
+        // Discarded bytes are progress too: publish loss even after retained bytes stop growing.
         commit_stream_progress(
             collected,
             stream,
             offset,
+            observed,
             line_start,
             lines,
             indexed_line_limit,
@@ -638,6 +794,7 @@ fn read_stream<R: Read>(
             collected,
             stream,
             offset,
+            observed,
             offset,
             vec![StreamLine {
                 stream,
@@ -663,6 +820,7 @@ fn commit_stream_progress(
     shared: &Mutex<CollectedLines>,
     stream: StreamKind,
     length: u64,
+    observed: u64,
     line_start: u64,
     lines: Vec<StreamLine>,
     maximum: usize,
@@ -673,10 +831,12 @@ fn commit_stream_progress(
     match stream {
         StreamKind::Stdout => {
             state.stdout_bytes = length;
+            state.observed_stdout_bytes = observed;
             state.stdout_line_start = line_start;
         }
         StreamKind::Stderr => {
             state.stderr_bytes = length;
+            state.observed_stderr_bytes = observed;
             state.stderr_line_start = line_start;
         }
     }
@@ -746,6 +906,60 @@ impl Utf8Validator {
 mod tests {
     use super::*;
 
+    #[test]
+    fn interrupted_reads_retry_without_losing_bytes_or_lines() {
+        struct Interrupted {
+            bytes: std::io::Cursor<Vec<u8>>,
+            interrupt: bool,
+        }
+        impl Read for Interrupted {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.bytes.read(&mut buffer[..1])
+            }
+        }
+        let bytes = b"a\nb";
+        let spool = Mutex::new(AdaptiveSpool::new("interrupted", 0));
+        let lines = Mutex::new(CollectedLines {
+            timeline: vec![],
+            total: 0,
+            stdout: 0,
+            stderr: 0,
+            truncated: false,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            observed_stdout_bytes: 0,
+            observed_stderr_bytes: 0,
+            stdout_line_start: 0,
+            stderr_line_start: 0,
+        });
+        let budget = RetentionBudget {
+            maximum: 100,
+            used: AtomicU64::new(0),
+        };
+        let result = read_stream(
+            Interrupted {
+                bytes: io::Cursor::new(bytes.to_vec()),
+                interrupt: false,
+            },
+            &spool,
+            StreamKind::Stdout,
+            &lines,
+            100,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(result.length, 3);
+        assert_eq!(result.observed_length, 3);
+        assert_eq!(result.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.total, 2);
+        assert_eq!(lines.stdout_bytes, 3);
+    }
+
     fn analysis(bytes: &[u8]) -> StreamAnalysis {
         StreamAnalysis {
             length: bytes.len() as u64,
@@ -788,5 +1002,65 @@ mod tests {
         assert_eq!(replayed, bytes);
         drop(spool);
         assert!(!path.exists());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_drain_tests {
+    use super::*;
+    use std::os::windows::io::FromRawHandle;
+    #[test]
+    fn held_pipe_is_bounded_and_eof_is_not_truncation() {
+        for held in [false, true] {
+            let mut read = std::ptr::null_mut();
+            let mut write = std::ptr::null_mut();
+            // SAFETY: outputs receive new handles owned by the Files below.
+            assert_ne!(
+                unsafe {
+                    windows_sys::Win32::System::Pipes::CreatePipe(
+                        &mut read,
+                        &mut write,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                0
+            );
+            let reader = unsafe { File::from_raw_handle(read) };
+            let mut writer = unsafe { File::from_raw_handle(write) };
+            writer.write_all(b"observed").unwrap();
+            let writer = if held {
+                Some(writer)
+            } else {
+                drop(writer);
+                None
+            };
+            let control = Arc::new(DrainControl::default());
+            *control.deadline.lock().unwrap() = Some(Instant::now() + Duration::from_millis(100));
+            let start = Instant::now();
+            let mut bytes = Vec::new();
+            drain_reader(reader, &control)
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, b"observed");
+            assert_eq!(control.truncated.load(Ordering::Acquire), held);
+            assert!(start.elapsed() < Duration::from_secs(2));
+            drop(writer);
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_announcement_tests {
+    use super::*;
+
+    #[test]
+    fn announcement_requires_running_child_and_elapsed_delay() {
+        assert!(!live_announcement_due(249, true));
+        assert!(live_announcement_due(250, true));
+        assert!(live_announcement_due(10_000, true));
+        // A delayed first poll must not call an already-exited child LIVE.
+        assert!(!live_announcement_due(250, false));
+        assert!(!live_announcement_due(10_000, false));
     }
 }

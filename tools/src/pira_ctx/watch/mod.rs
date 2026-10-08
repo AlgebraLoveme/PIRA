@@ -21,7 +21,7 @@ use state::{
     SourceKind, WatchConfiguration, WatchState,
 };
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const CONTROL_POLL_MS: u64 = 100;
 const MAX_REPORT_BYTES: usize = 12 * 1024;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -92,8 +92,13 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         analyzer.is_some(),
         config.watch_sample_every_ms,
     )?;
+    let cwd_native = crate::native_path::NativePath::from_path(&cwd);
     let watch = WatchState {
-        schema: SCHEMA,
+        schema: if cwd_native.requires_native() {
+            3
+        } else {
+            SCHEMA
+        },
         id: id.clone(),
         workspace_hash: storage::current_workspace_hash()?,
         created_ms: now,
@@ -106,6 +111,7 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         source_kind,
         source,
         source_cwd: cwd.display().to_string(),
+        source_cwd_native: Some(cwd_native),
         capture_path,
         intent: config.intent.clone(),
         sample_every_ms: config.watch_sample_every_ms,
@@ -193,6 +199,10 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
     if terminal(&watch) {
         return report(&watch, exit_code(&watch));
     }
+    // Validate before resume writes or any process can use the persisted cwd.
+    if watch.source_kind == SourceKind::Probe || watch.analyzer.is_some() {
+        crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?;
+    }
     if watch.monitor == MonitorStatus::Stopped {
         state::update_control(store, id, |control| control.stop_requested = false)?;
         watch.monitor = MonitorStatus::Active;
@@ -278,6 +288,7 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
                 return report(&watch, 22);
             }
         };
+        let observation_complete = sample.reliable;
         let run_analyzer = matches!(sample.job, JobStatus::Unknown | JobStatus::Pending);
         let analyzer_limit_ms = remaining_ms(
             state::now_ms(),
@@ -324,7 +335,7 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
             persist(&path, &mut watch)?;
             return report(&watch, 20);
         }
-        let attention = evaluate_attention(&mut watch, analyzer_attention);
+        let attention = evaluate_attention(&mut watch, analyzer_attention, observation_complete);
         watch.next_sample_ms = state::now_ms().saturating_add(u128::from(watch.sample_every_ms));
         persist(&path, &mut watch)?;
         if attention && watch.attention_policy == AttentionPolicy::Return {
@@ -361,12 +372,16 @@ fn incorporate_sample(
         watch.stdout_view = TerminalView::default();
         watch.stderr_view = TerminalView::default();
     }
+    if !sample.reliable {
+        watch.stdout_view.reliable = false;
+        watch.stderr_view.reliable = false;
+    }
     watch.stdout_view.feed(&sample.stdout);
     watch.stderr_view.feed(&sample.stderr);
     let stdout = watch.stdout_view.text();
     let stderr = watch.stderr_view.text();
     let visible_hash = sample::hash(&[stdout.as_bytes(), stderr.as_bytes()]);
-    if visible_hash != watch.visible_hash {
+    if stdout != watch.visible_stdout || stderr != watch.visible_stderr {
         watch.last_visible_change_ms = Some(now)
     }
     watch.visible_hash = visible_hash;
@@ -397,7 +412,7 @@ fn incorporate_sample(
             &input,
             attempt_limit_ms,
             store,
-            Path::new(&watch.source_cwd),
+            &crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?,
             || {
                 state::read::<ControlState>(&control_path, "watch control")
                     .is_ok_and(|control| control.stop_requested)
@@ -445,14 +460,25 @@ fn remaining_ms(now: u128, deadline: u128, review: Option<u128>, configured: u64
     configured.min(remaining.max(1))
 }
 
-fn evaluate_attention(watch: &mut WatchState, analyzer_reason: Option<String>) -> bool {
+fn evaluate_attention(
+    watch: &mut WatchState,
+    analyzer_reason: Option<String>,
+    observation_complete: bool,
+) -> bool {
     let now = state::now_ms();
     let reason = analyzer_reason.or_else(|| {
-        if watch.inactive_after_ms.is_some_and(|limit| {
+        // Retained cursors and analyzer tails cannot prove inactivity after output loss.
+        if !observation_complete
+            && (watch.inactive_after_ms.is_some() || watch.no_progress_after_ms.is_some())
+        {
+            Some("sample output is incomplete; inactivity or unchanged analyzer progress cannot be established".to_string())
+        } else if watch.inactive_after_ms.is_some_and(|limit| {
             now.saturating_sub(watch.last_activity_ms.unwrap_or(watch.created_ms))
                 >= u128::from(limit)
         }) {
             Some("no raw activity observed".to_string())
+        } else if !watch.rendered_reliable && watch.unchanged_after_ms.is_some() {
+            Some("rendered state is unreliable; unchanged output cannot be established".to_string())
         } else if watch.unchanged_after_ms.is_some_and(|limit| {
             now.saturating_sub(watch.last_visible_change_ms.unwrap_or(watch.created_ms))
                 >= u128::from(limit)
@@ -764,6 +790,16 @@ fn configuration_update_requested(config: &Config) -> bool {
 
 fn report(w: &WatchState, code: i32) -> Result<i32, String> {
     let mut out = util::BoundedStdout::new(MAX_REPORT_BYTES);
+    let risk = crate::security::inspect_combined([
+        w.visible_stdout.as_str(),
+        w.visible_stderr.as_str(),
+        w.progress.as_str(),
+        w.analyzer_summary.as_str(),
+        w.analyzer_error.as_deref().unwrap_or(""),
+        w.detail.as_str(),
+        w.attention_reason.as_deref().unwrap_or(""),
+    ]);
+    crate::print_content_warnings(&mut out, [(None, risk)])?;
     out.line("PIRA watch")?;
     out.line(&format!("Result: {}", w.id))?;
     let final_probe = terminal(w) && w.source_kind == SourceKind::Probe;
@@ -792,6 +828,11 @@ fn report(w: &WatchState, code: i32) -> Result<i32, String> {
         age(w.last_visible_change_ms),
         w.rendered_reliable
     ))?;
+    for (stream, view) in [("stdout", &w.stdout_view), ("stderr", &w.stderr_view)] {
+        if let Some(reason) = view.reason() {
+            out.line(&format!("Render {stream}: {reason}"))?;
+        }
+    }
     if let Some(analyzer) = w.analyzer.as_ref() {
         out.line(&format!(
             "Last semantic progress: {} | analyzer revision: {}",
@@ -837,8 +878,20 @@ fn age(value: Option<u128>) -> String {
 }
 
 fn validate(w: &WatchState, id: &str) -> Result<(), String> {
-    if w.schema != SCHEMA || w.id != id {
+    let expected_schema = if w
+        .source_cwd_native
+        .as_ref()
+        .is_some_and(|path| path.requires_native())
+    {
+        3
+    } else {
+        SCHEMA
+    };
+    if w.schema != expected_schema || w.id != id {
         return Err("watch state identity/schema mismatch".into());
+    }
+    if w.source.is_empty() {
+        return Err("watch source is empty".into());
     }
     state::validate_id(id)
 }

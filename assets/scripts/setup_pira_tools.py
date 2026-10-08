@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import gzip
 import hashlib
 import importlib.util
@@ -12,24 +11,22 @@ import json
 import os
 import re
 import shutil
-import shlex
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+import setup_pira_stores as stores
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
-BLOCK_START = "# >>> PIRA tools PATH >>>"
-BLOCK_END = "# <<< PIRA tools PATH <<<"
 RETIRED_TOOLS = {"pira_codenav"}
 TEAM_CODEX_MIN_VERSION = (0, 159, 0)
 CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
@@ -412,76 +409,43 @@ def executable_path(directory: Path, tool_name: str) -> Path:
     return directory / f"{tool_name}{suffix}"
 
 
-def shell_profiles() -> list[Path]:
-    shell = Path(os.environ.get("SHELL", "")).name
-    if shell == "zsh" or sys.platform == "darwin":
-        return [Path.home() / ".zprofile", Path.home() / ".zshrc"]
-    if shell == "bash" and (Path.home() / ".bash_profile").exists():
-        return [Path.home() / ".bash_profile", Path.home() / ".bashrc"]
-    if shell == "bash":
-        return [Path.home() / ".profile", Path.home() / ".bashrc"]
-    return [Path.home() / ".profile"]
-
-
-def shell_path_line(directory: Path) -> str:
-    value = shlex.quote(str(directory))
-    return f'case ":$PATH:" in *:{value}:*) ;; *) export PATH={value}:"$PATH" ;; esac'
-
-
 def update_managed_block(path: Path, body: str, dry_run: bool) -> bool:
-    old = path.read_text(encoding="utf-8") if path.exists() else ""
-    block = f"{BLOCK_START}\n{body}\n{BLOCK_END}"
-    if BLOCK_START in old:
-        start = old.index(BLOCK_START)
-        end_marker = old.find(BLOCK_END, start)
-        if end_marker < 0:
-            raise RuntimeError(f"incomplete PIRA PATH block in {path}")
-        end = end_marker + len(BLOCK_END)
-        prefix = old[:start].rstrip()
-        suffix = old[end:].strip("\n")
-        new = (prefix + "\n\n" if prefix else "") + block
-        new += "\n\n" + suffix + "\n" if suffix else "\n"
-    else:
-        new = old.rstrip() + ("\n\n" if old.strip() else "") + block + "\n"
+    old = stores.read_profile(path)
+    new = stores.managed_block_text(path, old, body)
     if new == old:
         return False
-    if dry_run:
-        print(f"DRY-RUN: would update PATH block in {path}")
-        return True
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
-        shutil.copy2(path, path.with_name(f"{path.name}.bak.{stamp}"))
-    temporary = path.with_name(f".{path.name}.pira-tmp-{os.getpid()}")
-    temporary.write_text(new, encoding="utf-8")
-    os.replace(temporary, path)
-    print(f"Updated PATH in {path}")
+    stores.write_profile(path, new, dry_run)
     return True
 
 
-def windows_user_path(directory: Path, dry_run: bool) -> bool:
+def windows_user_path(directory: Path, dry_run: bool, *, append: bool = False) -> bool:
     import winreg
 
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-        try:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
             current, kind = winreg.QueryValueEx(key, "Path")
-        except FileNotFoundError:
-            current, kind = "", winreg.REG_EXPAND_SZ
-        parts = [part for part in current.split(";") if part]
-        normalized = os.path.normcase(str(directory.resolve()))
-        if any(os.path.normcase(os.path.expandvars(part)) == normalized for part in parts):
+    except FileNotFoundError:
+        current, kind = "", winreg.REG_EXPAND_SZ
+    parts = [part for part in current.split(";") if part]
+    normalized = os.path.normcase(os.path.realpath(directory))
+    # Resolve both sides: Windows short names and directory aliases identify the same entry.
+    present = [part for part in parts
+               if os.path.normcase(os.path.realpath(os.path.expandvars(part))) == normalized]
+    if append:
+        # Move only this managed entry behind existing user choices, including on reruns.
+        updated = ";".join([*(part for part in parts if part not in present), str(directory)])
+        if updated == current:
+            return False
+    else:
+        if present:
             return False
         updated = ";".join([str(directory), *parts])
-        if dry_run:
-            print(f"DRY-RUN: would prepend {directory} to the user PATH")
-            return True
+    if dry_run:
+        print(f"DRY-RUN: would {'append' if append else 'prepend'} {directory} to the user PATH")
+        return True
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
         winreg.SetValueEx(key, "Path", 0, kind, updated)
-    try:
-        ctypes.windll.user32.SendMessageTimeoutW(
-            0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None
-        )
-    except Exception:
-        pass
+    stores.notify_windows_environment()
     print(f"Updated Windows user PATH with {directory}")
     return True
 
@@ -491,24 +455,31 @@ def ensure_path(directory: Path, dry_run: bool, *, include_codex: bool = False) 
     directories = [directory]
     if include_codex or executable_path(codex_bin, "codex").is_file():
         directories.append(codex_bin)
+    selected = shutil.which("codex")
+    external = selected is not None and os.path.normcase(os.path.realpath(selected)) != os.path.normcase(
+        os.path.realpath(executable_path(codex_bin, "codex")))
     changed = False
     if os.name == "nt":
         for entry in directories:
-            changed = windows_user_path(entry, dry_run) or changed
+            changed = windows_user_path(entry, dry_run, append=entry == codex_bin and external) or changed
     else:
-        body = "\n".join(shell_path_line(entry) for entry in directories)
-        for path in shell_profiles():
+        # Do not activate a retained package over the external backend we checked.
+        # The package stays available to prepare_team_runtime if that backend disappears.
+        body = "\n".join(stores.shell_path_line(entry) for entry in directories
+                         if entry != codex_bin or not external)
+        for path in stores.shell_profiles():
             changed = update_managed_block(path, body, dry_run) or changed
     return changed
 
 
 def path_is_configured(directory: Path) -> bool:
+    normalized = directory.resolve(strict=False)
     active = {
         Path(value).expanduser().resolve(strict=False)
         for value in os.environ.get("PATH", "").split(os.pathsep)
         if value
     }
-    if directory in active:
+    if normalized in active:
         return True
     if os.name == "nt":
         import winreg
@@ -518,14 +489,14 @@ def path_is_configured(directory: Path) -> bool:
         except (FileNotFoundError, OSError):
             return False
         return any(
-            Path(os.path.expandvars(value)).resolve(strict=False) == directory
+            Path(os.path.expandvars(value)).resolve(strict=False) == normalized
             for value in current.split(";") if value
         )
-    profiles = shell_profiles()
+    profiles = stores.shell_profiles()
     return all(
         path.exists()
-        and BLOCK_START in path.read_text(encoding="utf-8")
-        and shell_path_line(directory) in path.read_text(encoding="utf-8")
+        and stores.BLOCK_START in path.read_text(encoding="utf-8")
+        and stores.shell_path_line(directory) in path.read_text(encoding="utf-8")
         for path in profiles
     )
 
@@ -546,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Install or refresh cloud-built PIRA tools for this user."
     )
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
+    parser.add_argument("--no-team", action="store_true", help="Exclude Team and its backend/login setup; preserve existing binaries and configuration.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
     parser.add_argument(
         "--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
@@ -556,7 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify", action="store_true", help="Verify installed tools without changing them."
     )
     parser.add_argument(
-        "--no-path", action="store_true", help="Do not persist the install directory in PATH."
+        "--no-path", action="store_true", help="Do not change or verify user PATH/store environment persistence."
     )
     parser.add_argument(
         "--force", action="store_true", help="Refresh even when installed hashes already match."
@@ -571,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         action="append",
         help=(
-            "Pin one tool as ctx=VERSION, dec=VERSION, nav=VERSION, or svg=VERSION; "
+            "Pin one tool as ctx=VERSION, dec=VERSION, nav=VERSION, svg=VERSION, or team=VERSION; "
             "repeatable. "
             "Unspecified tools use latest. Exact history begins with cloud releases."
         ),
@@ -579,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def selected_tools(index: dict[str, object], requested: list[str] | None) -> list[str]:
+def selected_tools(index: dict[str, object], requested: list[str] | None, *, no_team: bool = False) -> list[str]:
     released = sorted(
         tool
         for tool in index["tools"]
@@ -587,6 +559,10 @@ def selected_tools(index: dict[str, object], requested: list[str] | None) -> lis
     )
     if not released:
         raise RuntimeError("no PIRA tools were found in the latest release")
+    if no_team:
+        released = [name for name in released if name != "pira_team"]
+        if requested and "pira_team" in requested:
+            raise RuntimeError("--no-team conflicts with --tool pira_team")
     if requested is None:
         return released
     tools = sorted(set(requested))
@@ -695,6 +671,146 @@ def tool_selection(
     )
 
 
+def check_team_schema(schema: dict, expected: dict) -> None:
+    """Check the published native API inventory; runtime also validates request values."""
+    def fields(node: dict, names: list[str]) -> None:
+        for name in names:
+            if name not in node.get("properties", {}):
+                raise ValueError(f"missing published field {name}")
+
+    def variant(node: dict, tag: str, value: str) -> dict:
+        for item in node.get("oneOf", []):
+            if value in item.get("properties", {}).get(tag, {}).get("enum", []):
+                return item
+        raise ValueError(f"missing published {tag} {value} (unsupported schema layout)")
+
+    fields(schema, expected.get("fields", []))
+    for signal in expected.get("signals", []):
+        variant(schema, "method", signal)
+    for method, names in expected.get("methods", {}).items():
+        item = variant(schema, "method", method)
+        reference = item["properties"]["params"]["$ref"]
+        if not reference.startswith("#/definitions/"):
+            raise ValueError(f"unsupported parameter reference for {method}")
+        fields(schema["definitions"][reference.removeprefix("#/definitions/")], names)
+    for name, names in expected.get("definitions", {}).items():
+        fields(schema["definitions"][name], names)
+    for name, variants in expected.get("variants", {}).items():
+        for tag, names in variants.items():
+            fields(variant(schema["definitions"][name], "type", tag), names)
+
+
+def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: float = 10) -> None:
+    """Wait with live stdin: 10s by default, then 1s EOF grace and 2s kill/reap limit."""
+    initialize = {"id": 1, "method": "initialize", "params": {
+        "clientInfo": {"name": "pira_team_setup", "version": "1"},
+        "capabilities": {"experimentalApi": False}}}
+    # Regular files avoid blocking pipe readers (including inherited descendant pipes),
+    # without platform-specific pipe polling. Read/write opens need independent offsets.
+    with tempfile.TemporaryDirectory(prefix="pira-team-initialize-") as temporary:
+        root = Path(temporary)
+        with (root / "stdout").open("wb") as out, (root / "stderr").open("wb") as err, \
+             (root / "stdout").open("rb") as reader:
+            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
+                                     env=env, bufsize=0)
+            matched = False
+            try:
+                deadline = time.monotonic() + timeout
+                # This one fixed, small initialize frame fits an empty stdin pipe.
+                child.stdin.write((json.dumps(initialize) + "\n").encode("utf-8"))
+                child.stdin.flush()
+                pending = b""
+                received = 0
+                exited = False
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    data = reader.readline(65537 - received)
+                    if data:
+                        received += len(data)
+                        if received > 65536:
+                            raise ValueError("initialize output exceeds 64 KiB")
+                        pending += data
+                    if pending and (pending.endswith(b"\n") or (exited and not data)):
+                        frame, pending = pending, b""
+                        if not frame.strip():
+                            continue
+                        reply = json.loads(frame)
+                        if not isinstance(reply, dict) or type(reply.get("id")) is not int or reply["id"] != 1:
+                            continue
+                        if ("error" in reply or not isinstance(reply.get("result"), dict)
+                                or not isinstance(reply["result"].get("userAgent"), str)):
+                            raise ValueError("invalid matching initialize response")
+                        matched = True
+                        return
+                    if data:
+                        continue
+                    # A process may write its final reply between our read and exit.
+                    # Drain once more after observing exit before diagnosing missing output.
+                    if exited:
+                        raise ValueError("backend exited without a complete matching initialize response")
+                    try:
+                        child.wait(timeout=min(0.02, remaining))
+                        exited = True
+                    except subprocess.TimeoutExpired:
+                        pass
+            except ValueError as error:
+                with (root / "stderr").open("rb") as diagnostics_file:
+                    diagnostics = diagnostics_file.read(65536).decode("utf-8", errors="replace")
+                raise ValueError(f"native strict-config stdio initialize failed: {error}; "
+                                 f"stderr (up to 64 KiB): {diagnostics.strip()}; "
+                                 "interactive/shared-daemon compatibility is a separate check") from error
+            finally:
+                try:
+                    child.stdin.close()
+                except OSError:
+                    pass  # An already-exited peer may have closed its input.
+                forced = False
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    forced = True
+                    child.kill()
+                    child.wait(timeout=2)
+                if matched and not forced and child.returncode:
+                    raise ValueError(f"native stdio initialize backend exited with status {child.returncode}")
+
+
+def check_team_protocol(executable: str) -> None:
+    """Probe direct stdio, not the interactive shared daemon; no auth or model turn."""
+    contract_path = REPO_ROOT / "tools/src/pira_team/backend_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(prefix="pira-team-backend-") as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        home.mkdir()
+        env = dict(os.environ, CODEX_HOME=str(home), TMPDIR=temporary, TMP=temporary, TEMP=temporary)
+        for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+            env.pop(key, None)
+        command = [executable, "app-server", "--strict-config", "--stdio"]
+        for setting in contract["config"]:
+            command.extend(["-c", setting])
+        schema_dir = root / "schema"
+        result = subprocess.run(
+            [executable, "app-server", "generate-json-schema", "--out", str(schema_dir)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+            check=False, env=env,
+        )
+        if result.returncode:
+            raise ValueError(f"native schema generation failed (exit {result.returncode}): {result.stderr.strip()}")
+        for name, expected in contract["schemas"].items():
+            path = schema_dir / name
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError(f"missing/oversized native schema {name}")
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                check_team_schema(schema, expected)
+            except (KeyError, TypeError, AttributeError, ValueError) as error:
+                raise ValueError(f"{name}: {error}") from error
+        check_team_initialize(command, env)
+
+
 def check_team_runtime(tools: list[str], executable: str | None = None) -> str | None:
     """Check the backend only when Team is selected; never log in or install Codex."""
     if "pira_team" not in tools:
@@ -709,10 +825,12 @@ def check_team_runtime(tools: list[str], executable: str | None = None) -> str |
         raise RuntimeError(f"pira_team requires the Codex executable. {guidance}")
     def probe(arguments: list[str]) -> str:
         try:
-            result = subprocess.run(
-                [executable, *arguments], stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, timeout=10, check=False,
-            )
+            with tempfile.TemporaryDirectory(prefix="pira-team-version-") as home:
+                result = subprocess.run(
+                    [executable, *arguments], stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=10, check=False,
+                    env=dict(os.environ, CODEX_HOME=home),
+                )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeError(f"Cannot check the Codex backend for pira_team: {error}. {guidance}") from error
         if result.returncode != 0:
@@ -731,10 +849,13 @@ def check_team_runtime(tools: list[str], executable: str | None = None) -> str |
     if missing:
         raise RuntimeError(
             "Codex app-server lacks required options: " + ", ".join(missing)
-            + ". Use a compatible Codex build (tested with 0.159.0); " + guidance
+            + ". Use a Codex build with the required native app-server interface; " + guidance
         )
+    try:
+        check_team_protocol(executable)
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"Unsupported native Codex backend for pira_team: {error}. {guidance}") from error
     return version_text
-
 
 
 def install_codex(install_dir: Path, platform_key: str) -> Path:
@@ -829,16 +950,23 @@ def install_codex(install_dir: Path, platform_key: str) -> Path:
     return destination / "bin" / f"codex{suffix}"
 
 
+def selected_codex_binary(install_dir: Path) -> str | None:
+    """Resolve the same external-first backend for setup and migration; no writes."""
+    existing = shutil.which("codex")
+    if existing:
+        return str(Path(existing).resolve())
+    managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
+    return str(managed.resolve()) if managed.is_file() else None
+
+
 def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
                          *, verify: bool, dry_run: bool) -> str | None:
     if "pira_team" not in tools:
         return None
-    existing = shutil.which("codex")
+    executable = selected_codex_binary(install_dir)
+    if executable:
+        return check_team_runtime(tools, executable)
     managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    if existing:
-        return check_team_runtime(tools)
-    if managed.is_file():
-        return check_team_runtime(tools, str(managed))
     if verify:
         return check_team_runtime(tools)  # Fail without downloading or writing.
     if dry_run:
@@ -929,24 +1057,33 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.no_path:
+        stores.configuration_toml()
     selector = load_selector()
     install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
     index = release_index()
     platform_key = selector.current_platform()
-    tools = selected_tools(index, args.tools)
+    tools = selected_tools(index, args.tools, no_team=args.no_team)
     requested_versions = parse_versions(args.version)
     unselected_versions = sorted(set(requested_versions) - set(tools))
     if unselected_versions:
         raise RuntimeError(
-            "version specified for tool excluded by --tool: "
+            "version specified for tool excluded by --tool or --no-team: "
             + ", ".join(unselected_versions)
         )
-    runtime = prepare_team_runtime(tools, install_dir, platform_key,
-                                   verify=args.verify, dry_run=args.dry_run)
-    if runtime:
-        print(f"OK: Team backend {runtime}; required app-server options available")
-    ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,
-                     login=args.codex_login)
+    if "pira_team" in tools:
+        runtime = prepare_team_runtime(tools, install_dir, platform_key,
+                                       verify=args.verify, dry_run=args.dry_run)
+        if runtime:
+            print(f"OK: Team backend {runtime}; native API inventory and isolated strict-config stdio initialize verified (not shared daemon/model access)")
+    # Preparation can install a managed backend outside PATH. Pass that exact
+    # selection to retained-history preflight before publishing any store paths.
+    codex_binary = selected_codex_binary(install_dir) if "pira_team" in tools else None
+    store_plan = (stores.plan_store_environment(tools, codex_binary=codex_binary)
+                  if not args.no_path else stores.StorePlan())
+    if "pira_team" in tools:
+        ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,
+                         login=args.codex_login)
     indexes = {tool_name: index for tool_name in index["tools"]}
     historical_versions: dict[str, str] = {}
     for tool_name, version in requested_versions.items():
@@ -976,6 +1113,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Platform: {platform_key}")
 
     if args.verify:
+        stores.apply_store_environment(store_plan, dry_run=True, verify=True)
         failures: list[str] = []
         for selection in selections:
             if selection.existing_hash != selection.expected_hash:
@@ -1038,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         remove_managed_legacy_tools(install_dir, args.dry_run)
 
     if not args.no_path:
+        stores.apply_store_environment(store_plan, dry_run=args.dry_run)
         ensure_path(install_dir, args.dry_run,
                     include_codex="pira_team" in tools and not shutil.which("codex"))
 

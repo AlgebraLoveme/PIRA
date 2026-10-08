@@ -3,6 +3,8 @@ mod export;
 mod model;
 mod storage;
 mod util;
+#[cfg(windows)]
+mod windows;
 
 use cli::{Command, SearchField};
 use model::{DecisionRecord, DecisionView};
@@ -15,14 +17,21 @@ pub fn run() -> i32 {
         Ok(code) => code,
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
-            eprintln!("pira_dec: {error}");
+            eprintln!("pira_dec: {}", util::escape_diagnostic(&error));
             2
         }
     }
 }
 
 fn real_main() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| "command-line arguments must be valid UTF-8".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     let config = cli::parse_args(&args)?;
     let store = config.store_dir.as_deref();
     match config.command {
@@ -329,7 +338,7 @@ fn parse_time_window(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<(Option<u64>, Option<u64>), String> {
-    let (since_ms, until_ms) = if since.is_some() || until.is_some() {
+    let (since_time, until_time) = if since.is_some() || until.is_some() {
         let now_ms = util::now_ms()?;
         (
             since
@@ -342,13 +351,16 @@ fn parse_time_window(
     } else {
         (None, None)
     };
-    if since_ms
-        .zip(until_ms)
+    if since_time
+        .zip(until_time)
         .is_some_and(|(since, until)| since >= until)
     {
         return Err(format!("{command} --since must be earlier than --until"));
     }
-    Ok((since_ms, until_ms))
+    // Records have millisecond precision. Ceiling both bounds preserves >= and <
+    // membership, but window validity must be checked before rounding.
+    let ceil_ms = |time: jiff::Timestamp| ((time.as_nanosecond() + 999_999) / 1_000_000) as u64;
+    Ok((since_time.map(ceil_ms), until_time.map(ceil_ms)))
 }
 
 fn match_excerpt(text: &str, regex: &Regex) -> Option<String> {
@@ -549,7 +561,17 @@ fn print_human_record(record: &DecisionRecord) -> Result<(), String> {
         output.push_str(&format!("  {}. {}{}\n", index + 1, choice, selected));
     }
     output.push_str(&format!("Decision: {}\n", record.decision));
-    util::stdout_text(&output)
+    let mut safe = String::with_capacity(output.len());
+    for character in output.chars() {
+        if (character.is_control() && !matches!(character, '\n' | '\t'))
+            || util::is_bidi_control(character)
+        {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    util::stdout_text(&safe)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
@@ -588,6 +610,22 @@ mod tests {
         assert!(time_matches(&record, Some(2_000), Some(2_001)));
         assert!(!time_matches(&record, Some(2_001), None));
         assert!(!time_matches(&record, None, Some(2_000)));
+    }
+
+    #[test]
+    fn fractional_bounds_preserve_membership_and_window_order() {
+        let lower = "1970-01-01T00:00:02.000000001Z";
+        let upper = "1970-01-01T00:00:02.000999999Z";
+        let (since, _) = parse_time_window("list", Some(lower), None).unwrap();
+        let (_, until) = parse_time_window("list", None, Some(lower)).unwrap();
+        assert!(!time_matches(&record(2_000), since, None));
+        assert!(time_matches(&record(2_000), None, until));
+        assert!(!time_matches(&record(2_001), None, until));
+        let (since, until) = parse_time_window("list", Some(lower), Some(upper)).unwrap();
+        assert_eq!((since, until), (Some(2_001), Some(2_001)));
+        assert!(!time_matches(&record(2_001), since, until));
+        assert!(parse_time_window("list", Some(upper), Some(lower)).is_err());
+        assert!(parse_time_window("list", Some(lower), Some(lower)).is_err());
     }
 
     #[test]

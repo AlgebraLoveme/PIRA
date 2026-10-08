@@ -88,6 +88,14 @@ pub fn run(store: &StoredResult, options: &TransformOptions) -> Result<Vec<Strin
     if options.plan.is_none() {
         return stream_direct(store, options);
     }
+    let path = options.plan.as_ref().unwrap();
+    let bytes = util::read_file_limited(path, MAX_PLAN_BYTES, "transform plan")?;
+    let plan: Plan =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid transform plan: {e}"))?;
+    validate_steps(&plan.steps)?;
+    if options.count && !plan.steps.is_empty() {
+        return Err("count is terminal; cannot follow --count with plan steps".into());
+    }
     let mut rows = load_rows(store)?;
     for pattern in &options.matches {
         rows = filter(rows, pattern, true)?;
@@ -108,18 +116,7 @@ pub fn run(store: &StoredResult, options: &TransformOptions) -> Result<Vec<Strin
     if options.count {
         return Ok(vec![rows.len().to_string()]);
     }
-    if let Some(path) = &options.plan {
-        let bytes = util::read_file_limited(path, MAX_PLAN_BYTES, "transform plan")?;
-        let plan: Plan =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid transform plan: {e}"))?;
-        if plan.steps.len() > MAX_PLAN_STEPS {
-            return Err(format!(
-                "transform plan is limited to {MAX_PLAN_STEPS} steps"
-            ));
-        }
-        return apply(rows, &plan.steps);
-    }
-    Ok(rows.into_iter().map(|r| r.text).collect())
+    apply(rows, &plan.steps)
 }
 
 fn check_materialization_budget(used: usize, next: u64) -> Result<(), String> {
@@ -169,12 +166,16 @@ fn stream_direct(store: &StoredResult, options: &TransformOptions) -> Result<Vec
     }
     let mut reader = store.reader()?;
     let mut seen = HashSet::new();
+    let mut seen_bytes = 0;
     let mut selected = 0_usize;
     let mut output = Vec::new();
     let mut tail = VecDeque::new();
     let mut tail_bytes = 0_usize;
     let mut output_bytes = 0_usize;
     for line in &store.metadata.line_timeline {
+        if options.head.is_some_and(|limit| selected >= limit) {
+            break;
+        }
         if line.length > MAX_MATERIALIZED_BYTES as u64 {
             return Err("transform line exceeds the 128 MiB safety limit".into());
         }
@@ -188,18 +189,8 @@ fn stream_direct(store: &StoredResult, options: &TransformOptions) -> Result<Vec
         {
             continue;
         }
-        if options.unique {
-            if seen.len() >= MAX_UNIQUE_VALUES && !seen.contains(&text) {
-                return Err(format!(
-                    "--unique exceeded {MAX_UNIQUE_VALUES} distinct values; narrow the input first"
-                ));
-            }
-            if !seen.insert(text.clone()) {
-                continue;
-            }
-        }
-        if options.head.is_some_and(|limit| selected >= limit) {
-            break;
+        if options.unique && !retain_unique(&mut seen, &mut seen_bytes, &text)? {
+            continue;
         }
         selected += 1;
         if options.count {
@@ -225,12 +216,36 @@ fn stream_direct(store: &StoredResult, options: &TransformOptions) -> Result<Vec
         }
     }
     if options.count {
+        if let Some(limit) = options.tail {
+            selected = selected.min(limit);
+        }
         return Ok(vec![selected.to_string()]);
     }
     if options.tail.is_some() {
         return Ok(tail.into());
     }
     Ok(output)
+}
+
+fn retain_unique(
+    seen: &mut HashSet<String>,
+    bytes: &mut usize,
+    text: &str,
+) -> Result<bool, String> {
+    if seen.contains(text) {
+        return Ok(false);
+    }
+    if seen.len() >= MAX_UNIQUE_VALUES {
+        return Err(format!(
+            "--unique exceeded {MAX_UNIQUE_VALUES} distinct values; narrow the input first"
+        ));
+    }
+    if text.len() > MAX_MATERIALIZED_BYTES.saturating_sub(*bytes) {
+        return Err("--unique exceeds the 128 MiB retention limit; narrow the input first".into());
+    }
+    *bytes += text.len();
+    seen.insert(text.to_owned());
+    Ok(true)
 }
 
 fn compile_patterns(patterns: &[String]) -> Result<Vec<regex::Regex>, String> {
@@ -252,7 +267,28 @@ fn unique(rows: Vec<Row>) -> Vec<Row> {
         .filter(|r| seen.insert(r.text.clone()))
         .collect()
 }
+fn validate_steps(steps: &[Step]) -> Result<(), String> {
+    if steps.len() > MAX_PLAN_STEPS {
+        return Err(format!(
+            "transform plan is limited to {MAX_PLAN_STEPS} steps"
+        ));
+    }
+    for (index, step) in steps.iter().enumerate().take(steps.len().saturating_sub(1)) {
+        if matches!(
+            step,
+            Step::Count | Step::GroupCount | Step::Sum | Step::Min | Step::Max | Step::Mean
+        ) {
+            return Err(format!(
+                "transform step {} is a terminal reduction; trailing steps are not allowed",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn apply(mut rows: Vec<Row>, steps: &[Step]) -> Result<Vec<String>, String> {
+    validate_steps(steps)?;
     let diagnostic_re =
         regex::Regex::new("(?i)(error|failed|failure|panic|exception|warning)").unwrap();
     for step in steps {
@@ -399,6 +435,60 @@ fn value_text(v: &serde_json::Value) -> String {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn reductions_are_terminal_and_preserve_final_results() {
+        for (op, expected) in [
+            ("count", "2"),
+            ("group_count", "1\t1\n1\t3"),
+            ("sum", "4"),
+            ("min", "1"),
+            ("max", "3"),
+            ("mean", "2"),
+        ] {
+            let reduction =
+                || serde_json::from_value::<Step>(serde_json::json!({"op": op})).unwrap();
+            let rows = || {
+                ["1", "3"]
+                    .into_iter()
+                    .map(|text| Row {
+                        text: text.into(),
+                        stream: StreamKind::Stdout,
+                    })
+                    .collect()
+            };
+            assert_eq!(apply(rows(), &[reduction()]).unwrap().join("\n"), expected);
+            assert_eq!(
+                apply(rows(), &[Step::Head { n: 2 }, reduction()])
+                    .unwrap()
+                    .join("\n"),
+                expected
+            );
+            assert!(
+                apply(rows(), &[reduction(), Step::Head { n: 0 }])
+                    .unwrap_err()
+                    .contains("terminal reduction")
+            );
+            assert!(apply(rows(), &[Step::Head { n: 1 }, reduction(), Step::Count]).is_err());
+        }
+        assert_eq!(apply(vec![], &[Step::Count]).unwrap(), ["0"]);
+        // Rust f64 Sum starts at negative zero; preserve that pre-existing result.
+        assert_eq!(apply(vec![], &[Step::Sum]).unwrap(), ["-0"]);
+        assert_eq!(apply(vec![], &[Step::Mean]).unwrap(), ["NaN"]);
+    }
+
+    #[test]
+    fn unique_bytes_charge_only_new_values_and_reject_before_insertion() {
+        let mut seen = HashSet::new();
+        let mut bytes = MAX_MATERIALIZED_BYTES - 3;
+        assert!(retain_unique(&mut seen, &mut bytes, "abc").unwrap());
+        assert_eq!(bytes, MAX_MATERIALIZED_BYTES);
+        assert!(!retain_unique(&mut seen, &mut bytes, "abc").unwrap());
+        assert!(retain_unique(&mut seen, &mut bytes, "d").is_err());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(bytes, MAX_MATERIALIZED_BYTES);
+    }
+
     #[test]
     fn materialization_preflight_rejects_before_copying() {
         assert!(check_materialization_budget(0, MAX_MATERIALIZED_BYTES as u64).is_ok());

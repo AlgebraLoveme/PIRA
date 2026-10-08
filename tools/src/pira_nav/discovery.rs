@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::language::Language;
-use crate::util::absolute_lexical;
+use crate::util::{absolute_lexical, reject_symlink_components};
 
 pub struct FileDiscovery {
     pub files: Vec<(PathBuf, Language)>,
@@ -89,7 +89,15 @@ pub fn discover_files_with_max_depth(
     selection: DiscoverySelection,
     max_depth: Option<usize>,
 ) -> FileDiscovery {
-    discover_filtered_files(root, selection, max_depth, &[]).expect("empty glob set is valid")
+    discover_filtered_files(root, selection, max_depth, &[]).unwrap_or_else(|error| FileDiscovery {
+        files: Vec::new(),
+        all_files: Vec::new(),
+        discovered: 0,
+        unsupported: 0,
+        ambiguous: 0,
+        walk_errors: vec![error],
+        walk_errors_total: 1,
+    })
 }
 
 pub fn discover_filtered_files(
@@ -98,6 +106,7 @@ pub fn discover_filtered_files(
     max_depth: Option<usize>,
     globs: &[String],
 ) -> Result<FileDiscovery, String> {
+    reject_symlink_components(root)?;
     let mut filters = ignore::overrides::OverrideBuilder::new(root);
     for glob in globs {
         filters
@@ -175,6 +184,13 @@ where
     let mut walk_errors_total = 0usize;
     for root in roots {
         let root = root.as_ref();
+        if let Err(error) = reject_symlink_components(root) {
+            walk_errors_total += 1;
+            if walk_errors.len() < 20 {
+                walk_errors.push(error);
+            }
+            continue;
+        }
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(true)

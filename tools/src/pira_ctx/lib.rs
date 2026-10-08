@@ -3,9 +3,11 @@ mod cli;
 mod events;
 mod help;
 mod model;
+mod native_path;
 mod python_exec;
 mod security;
 mod storage;
+mod store_location;
 mod summarize;
 mod transform;
 mod util;
@@ -41,8 +43,18 @@ pub fn run() -> i32 {
 }
 
 fn real_main() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string()
+                .map_err(|_| format!("argument {} is not valid UTF-8", index + 1))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let config = cli::parse_args(&args)?;
+    if !matches!(config.mode, Mode::Help | Mode::Version) {
+        store_location::warn_legacy_default(config.store_dir.as_ref());
+    }
     if matches!(config.mode, Mode::Auto | Mode::Exact)
         && util::stdout_is_data_destination()
         && util::stderr_is_data_destination()
@@ -170,6 +182,8 @@ fn run_exact(config: &Config) -> Result<i32, String> {
         let mut notice = util::BoundedStdout::report(1024, capture.redirected_stream);
         if capture.cancelled {
             notice.line("Cancelled command: partial captured output retained.")?;
+        } else if capture.drain_truncated {
+            notice.line("Exact output incomplete: post-exit pipe drain expired; only observed bytes were retained.")?;
         } else if capture.retention_truncated {
             notice.line(&format!(
                 "Exact output incomplete: kept {} of {} observed bytes after the output-space ceiling was reached; retained output is available through raw.",
@@ -357,7 +371,9 @@ fn run_check(config: &Config) -> Result<i32, String> {
     score_capture(config, &mut capture, &ranking)?;
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
-    let retention = if capture.retention_truncated {
+    let retention = if capture.drain_truncated {
+        " | drain_truncated=1 observed_bytes_are_lower_bounds=1".to_string()
+    } else if capture.retention_truncated {
         format!(
             " | retained={}/{}B",
             capture.total_bytes(),
@@ -766,6 +782,9 @@ fn print_retention_notice(
     if let Some(stream) = capture.redirected_stream {
         output.line(&format!("Scope: {stream} was redirected, not retained; counts and evidence cover the captured stream only"))?;
     }
+    if capture.drain_truncated {
+        output.line("Pipe drain incomplete: retained bytes are exact; observed byte counts are lower bounds, not complete output lengths")?;
+    }
     if capture.timeline_truncated {
         output.line(
             "Index: truncated; search covers only the indexed retained prefix; range unavailable",
@@ -898,8 +917,8 @@ fn run_search(config: &Config) -> Result<i32, String> {
             oversized += 1;
             continue;
         }
-        let text = reader.read_search_line(line)?;
-        let terms = if config.regex {
+        let (text, _) = reader.read_search_line(line)?;
+        let terms = if !config.approximate {
             Vec::new()
         } else {
             lexical_terms(&text)
@@ -912,18 +931,23 @@ fn run_search(config: &Config) -> Result<i32, String> {
                     &mut query.hits,
                     (
                         index,
-                        line.score + if config.regex { 70 } else { 80 } - penalty,
+                        line.score
+                            .saturating_add(if config.regex { 70 } else { 80 })
+                            .saturating_sub(penalty),
                     ),
                     lines,
                     config.search_limit,
                 );
-            } else if !config.regex && query.count == 0 {
+            } else if config.approximate && query.count == 0 {
                 let score = lexical_score_terms(&terms, &query.terms);
                 if score > 0 {
                     query.lexical_count += 1;
                     offer_search_hit(
                         &mut query.lexical_hits,
-                        (index, line.score + score - penalty),
+                        (
+                            index,
+                            line.score.saturating_add(score).saturating_sub(penalty),
+                        ),
                         lines,
                         config.search_limit,
                     );
@@ -974,12 +998,13 @@ fn run_search(config: &Config) -> Result<i32, String> {
                 continue;
             };
             let line = &lines[index];
-            let raw = if hit {
+            let (raw, risk) = if hit {
                 reader.read_search_line(line)?
             } else {
-                reader.read_security_line(line)?
+                let raw = reader.read_security_line(line)?;
+                let risk = security::inspect(&raw);
+                (raw, risk)
             };
-            let risk = security::inspect(&raw);
             let text = if hit && !lexical[qi] {
                 queries[qi].matcher.find(&raw).map_or_else(
                     || prepare_program_display(&raw).0,
@@ -1017,6 +1042,9 @@ fn run_search(config: &Config) -> Result<i32, String> {
     let mut output = util::BoundedStdout::new(64 * 1024);
     if store.metadata.timeline_truncated {
         output.line("Index: truncated; search covered only the indexed retained prefix")?;
+    }
+    if store.metadata.drain_truncated {
+        output.line("complete=0 drain_truncated=1; unobserved bytes are not recoverable")?;
     }
     if store.metadata.retention_truncated {
         output.line("complete=0 retention_truncated=1; discarded bytes are not recoverable")?;
@@ -1190,11 +1218,10 @@ fn run_raw(config: &Config) -> Result<i32, String> {
         Some(RawStream::Stderr) => Some(StreamKind::Stderr),
         None => None,
     };
-    if selected.is_some() && selected == store.metadata.redirected_stream {
-        return Err(format!(
-            "{} was redirected and was not retained",
-            selected.unwrap()
-        ));
+    if let Some(stream) = selected
+        && Some(stream) == store.metadata.redirected_stream
+    {
+        return Err(format!("{stream} was redirected and was not retained"));
     }
     let mut reader = store.reader()?;
     let mut output = io::stdout().lock();
@@ -1226,11 +1253,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
                 let path = storage::resolve_result(&dir, target)?;
                 let store = storage::read_result_path(&path)?;
                 let metadata = &store.metadata;
-                let state = if store.is_running() {
-                    "running"
-                } else {
-                    "complete"
-                };
+                let state = store.state();
                 let exit = if store.is_running() {
                     "unknown".to_string()
                 } else {
@@ -1290,7 +1313,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
             .saturating_sub(store.checkpoint_unix_ms().unwrap_or_default());
         util::stdout_line(&format!("CheckpointAge: {age} ms"))?;
     } else {
-        util::stdout_line("State: complete")?;
+        util::stdout_line(&format!("State: {}", store.state()))?;
     }
     util::stdout_line(&format!(
         "Command: {}",
@@ -1322,6 +1345,9 @@ fn run_stats(config: &Config) -> Result<i32, String> {
     util::stdout_line(&format!("Store: {}", store.path.display()))?;
     util::stdout_line(&format!("Created: {}", metadata.created_at))?;
     util::stdout_line(&format!("Tool: {}", metadata.tool_version))?;
+    if metadata.drain_truncated {
+        util::stdout_line("Drain: truncated; observed byte counts are lower bounds")?;
+    }
     util::stdout_line(&format!("Format: {}", store.format_version))?;
     util::stdout_line(&format!(
         "Index: indexed_lines={} truncated={}",
@@ -1367,7 +1393,11 @@ fn run_command(config: &Config) -> Result<i32, String> {
     let record = serde_json::json!({
         "argv": argv,
         "cwd": metadata.cwd,
-        "exact": exact,
+        "exact": exact && metadata.cwd_native.as_ref().map_or_else(
+            || native_path::legacy_is_exact(&metadata.cwd),
+            |path| matches!(path, native_path::NativePath::Utf8(text) if !text.is_empty() && text == &metadata.cwd),
+        ),
+        "cwd_native": metadata.cwd_native,
     });
     util::stdout_line(&serde_json::to_string(&record).map_err(|error| error.to_string())?)?;
     Ok(0)
@@ -1797,9 +1827,9 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                 Ok(capture) => capture,
                 Err(code) => {
                     if let Err(error) = events::record(&dir, &intent, &argv, code, 0, None) {
-                        eprintln!(
+                        util::diagnostic_line(&format!(
                             "pira_ctx: warning: batch child completed but event recording failed: {error}"
-                        );
+                        ));
                     }
                     completed.push((index, code, 0, None, intent));
                     continue;
@@ -1816,9 +1846,9 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                 capture.duration_ms,
                 Some(&stored.metadata),
             ) {
-                eprintln!(
+                util::diagnostic_line(&format!(
                     "pira_ctx: warning: batch child completed but event recording failed: {error}"
-                );
+                ));
             }
             completed.push((
                 index,

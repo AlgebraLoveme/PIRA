@@ -56,6 +56,7 @@ impl LspConfig {
                 executable.display()
             ));
         }
+        crate::util::reject_symlink_components(&root)?;
         if !root.is_dir() {
             return Err(format!("LSP root is not a directory: {}", root.display()));
         }
@@ -109,7 +110,7 @@ impl LspService {
             .then_some(language);
         if key.is_none() && self.configs.default.is_none() {
             return Err(format!(
-                "no LSP server is configured for {}",
+                "no LSP server is configured for {}; install a conventional server on PATH or pass --lsp LANGUAGE=ABSOLUTE_SERVER_PATH",
                 language.name()
             ));
         }
@@ -153,8 +154,35 @@ impl LspService {
         language: Language,
         source: &str,
     ) -> Result<Vec<Symbol>, String> {
+        let root = self
+            .configs
+            .languages
+            .get(&language)
+            .or(self.configs.default.as_ref())
+            .map(|config| &config.root)
+            .or(self.configs.auto_root.as_ref());
+        if let Some(root) = root {
+            crate::util::reject_symlink_components(root)?;
+            crate::util::reject_symlink_components(path)?;
+            let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+            let source = fs::canonicalize(path).map_err(|error| error.to_string())?;
+            if !source.starts_with(&root) {
+                return Err("structural target is outside the selected LSP root".into());
+            }
+        }
         self.client(language)?
             .document_symbols(path, language, source)
+    }
+
+    pub fn require_definitions(&mut self, language: Language) -> Result<(), String> {
+        self.client(language)?
+            .require_definitions()
+            .map_err(|error| {
+                format!(
+                    "{error}; import resolution needs textDocument/definition for {}",
+                    language.name()
+                )
+            })
     }
 
     pub fn definition(
