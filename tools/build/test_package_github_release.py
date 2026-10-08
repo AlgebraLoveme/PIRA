@@ -53,7 +53,6 @@ class PackageGitHubReleaseTests(unittest.TestCase):
                 "pira_dec": "0.5.1",
                 "pira_nav": "0.11.0",
                 "pira_svg_check": "0.1.0",
-                "pira_team": "0.2.0",
             }
             for tool, version in versions.items():
                 self.make_bundle(root, tool, version)

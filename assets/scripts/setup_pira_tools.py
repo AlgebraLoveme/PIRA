@@ -12,10 +12,8 @@ import json
 import os
 import re
 import shutil
-import shlex
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -31,19 +29,6 @@ SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
 RETIRED_TOOLS = {"pira_codenav"}
-TEAM_CODEX_MIN_VERSION = (0, 159, 0)
-CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
-MAX_CODEX_BYTES = 512 * 1024 * 1024
-CODEX_PACKAGE_DIR = ".pira-codex"
-CODEX_TARGETS = {
-    "darwin-x64": "x86_64-apple-darwin",
-    "darwin-arm64": "aarch64-apple-darwin",
-    "linux-x64": "x86_64-unknown-linux-musl",
-    "linux-arm64": "aarch64-unknown-linux-musl",
-    "windows-x64": "x86_64-pc-windows-msvc",
-    "windows-arm64": "aarch64-pc-windows-msvc",
-}
-CODEX_INSTALL_GUIDE = "https://learn.chatgpt.com/docs/cli"
 RELEASE_REPOSITORY = "AlgebraLoveme/PIRA"
 RELEASE_INDEX_NAME = "pira-tools-release.json"
 LATEST_RELEASE_BASE = (
@@ -266,7 +251,6 @@ def parse_versions(values: list[str] | None) -> dict[str, str]:
         "dec": "pira_dec",
         "nav": "pira_nav",
         "svg": "pira_svg_check",
-        "team": "pira_team",
     }
     versions: dict[str, str] = {}
     for value in values or []:
@@ -424,8 +408,13 @@ def shell_profiles() -> list[Path]:
 
 
 def shell_path_line(directory: Path) -> str:
-    value = shlex.quote(str(directory))
-    return f'case ":$PATH:" in *:{value}:*) ;; *) export PATH={value}:"$PATH" ;; esac'
+    home = Path.home()
+    try:
+        relative = directory.relative_to(home)
+        value = f'$HOME/{relative.as_posix()}'
+    except ValueError:
+        value = "'" + str(directory).replace("'", "'\\''") + "'"
+    return f'case ":$PATH:" in *":{value}:"*) ;; *) export PATH="{value}:$PATH" ;; esac'
 
 
 def update_managed_block(path: Path, body: str, dry_run: bool) -> bool:
@@ -486,19 +475,12 @@ def windows_user_path(directory: Path, dry_run: bool) -> bool:
     return True
 
 
-def ensure_path(directory: Path, dry_run: bool, *, include_codex: bool = False) -> bool:
-    codex_bin = directory / CODEX_PACKAGE_DIR / "bin"
-    directories = [directory]
-    if include_codex or executable_path(codex_bin, "codex").is_file():
-        directories.append(codex_bin)
-    changed = False
+def ensure_path(directory: Path, dry_run: bool) -> bool:
     if os.name == "nt":
-        for entry in directories:
-            changed = windows_user_path(entry, dry_run) or changed
-    else:
-        body = "\n".join(shell_path_line(entry) for entry in directories)
-        for path in shell_profiles():
-            changed = update_managed_block(path, body, dry_run) or changed
+        return windows_user_path(directory, dry_run)
+    changed = False
+    for path in shell_profiles():
+        changed = update_managed_block(path, shell_path_line(directory), dry_run) or changed
     return changed
 
 
@@ -547,11 +529,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
-    parser.add_argument(
-        "--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
-        help="Missing Team login: auto uses browser in a terminal, otherwise device link/code; "
-             "skip fails without signing in. Verify/dry-run never start login.",
-    )
     parser.add_argument(
         "--verify", action="store_true", help="Verify installed tools without changing them."
     )
@@ -695,238 +672,6 @@ def tool_selection(
     )
 
 
-def check_team_runtime(tools: list[str], executable: str | None = None) -> str | None:
-    """Check the backend only when Team is selected; never log in or install Codex."""
-    if "pira_team" not in tools:
-        return None
-    executable = executable or shutil.which("codex")
-    guidance = (
-        "Install/update the Codex CLI on the agent's execution host and make codex available "
-        f"in its PATH, then rerun setup: {CODEX_INSTALL_GUIDE}. "
-        "You can keep using the app or IDE extension; the terminal UI need not be running."
-    )
-    if executable is None:
-        raise RuntimeError(f"pira_team requires the Codex executable. {guidance}")
-    def probe(arguments: list[str]) -> str:
-        try:
-            result = subprocess.run(
-                [executable, *arguments], stdin=subprocess.DEVNULL,
-                capture_output=True, text=True, timeout=10, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError(f"Cannot check the Codex backend for pira_team: {error}. {guidance}") from error
-        if result.returncode != 0:
-            raise RuntimeError(f"Codex {' '.join(arguments)} failed (exit {result.returncode}). {guidance}")
-        return result.stdout.strip()
-    version_text = probe(["--version"])
-    version = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)(?:\+[A-Za-z0-9.-]+)?", version_text)
-    if version is None:
-        raise RuntimeError(f"Cannot verify a stable Codex version for pira_team. {guidance}")
-    if tuple(map(int, version.groups())) < TEAM_CODEX_MIN_VERSION:
-        minimum = ".".join(map(str, TEAM_CODEX_MIN_VERSION))
-        raise RuntimeError(f"pira_team requires Codex >= {minimum}; found {version_text}. {guidance}")
-    help_text = probe(["app-server", "--help"])
-    missing = [flag for flag in ("--stdio", "--strict-config")
-               if re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", help_text) is None]
-    if missing:
-        raise RuntimeError(
-            "Codex app-server lacks required options: " + ", ".join(missing)
-            + ". Use a compatible Codex build (tested with 0.159.0); " + guidance
-        )
-    return version_text
-
-
-
-def install_codex(install_dir: Path, platform_key: str) -> Path:
-    """Install the latest stable official package without login or remote script execution."""
-    target = CODEX_TARGETS.get(platform_key)
-    if target is None:
-        raise RuntimeError(f"Automatic Codex installation does not support {platform_key}")
-    destination = install_dir / CODEX_PACKAGE_DIR
-    if destination.exists() or destination.is_symlink():
-        raise RuntimeError(f"Refusing to overwrite existing Codex package: {destination}")
-    try:
-        release = json.loads(request_bytes(CODEX_RELEASE_API, limit=MAX_INDEX_BYTES,
-                                           accept="application/vnd.github+json"))
-    except (ValueError, UnicodeError) as error:
-        raise RuntimeError("Invalid official Codex release metadata") from error
-    tag = release.get("tag_name", "") if isinstance(release, dict) else ""
-    if (not isinstance(tag, str) or not re.fullmatch(r"rust-v[0-9]+\.[0-9]+\.[0-9]+", tag)
-            or release.get("draft") is not False or release.get("prerelease") is not False):
-        raise RuntimeError("Cannot resolve a stable official Codex release")
-    name = f"codex-package-{target}.tar.gz"
-    assets = release.get("assets", [])
-    if not isinstance(assets, list):
-        raise RuntimeError("Invalid Codex release assets")
-    matches = [a for a in assets if isinstance(a, dict) and a.get("name") == name]
-    if len(matches) != 1:
-        raise RuntimeError(f"Official Codex release lacks a unique package for {platform_key}")
-    asset = matches[0]
-    digest = asset.get("digest", "")
-    size = asset.get("size")
-    if (not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)
-            or type(size) is not int or not 0 < size <= MAX_CODEX_BYTES):
-        raise RuntimeError("Invalid Codex package checksum or size")
-    # Construct the official URL; do not execute URLs/scripts supplied by metadata.
-    url = f"https://github.com/openai/codex/releases/download/{tag}/{name}"
-    print(f"Installing missing Codex: {tag} ({platform_key}) -> {destination}")
-    with tempfile.TemporaryDirectory(prefix="pira-codex-download-") as temporary:
-        archive = Path(temporary) / name
-        request_to_path(url, archive, limit=MAX_CODEX_BYTES, expected_size=size,
-                        expected_hash=digest[7:].lower())
-        install_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".pira-codex-stage-", dir=install_dir) as stage:
-            package = Path(stage) / "package"
-            package.mkdir()
-            # Never extract links, devices or archive-provided permissions/ownership.
-            total = 0
-            seen: set[str] = set()
-            try:
-                with tarfile.open(archive, "r:gz") as tar:
-                    for member in tar:
-                        parts = member.name.split("/")
-                        parts = [part for part in parts if part != "."]
-                        if (not parts or any(not part or part == ".." or
-                                re.search(r'[\\:\x00-\x1f]', part) for part in parts)
-                                or member.name.startswith("/") or len(seen) >= 1024):
-                            raise RuntimeError("Unsafe Codex archive path")
-                        relative = "/".join(parts)
-                        if relative in seen:
-                            raise RuntimeError("Duplicate Codex archive path")
-                        seen.add(relative)
-                        out = package.joinpath(*parts)
-                        if member.isdir():
-                            out.mkdir(parents=True, exist_ok=True)
-                        elif member.isfile():
-                            total += member.size
-                            if member.size < 0 or total > 2 * MAX_CODEX_BYTES:
-                                raise RuntimeError("Expanded Codex package exceeds safety limit")
-                            out.parent.mkdir(parents=True, exist_ok=True)
-                            source = tar.extractfile(member)
-                            if source is None:
-                                raise RuntimeError("Missing Codex archive member")
-                            with source, out.open("xb") as sink:
-                                shutil.copyfileobj(source, sink)
-                            out.chmod(0o755 if member.mode & 0o111 else 0o644)
-                        else:
-                            raise RuntimeError("Codex archive contains a link or special file")
-            except tarfile.TarError as error:
-                raise RuntimeError(f"Invalid Codex package archive: {error}") from error
-            suffix = ".exe" if platform_key.startswith("windows-") else ""
-            required = ["codex-package.json", f"bin/codex{suffix}",
-                        f"bin/codex-code-mode-host{suffix}", f"codex-path/rg{suffix}"]
-            if platform_key.startswith("linux-"):
-                required.append("codex-resources/bwrap")
-            if any(not (package / entry).is_file() for entry in required):
-                raise RuntimeError("Incomplete Codex package")
-            binary = package / "bin" / f"codex{suffix}"
-            version = check_team_runtime(["pira_team"], str(binary))
-            if version != f"codex-cli {tag.removeprefix('rust-v')}":
-                raise RuntimeError("Downloaded Codex version does not match release metadata")
-            if destination.exists() or destination.is_symlink():
-                raise RuntimeError(f"Codex destination appeared during installation: {destination}")
-            package.rename(destination)
-    return destination / "bin" / f"codex{suffix}"
-
-
-def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
-                         *, verify: bool, dry_run: bool) -> str | None:
-    if "pira_team" not in tools:
-        return None
-    existing = shutil.which("codex")
-    managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    if existing:
-        return check_team_runtime(tools)
-    if managed.is_file():
-        return check_team_runtime(tools, str(managed))
-    if verify:
-        return check_team_runtime(tools)  # Fail without downloading or writing.
-    if dry_run:
-        print(f"DRY-RUN: would download latest stable Codex into {managed.parent.parent}")
-        return None
-    return check_team_runtime(tools, str(install_codex(install_dir, platform_key)))
-
-
-def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
-                     dry_run: bool, login: str) -> None:
-    """Check Team's auth source, initiating official login only during normal setup."""
-    if "pira_team" not in tools:
-        return
-    if dry_run and not verify:
-        print("DRY-RUN: would check Team-compatible Codex authentication and offer login if missing")
-        return
-    if os.environ.get("CODEX_API_KEY"):
-        print("OK: CODEX_API_KEY is configured for Team (not remotely validated)")
-        return
-    executable = shutil.which("codex") or str(
-        executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    )
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    auth_file = home / "auth.json"
-    # Team links file auth into a private home; a keyring-only status is insufficient.
-    command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
-    env = dict(os.environ)
-    for key in ("OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
-        env.pop(key, None)
-
-    def cached_login_ready() -> bool:
-        if not auth_file.is_file():
-            return False
-        try:
-            result = subprocess.run(
-                [*command, "status"], stdin=subprocess.DEVNULL, capture_output=True,
-                text=True, timeout=15, check=False, env=env,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError("Could not check Codex login status; fix the runtime/configuration "
-                               "and rerun setup. No login was started.") from error
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1 and "Not logged in" in (result.stdout + result.stderr).splitlines():
-            return False
-        # Status may include an account identifier or partial key; never echo its output.
-        raise RuntimeError("Codex login status failed unexpectedly; inspect Codex configuration "
-                           "or run codex login status privately. No automatic re-login was attempted.")
-
-    if cached_login_ready():
-        print("OK: Codex recognizes Team's file-backed login (model access not remotely validated)")
-        return
-    guidance = ("Rerun setup with --codex-login browser for local browser login, or "
-                "--codex-login device for a link/code. Device login must be enabled in "
-                "ChatGPT security/workspace settings. Admin-enforced storage rules are not bypassed.")
-    if verify or login == "skip":
-        raise RuntimeError("Team-compatible Codex login is missing. " + guidance)
-    mode = login
-    if mode == "auto":
-        mode = "browser" if sys.stdin.isatty() else "device"
-    print("Team needs a file-backed Codex login. The official flow will save credentials in "
-          "CODEX_HOME/auth.json (default ~/.codex/auth.json); protect this file like a password. "
-          "Global credential-storage configuration is unchanged.", flush=True)
-    if mode == "device":
-        command.append("--device-auth")
-        print("Open Codex's displayed link and enter its code. Device login must be enabled "
-              "in ChatGPT security/workspace settings.", flush=True)
-    else:
-        print("Complete login in the browser Codex opens, or use the URL it displays.", flush=True)
-    print("Waiting up to 5 minutes; Ctrl-C cancels. Run setup directly in a terminal "
-          "if your agent hides subprocess output.", flush=True)
-    try:
-        # Inherit output so the official URL/code reaches the user immediately.
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, env=env,
-                                timeout=300, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Codex login timed out. " + guidance) from error
-    except KeyboardInterrupt as error:
-        raise RuntimeError("Codex login cancelled; setup is incomplete.") from error
-    except OSError as error:
-        raise RuntimeError("Could not launch Codex login. " + guidance) from error
-    if result.returncode != 0:
-        raise RuntimeError("Codex login did not complete. " + guidance)
-    if not cached_login_ready():
-        raise RuntimeError("Login returned without a Team-compatible file cache. "
-                           "Check enforced credential-storage requirements. " + guidance)
-    print("OK: Team-compatible Codex login is ready (model access not remotely validated)")
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     selector = load_selector()
@@ -941,12 +686,6 @@ def main(argv: list[str] | None = None) -> int:
             "version specified for tool excluded by --tool: "
             + ", ".join(unselected_versions)
         )
-    runtime = prepare_team_runtime(tools, install_dir, platform_key,
-                                   verify=args.verify, dry_run=args.dry_run)
-    if runtime:
-        print(f"OK: Team backend {runtime}; required app-server options available")
-    ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,
-                     login=args.codex_login)
     indexes = {tool_name: index for tool_name in index["tools"]}
     historical_versions: dict[str, str] = {}
     for tool_name, version in requested_versions.items():
@@ -984,10 +723,6 @@ def main(argv: list[str] | None = None) -> int:
             version = direct_version(selection.destination)
             if not version_matches(selection.name, selection.version, version):
                 failures.append(f"{selection.name}: unexpected version: {version}")
-        codex_bin = install_dir / CODEX_PACKAGE_DIR / "bin"
-        if ("pira_team" in tools and not shutil.which("codex") and not args.no_path
-                and not path_is_configured(codex_bin)):
-            failures.append("managed Codex directory is not configured in the user PATH")
         if not args.no_path and not path_is_configured(install_dir):
             failures.append("install directory is not configured in the user PATH")
         if failures:
@@ -1038,11 +773,10 @@ def main(argv: list[str] | None = None) -> int:
         remove_managed_legacy_tools(install_dir, args.dry_run)
 
     if not args.no_path:
-        ensure_path(install_dir, args.dry_run,
-                    include_codex="pira_team" in tools and not shutil.which("codex"))
+        ensure_path(install_dir, args.dry_run)
 
     if not args.dry_run:
-        restart_needed = "pira_team" in tools and not shutil.which("codex")
+        restart_needed = False
         for selection in selections:
             version = direct_version(selection.destination)
             if not version_matches(selection.name, selection.version, version):

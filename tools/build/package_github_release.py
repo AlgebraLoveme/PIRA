@@ -12,7 +12,7 @@ import tarfile
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team")
+TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check")
 PLATFORMS = (
     "darwin-arm64",
     "darwin-x64",
