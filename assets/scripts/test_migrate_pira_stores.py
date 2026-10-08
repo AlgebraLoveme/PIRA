@@ -364,6 +364,30 @@ class MigrationTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(RuntimeError):
                 migration.transform_team_manifest(self.team_manifest(old, **changes), old, new)
 
+    def test_team_first_revision_root_outputs_are_field_scoped(self):
+        old = self.source / "run-id"
+        new = self.destination / "run-id"
+        for directory in (Path(), Path("revisions/000002")):
+            with self.subTest(directory=directory):
+                raw = self.team_manifest(old, logs=str(old / directory), attempts=[{
+                    "logs": str(old / directory),
+                    "candidate": str(old / directory / "candidate.txt"),
+                    "diagnostics": str(old / directory / "validation.json"),
+                }])
+                result = json.loads(migration.transform_team_manifest(raw, old, new))
+                self.assertEqual(result["logs"], str(new / directory))
+                self.assertEqual(result["attempts"][0], {
+                    "logs": str(new / directory),
+                    "candidate": str(new / directory / "candidate.txt"),
+                    "diagnostics": str(new / directory / "validation.json"),
+                })
+        for field, path in (("candidate", old), ("candidate", old / "auth.json"),
+                            ("logs", old / "candidate.txt"),
+                            ("diagnostics", old / "candidate.txt")):
+            with self.subTest(field=field, path=path), self.assertRaises(RuntimeError):
+                migration.transform_team_manifest(
+                    self.team_manifest(old, attempts=[{field: str(path)}]), old, new)
+
     @patch('team_store_relocation._VALIDATED_PLATFORMS', frozenset())
     def test_team_same_id_compares_whole_transformed_history_and_omits_capabilities(self):
         old = self.source / "run-id"

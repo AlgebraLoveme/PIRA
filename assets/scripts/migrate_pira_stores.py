@@ -291,7 +291,7 @@ def transform_team_manifest(data: bytes, source_run: Path, destination_run: Path
         if any(part in ("", ".", "..") for part in re.split(r"[\\/]", value)):
             raise RuntimeError("Team artifact contains non-normal path components")
         return Path(value)
-    def managed(value):
+    def managed(value, field):
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise RuntimeError("Team managed field must be an absolute path")
         if any(part in (".", "..") for part in re.split(r"[\\/]", value)):
@@ -300,12 +300,16 @@ def transform_team_manifest(data: bytes, source_run: Path, destination_run: Path
             tail = Path(value).relative_to(source_run)
         except ValueError as error:
             raise RuntimeError("Team managed field lies outside its actual source run") from error
-        if not tail.parts or tail.parts[0] not in ("artifacts", "logs", "implementation", "revisions"):
+        # Revision one writes launcher outputs directly in the run directory.
+        first_revision = ((field == "logs" and not tail.parts)
+                          or (field == "candidate" and tail.parts == ("candidate.txt",))
+                          or (field == "diagnostics" and tail.parts == ("validation.json",)))
+        if not first_revision and (not tail.parts or tail.parts[0] not in ("artifacts", "logs", "implementation", "revisions")):
             raise RuntimeError("Unsupported Team managed artifact layout")
         return str(destination_run / tail)
     for key in ("result", "logs", "review_checkpoint"):
         if manifest.get(key) is not None:
-            manifest[key] = managed(manifest[key])
+            manifest[key] = managed(manifest[key], key)
     if manifest.get("artifact") is not None:
         relative(manifest["artifact"])
     for key in ("attempts", "revisions"):
@@ -316,7 +320,7 @@ def transform_team_manifest(data: bytes, source_run: Path, destination_run: Path
     for attempt in manifest.get("attempts", []):
         for key in ("logs", "candidate", "diagnostics"):
             if attempt.get(key) is not None:
-                attempt[key] = managed(attempt[key])
+                attempt[key] = managed(attempt[key], key)
     for revision in manifest.get("revisions", []):
         for key in ("artifact", "manifest"):
             if revision.get(key) is not None:
