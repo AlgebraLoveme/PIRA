@@ -509,6 +509,7 @@ class AutoRecapTests(unittest.TestCase):
         config.write_text('model = "custom"\n')
         code = ("import sys; from pathlib import Path; from unittest.mock import patch, MagicMock; "
                 + "sys.path.insert(0," + repr(str(SCRIPT.parent.resolve())) + "); import setup_pira as s; "
+                + "profiles=patch.object(s.audio_retirement,'default_profiles',return_value=[Path(" + repr(str(root / ".zshrc")) + ")]); profiles.start(); "
                 + "registry=MagicMock(); registry.OpenKey.side_effect=FileNotFoundError; "
                 + "winreg=patch.dict(sys.modules,{'winreg':registry}); winreg.start(); "
                 + "notify=patch.object(s.stores,'notify_windows_environment'); notify.start(); "
@@ -520,6 +521,7 @@ class AutoRecapTests(unittest.TestCase):
                 + "choose=lambda tools,*a,**kw: {s.stores.STORE_ENV_KEYS[t]:paths[s.stores.STORE_ENV_KEYS[t]] for t in tools if t in s.stores.STORE_ENV_KEYS}; "
                 + "selection=patch.object(s.stores,'selected_store_paths',side_effect=choose); selection.start(); "
                 + "result=s.main(" + repr(["--agent-dir", str(root / "agent"), "--codex-config", str(config), "--skip-tools", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]) + "); "
+                + "s.audio_retirement.default_profiles.assert_called_once(); "
                 + "registry.SetValueEx.assert_not_called(); s.stores.notify_windows_environment.assert_not_called(); raise SystemExit(result)")
         env.update(PIRA_CTX_STORE_DIR=str(destination), PIRA_DEC_STORE_DIR=str(root / "dec"), PIRA_TEAM_DIR=str(root / "team"))
         captured = subprocess.run([binary, "capture", "--interest", "(?i)active|error", "--intent", "probe fresh captured setup", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)

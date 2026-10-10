@@ -775,6 +775,20 @@ mod tests {
         }
     }
 
+    fn literal_parent_path(path: &Path) -> PathBuf {
+        // PathBuf::join normalizes parent components for Windows verbatim paths.
+        let mut raw = path.as_os_str().to_os_string();
+        raw.push(std::path::MAIN_SEPARATOR_STR);
+        raw.push("..");
+        let path = PathBuf::from(raw);
+        assert!(
+            path.components()
+                .any(|component| component == Component::ParentDir),
+            "parent fixture was normalized: {path:?}"
+        );
+        path
+    }
+
     #[test]
     fn decision_anchor_capture_and_retention_preserve_canonical_scope() {
         let dir = TestDir::new();
@@ -800,13 +814,14 @@ mod tests {
         for value in [json!("relative"), json!([]), json!(dir.0.join("missing"))] {
             assert!(retained_dec_workspace(&json!({"dec_workspace":value})).is_err());
         }
-        assert!(retained_dec_workspace(&json!({"dec_workspace":child.join("..")})).is_err());
+        let parent = literal_parent_path(&child);
+        assert!(retained_dec_workspace(&json!({"dec_workspace":parent})).is_err());
     }
 
     #[test]
     fn retained_dec_workspace_rejects_parent_components_before_io() {
         let dir = TestDir::new();
-        let path = dir.0.canonicalize().unwrap().join("missing").join("..");
+        let path = literal_parent_path(&dir.0.canonicalize().unwrap().join("missing"));
         assert_eq!(
             retained_dec_workspace(&json!({"dec_workspace":path})).unwrap_err(),
             "persisted dec_workspace must remain the same canonical directory"

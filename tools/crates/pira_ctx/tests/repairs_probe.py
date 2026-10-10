@@ -156,19 +156,27 @@ def exec_case():
     path = capture(store, "exact α bytes")
     native = ROOT / "temp-�-é"
     native.mkdir()
-    environments = [{**ENV, "TMPDIR": str(native)}]
+    environments = [{**ENV, "TMPDIR": str(native), "TMP": str(native), "TEMP": str(native)}]
     if os.name == "posix" and sys.platform != "darwin":
         bad = os.fsencode(ROOT) + b"/native-\xff"
         os.mkdir(bad)
-        environments.append({**ENV, "TMPDIR": os.fsdecode(bad)})
-    code = "import os;assert isinstance(MSG_PATH,str);assert open(MSG_PATH,'rb').read()==MSG_BYTES;assert open(MSG_STDOUT_PATH,'rb').read()==MSG_BYTES;assert open(MSG_STDERR_PATH,'rb').read()==b'';print(MSG.strip())"
+        environments.append({**ENV, "TMPDIR": os.fsdecode(bad), "TMP": os.fsdecode(bad), "TEMP": os.fsdecode(bad)})
+    code = ("import os,sys;assert isinstance(MSG_PATH,str);"
+            "assert os.path.samefile(os.path.dirname(os.path.dirname(MSG_PATH)),os.environ['TMPDIR']);"
+            "assert open(MSG_PATH,'rb').read()==MSG_BYTES;"
+            "assert open(MSG_STDOUT_PATH,'rb').read()==MSG_BYTES;"
+            "assert open(MSG_STDERR_PATH,'rb').read()==b'';"
+            "sys.stdout.buffer.write(MSG.strip().encode('utf-8')+b'\\n')")
     for env in environments:
         result = run(store, "exec", path, "--code", code, env=env)
-        assert ok(result).strip() == "exact α bytes"
+        assert ok(result) == "exact α bytes\n", (result.returncode, result.stdout, result.stderr)
         assert not list(Path(env["TMPDIR"]).glob(".pira_ctx-exec-*"))
     # Multiple labels keep the same public eager snapshot/path API.
-    code = "assert CAPTURE_NAMES==['first','second'];assert CAPTURES['first']['bytes']==CAPTURES['second']['bytes'];print('snapshots')"
-    assert ok(run(store, "exec", "--input", "first=" + str(path), "--input", "second=" + str(path), "--code", code)).strip() == "snapshots"
+    code = ("import sys;assert CAPTURE_NAMES==['first','second'];"
+            "assert CAPTURES['first']['bytes']==CAPTURES['second']['bytes'];"
+            "sys.stdout.buffer.write(b'snapshots\\n')")
+    result = run(store, "exec", "--input", "first=" + str(path), "--input", "second=" + str(path), "--code", code)
+    assert ok(result) == "snapshots\n", (result.returncode, result.stdout, result.stderr)
 
 
 def attention():
@@ -317,7 +325,7 @@ with tempfile.TemporaryDirectory(prefix="pira-ctx-repair-") as temporary:
     spool.mkdir()
     ENV = {**os.environ, "TMPDIR": str(spool), "PIRA_CTX_STORE_DIR": str(ROOT / "unused"), "PIRA_CTX_THREAD_ID": "repair-regression"}
     # Both capture and exec children must emit UTF-8, including on CP1252 hosts.
-    ENV["PYTHONIOENCODING"] = "utf-8"
+    ENV.update(PYTHONIOENCODING="utf-8", TMP=str(spool), TEMP=str(spool))
     {"search": search, "check": check, "history": history, "index": index,
      "prune": prune, "exec": exec_case, "attention": attention,
      "controls": controls, "checkpoints": checkpoints, "interrupted": interrupted}[CASE]()
