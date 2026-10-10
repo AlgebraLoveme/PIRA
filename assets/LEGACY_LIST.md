@@ -17,3 +17,10 @@ Legacy files removed from the active scheme. During setup or migration, if any o
 - `~/agent/tools/src/pira_team/code_review.md` — renamed and broadened as `review.md`.
 
 - `~/agent/tools/crates/pira_team/build.rs` — removed; the three worker policies are embedded directly.
+
+- `~/agent/assets/scripts/setup_codex_audio_mode.py` — audio installation retired; use `retire_pira_audio.py` for narrowly validated, backed-up cleanup.
+- `~/agent/assets/scripts/setup_codex_audio_mode.sh` — retired audio installer wrapper.
+- `~/agent/assets/scripts/setup_codex_audio_mode_windows.ps1` — retired audio installer wrapper.
+- `~/agent/assets/AUDIO_CUSTOMIZATION_GUIDE.md` — retired audio customization support.
+
+Tracked default audio assets were removed from the repository. Local/custom media are not cleanup targets; do not delete `PIRA_Voice` directories or external hook/configuration paths based on this list.

@@ -11,12 +11,25 @@ use crate::storage::StoredResult;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-const BOOTSTRAP: &str = r#"import json, sys
-manifest_path, code_path, source_name = sys.argv[1:4]
+const BOOTSTRAP: &str = r#"import json, os, sys
+
+def decode_path(value):
+    if isinstance(value, str):
+        return value
+    if value["encoding"] == "unix_bytes":
+        return os.fsdecode(bytes(value["value"]))
+    if value["encoding"] == "windows_wide":
+        return b"".join(n.to_bytes(2, "little") for n in value["value"]).decode("utf-16-le", "surrogatepass")
+    raise ValueError("unsupported materialized path encoding")
+
+manifest_arg, code_arg, source_name = sys.argv[1:4]
+manifest_path, code_path = decode_path(json.loads(manifest_arg)), decode_path(json.loads(code_arg))
 with open(manifest_path, "rb") as _f:
     entries = json.load(_f)
 CAPTURES = {}
 for entry in entries:
+    for key in ("path", "stdout_path", "stderr_path"):
+        entry[key] = decode_path(entry[key])
     with open(entry["path"], "rb") as _f:
         exact = _f.read()
     CAPTURES[entry["name"]] = {
@@ -113,9 +126,9 @@ pub fn prepare(
         materialize(source, &merged_path, &stdout_path, &stderr_path)?;
         manifest.push(serde_json::json!({
             "name": name,
-            "path": merged_path.to_string_lossy(),
-            "stdout_path": stdout_path.to_string_lossy(),
-            "stderr_path": stderr_path.to_string_lossy(),
+            "path": exec_path(&merged_path)?,
+            "stdout_path": exec_path(&stdout_path)?,
+            "stderr_path": exec_path(&stderr_path)?,
             "id": source.metadata.result_id,
             "exit": if source.is_running() { serde_json::Value::Null } else { serde_json::json!(source.metadata.exit_code) },
             "state": source.state(),
@@ -147,14 +160,23 @@ pub fn prepare(
     command.extend([
         "-c".to_string(),
         BOOTSTRAP.to_string(),
-        manifest_path.display().to_string(),
-        code_path.display().to_string(),
+        serde_json::to_string(&exec_path(&manifest_path)?).map_err(|e| e.to_string())?,
+        serde_json::to_string(&exec_path(&code_path)?).map_err(|e| e.to_string())?,
         source_name,
     ]);
     Ok(PreparedExec {
         _workspace: workspace,
         command,
     })
+}
+
+// The manifest is private and ephemeral; Python receives ordinary strings unchanged.
+fn exec_path(path: &Path) -> Result<serde_json::Value, String> {
+    match path.to_str() {
+        Some(text) => Ok(serde_json::Value::String(text.into())),
+        None => serde_json::to_value(crate::native_path::NativePath::from_path(path))
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn read_stdin_limited() -> Result<Vec<u8>, String> {
@@ -294,4 +316,34 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = create_private(path)?;
     file.write_all(bytes)
         .map_err(|error| format!("write private analysis file: {error}"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn ephemeral_native_paths_decode_losslessly_without_filesystem_aliases() {
+        let raw = b"/tmp/native-\xff/input.log";
+        let path = PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec()));
+        let value = exec_path(&path).unwrap();
+        assert_eq!(value["encoding"], "unix_bytes");
+        let prefix = BOOTSTRAP.split("manifest_arg,").next().unwrap();
+        let code = format!(
+            "{prefix}\nsys.stdout.buffer.write(os.fsencode(decode_path(json.loads(sys.argv[1]))))"
+        );
+        let output = Command::new("python3")
+            .args(["-c", &code, &serde_json::to_string(&value).unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, raw);
+        let ordinary = Path::new("/tmp/literal-�-é/input.log");
+        assert_eq!(exec_path(ordinary).unwrap(), ordinary.to_str().unwrap());
+    }
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -240,7 +241,8 @@ class StoreConfigurationTests(unittest.TestCase):
 
     def test_shell_embedded_hash_and_comment_do_not_change_identity(self) -> None:
         value = (self.root / "name#literal").as_posix()
-        self.profile.write_text(f"export PIRA_CTX_STORE_DIR={value} # user's comment\n")
+        self.assertEqual(setup.shell_store_value("name#literal # user's comment", self.profile), "name#literal")
+        self.profile.write_text(f"export PIRA_CTX_STORE_DIR={shlex.quote(value)} # user's comment\n")
         self.assertEqual(setup.plan_store_environment(["pira_ctx"]).stores["PIRA_CTX_STORE_DIR"], str(Path(value)))
 
     def test_literal_shell_path_quotes_and_dollars_roundtrip(self) -> None:
@@ -379,6 +381,18 @@ class StoreConfigurationTests(unittest.TestCase):
         tools_setup.ensure_path(self.root / "bin", False)
         self.assertTrue(self.profile.read_bytes().startswith(original))
         self.assertEqual(setup.plan_store_environment(["pira_ctx"]).profiles, {})
+
+    def test_malformed_path_blocks_fail_before_changes(self):
+        block = setup.BLOCK_START + "\n" + setup.shell_path_line(self.root / "stale") + "\n" + setup.BLOCK_END + "\n"
+        for broken in (block + block, setup.BLOCK_END + "\n", setup.BLOCK_START + "\n",
+                       "prefix " + block, block.replace(setup.BLOCK_END, setup.BLOCK_END + " suffix")):
+            with self.subTest(broken=broken):
+                self.profile.write_bytes(broken.encode())
+                with self.assertRaisesRegex(RuntimeError, "PATH block"):
+                    setup.plan_store_environment(["pira_ctx"])
+                with self.assertRaisesRegex(RuntimeError, "PATH block"):
+                    tools_setup.ensure_path(self.root / "fresh", False)
+                self.assertEqual(self.profile.read_bytes(), broken.encode())
 
     def test_managed_store_crlf_preserves_surroundings_and_rejects_invalid_blocks(self) -> None:
         surrounding = '# opaque before\r\nprintf kept\r\n'

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const CONTRACT: &str = include_str!("backend_contract.json");
 const GUIDE: &str = "Install/update the native Codex CLI on this execution host (https://developers.openai.com/codex/app-server/); Team requires the published app-server API and strict-config support. No model call was started by this preflight.";
@@ -18,46 +18,48 @@ pub fn preflight(
     run: &Path,
     dir: &Path,
 ) -> Result<jsonschema::Validator, String> {
-    let check = || -> Result<jsonschema::Validator, String> {
-        let output = dir.join("backend-schema");
-        fs::create_dir(&output).map_err(|e| format!("create backend schema directory: {e}"))?;
-        let mut cmd = Command::new("codex");
-        cmd.args(["app-server", "generate-json-schema", "--out"])
-            .arg(&output)
-            .env("CODEX_HOME", run.join("codex-home"))
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(create(&dir.join("backend-check.log"))?);
-        isolate(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("generate native Codex schema: {e}"))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None)
-                    if Instant::now() < deadline
-                        && !crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) =>
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                result => {
-                    terminate(child.id());
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "native schema generation interrupted/timed out or failed: {result:?}"
-                    ));
-                }
-            }
+    let output = dir.join("backend-schema");
+    fs::create_dir(&output).map_err(|e| format!("create backend schema directory: {e}"))?;
+    let mut cmd = Command::new("codex");
+    cmd.args(["app-server", "generate-json-schema", "--out"])
+        .arg(&output)
+        .env("CODEX_HOME", run.join("codex-home"))
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(create(&dir.join("backend-check.log"))?);
+    isolate(&mut cmd);
+    if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("interrupted before native schema generation".into());
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("generate native Codex schema: {e}"))?;
+    let status = loop {
+        let result = if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("interrupted during native schema generation".to_owned())
+        } else {
+            child
+                .try_wait()
+                .map_err(|e| format!("wait for native schema generation: {e}"))
         };
-        if !status.success() {
-            return Err(format!(
-                "native schema generation failed ({status}); see backend-check.log"
-            ));
+        match result {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                terminate(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
+    };
+    if !status.success() {
+        return Err(format!(
+            "native schema generation failed ({status}); see backend-check.log"
+        ));
+    }
+    let check = || -> Result<jsonschema::Validator, String> {
         let schemas = contract()["schemas"].as_object().unwrap().clone();
         let mut request = None;
         for (file, expected) in schemas {

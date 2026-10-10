@@ -1,6 +1,7 @@
 mod app_server;
 mod artifact;
 mod backend;
+mod bookmarks;
 mod build_roots;
 mod lifecycle;
 mod profile;
@@ -22,7 +23,7 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-const WORKER_POLICY_VERSION: u64 = 13;
+const WORKER_POLICY_VERSION: u64 = 16;
 
 pub const POLICY: &str = include_str!("main.md");
 const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
@@ -33,9 +34,16 @@ Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inj
        pira_team steer RUN_ID --task TASK --completion-gate TEXT [--store DIR]
        pira_team interrupt RUN_ID [--store DIR]
        pira_team read|path RUN_ID [RELATIVE_FILE] [--store DIR]
+       pira_team bookmark RUN_REF --label LABEL [--store DIR]
+       pira_team unbookmark LABEL [--store DIR]
+       pira_team bookmarks [--limit N] [--store DIR]
+       pira_team search QUERY [--limit N] [--store DIR]
+       pira_team config show [--store DIR]
+       pira_team config set --main MODEL --model WORKER --effort EFFORT [--store DIR]
+       pira_team config reset --main MODEL [--store DIR]
 
 Use one quoted --task (also --task=TEXT) or --task-file FILE; the file is INPUT.
-Run options: --cwd DIR --store DIR --model MODEL --effort EFFORT
+Run options: --cwd DIR --store DIR --model MODEL --effort EFFORT --label LABEL
              --format auto|markdown|text|json|csv --schema FILE --columns JSON_ARRAY
              --output artifact|answer
 Resume can override model/effort/output. Taskless resume retains the assignment's gate.
@@ -77,6 +85,28 @@ decision under the same parent; their explicit environment overrides remain supp
 Older temporary-store runs require --store OLD_STORE or PIRA_TEAM_DIR until explicitly
 migrated. Retained runs embed absolute paths: do not simply move/merge run directories.
 Use the same store across commands. Read/path never launch a worker.
+Bookmarks are optional management metadata, never worker input. Labels are exact,
+case-sensitive, store-wide unique names (1..128 UTF-8 bytes, no edge whitespace,
+control characters, / or \; no leading @ or . / .. names). --label attaches after
+creation of the initial running manifest; later startup/worker failures retain the
+bookmark on that failed/interrupted run. Pre-run validation never moves a bookmark.
+Bookmark write failure fails the new run before worker launch. Errors before atomic
+replacement preserve prior mappings; a later directory-sync error reports replacement.
+The managed bookmarks.json index is bounded to 1 MiB; no automatic pruning is done.
+Contended edits wait up to 5 seconds for the metadata lock, then fail busy; readers
+observe complete snapshots. This budget never limits worker startup/inference.
+bookmark RUN_REF --label LABEL atomically adds/moves a label; its JSON receipt reports
+previous/current run references and changed. Same-target assignment is a no-write no-op.
+unbookmark LABEL removes only the mapping, never runs/artifacts; absence is a no-op.
+bookmarks lists labels; search performs case-insensitive literal keyword matching on
+labels only. Both return JSON matches (label, run_id, run_root) and has_more, ordered
+by exact label ascending, with --limit 1..1000 (default 20). Invalid/unreadable metadata
+fails visibly, never resets or reports partial results. No runs/logs are scanned.
+Use @LABEL as RUN_REF for resume/steer/interrupt/read/path/bookmark. Aliases resolve once
+at invocation; plain run IDs are never interpreted as labels. Missing labels fail closed.
+Metadata commands and read/path require no caller session/auth and launch no workers.
+Run/resume still require verified caller permissions. Absent bookmark state means empty;
+old stores/runs require no migration.
 
 --format auto lets the worker declare markdown/text/json/csv for its extensionless handoff.
 Explicit formats assign a matching extension. --schema requires json; --columns requires csv
@@ -102,10 +132,22 @@ cannot handle interactive approvals. Read-only callers cannot supply required ma
 Fine-grained restricted permission profiles are unsupported by this native API. Workspace-write
 callers must place managed Team/tool stores and configured build roots within their writable scope;
 Team does not add filesystem/network authority. Full access does not expand task ownership.
-Model/effort inherit the main's latest recorded profile; resume retains them. Explicit flags
-independently override them. If inheritance is unavailable/ambiguous, supply explicit values.
+On new runs, caller model exactly gpt-6-astra (at any effort) maps to gpt-6.1-sol/high.
+Recognized callers gpt-6.1-sol, gpt-6-sol, gpt-6-luna and gpt-5.6-sol inherit model/effort
+unchanged. Unknown or missing caller model identity falls back to gpt-6.1-sol/high, not the
+caller's effort. These bundled defaults apply unless config supplies an exact caller-model
+override; no aliases or network discovery are used. Config show displays bundled policy,
+overrides and their file path. Set requires both fields; reset removes only that caller's
+override. Config uses worker_defaults.json in the selected Team store, needs no Codex
+session, and launches no worker. Invalid config fails visibly without being overwritten;
+fix/restore the reported file before retrying. Caller discovery requires a matching Codex session
+and verified execution context; fallback does not enable Claude/non-Codex session discovery.
+Explicit --model and --effort independently override their respective fields, including
+partial overrides. Resume retains stored model/effort unless explicitly overridden; it does
+not reapply caller defaults. Missing effort for a recognized caller requires --effort;
+missing or ambiguous caller execution context always fails, even with explicit profile flags.
 Requires native Codex app-server with the published Team protocol and strict-config support,
-plus existing local file auth or CODEX_API_KEY. Preflight generates native schemas (10s limit);
+plus existing local file auth or CODEX_API_KEY. Preflight generates native schemas without an execution deadline;
 missing API fields/methods fail before model work. Sent requests are schema-validated.
 Direct stdio is separate from the interactive shared daemon; its version/features are not
 Team compatibility evidence. This checks published API inventory and outgoing request shapes,
@@ -132,6 +174,7 @@ struct Options {
     profile_sources: Value,
     execution: profile::Execution,
     task: String,
+    label: Option<String>,
     output: String,
     navigation: String,
     completion_gate: String,
@@ -139,6 +182,7 @@ struct Options {
     inject_implement: bool,
     ctx_store: PathBuf,
     dec_store: PathBuf,
+    dec_workspace: Option<PathBuf>,
     contract: artifact::Contract,
 }
 
@@ -157,6 +201,11 @@ fn tool_store(kind: &str, cwd: &Path) -> Result<PathBuf, String> {
     let path = storage::configured_root(key, if kind == "ctx" { "ctx" } else { "decision" })?;
     Ok(if path.is_absolute() {
         path
+    } else if kind == "dec" {
+        // Match the invoking Dec CLI before changing to the worker's cwd.
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
     } else {
         cwd.join(path)
     })
@@ -209,6 +258,7 @@ fn parse_using(
     let (mut schema, mut columns) = (None, None);
     let mut navigation = "nav".to_string();
     let mut gate = None;
+    let mut label = None;
     let mut inject_review = None;
     let mut inject_implement = None;
     let mut code_review = None;
@@ -235,6 +285,10 @@ fn parse_using(
             set_once(&mut gate, value.to_owned(), "--completion-gate")?;
             continue;
         }
+        if let Some(value) = arg.strip_prefix("--label=") {
+            set_once(&mut label, value.to_owned(), "--label")?;
+            continue;
+        }
         if arg == "--inject-review" {
             set_once(&mut inject_review, true, "--inject-review")?;
             continue;
@@ -255,6 +309,7 @@ fn parse_using(
             .next()
             .ok_or_else(|| format!("missing value for {arg}"))?;
         match arg.as_str() {
+            "--label" => set_once(&mut label, value.clone(), "--label")?,
             "--completion-gate" => set_once(&mut gate, value.clone(), "--completion-gate")?,
             "--cwd" => cwd = PathBuf::from(value),
             "--store" => store = Some(PathBuf::from(value)),
@@ -283,12 +338,17 @@ fn parse_using(
             "pira_team: --navigation shell is deprecated; normal ctx/nav/dec guidance is always injected"
         );
     }
+    if let Some(text) = &label {
+        bookmarks::validate_label(text)?;
+    }
     let completion_gate = completion_gate(gate)?;
     let task = task_input(task, task_file, None)?;
-    let (model, effort, profile_sources, execution) = profile::resolve(
+    let store = store.map(Ok).unwrap_or_else(storage::default_root)?;
+    let (model, effort, profile_sources, execution) = profile::resolve_with_store(
         model,
         effort,
         parent().map_err(|e| format!("cannot inherit verified caller execution/profile: {e}"))?,
+        &store,
     )?;
     if task.trim().is_empty() {
         return Err("task must be nonempty".into());
@@ -308,13 +368,17 @@ fn parse_using(
     Ok(Options {
         ctx_store: tool_store("ctx", &cwd)?,
         dec_store: tool_store("dec", &cwd)?,
+        dec_workspace: Some(lifecycle::decision_workspace(
+            &std::env::current_dir().map_err(|e| e.to_string())?,
+        )?),
         cwd,
-        store: store.map(Ok).unwrap_or_else(storage::default_root)?,
+        store,
         model,
         effort,
         profile_sources,
         execution,
         task,
+        label,
         output,
         navigation,
         completion_gate,
@@ -422,7 +486,8 @@ impl IsolatedHome {
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
                     .map(|p| PathBuf::from(p).join(".codex"))
             });
         if let Some(source) = source {
@@ -490,6 +555,12 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
             json!(value)
         ));
     }
+    if let Some(workspace) = &options.dec_workspace {
+        cmd.arg("-c").arg(format!(
+            "shell_environment_policy.set.PIRA_DEC_WORKSPACE_DIR={}",
+            json!(workspace)
+        ));
+    }
     cmd.arg("-c").arg(format!(
         "shell_environment_policy.set.PIRA_TEAM_HANDOFF={}",
         json!(handoff)
@@ -511,6 +582,7 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
             "PIRA_TEAM_CHILD",
             "PIRA_CTX_STORE_DIR",
             "PIRA_DEC_STORE_DIR",
+            "PIRA_DEC_WORKSPACE_DIR",
             "CODEX_API_KEY",
             "OPENAI_API_KEY",
             "OPENAI_ADMIN_KEY",
@@ -615,6 +687,13 @@ pub fn run() -> i32 {
     }
     let outcome = if matches!(args[0].as_str(), "read" | "path") {
         storage::access(&args)
+    } else if matches!(
+        args[0].as_str(),
+        "bookmark" | "unbookmark" | "bookmarks" | "search"
+    ) {
+        bookmarks::command(&args)
+    } else if args[0] == "config" {
+        profile::defaults::command(&args, storage::default_root)
     } else if matches!(args[0].as_str(), "resume" | "steer" | "interrupt") {
         lifecycle::existing(&args)
     } else {
@@ -674,7 +753,7 @@ mod tests {
         ] {
             assert!(safety.contains(expected), "{expected}");
         }
-        assert_eq!(WORKER_POLICY_VERSION, 13);
+        assert_eq!(WORKER_POLICY_VERSION, 16);
         assert!(!IMPLEMENTATION_POLICY.contains("exact prefix `Safety:`"));
     }
 

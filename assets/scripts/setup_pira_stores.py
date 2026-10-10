@@ -15,6 +15,7 @@ from pathlib import Path
 from types import ModuleType
 
 import migrate_pira_stores as migration
+import setup_migration_choices as choices
 
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
@@ -33,15 +34,17 @@ class StorePlan:
     notices: list[str] = field(default_factory=list)
     migrations: list[migration.Migration] = field(default_factory=list)
     team_migrations: list[migration.TeamMigration] = field(default_factory=list)
+    choices: list[choices.Choice] = field(default_factory=list)
+    team_metadata_migrations: list[migration.TeamMetadataMigration] = field(default_factory=list)
 
 
 def add_migration_arguments(parser) -> None:
     parser.add_argument("--completed-ctx-only", action="store_true",
-                        help="Idle maintenance: migrate completed Ctx captures and history; leave live/watch state at source. Existing owner locks are still checked.")
+                        help="Idle maintenance: migrate completed Ctx captures and history; leave live/watch state at source. Existing owner locks are still checked; successful choices persist for unchanged sources.")
     parser.add_argument("--exclude-ctx-record", action="append", default=[], metavar="FILENAME",
-                        help="Leave this explicitly rejected .piractx record at source; repeatable. No deletion or repair.")
+                        help="Leave this explicitly rejected .piractx record at source; repeatable. No deletion or repair; successful choices persist for unchanged sources.")
     parser.add_argument("--fresh-team", action="store_true",
-                        help="Use the selected Team store without importing historical default runs; preserve old stores.")
+                        help="Use the selected Team store without importing historical default runs; preserve old stores. Successful choices persist for unchanged sources.")
 
 
 def physical_store_path(value: str | Path) -> Path:
@@ -431,6 +434,8 @@ def plan_store_environment(
     stores = selected_store_paths(tools, overrides)
     relocations = []
     team_relocations = []
+    team_metadata = []
+    selections = []
     codex_legacy: set[str] = set()
     if codex_text is not None:
         parsed = parse_configuration(codex_text)
@@ -456,27 +461,30 @@ def plan_store_environment(
         if key is None:
             continue
         destination = Path(stores[key])
-        if tool == "pira_team":
-            if fresh_team:
-                notices.append("MIGRATION: historical Team stores left untouched (--fresh-team)")
-                continue
-            if stores[key] == defaults.get(key) or tool in codex_legacy:
-                destination = Path(defaults[key])
-                sources = [path for path in historical_store_paths(tool) if path != destination and path.exists()]
-                if sources:
-                    team_relocations.extend(migration.preflight_team_relocation(sources, destination, codex_binary=codex_binary))
-        elif stores[key] == defaults.get(key) or tool in codex_legacy:
+        if stores[key] == defaults.get(key) or tool in codex_legacy:
             destination = Path(defaults[key])
             sources = [path for path in historical_store_paths(tool) if path != destination and path.exists()]
+            selection = {}
+            if tool in ("pira_ctx", "pira_team"):
+                explicit = None
+                if tool == "pira_team" and fresh_team:
+                    explicit = {"fresh_team": True}
+                elif tool == "pira_ctx" and (completed_ctx_only or exclude_ctx_records):
+                    explicit = dict(completed_only=completed_ctx_only,
+                                    excluded_records=sorted(set(exclude_ctx_records)))
+                selection, receipt = choices.plan_choice(tool, sources, destination, explicit)
+                if receipt:
+                    selections.append(receipt)
+                    notices.append(f"MIGRATION: {tool} selective historical migration (successful choices remembered for unchanged sources)")
             if sources:
-                if (completed_ctx_only or exclude_ctx_records) and tool == "pira_ctx":
-                    relocations.append(migration.plan_migration(tool, sources, destination, completed_only=completed_ctx_only, excluded_records=frozenset(exclude_ctx_records)))
-                    if completed_ctx_only:
-                        notices.append("MIGRATION: Ctx live/watch state left untouched at historical sources (--completed-ctx-only)")
-                    for name in sorted(set(exclude_ctx_records)):
-                        notices.append(f"MIGRATION: rejected Ctx record left at source: {name}")
+                if tool == "pira_team":
+                    if not selection.get("fresh_team"):
+                        team_relocations.extend(migration.preflight_team_relocation(sources, destination, codex_binary=codex_binary))
+                        team_metadata.append(migration.plan_team_metadata(sources, destination))
                 else:
-                    relocations.append(migration.plan_migration(tool, sources, destination))
+                    relocations.append(migration.plan_migration(tool, sources, destination,
+                        completed_only=selection.get("completed_only", False),
+                        excluded_records=frozenset(selection.get("excluded_records", ()))))
     if sys.platform != "win32" and any("\n" in value or "\r" in value for value in stores.values()):
         raise RuntimeError("Shell store paths must be single-line; choose a path without newline characters")
     updates: dict[Path, tuple[str, str]] = {}
@@ -489,7 +497,7 @@ def plan_store_environment(
         if new != old:
             updates[path] = (old, new)
     registry_updates = {key: value for key, value in stores.items() if registry.get(key) != value} if sys.platform == "win32" else {}
-    return StorePlan(stores, updates, registry_updates, notices, relocations, team_relocations)
+    return StorePlan(stores, updates, registry_updates, notices, relocations, team_relocations, selections, team_metadata)
 
 
 def apply_store_migrations(plan: StorePlan, *, dry_run: bool, verify: bool = False) -> None:
@@ -498,8 +506,10 @@ def apply_store_migrations(plan: StorePlan, *, dry_run: bool, verify: bool = Fal
     Unified setup must retain this exact plan through its configuration writes.
     Standalone tools setup gets the barrier via apply_store_environment below.
     """
-    migration.apply_migrations(plan.migrations, dry_run=dry_run, verify=verify)
-    migration.apply_team_migrations(plan.team_migrations, dry_run=dry_run, verify=verify)
+    with choices.successful_choices(plan.choices, readonly=dry_run or verify):
+        migration.apply_migrations(plan.migrations, dry_run=dry_run, verify=verify)
+        migration.apply_team_migrations(plan.team_migrations, dry_run=dry_run, verify=verify)
+        migration.apply_team_metadata(plan.team_metadata_migrations, dry_run=dry_run, verify=verify)
 
 
 def apply_store_environment(
@@ -556,12 +566,12 @@ def shell_path_line(directory: Path) -> str:
 
 def managed_block_text(path: Path, old: str, body: str) -> str:
     block = f"{BLOCK_START}\n{body}\n{BLOCK_END}"
-    if BLOCK_START in old:
-        start = old.index(BLOCK_START)
-        end_marker = old.find(BLOCK_END, start)
-        if end_marker < 0:
-            raise RuntimeError(f"incomplete PIRA PATH block in {path}")
-        return old[:start] + block + old[end_marker + len(BLOCK_END):]
+    if BLOCK_START in old or BLOCK_END in old:
+        match = re.search(r"(?m)^" + re.escape(BLOCK_START) + r"\r?\n(?s:.*?)^"
+                          + re.escape(BLOCK_END) + r"(?=\r?$)", old)
+        if (match is None or old.count(BLOCK_START) != 1 or old.count(BLOCK_END) != 1):
+            raise RuntimeError(f"Invalid PIRA PATH block in {path}; repair its markers before setup")
+        return old[:match.start()] + block + old[match.end():]
     # Store exports stay last. Do not trim or reformat unrelated shell content.
     position = old.find(STORE_BLOCK_START)
     if position < 0:

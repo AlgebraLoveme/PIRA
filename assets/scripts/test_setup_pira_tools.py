@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import runpy
 import sys
 import subprocess
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("setup_pira_tools.py")
+sys.path.insert(0, str(SCRIPT.parent.resolve()))
 SPEC = importlib.util.spec_from_file_location("pira_tools_setup_test", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 setup = importlib.util.module_from_spec(SPEC)
@@ -304,11 +306,40 @@ class SetupPiraToolsTests(unittest.TestCase):
         network.start()
         self.addCleanup(network.stop)
 
+    @unittest.skipIf(os.name == "nt", "POSIX execute permission")
+    def test_nonexecutable_matching_binary_refresh_and_readonly_modes(self):
+        root = Path(setup.os.environ["HOME"])
+        binary = setup.executable_path(root / "bin", "pira_ctx")
+        binary.parent.mkdir()
+        binary.write_bytes(b"binary")
+        binary.chmod(0o644)
+        platform = setup.load_selector().current_platform()
+        args = ["--tool", "pira_ctx", "--no-path", "--install-dir", str(binary.parent)]
+        def download(tag, selection, directory):
+            source = directory / "pira_ctx"
+            source.write_bytes(b"binary")
+            return source
+        with patch.object(setup, "release_index", return_value=self.index(platform)), \
+             patch.object(setup, "download_binary", side_effect=download) as fetch, \
+             patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"):
+            self.assertEqual(setup.main([*args, "--dry-run"]), 0)
+            self.assertEqual(setup.main([*args, "--verify"]), 1)
+            fetch.assert_not_called()
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(setup.main(args), 0)
+            fetch.assert_called_once()
+            self.assertTrue(os.access(binary, os.X_OK))
+            inode = binary.stat().st_ino
+            self.assertEqual(setup.main(args), 0)
+            fetch.assert_called_once()
+            self.assertEqual(binary.stat().st_ino, inode)
+
     def test_no_path_skips_all_environment_persistence_and_verification(self) -> None:
         root = Path(setup.os.environ["HOME"])
         binary = setup.executable_path(root / "bin", "pira_ctx")
         binary.parent.mkdir()
         binary.write_bytes(b"binary")
+        binary.chmod(0o755)
         selector = setup.load_selector()
         platform_key = selector.current_platform()
         for mode in ([], ["--verify"], ["--dry-run"]):
@@ -318,7 +349,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                  patch.object(setup, "download_binary") as fetch, \
                  patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
                  patch.object(setup.stores, "plan_store_environment") as stores, patch.object(setup, "ensure_path") as path:
-                self.assertEqual(setup.main(["--no-path", "--no-team", "--install-dir", str(binary.parent), *mode]), 0)
+                self.assertEqual(setup.main(["--tool", "pira_ctx", "--no-path", "--install-dir", str(binary.parent), *mode]), 0)
                 fetch.assert_not_called()
                 stores.assert_not_called()
                 path.assert_not_called()
@@ -335,8 +366,9 @@ class SetupPiraToolsTests(unittest.TestCase):
         binary = setup.executable_path(root / "bin", "pira_ctx")
         binary.parent.mkdir()
         binary.write_bytes(b"binary")
+        binary.chmod(0o755)
         platform = setup.load_selector().current_platform()
-        args = ["--install-dir", str(binary.parent), "--no-team", "--tool", "pira_ctx"]
+        args = ["--install-dir", str(binary.parent), "--tool", "pira_ctx"]
         profiles = setup.stores.shell_profiles()
         with patch.object(setup, "release_index", return_value=self.index(platform)), \
              patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
@@ -361,20 +393,21 @@ class SetupPiraToolsTests(unittest.TestCase):
             self.assertEqual(setup.main(args), 0)
             self.assertEqual([profile.read_bytes() for profile in profiles], before)
 
-    def test_no_team_selection_and_conflicts(self) -> None:
+    def test_normal_selection_requires_team_but_partial_maintenance_is_allowed(self) -> None:
         index = self.index()
+        with self.assertRaisesRegex(RuntimeError, "requires a release containing pira_team"):
+            setup.selected_tools(index, None)
+        self.assertEqual(setup.selected_tools(index, ["pira_ctx"]), ["pira_ctx"])
         index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
         self.assertIn("pira_team", setup.selected_tools(index, None))
-        self.assertEqual(setup.selected_tools(index, None, no_team=True), ["pira_ctx"])
-        with self.assertRaisesRegex(RuntimeError, "conflicts"):
-            setup.selected_tools(index, ["pira_team"], no_team=True)
-        with patch.object(setup, "release_index", return_value=index), \
-             patch.object(setup, "prepare_team_runtime") as runtime:
+        with self.assertRaises(SystemExit):
+            setup.build_parser().parse_args(["--no-team"])
+        with patch.object(setup, "release_index", return_value=index), patch.object(setup, "prepare_team_runtime") as runtime:
             with self.assertRaisesRegex(RuntimeError, "excluded"):
-                setup.main(["--no-team", "--version", "team=0.2.0"])
+                setup.main(["--tool", "pira_ctx", "--version", "team=0.2.0"])
             runtime.assert_not_called()
 
-    def test_no_team_install_verify_and_dry_run_skip_backend_and_preserve_binary(self) -> None:
+    def test_partial_install_verify_and_dry_run_skip_backend_and_preserve_binary(self) -> None:
         selector = setup.load_selector()
         platform_key = selector.current_platform()
         index = self.index(platform_key)
@@ -387,6 +420,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                 ctx = setup.executable_path(root, "pira_ctx")
                 if mode:
                     ctx.write_bytes(b"binary")
+                    ctx.chmod(0o755)
                 def download(tag, selection, directory):
                     self.assertEqual(selection.name, "pira_ctx")
                     path = directory / selection.asset.removesuffix(".gz")
@@ -403,7 +437,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                      patch.object(setup, "path_is_configured", return_value=True):
                     if "--verify" in mode:
                         setup.stores.apply_store_environment(setup.stores.plan_store_environment(["pira_ctx"]), dry_run=False)
-                    self.assertEqual(setup.main(["--no-team", "--install-dir", str(root), *mode]), 0)
+                    self.assertEqual(setup.main(["--tool", "pira_ctx", "--install-dir", str(root), *mode]), 0)
                     runtime.assert_not_called()
                     auth.assert_not_called()
                     if mode:
@@ -675,7 +709,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                         self.assertEqual(result.stdout.strip(), expected)
                         # New PATH syntax must remain compatible with store inference.
                         with profile.open("a") as stream:
-                            stream.write("export PIRA_CTX_STORE_DIR=" + str(root / "ctx") + "\n")
+                            stream.write("export PIRA_CTX_STORE_DIR=" + shlex.quote(str(root / "ctx")) + "\n")
                         self.assertEqual(setup.stores.plan_store_environment(["pira_ctx"]).stores,
                                          {"PIRA_CTX_STORE_DIR": str((root / "ctx").resolve())})
         self.assertEqual((managed / "codex").read_bytes(), package_bytes)
@@ -848,7 +882,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             "binaries": {},
         }
         self.assertEqual(
-            setup.selected_tools(index, None),
+            setup.selected_tools(index, ["pira_ctx", "pira_svg_check"]),
             ["pira_ctx", "pira_svg_check"],
         )
 

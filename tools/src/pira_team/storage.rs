@@ -89,7 +89,7 @@ pub fn access(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn locate(root: &Path, id: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_run_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -98,6 +98,19 @@ pub fn locate(root: &Path, id: &str) -> Result<PathBuf, String> {
     {
         return Err("invalid run ID; use run_id from the receipt".into());
     }
+    Ok(())
+}
+
+pub fn locate(root: &Path, reference: &str) -> Result<PathBuf, String> {
+    // Literal IDs keep their existing lookup path, even when bookmark metadata is bad.
+    let resolved;
+    let id = if let Some(label) = reference.strip_prefix('@') {
+        resolved = crate::bookmarks::resolve(root, label)?;
+        resolved.as_str()
+    } else {
+        reference
+    };
+    validate_run_id(id)?;
     let root = root
         .canonicalize()
         .map_err(|e| lookup_error("open Team store", e))?;
@@ -176,6 +189,7 @@ fn managed_path(run: &Path, relative: &Path) -> Result<PathBuf, String> {
         "task.txt",
         "events.jsonl",
         "stderr.log",
+        "backend-check.log",
         "candidate.txt",
         "rejected-handoff.txt",
         "validation.json",

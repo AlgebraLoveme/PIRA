@@ -6,11 +6,36 @@ use std::path::{Path, PathBuf};
 
 const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SESSION_BYTES: u64 = 256 * 1024 * 1024;
+const WORKER_PROFILES: &str = include_str!("worker_profiles.json");
 
+#[path = "defaults.rs"]
+pub mod defaults;
+
+/// Resolve bundled defaults only; resumes supply both retained fields here.
 pub fn resolve(
     model: Option<String>,
     effort: Option<String>,
     parent: Value,
+) -> Result<(String, String, Value, Execution), String> {
+    resolve_using(model, effort, parent, &json!({}))
+}
+
+/// Resolve new-launch defaults from the selected Team store, then explicit fields.
+pub fn resolve_with_store(
+    model: Option<String>,
+    effort: Option<String>,
+    parent: Value,
+    store: &Path,
+) -> Result<(String, String, Value, Execution), String> {
+    let overrides = defaults::load(store)?;
+    resolve_using(model, effort, parent, &overrides)
+}
+
+fn resolve_using(
+    model: Option<String>,
+    effort: Option<String>,
+    parent: Value,
+    overrides: &Value,
 ) -> Result<(String, String, Value, Execution), String> {
     if let Some(m) = &model {
         validate_model(m)?;
@@ -18,24 +43,46 @@ pub fn resolve(
     if let Some(e) = &effort {
         validate_effort(e)?;
     }
-    let sources = json!({"model": if model.is_some() { "explicit" } else { "parent" },
-        "effort": if effort.is_some() { "explicit" } else { "parent" }});
     let execution = Execution::from_context(&parent)?;
-    let inherited = |name: &str| {
-        parent
+    let profiles: Value = serde_json::from_str(WORKER_PROFILES)
+        .map_err(|e| format!("invalid bundled worker profiles: {e}"))?;
+    // Match the caller, not an explicit worker model; resumes supply both stored fields.
+    let caller_model = parent["model"].as_str();
+    let configured = caller_model.and_then(|model| overrides.get(model));
+    let mapped = caller_model.and_then(|model| profiles["mappings"].get(model));
+    let inherit = profiles["inherit"]
+        .as_array()
+        .ok_or("invalid bundled worker inheritance list")?;
+    let (defaults, source) = match (configured, mapped) {
+        (Some(profile), _) => (profile, "config"),
+        (None, Some(profile)) => (profile, "mapping"),
+        (None, None)
+            if caller_model
+                .is_some_and(|model| inherit.iter().any(|entry| entry.as_str() == Some(model))) =>
+        {
+            (&parent, "parent")
+        }
+        (None, None) => (&profiles["fallback"], "fallback"),
+    };
+    let field = |name: &str, explicit: Option<String>| {
+        if let Some(value) = explicit {
+            return Ok((value, "explicit"));
+        }
+        defaults
             .get(name)
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("parent {name} is unavailable; supply --{name} explicitly"))
+            .map(|s| (s.to_owned(), source))
+            .ok_or_else(|| {
+                if source == "parent" {
+                    format!("parent {name} is unavailable; supply --{name} explicitly")
+                } else {
+                    format!("invalid bundled worker {source} {name}")
+                }
+            })
     };
-    let model = match model {
-        Some(m) => m,
-        None => inherited("model")?,
-    };
-    let effort = match effort {
-        Some(e) => e,
-        None => inherited("effort")?,
-    };
+    let (model, model_source) = field("model", model)?;
+    let (effort, effort_source) = field("effort", effort)?;
+    let sources = json!({"model": model_source, "effort": effort_source});
     validate_model(&model)?;
     validate_effort(&effort)?;
     Ok((model, effort, sources, execution))
@@ -78,8 +125,7 @@ pub fn load() -> Result<Value, String> {
         .or_else(|| {
             ["HOME", "USERPROFILE"]
                 .iter()
-                .find_map(std::env::var_os)
-                .filter(|s| !s.is_empty())
+                .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
                 .map(|p| PathBuf::from(p).join(".codex"))
         })
         .ok_or("cannot locate Codex home")?;
@@ -342,6 +388,179 @@ fn physical(path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn caller(model: &str, effort: &str) -> Value {
+        let mut context = restricted();
+        context["model"] = json!(model);
+        context["effort"] = json!(effort);
+        context
+    }
+
+    #[test]
+    fn astra_defaults_are_independent_of_caller_effort() {
+        for effort in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            let (model, effort, sources, execution) =
+                resolve(None, None, caller("gpt-6-astra", effort)).unwrap();
+            assert_eq!((model.as_str(), effort.as_str()), ("gpt-6.1-sol", "high"));
+            assert_eq!(sources, json!({"model":"mapping", "effort":"mapping"}));
+            assert_eq!(execution.mode, "workspace-write");
+        }
+    }
+
+    #[test]
+    fn overrides_replace_only_the_selected_mapped_field() {
+        for (model, effort, expected_model, expected_effort, sources) in [
+            (
+                Some("custom"),
+                None,
+                "custom",
+                "high",
+                json!({"model":"explicit", "effort":"mapping"}),
+            ),
+            (
+                None,
+                Some("low"),
+                "gpt-6.1-sol",
+                "low",
+                json!({"model":"mapping", "effort":"explicit"}),
+            ),
+            (
+                Some("custom"),
+                Some("low"),
+                "custom",
+                "low",
+                json!({"model":"explicit", "effort":"explicit"}),
+            ),
+        ] {
+            let (model, effort, actual_sources, _) = resolve(
+                model.map(str::to_owned),
+                effort.map(str::to_owned),
+                caller("gpt-6-astra", "ultra"),
+            )
+            .unwrap();
+            assert_eq!(
+                (model.as_str(), effort.as_str()),
+                (expected_model, expected_effort)
+            );
+            assert_eq!(actual_sources, sources);
+        }
+    }
+
+    #[test]
+    fn recognized_models_inherit_without_alias_matching() {
+        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] {
+            let (actual_model, effort, sources, _) =
+                resolve(None, None, caller(model, "medium")).unwrap();
+            assert_eq!((actual_model.as_str(), effort.as_str()), (model, "medium"));
+            assert_eq!(sources, json!({"model":"parent", "effort":"parent"}));
+        }
+        let (_, effort, sources, _) =
+            resolve(Some("gpt-6-astra".into()), None, caller("gpt-6-sol", "low")).unwrap();
+        assert_eq!(effort, "low");
+        assert_eq!(sources, json!({"model":"explicit", "effort":"parent"}));
+    }
+
+    #[test]
+    fn unknown_or_missing_model_identity_uses_fallback_not_caller_effort() {
+        for model in [
+            json!("claude-sonnet"),
+            json!("other"),
+            json!("gpt-6-astra-preview"),
+            json!("GPT-6-ASTRA"),
+            json!("gpt-6-sol-preview"),
+            json!(""),
+            Value::Null,
+        ] {
+            let mut context = caller("unused", "ultra");
+            context["model"] = model;
+            let (model, effort, sources, _) = resolve(None, None, context).unwrap();
+            assert_eq!((model.as_str(), effort.as_str()), ("gpt-6.1-sol", "high"));
+            assert_eq!(sources, json!({"model":"fallback", "effort":"fallback"}));
+        }
+        let (model, effort, sources, _) = resolve(None, None, restricted()).unwrap();
+        assert_eq!((model.as_str(), effort.as_str()), ("gpt-6.1-sol", "high"));
+        assert_eq!(sources, json!({"model":"fallback", "effort":"fallback"}));
+    }
+
+    #[test]
+    fn explicit_fields_override_unknown_caller_fallback() {
+        for (model, effort, expected_model, expected_effort, sources) in [
+            (
+                Some("custom"),
+                None,
+                "custom",
+                "high",
+                json!({"model":"explicit", "effort":"fallback"}),
+            ),
+            (
+                None,
+                Some("low"),
+                "gpt-6.1-sol",
+                "low",
+                json!({"model":"fallback", "effort":"explicit"}),
+            ),
+            (
+                Some("custom"),
+                Some("low"),
+                "custom",
+                "low",
+                json!({"model":"explicit", "effort":"explicit"}),
+            ),
+        ] {
+            let (model, effort, actual_sources, _) = resolve(
+                model.map(str::to_owned),
+                effort.map(str::to_owned),
+                caller("claude", "ultra"),
+            )
+            .unwrap();
+            assert_eq!(
+                (model.as_str(), effort.as_str()),
+                (expected_model, expected_effort)
+            );
+            assert_eq!(actual_sources, sources);
+        }
+        assert!(resolve(Some("bad model".into()), None, restricted()).is_err());
+        assert!(resolve(None, Some("invalid".into()), restricted()).is_err());
+    }
+
+    #[test]
+    fn fallback_and_explicit_fields_still_require_verified_permissions() {
+        for field in ["approval_policy", "sandbox_policy"] {
+            for (model, effort) in [(None, None), (Some("custom"), Some("low"))] {
+                let mut context = caller("claude", "medium");
+                context[field] = Value::Null;
+                assert!(
+                    resolve(model.map(str::to_owned), effort.map(str::to_owned), context).is_err(),
+                    "{field}"
+                );
+            }
+        }
+        assert!(resolve(None, None, Value::Null).is_err());
+    }
+
+    #[test]
+    fn mapping_and_explicit_overrides_cannot_bypass_permissions_or_validation() {
+        for (model, effort) in [(None, None), (Some("custom"), Some("low"))] {
+            let mut context = caller("gpt-6-astra", "high");
+            context["approval_policy"] = json!("on-request");
+            assert!(
+                resolve(model.map(str::to_owned), effort.map(str::to_owned), context)
+                    .unwrap_err()
+                    .contains("approval")
+            );
+        }
+        assert!(
+            resolve(
+                Some("bad model".into()),
+                None,
+                caller("gpt-6-astra", "high")
+            )
+            .is_err()
+        );
+        assert!(resolve(None, Some("invalid".into()), caller("gpt-6-astra", "high")).is_err());
+    }
+
     fn restricted() -> Value {
         json!({"approval_policy":"never", "cwd":std::env::current_dir().unwrap(),
             "sandbox_policy":{"type":"workspace-write","writable_roots":[],

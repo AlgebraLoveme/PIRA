@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import tomllib
@@ -516,6 +517,244 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "source changed"):
             migration.team_migration_receipt(old, new, expected_source=fingerprint,
                                              validate_native_identity=native)
+
+    def metadata_plan(self):
+        with patch.dict(os.environ, {"HOME": str(self.root)}, clear=True), \
+             patch.object(setup.sys, "platform", "linux"), \
+             patch.object(setup, "historical_store_paths", return_value=[self.source]):
+            self.destination = self.root / ".local/share/pira/team"
+            return setup.plan_store_environment(["pira_team"], profile_paths=[], codex_binary="/inert/fixture-codex")
+
+    def test_team_metadata_only_merge_and_post_use_rerun(self):
+        self.put(self.source, "bookmarks.json", b'[1, [["same", "run"], ["source", "old-run"]]]')
+        self.put(self.source, "bookmarks.lock", b"")
+        self.put(self.source, "worker_defaults.json", b'{"main-old": {"model": "worker", "effort": "high"}}')
+        self.put(self.source, "worker_defaults.lock", b"")
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.destination, "bookmarks.json", b'[1, [["same", "run"], ["target", "new-run"]]]')
+        original = migration.inventory(self.source, tool="pira_team")
+        plan = self.metadata_plan()
+        before = sorted(self.root.rglob("*"))
+        setup.apply_store_migrations(plan, dry_run=True)
+        self.assertEqual(sorted(self.root.rglob("*")), before)
+        with self.assertRaisesRegex(RuntimeError, "metadata"):
+            setup.apply_store_migrations(plan, dry_run=True, verify=True)
+        setup.apply_store_migrations(plan, dry_run=False)
+        bookmarks = self.destination / "bookmarks.json"
+        self.assertEqual(dict(json.loads(bookmarks.read_bytes())[1]),
+                         {"same": "run", "source": "old-run", "target": "new-run"})
+        defaults = self.destination / "worker_defaults.json"
+        self.assertEqual(json.loads(defaults.read_bytes()), {"main-old": {"model": "worker", "effort": "high"}})
+        self.assertFalse(os.path.samefile(defaults, self.source / "worker_defaults.json"))
+        # New destination-only keys and formatting survive ordinary reruns.
+        bookmarks.write_bytes(b'[1, [["same", "run"], ["source", "old-run"], ["target", "new-run"], ["later", "later-run"]]]')
+        used = migration.inventory(self.destination, tool="pira_team")
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=True, verify=True)
+        self.assertEqual(migration.inventory(self.destination, tool="pira_team"), used)
+        self.assertEqual(migration.inventory(self.source, tool="pira_team"), original)
+        # Remapped imported keys, removed keys and added defaults are local use,
+        # not permission to replay the retained original maps.
+        bookmarks.write_bytes(b'[1, [["same", "remapped"], ["later", "later-run"]]]')
+        defaults.write_bytes(b'{"main-old": {"model": "custom", "effort": "low"}, "new-main": {"model": "new", "effort": "high"}}')
+        used = migration.inventory(self.destination, tool="pira_team")
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=True, verify=True)
+        self.assertEqual(migration.inventory(self.destination, tool="pira_team"), used)
+        bookmarks.unlink()
+        defaults.unlink()
+        used = migration.inventory(self.destination, tool="pira_team")
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=True, verify=True)
+        self.assertEqual(migration.inventory(self.destination, tool="pira_team"), used)
+        self.assertEqual(migration.inventory(self.source, tool="pira_team"), original)
+
+    def test_team_metadata_conflicts_and_malformed_maps_preserve_stores(self):
+        self.destination = self.root / ".local/share/pira/team"
+        for name, source, target in (
+                ("bookmarks.json", b'[1, [["label", "old"]]]', b'[1, [["label", "new"]]]'),
+                ("worker_defaults.json", b'{"main": {"model": "old", "effort": "high"}}', b'{"main": {"model": "new", "effort": "high"}}')):
+            with self.subTest(name=name):
+                self.put(self.source, name, source)
+                self.put(self.destination, name, target)
+                before = migration.inventory(self.destination)
+                with self.assertRaisesRegex(RuntimeError, "Conflicting Team metadata"):
+                    self.metadata_plan()
+                self.assertEqual(migration.inventory(self.destination), before)
+                (self.source / name).unlink()
+                (self.destination / name).unlink()
+        malformed = [("bookmarks.json", b'[1, [["same", "a"], ["same", "b"]]]'),
+                     ("bookmarks.json", b'[true, []]'),
+                     ("bookmarks.json", b'[1, [["label", "../outside"]]]'),
+                     ("worker_defaults.json", b'{"main": {"model": "m", "effort": "unknown"}}'),
+                     ("worker_defaults.json", b'{"main": {}, "main": {}}')]
+        for name, data in malformed:
+            with self.subTest(data=data):
+                self.put(self.source, name, data)
+                with self.assertRaisesRegex(RuntimeError, "metadata"):
+                    self.metadata_plan()
+                self.assertFalse((self.destination / name).exists())
+                (self.source / name).unlink()
+
+    def test_team_metadata_with_retained_run_and_interrupted_publish(self):
+        self.put_team_run(self.source / "run-id")
+        self.put(self.source, "bookmarks.json", b'[1, [["retained", "run-id"]]]')
+        helper = self.fake_team_backend()
+        with patch.object(migration, "team_backend", return_value=helper):
+            plan = self.metadata_plan()
+            self.assertEqual(len(plan.team_migrations), 1)
+            with patch.object(migration.os, "replace", side_effect=OSError("interrupted")):
+                with self.assertRaises(OSError):
+                    setup.apply_store_migrations(plan, dry_run=False)
+            # Retry from a new preflight: original source and target histories survive.
+            setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+            self.assertEqual(json.loads((self.destination / "bookmarks.json").read_bytes()), [1, [["retained", "run-id"]]])
+            self.assertTrue((self.destination / "run-id/artifacts/handoff").exists())
+            self.assertTrue((self.source / "run-id/artifacts/handoff").exists())
+
+    def test_team_metadata_interrupted_merge_backup_and_retry(self):
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.source, "bookmarks.json", b'[1, [["source", "old"]]]')
+        target = self.put(self.destination, "bookmarks.json", b'[1, [["target", "new"]]]')
+        original = target.read_bytes()
+        plan = self.metadata_plan()
+        replace = os.replace
+        def interrupt(source, destination):
+            if Path(destination) == target:
+                raise OSError("interrupted metadata publication")
+            return replace(source, destination)
+        with patch.object(migration.os, "replace", side_effect=interrupt):
+            with self.assertRaises(OSError):
+                setup.apply_store_migrations(plan, dry_run=False)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(target.stat().st_nlink, 1)
+        backups = list(self.destination.parent.glob(".pira-team-metadata-*/previous-*"))
+        self.assertEqual([p.read_bytes() for p in backups], [original])
+        self.assertFalse(os.path.samefile(backups[0], target))
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        self.assertEqual(dict(json.loads(target.read_bytes())[1]), {"source": "old", "target": "new"})
+        self.assertEqual((self.source / "bookmarks.json").read_bytes(), b'[1, [["source", "old"]]]')
+
+    def test_team_metadata_receipt_rejects_drift_invalid_and_replaced_roots(self):
+        source = self.put(self.source, "bookmarks.json", b'[1, [["source", "old"]]]')
+        original = source.read_bytes()
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        plan = self.metadata_plan().team_metadata_migrations[0]
+        receipt = plan.ledger / "state.json"
+        valid = receipt.read_bytes()
+        destination_before = migration.inventory(self.destination, tool="pira_team")
+        source.write_bytes(b'[1, [["source", "changed"]]]')
+        with self.assertRaisesRegex(RuntimeError, "receipt|changed"):
+            self.metadata_plan()
+        source.write_bytes(original)
+        for data in (b'{', valid.replace(b'"schema": 1', b'"schema": true'),
+                     valid.replace(b'"complete"', b'"unknown"'), b'{"schema":1,"schema":1}'):
+            with self.subTest(data=data):
+                receipt.write_bytes(data)
+                with self.assertRaisesRegex(RuntimeError, "receipt"):
+                    self.metadata_plan()
+                receipt.write_bytes(valid)
+        receipt.unlink()
+        with self.assertRaisesRegex(RuntimeError, "Missing.*receipt"):
+            self.metadata_plan()
+        receipt.write_bytes(valid)
+        for root in (self.source, self.destination):
+            with self.subTest(root=root):
+                saved = root.with_name(root.name + "-original")
+                root.rename(saved)
+                shutil.copytree(saved, root)
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    self.metadata_plan()
+                shutil.rmtree(root)
+                saved.rename(root)
+        self.assertEqual(migration.inventory(self.destination, tool="pira_team"), destination_before)
+
+    def test_team_metadata_partial_publication_cannot_mark_complete(self):
+        self.put(self.source, "bookmarks.json", b'[1, [["source", "old"]]]')
+        self.put(self.source, "worker_defaults.json", b'{"main": {"model": "worker", "effort": "high"}}')
+        original = migration.inventory(self.source, tool="pira_team")
+        plan = self.metadata_plan()
+        replace = os.replace
+        def interrupt(source, destination):
+            if Path(destination).name == "worker_defaults.json":
+                raise OSError("second map interrupted")
+            return replace(source, destination)
+        with patch.object(migration.os, "replace", side_effect=interrupt):
+            with self.assertRaises(OSError):
+                setup.apply_store_migrations(plan, dry_run=False)
+        receipt = plan.team_metadata_migrations[0].ledger / "state.json"
+        self.assertEqual(json.loads(receipt.read_bytes())["phase"], "publishing")
+        self.assertTrue((self.destination / "bookmarks.json").exists())
+        self.assertFalse((self.destination / "worker_defaults.json").exists())
+        pending = receipt.read_bytes()
+        receipt.write_bytes(pending.replace(b'"publishing"', b'"complete"'))
+        with self.assertRaisesRegex(RuntimeError, "receipt"):
+            self.metadata_plan()
+        receipt.write_bytes(pending)
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            setup.apply_store_migrations(self.metadata_plan(), dry_run=True, verify=True)
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        self.assertEqual(json.loads(receipt.read_bytes())["phase"], "complete")
+        self.assertEqual(json.loads((self.destination / "worker_defaults.json").read_bytes()),
+                         {"main": {"model": "worker", "effort": "high"}})
+        self.assertEqual(migration.inventory(self.source, tool="pira_team"), original)
+
+    def test_team_metadata_completion_write_failure_requires_verified_retry(self):
+        self.put(self.source, "bookmarks.json", b'[1, [["source", "old"]]]')
+        plan = self.metadata_plan()
+        replace = os.replace
+        def interrupt(source, destination):
+            if Path(destination).name == "state.json" and json.loads(Path(source).read_bytes())["phase"] == "complete":
+                raise OSError("completion receipt interrupted")
+            return replace(source, destination)
+        with patch.object(migration.os, "replace", side_effect=interrupt):
+            with self.assertRaises(OSError):
+                setup.apply_store_migrations(plan, dry_run=False)
+        receipt = plan.team_metadata_migrations[0].ledger / "state.json"
+        self.assertEqual(json.loads(receipt.read_bytes())["phase"], "publishing")
+        target = self.destination / "bookmarks.json"
+        published = target.read_bytes()
+        target.write_bytes(b'[1, [["local", "new"]]]')
+        with self.assertRaisesRegex(RuntimeError, "Interrupted.*changed"):
+            self.metadata_plan()
+        target.write_bytes(published)
+        retry = self.metadata_plan()
+        self.assertEqual(retry.team_metadata_migrations[0].files, {})
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            setup.apply_store_migrations(retry, dry_run=True, verify=True)
+        setup.apply_store_migrations(retry, dry_run=False)
+        self.assertEqual(json.loads(receipt.read_bytes())["phase"], "complete")
+        target.write_bytes(b'[1, []]')
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        self.assertEqual(target.read_bytes(), b'[1, []]')
+
+    def test_team_metadata_intent_failure_preserves_maps_without_completion(self):
+        self.put(self.source, "bookmarks.json", b'[1, [["source", "old"]]]')
+        plan = self.metadata_plan()
+        with patch.object(migration.os, "replace", side_effect=OSError("intent publication failed")):
+            with self.assertRaises(OSError):
+                setup.apply_store_migrations(plan, dry_run=False)
+        receipt = plan.team_metadata_migrations[0].ledger / "state.json"
+        self.assertFalse(receipt.exists())
+        self.assertFalse((self.destination / "bookmarks.json").exists())
+        self.assertEqual((self.source / "bookmarks.json").read_bytes(), b'[1, [["source", "old"]]]')
+        with self.assertRaisesRegex(RuntimeError, "Missing.*receipt"):
+            self.metadata_plan()
+
+    @unittest.skipIf(os.name == "nt", "POSIX lock interaction")
+    def test_team_metadata_active_lock_and_stale_plan_block_switch(self):
+        import fcntl
+        self.put(self.source, "bookmarks.json", b'[1, []]')
+        lock = self.put(self.source, "bookmarks.lock", b"")
+        with lock.open("rb") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, "lease"):
+                self.metadata_plan()
+        plan = self.metadata_plan()
+        (self.source / "bookmarks.json").write_bytes(b'[1, [["late", "run"]]]')
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            setup.apply_store_migrations(plan, dry_run=False)
+        self.assertFalse(self.destination.exists())
 
     def fake_team_backend(self):
         """EXPLICIT native/admission double: caller-order evidence, not native proof."""

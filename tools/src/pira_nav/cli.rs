@@ -595,7 +595,7 @@ pub(crate) fn command_show(
         }
         let target = &options.targets[0];
         let mut item = Vec::new();
-        render_show_slice(
+        let source_bytes = render_show_slice(
             target,
             explicit,
             cwd,
@@ -605,7 +605,7 @@ pub(crate) fn command_show(
             &mut item,
         )?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -639,9 +639,9 @@ pub(crate) fn command_show(
         let start = line.saturating_sub(window).max(1);
         let end = line.saturating_add(window);
         let mut item = Vec::new();
-        render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
+        let source_bytes = render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -662,9 +662,9 @@ pub(crate) fn command_show(
         }
         validate_show_file_target(&options.targets[0].value, &path, cwd)?;
         let mut item = Vec::new();
-        render_entire_file(&path, cwd, options.glance, &mut item)?;
+        let source_bytes = render_entire_file(&path, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -682,9 +682,10 @@ pub(crate) fn command_show(
     {
         let path = absolute_lexical(Path::new(path_text), cwd);
         let mut item = Vec::new();
-        render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)?;
+        let source_bytes =
+            render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -709,6 +710,7 @@ pub(crate) fn command_show(
             .get(&key)
             .and_then(|result| result.as_ref().ok())
             .expect("resolved show target has a cached parse");
+        render_selection_notice(&options.targets[0].value, parsed, output)?;
         render_source(
             parsed,
             &parsed.symbols[symbol_index],
@@ -769,18 +771,21 @@ pub(crate) fn command_show(
                 &mut resolver,
                 &mut item,
             );
-            if let Err((code, message)) = result {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let source_bytes = match result {
+                Ok(bytes) => bytes,
+                Err((code, message)) => {
+                    identities.remove(&identity);
+                    failures.record(target.value.clone(), code, message);
+                    continue;
+                }
+            };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -793,18 +798,21 @@ pub(crate) fn command_show(
             let mut item = Vec::new();
             let result = validate_show_file_target(&target.value, &path, cwd)
                 .and_then(|()| render_entire_file(&path, cwd, options.glance, &mut item));
-            if let Err((code, message)) = result {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let source_bytes = match result {
+                Ok(bytes) => bytes,
+                Err((code, message)) => {
+                    identities.remove(&identity);
+                    failures.record(target.value.clone(), code, message);
+                    continue;
+                }
+            };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -816,20 +824,23 @@ pub(crate) fn command_show(
                 continue;
             }
             let mut item = Vec::new();
-            if let Err((code, message)) =
-                render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)
-            {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let source_bytes =
+                match render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)
+                {
+                    Ok(bytes) => bytes,
+                    Err((code, message)) => {
+                        identities.remove(&identity);
+                        failures.record(target.value.clone(), code, message);
+                        continue;
+                    }
+                };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -860,12 +871,13 @@ pub(crate) fn command_show(
         }
         considered += 1;
         let mut item = Vec::new();
-        render_source(parsed, symbol, cwd, options.glance, &mut item)?;
-        if item.len() > max_bytes.saturating_sub(payload_bytes) {
+        render_selection_notice(&target.value, parsed, &mut item)?;
+        let source_bytes = render_source(parsed, symbol, cwd, options.glance, &mut item)?;
+        if source_bytes > max_bytes.saturating_sub(payload_bytes) {
             byte_limited += 1;
             continue;
         }
-        payload_bytes += item.len();
+        payload_bytes += source_bytes;
         rendered.push(item);
     }
     let omitted = options
@@ -2148,7 +2160,7 @@ fn command_symbols(
                     continue;
                 };
                 let mut source = Vec::new();
-                render_text_range(
+                let source_bytes = render_text_range(
                     &row.path,
                     selected,
                     row.symbol.start_row + 1,
@@ -2157,21 +2169,21 @@ fn command_symbols(
                     false,
                     &mut source,
                 )?;
-                if source.len() > SYMBOL_UNIQUE_MAX_BYTES
-                    || source.len() > SYMBOL_UNIQUE_TOTAL_BYTES.saturating_sub(unique_source_bytes)
+                if source_bytes > SYMBOL_UNIQUE_MAX_BYTES
+                    || source_bytes > SYMBOL_UNIQUE_TOTAL_BYTES.saturating_sub(unique_source_bytes)
                 {
                     writeln!(
                         output,
                         "source_omitted query={} reason=byte-limit bytes={} per_item_max={} total_max={} hint=use-show-with-max-bytes",
                         query_index + 1,
-                        source.len(),
+                        source_bytes,
                         SYMBOL_UNIQUE_MAX_BYTES,
                         SYMBOL_UNIQUE_TOTAL_BYTES
                     )
                     .map_err(output_error)?;
                     continue;
                 }
-                unique_source_bytes += source.len();
+                unique_source_bytes += source_bytes;
                 output.write_all(&source).map_err(output_error)?;
             }
         }
@@ -3613,13 +3625,25 @@ fn outline_symbol_matches(symbol: &Symbol, matches: &[String], exact_matches: &[
     })
 }
 
+fn render_selection_notice(
+    target: &str,
+    parsed: &ParsedFile,
+    output: &mut dyn Write,
+) -> CommandResult {
+    if parsed.symbols_truncated && parse_location(target).is_some() {
+        writeln!(output, "# pira_nav show selection=smallest-recorded-item inventory_truncated=1 complete=0 smallest_item=not-guaranteed; use an exact line range or --window for parser-free access")
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
 fn render_source(
     parsed: &ParsedFile,
     symbol: &Symbol,
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let source = parsed
         .source
         .get(symbol.start_byte..symbol.end_byte)
@@ -3672,7 +3696,7 @@ fn render_source(
         writeln!(output).map_err(output_error)?;
     }
     writeln!(output, "--- end ---").map_err(output_error)?;
-    Ok(())
+    Ok(rendered.len())
 }
 
 fn render_show_slice(
@@ -3683,7 +3707,7 @@ fn render_show_slice(
     cache: &mut ParsedFileCache,
     resolver: &mut StructuralResolver,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let slice = target.file_slice.expect("slice target");
     if let Some(path) = plain_show_path(&target.value, cwd) {
         validate_show_file_target(&target.value, &path, cwd)?;
@@ -3702,6 +3726,7 @@ fn render_show_slice(
         .get(&key)
         .and_then(|r| r.as_ref().ok())
         .expect("resolved parse");
+    render_selection_notice(&target.value, parsed, output)?;
     let symbol = &parsed.symbols[index];
     let source = parsed
         .source
@@ -3726,7 +3751,7 @@ fn render_slice(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let count = source_line_count(source);
     if matches!(slice, ShowFileSlice::Head(0) | ShowFileSlice::Tail(0))
         || (count == 0 && !matches!(slice, ShowFileSlice::Range(..)))
@@ -3757,7 +3782,7 @@ fn render_line_range(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     if start == 0 || requested_end < start {
         return Err((2, "line range must satisfy 1 <= START <= END".into()));
     }
@@ -3771,7 +3796,7 @@ fn render_entire_file(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let source = read_source(path).map_err(input_error)?;
     let line_count = source_line_count(&source);
     render_text_range(
@@ -3843,7 +3868,7 @@ fn render_text_range(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let glance_rendered = glance.then(|| render_glance(selected, start, GLANCE_LINE_PREFIX_BYTES));
     write!(
         output,
@@ -3879,7 +3904,7 @@ fn render_text_range(
         writeln!(output).map_err(output_error)?;
     }
     writeln!(output, "--- end ---").map_err(output_error)?;
-    Ok(())
+    Ok(rendered.len())
 }
 
 fn render_glance(source: &str, start_line: usize, prefix_bytes: usize) -> (String, usize) {
@@ -4105,7 +4130,7 @@ fn render_relative_line_range(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let source = read_source(path).map_err(input_error)?;
     let (start, end) = resolve_relative_range(start, end, source_line_count(&source))?;
     let (_, selected) = select_line_range(&source, path, start, end)?;

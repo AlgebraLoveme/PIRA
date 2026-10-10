@@ -137,7 +137,7 @@ def is_lease(tool: str, name: str) -> bool:
     if tool == "pira_dec":
         return len(parts) == 2 and parts[-1] == ".write.lock"
     if tool == "pira_team":
-        return name == "run.lock"
+        return name in ("run.lock", "bookmarks.lock", "worker_defaults.lock") or name.endswith("/run.lock")
     return (name == "indexes/.index.owner-lock"
             or (len(parts) == 2 and parts[0] == ".events" and parts[1].endswith(".lock"))
             or (name.startswith(("live/owners/", "watch/owners/")) and name.endswith(".lock"))
@@ -495,7 +495,16 @@ def read_team_state(plan: TeamMigration):
     return state
 
 
-def save_team_state(plan: TeamMigration, state: dict) -> None:
+def sync_directory(path: Path) -> None:
+    if os.name != "nt":
+        directory = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def save_team_state(plan: TeamMigration | TeamMetadataMigration, state: dict) -> None:
     path = plan.ledger / "state.json"
     checked_path(path)
     fd, name = tempfile.mkstemp(prefix="state-", dir=plan.ledger)
@@ -505,12 +514,7 @@ def save_team_state(plan: TeamMigration, state: dict) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
-        if os.name != "nt":
-            directory = os.open(plan.ledger, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        sync_directory(plan.ledger)
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -548,6 +552,356 @@ def team_lineage(plan: TeamMigration, state: dict, *, locks_held=False) -> dict:
     return identity
 
 
+TEAM_METADATA = {"bookmarks.json": ("bookmarks.lock", 1024 * 1024),
+                 "worker_defaults.json": ("worker_defaults.lock", 64 * 1024)}
+TEAM_ROOT_FILES = frozenset(TEAM_METADATA) | {lock for lock, _ in TEAM_METADATA.values()}
+
+
+@dataclass
+class TeamMetadataMigration:
+    sources: tuple[Path, ...]
+    destination: Path
+    inventories: dict[Path, dict[str, Entry]]
+    members: dict[Path, tuple[str, ...]]
+    files: dict[str, tuple[bytes, Path, int]]
+    ledger: Path
+    identities: dict[Path, list[int] | None]
+    state: dict | None
+    images: dict
+
+
+def metadata_root_identity(root: Path) -> list[int] | None:
+    checked_path(root)
+    if not root.exists():
+        return None
+    info = root.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_ino <= 0:
+        raise RuntimeError(f"Unrecognized physical Team metadata root: {root}")
+    return [info.st_dev, info.st_ino]
+
+
+def metadata_image(entry: Entry | None):
+    return [entry.mode, entry.size, entry.digest] if entry is not None else None
+
+
+def metadata_sources(plan: TeamMetadataMigration) -> dict:
+    return {str(root): {"identity": metadata_root_identity(root),
+                        "files": {name: metadata_image(entry)
+                                  for name, entry in plan.inventories[root].items() if name in TEAM_METADATA}}
+            for root in plan.sources}
+
+
+def metadata_state_checksum(state: dict) -> str:
+    # Integrity check, not authentication against the owner of these private files.
+    data = json.dumps({key: value for key, value in state.items() if key != "checksum"}, sort_keys=True).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def save_team_metadata_state(plan: TeamMetadataMigration, state: dict) -> None:
+    state = dict(state, checksum=metadata_state_checksum(state))
+    if len(json.dumps(state).encode()) > 1024 * 1024:
+        raise RuntimeError("Oversized Team metadata import receipt")
+    save_team_state(plan, state)
+
+
+def read_team_metadata_state(plan: TeamMetadataMigration, *, allow_empty=False):
+    path = plan.ledger / "state.json"
+    checked_path(path)
+    if not path.exists():
+        if plan.ledger.exists() and not allow_empty:
+            raise RuntimeError("Missing Team metadata receipt; preserve ledger for explicit recovery")
+        return None
+    info = path.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 1024 * 1024
+            or (os.name != "nt" and (info.st_uid != os.geteuid() or info.st_mode & 0o022))):
+        raise RuntimeError("Unsafe Team metadata receipt")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate receipt key")
+            result[key] = value
+        return result
+    def image(value, name):
+        return value is None or (isinstance(value, list) and len(value) == 3
+            and type(value[0]) is int and 0 <= value[0] <= 0o7777
+            and type(value[1]) is int and 0 <= value[1] <= TEAM_METADATA[name][1]
+            and isinstance(value[2], str) and re.fullmatch(r"[0-9a-f]{64}", value[2]) is not None)
+    try:
+        state = json.loads(path.read_bytes(), object_pairs_hook=unique)
+        if (set(state) != {"schema", "sources", "destination", "destination_identity", "phase", "images", "checksum"}
+                or state["checksum"] != metadata_state_checksum(state)
+                or type(state["schema"]) is not int or state["schema"] != 1
+                or json.dumps(state["sources"], sort_keys=True) != json.dumps(metadata_sources(plan), sort_keys=True)
+                or state["destination"] != str(plan.destination)
+                or json.dumps(state["destination_identity"]) != json.dumps(metadata_root_identity(plan.destination))
+                or state["destination_identity"] is None
+                or state["phase"] not in ("publishing", "complete")
+                or set(state["images"]) != set(TEAM_METADATA)
+                or any(set(values) != {"before", "after"}
+                       or not image(values["before"], name) or not image(values["after"], name)
+                       for name, values in state["images"].items())):
+            raise ValueError("invalid binding/schema or source changed")
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError) as error:
+        raise RuntimeError("Invalid Team metadata receipt or source/destination identity changed; preserve for revalidation") from error
+    if state["phase"] == "publishing":
+        for name, values in state["images"].items():
+            current = metadata_image(plan.inventories[plan.destination].get(name))
+            if current != values["before"] and current != values["after"]:
+                raise RuntimeError("Interrupted Team metadata destination changed; explicit recovery required")
+    return state
+
+
+def team_metadata_inventory(root: Path) -> dict[str, Entry]:
+    checked_path(root)
+    result = {}
+    for name in sorted(TEAM_ROOT_FILES):
+        path = root / name
+        checked_path(path)
+        if not path.exists():
+            continue
+        info = path.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or (os.name != "nt" and (info.st_uid != os.geteuid() or info.st_mode & 0o022))):
+            raise RuntimeError(f"Unsafe Team metadata file: {path}")
+        if name in TEAM_METADATA:
+            if info.st_size > TEAM_METADATA[name][1]:
+                raise RuntimeError(f"Oversized Team metadata file: {path}")
+            result[name] = file_entry(path)
+        else:
+            result[name] = Entry(stat.S_IMODE(info.st_mode), info.st_size,
+                                 f"lease:{info.st_dev}:{info.st_ino}", info.st_mtime_ns)
+    return result
+
+
+def read_team_metadata(path: Path) -> dict:
+    """Read only the two published bounded formats; never interpret unknown files."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate metadata key")
+            result[key] = value
+        return result
+    def model(value):
+        return (isinstance(value, str) and 0 < len(value.encode()) <= 256
+                and not value.startswith("-") and all(33 <= ord(c) <= 126 for c in value))
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(TEAM_METADATA[path.name][1] + 1)
+        if len(data) > TEAM_METADATA[path.name][1]:
+            raise ValueError("metadata size limit exceeded")
+        value = json.loads(data, object_pairs_hook=unique)
+        if path.name == "bookmarks.json":
+            if (not isinstance(value, list) or len(value) != 2 or type(value[0]) is not int
+                    or value[0] != 1 or not isinstance(value[1], list)):
+                raise ValueError("invalid bookmark schema")
+            result = {}
+            for pair in value[1]:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    raise ValueError("invalid bookmark entry")
+                label, run = pair
+                if (not isinstance(label, str) or not 0 < len(label.encode()) <= 128
+                        or label.strip() != label or label in (".", "..") or label.startswith("@")
+                        or any(c in label for c in ("/", "\\"))
+                        or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in label)
+                        or not isinstance(run, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run) is None
+                        or label in result):
+                    raise ValueError("invalid/duplicate bookmark")
+                result[label] = run
+            return result
+        if not isinstance(value, dict):
+            raise ValueError("invalid worker defaults object")
+        for main, profile in value.items():
+            if (not model(main) or not isinstance(profile, dict) or set(profile) != {"model", "effort"}
+                    or not model(profile["model"]) or profile["effort"] not in
+                    ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")):
+                raise ValueError("invalid worker defaults entry")
+        return value
+    except (ValueError, TypeError, UnicodeError) as error:
+        raise RuntimeError(f"Invalid Team metadata: {path}: {error}") from error
+
+
+def plan_team_metadata(sources: list[Path], destination: Path) -> TeamMetadataMigration:
+    roots = tuple(sorted(set(sources)))
+    inventories = {root: team_metadata_inventory(root) for root in (*roots, destination)}
+    members = {root: tuple(sorted(item.name for item in root.iterdir())) for root in roots}
+    ledger = destination.parent / (".pira-team-metadata-import-" + hashlib.sha256(str(destination).encode()).hexdigest())
+    plan = TeamMetadataMigration(roots, destination, inventories, members, {}, ledger,
+                                 {root: metadata_root_identity(root) for root in (*roots, destination)}, None, {})
+    with ExitStack() as locks:
+        for root, entries in inventories.items():
+            for name in entries:
+                if name not in TEAM_METADATA:
+                    locks.enter_context(lease(root / name))
+        plan.state = read_team_metadata_state(plan)
+        # Completion is provenance, not equality with the now mutable destination.
+        if plan.state is not None and plan.state["phase"] == "complete":
+            for root, entries in inventories.items():
+                for name in entries:
+                    if name in TEAM_METADATA:
+                        read_team_metadata(root / name)
+            plan.images = plan.state["images"]
+        else:
+            plan.images = plan_team_metadata_images(plan)
+            if plan.state is not None:
+                if any(plan.images[name]["after"] != values["after"]
+                       for name, values in plan.state["images"].items()):
+                    raise RuntimeError("Interrupted Team metadata import no longer matches its publication plan")
+                plan.images = plan.state["images"]
+            elif not any(name in entries for root, entries in inventories.items()
+                         if root in roots for name in TEAM_METADATA):
+                plan.images = {}  # No source maps to import or remember.
+        for root, expected in inventories.items():
+            if (team_metadata_inventory(root) != expected
+                    or metadata_root_identity(root) != plan.identities[root]):
+                raise RuntimeError(f"Team metadata changed during preflight: {root}")
+    return plan
+
+
+def plan_team_metadata_images(plan: TeamMetadataMigration) -> dict:
+    images = {}
+    inventories, destination = plan.inventories, plan.destination
+    for name, (_, limit) in TEAM_METADATA.items():
+        merged = {}
+        mode = 0o777
+        template = None
+        current = None
+        for root in (*plan.sources, destination):
+            if name not in inventories[root]:
+                continue
+            values = read_team_metadata(root / name)
+            for key, value in values.items():
+                if key in merged and merged[key] != value:
+                    raise RuntimeError(f"Conflicting Team metadata {name} entry {key!r}; neither store changed")
+                merged[key] = value
+            mode &= inventories[root][name].mode
+            template = root / name
+            if root == destination:
+                current = values
+        before = metadata_image(inventories[destination].get(name))
+        after = before
+        if template is not None and merged != current:
+            value = [1, sorted(merged.items())] if name == "bookmarks.json" else merged
+            data = (json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n").encode()
+            if len(data) > limit:
+                raise RuntimeError(f"Merged Team metadata exceeds its published limit: {name}")
+            plan.files[name] = (data, template, mode)
+            after = [mode, len(data), hashlib.sha256(data).hexdigest()]
+        images[name] = {"before": before, "after": after}
+    return images
+
+
+@contextmanager
+def staged_team_metadata(data: bytes, template: Path, mode: int, directory: Path):
+    fd, name = tempfile.mkstemp(prefix="merge-", dir=directory)
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            copy_permissions(template, path)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(path, mode)
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def apply_team_metadata(plans: list[TeamMetadataMigration], *, dry_run=False, verify=False) -> None:
+    for plan in plans:
+        with ExitStack() as locks:
+            for root, entries in plan.inventories.items():
+                for name in entries:
+                    if name not in TEAM_METADATA:
+                        locks.enter_context(lease(root / name))
+            for root, expected in plan.inventories.items():
+                if (team_metadata_inventory(root) != expected
+                        or (plan.identities[root] is not None and metadata_root_identity(root) != plan.identities[root])):
+                    raise RuntimeError(f"Team metadata changed after preflight: {root}")
+            for root, members in plan.members.items():
+                if tuple(sorted(item.name for item in root.iterdir())) != members:
+                    raise RuntimeError("Team source membership changed after metadata preflight")
+            if verify and plan.images and (plan.state is None or plan.state["phase"] != "complete"):
+                raise RuntimeError("Team metadata migration incomplete; rerun setup without --verify")
+            if read_team_metadata_state(plan) != plan.state:
+                raise RuntimeError("Team metadata receipt changed after preflight")
+            if dry_run or verify or not plan.images or (plan.state is not None and plan.state["phase"] == "complete"):
+                continue
+            if plan.state is None:
+                private_parents(plan.ledger.parent, plan.sources[0])
+                plan.ledger.mkdir(mode=0o700)  # A concurrently created ledger is not a new import.
+                if os.name == "nt":
+                    copy_permissions(plan.sources[0], plan.ledger)
+                sync_directory(plan.ledger.parent)
+            owner = plan.ledger / "owner.lock"
+            checked_path(owner)
+            try:
+                fd = os.open(owner, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(fd)
+            except FileExistsError:
+                pass
+            locks.enter_context(lease(owner))
+            if read_team_metadata_state(plan, allow_empty=plan.state is None) != plan.state:
+                raise RuntimeError("Team metadata receipt changed while acquiring migration lease")
+            private_parents(plan.destination, plan.sources[0])
+            sync_directory(plan.destination.parent)
+            # Create only destination leases: originals stay untouched. New native
+            # management commands serialize on the same stable lock objects.
+            for name in plan.files:
+                lock = plan.destination / TEAM_METADATA[name][0]
+                if lock.name not in plan.inventories[plan.destination]:
+                    checked_path(lock)
+                    try:
+                        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        os.close(fd)
+                    except FileExistsError:
+                        pass
+                    locks.enter_context(lease(lock))
+            state = plan.state
+            if state is None:
+                state = {"schema": 1, "sources": metadata_sources(plan), "destination": str(plan.destination),
+                         "destination_identity": metadata_root_identity(plan.destination),
+                         "phase": "publishing", "images": plan.images}
+                save_team_metadata_state(plan, state)  # Durable intent precedes the first map publication.
+            for name, (data, template, mode) in plan.files.items():
+                target = plan.destination / name
+                expected = plan.inventories[plan.destination].get(name)
+                checked_path(target)
+                if (file_entry(target) if target.exists() else None) != expected:
+                    raise RuntimeError(f"Team metadata destination changed: {target}")
+                stage = plan.destination.parent / (".pira-team-metadata-" + hashlib.sha256(str(target).encode()).hexdigest())
+                private_parents(stage, plan.sources[0])
+                with staged_team_metadata(data, template, mode, stage) as ready:
+                    if expected is not None:
+                        backup = stage / (f"previous-{expected.mode:o}-" + expected.digest)
+                        checked_path(backup)
+                        with staged_team_metadata(target.read_bytes(), target, expected.mode, stage) as previous:
+                            if not same_data(file_entry(previous), expected):
+                                raise RuntimeError("Team metadata changed during backup")
+                            try:
+                                os.link(previous, backup)  # Independent copy, never alias live config.
+                            except FileExistsError:
+                                if not same_data(file_entry(backup), expected):
+                                    raise RuntimeError("Conflicting Team metadata recovery backup")
+                        sync_directory(stage)
+                    os.replace(ready, target)
+                    sync_directory(plan.destination)
+                    if target.read_bytes() != data:
+                        raise RuntimeError(f"Team metadata publication verification failed: {target}")
+            for root in plan.sources:
+                if (team_metadata_inventory(root) != plan.inventories[root]
+                        or metadata_root_identity(root) != plan.identities[root]
+                        or tuple(sorted(item.name for item in root.iterdir())) != plan.members[root]):
+                    raise RuntimeError("Team metadata source changed before configuration publication")
+            published = team_metadata_inventory(plan.destination)
+            if (metadata_root_identity(plan.destination) != state["destination_identity"]
+                    or any(metadata_image(published.get(name)) != values["after"]
+                           for name, values in state["images"].items())):
+                raise RuntimeError("Team metadata publication incomplete; no completion receipt published")
+            save_team_metadata_state(plan, dict(state, phase="complete"))
+
+
 def preflight_team_relocation(sources: list[Path], destination: Path, *, codex_binary=None) -> list[TeamMigration]:
     """Read-only discovery. Incomplete caller transactions are resumed only on apply."""
     plans = []
@@ -561,6 +915,8 @@ def preflight_team_relocation(sources: list[Path], destination: Path, *, codex_b
             continue
         for source in sorted(root.iterdir()):
             checked_path(source)
+            if source.name in TEAM_ROOT_FILES:
+                continue  # Validated/leased by the separate metadata merge plan.
             if not source.is_dir() or source.name in seen:
                 raise RuntimeError(f"Unattributed/ambiguous Team source: {source}")
             seen.add(source.name)

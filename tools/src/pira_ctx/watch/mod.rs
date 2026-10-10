@@ -204,7 +204,10 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
         crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?;
     }
     if watch.monitor == MonitorStatus::Stopped {
-        state::update_control(store, id, |control| control.stop_requested = false)?;
+        state::update_control(store, id, |control| {
+            control.stop_requested = false;
+            Ok(())
+        })?;
         watch.monitor = MonitorStatus::Active;
         watch.detail = "watch resumed".into();
     } else if watch.monitor == MonitorStatus::Paused {
@@ -245,6 +248,14 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
             sleep_controlled(store, &mut watch, wake_at)?;
             continue;
         }
+        validate_sampling_cost(
+            watch.source_kind,
+            watch.analyzer.is_some(),
+            watch.sample_every_ms,
+        )?;
+        if watch.no_progress_after_ms.is_some() && watch.analyzer.is_none() {
+            return Err("--no-progress-after requires an effective analyzer".into());
+        }
         watch.attempt = AttemptStatus::Probing;
         watch.updated_ms = now;
         state::write(&path, &watch)?;
@@ -270,6 +281,8 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
                 return report(&watch, 23);
             }
             Err(error) => {
+                watch.job = JobStatus::Unknown;
+                watch.rendered_reliable = false;
                 if state::now_ms() >= watch.deadline_ms {
                     watch.monitor = MonitorStatus::Deadline;
                     watch.detail = "overall deadline reached".into();
@@ -472,13 +485,15 @@ fn evaluate_attention(
             && (watch.inactive_after_ms.is_some() || watch.no_progress_after_ms.is_some())
         {
             Some("sample output is incomplete; inactivity or unchanged analyzer progress cannot be established".to_string())
+        } else if !watch.rendered_reliable {
+            Some("rendered state is unreliable; unchanged output cannot be established".to_string())
+        } else if !observation_complete {
+            Some("sample output is incomplete".to_string())
         } else if watch.inactive_after_ms.is_some_and(|limit| {
             now.saturating_sub(watch.last_activity_ms.unwrap_or(watch.created_ms))
                 >= u128::from(limit)
         }) {
             Some("no raw activity observed".to_string())
-        } else if !watch.rendered_reliable && watch.unchanged_after_ms.is_some() {
-            Some("rendered state is unreliable; unchanged output cannot be established".to_string())
         } else if watch.unchanged_after_ms.is_some_and(|limit| {
             now.saturating_sub(watch.last_visible_change_ms.unwrap_or(watch.created_ms))
                 >= u128::from(limit)
@@ -617,7 +632,10 @@ fn stop(store: &Path, id: &str) -> Result<i32, String> {
         ))?;
         return Ok(0);
     }
-    state::update_control(store, id, |control| control.stop_requested = true)?;
+    state::update_control(store, id, |control| {
+        control.stop_requested = true;
+        Ok(())
+    })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         let watch: WatchState = state::read(&state::state_path(store, id), "watch state")?;
@@ -663,50 +681,49 @@ fn update_controls(
         .map(|value| analyzer::store_code(store, value))
         .transpose()?;
     let state: WatchState = state::read(&state::state_path(store, id), "watch state")?;
-    let existing_control: ControlState =
-        state::read(&state::control_path(store, id), "watch control")?;
-    let effective_analyzer = if analyzer_update {
-        !config.watch_clear_analyzer
-    } else if existing_control.clear_analyzer {
-        existing_control.analyzer.is_some()
-    } else {
-        existing_control.analyzer.is_some() || state.analyzer.is_some()
-    };
-    let requested_no_progress = if config.watch_clear_analyzer {
-        if config.watch_no_progress_after_set {
-            config.watch_no_progress_after_ms
-        } else {
-            None
-        }
-    } else if config.watch_no_progress_after_set {
-        config.watch_no_progress_after_ms
-    } else {
-        existing_control
-            .configuration
-            .as_ref()
-            .map_or(state.no_progress_after_ms, |value| {
-                value.no_progress_after_ms
-            })
-    };
-    if requested_no_progress.is_some() && !effective_analyzer {
-        return Err("--no-progress-after requires an effective analyzer".into());
-    }
-    let requested_sample_every = if config.watch_sample_every_set {
-        config.watch_sample_every_ms
-    } else {
-        existing_control
-            .configuration
-            .as_ref()
-            .map_or(state.sample_every_ms, |value| value.sample_every_ms)
-    };
-    validate_sampling_cost(
-        state.source_kind,
-        effective_analyzer,
-        requested_sample_every,
-    )?;
     let mut analyzer_revision = None;
     let mut configuration_revision = None;
     state::update_control(store, id, |control| {
+        let effective_analyzer = if analyzer_update {
+            !config.watch_clear_analyzer
+        } else if control.clear_analyzer {
+            control.analyzer.is_some()
+        } else {
+            control.analyzer.is_some() || state.analyzer.is_some()
+        };
+        let requested_no_progress = if config.watch_clear_analyzer {
+            if config.watch_no_progress_after_set {
+                config.watch_no_progress_after_ms
+            } else {
+                None
+            }
+        } else if config.watch_no_progress_after_set {
+            config.watch_no_progress_after_ms
+        } else {
+            control
+                .configuration
+                .as_ref()
+                .map_or(state.no_progress_after_ms, |value| {
+                    value.no_progress_after_ms
+                })
+        };
+        if requested_no_progress.is_some() && !effective_analyzer {
+            return Err("--no-progress-after requires an effective analyzer".into());
+        }
+        let requested_sample_every = if config.watch_sample_every_set {
+            config.watch_sample_every_ms
+        } else {
+            control
+                .configuration
+                .as_ref()
+                .map_or(state.sample_every_ms, |value| value.sample_every_ms)
+        };
+        validate_sampling_cost(
+            state.source_kind,
+            effective_analyzer,
+            requested_sample_every,
+        )?;
+
         if analyzer_update {
             let revision = control
                 .analyzer_revision
@@ -725,7 +742,7 @@ fn update_controls(
             }
         }
         if !configuration_update {
-            return;
+            return Ok(());
         }
         let current = control.configuration.as_ref();
         let revision = control
@@ -769,6 +786,7 @@ fn update_controls(
                 current.map_or(state.attention_policy, |value| value.attention_policy)
             },
         });
+        Ok(())
     })?;
     let analyzer =
         analyzer_revision.map_or_else(String::new, |revision| format!(" analyzer={revision}"));

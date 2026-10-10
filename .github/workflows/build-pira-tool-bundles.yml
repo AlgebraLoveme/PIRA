@@ -69,6 +69,7 @@ jobs:
           python3 -m unittest \
             assets.scripts.test_setup_pira \
             assets.scripts.test_setup_pira_tools \
+            assets.scripts.test_retire_pira_audio \
             tools.build.test_build_pira_ctx_platform_bins \
             tools.build.test_package_github_release
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
@@ -140,6 +141,7 @@ jobs:
           python -m unittest `
             assets.scripts.test_setup_pira `
             assets.scripts.test_setup_pira_tools `
+            assets.scripts.test_retire_pira_audio `
             tools.build.test_build_pira_ctx_platform_bins `
             tools.build.test_package_github_release
           cargo test --manifest-path tools/Cargo.toml --workspace --locked

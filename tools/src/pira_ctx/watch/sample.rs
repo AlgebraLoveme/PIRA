@@ -42,8 +42,19 @@ fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, St
         storage::resolve_result(store, target)?
     };
     let stored = storage::read_result_path(&path)?;
-    let (stored, growth) =
+    let (mut stored, mut growth) =
         stored.sample_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
+    if stored.is_running() && !storage::live_result_is_active(store, &stored) {
+        // Owner release follows final publication. Recheck this exact result first.
+        let latest = storage::read_result_path(&path)?;
+        if latest.is_running() {
+            return Err(
+                "capture owner lost; interrupted checkpoint cannot establish child outcome".into(),
+            );
+        }
+        (stored, growth) =
+            latest.sample_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
+    }
     let activity =
         growth.stdout_total > state.stdout_offset || growth.stderr_total > state.stderr_offset;
     state.stdout_offset = growth.stdout_total;
@@ -311,6 +322,18 @@ mod tests {
                     "no raw activity observed"
                 })
             );
+        }
+    }
+
+    #[test]
+    fn incomplete_pending_samples_request_default_attention_once() {
+        for rendered in [true, false] {
+            let mut state = probe_state(vec!["true".into()]);
+            state.rendered_reliable = rendered;
+            assert!(super::super::evaluate_attention(&mut state, None, false));
+            assert!(state.attention_reason.is_some());
+            assert!(!super::super::evaluate_attention(&mut state, None, false));
+            assert_eq!(state.attention_sequence, 1);
         }
     }
 

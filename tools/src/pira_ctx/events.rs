@@ -242,7 +242,7 @@ pub fn record(
     storage::ensure_private_dir(&records_dir)?;
     let _workspace_lock = lock_workspace(&workspace_dir)?;
     let state_path = retention_state_path(&workspace_dir);
-    let loaded = load_or_rebuild_retention_state(&workspace_dir, &workspace_hash);
+    let loaded = load_or_rebuild_retention_state(&workspace_dir, &workspace_hash)?;
     let mut retention = loaded.state;
     event.timestamp_ms = next_retention_timestamp(&retention, event.timestamp_ms);
     let name = format!(
@@ -349,7 +349,7 @@ where
     let state = match read_retention_state(&state_path, &workspace_hash) {
         Ok(state) => state,
         Err(_) => {
-            let state = rebuild_retention_state(&workspace_dir, &workspace_hash);
+            let state = rebuild_retention_state(&workspace_dir, &workspace_hash)?;
             write_retention_snapshot(&state_path, &workspace_hash, &state)?;
             state
         }
@@ -719,13 +719,20 @@ fn record_paths(records_dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !real_directory(records_dir, "event records")? {
         return Ok(Vec::new());
     }
-    Ok(fs::read_dir(records_dir)
-        .map_err(|error| error.to_string())?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("piraevt"))
-        .collect())
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(records_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("piraevt")
+            && entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 fn recursive_record_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -827,32 +834,33 @@ fn valid_record_name(value: &str) -> bool {
         && timestamp_from_path(path).is_some()
 }
 
-fn load_or_rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> RetentionLoad {
+fn load_or_rebuild_retention_state(
+    workspace_dir: &Path,
+    workspace_hash: &str,
+) -> Result<RetentionLoad, String> {
     let path = retention_state_path(workspace_dir);
-    match read_retention_state(&path, workspace_hash) {
+    Ok(match read_retention_state(&path, workspace_hash) {
         Ok(state) => RetentionLoad {
             state,
             appendable: true,
             bytes: fs::metadata(path).map_or(RETENTION_COMPACT_BYTES, |value| value.len()),
         },
         Err(_) => RetentionLoad {
-            state: rebuild_retention_state(workspace_dir, workspace_hash),
+            state: rebuild_retention_state(workspace_dir, workspace_hash)?,
             appendable: false,
             bytes: 0,
         },
-    }
+    })
 }
 
-fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> RetentionState {
+fn rebuild_retention_state(
+    workspace_dir: &Path,
+    workspace_hash: &str,
+) -> Result<RetentionState, String> {
     let mut state = RetentionState::default();
-    let Ok(entries) = fs::read_dir(workspace_dir) else {
-        return state;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let scope_dir = entry.path();
+    let entries = fs::read_dir(workspace_dir).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let scope_dir = entry.map_err(|error| error.to_string())?.path();
         let Some(scope_name) = scope_dir
             .file_name()
             .and_then(|value| value.to_str())
@@ -860,9 +868,10 @@ fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> Retent
         else {
             continue;
         };
-        let Ok(paths) = record_paths(&scope_dir.join("records")) else {
+        if !real_directory(&scope_dir, "event scope")? {
             continue;
-        };
+        }
+        let paths = record_paths(&scope_dir.join("records"))?;
         let records = state.scopes.entry(scope_name.to_string()).or_default();
         for path in paths {
             let Some(record_name) = path
@@ -895,7 +904,7 @@ fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> Retent
         records.sort_by(retention_record_key);
     }
     state.scopes.retain(|_, records| !records.is_empty());
-    state
+    Ok(state)
 }
 
 fn retention_record_key(left: &RetentionRecord, right: &RetentionRecord) -> std::cmp::Ordering {

@@ -99,7 +99,11 @@ class PrivateCITests(unittest.TestCase):
                 b'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n',
             'assets/scripts/setup_pira_tools.py': b'import setup_pira_stores',
             'assets/scripts/test_setup_pira_tools.py': b'# fixture',
-            'assets/scripts/setup_pira_stores.py': b'import migrate_pira_stores',
+            'assets/scripts/retire_pira_audio.py': b'# retirement helper fixture',
+            'assets/scripts/test_retire_pira_audio.py': b'# retirement test fixture',
+            'assets/scripts/setup_pira_stores.py': b'import migrate_pira_stores\nimport setup_migration_choices',
+            'assets/scripts/setup_migration_choices.py': b'# receipt helper fixture',
+            'assets/scripts/test_setup_migration_choices.py': b'import setup_migration_choices',
             'assets/scripts/migrate_pira_stores.py': b'# migration fixture',
             'assets/scripts/test_migrate_pira_stores.py': b'# migration test fixture',
             'assets/scripts/setup_pira.py': b'import setup_pira_stores',
@@ -155,8 +159,13 @@ class PrivateCITests(unittest.TestCase):
         before = ci.git(self.root, 'status', '--porcelain=v1', '-z').stdout
         stage = self.stage(('pira_ctx',))
         data = ci.verify(stage)
+        self.assertIn('tools/src/pira_team/worker_profiles.json', data)
         for name in excluded:
             self.assertNotIn(name, data)
+        expected_sources = set(self.files) - {'.github/workflows/build-pira-tool-bundles.yml'}
+        self.assertEqual({path.as_posix() for path in ci.selected(self.root)}, expected_sources)
+        self.assertEqual(set(data), expected_sources | {'SNAPSHOT_PROVENANCE.json',
+            '.github/workflows/private-pira-tests.yml', '.gitattributes', 'SOURCE_SHA256SUMS'})
         for name in ci.selected(self.root):
             self.assertEqual(data[name.as_posix()], (self.root / name).read_bytes())
         self.assertTrue(self.result['original_dirty'])
@@ -179,6 +188,8 @@ class PrivateCITests(unittest.TestCase):
         for name in ('setup_pira.py', 'test_setup_pira.py', 'setup_pira_tools.py',
                      'test_setup_pira_tools.py', 'setup_pira_stores.py', 'test_setup_pira_stores.py',
                      'migrate_pira_stores.py', 'test_migrate_pira_stores.py',
+                     'setup_migration_choices.py', 'test_setup_migration_choices.py',
+                     'retire_pira_audio.py', 'test_retire_pira_audio.py',
                      'team_store_relocation.py', 'test_team_store_relocation.py', 'team_relocation_fixture.py'):
             self.assertIn('assets/scripts/' + name, data)
         self.assertIn('tests/test_team.py', workflow)
@@ -228,9 +239,18 @@ class PrivateCITests(unittest.TestCase):
         self.assertIn('FileNotFoundError', result.stderr)
 
     def test_missing_setup_dependency_fails_staging(self):
-        (self.root / 'assets/scripts/setup_pira_stores.py').unlink()
-        with self.assertRaises(FileNotFoundError):
-            self.stage()
+        for name in ('retire_pira_audio.py', 'test_retire_pira_audio.py',
+                     'setup_pira_stores.py', 'setup_migration_choices.py',
+                     'test_setup_migration_choices.py'):
+            with self.subTest(name=name):
+                path = self.root / 'assets/scripts' / name
+                original = path.read_bytes()
+                path.unlink()
+                try:
+                    with self.assertRaises(FileNotFoundError):
+                        ci.stage(self.root)
+                finally:
+                    path.write_bytes(original)
 
     def test_missing_native_fixture_fails_staging(self):
         (self.root / 'assets/scripts/team_relocation_fixture.py').unlink()

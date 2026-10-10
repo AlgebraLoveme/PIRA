@@ -66,6 +66,11 @@ while True:
                              "end": {"line": 0, "character": 18}},
                    "selectionRange": {"start": {"line": 0, "character": 4},
                                       "end": {"line": 0, "character": 10}}}]))
+    elif method == "textDocument/prepareCallHierarchy":
+        result = config.get("prepared_calls", [])
+    elif method in ("callHierarchy/outgoingCalls", "callHierarchy/incomingCalls"):
+        direction = "outgoing_calls" if method.endswith("outgoingCalls") else "incoming_calls"
+        result = config.get(direction, {}).get(message["params"]["item"]["uri"], [])
     elif method in ("textDocument/definition", "textDocument/hover"):
         params = message["params"]
         path = Path(url2pathname(urlparse(params["textDocument"]["uri"]).path))

@@ -714,7 +714,7 @@ pub fn query(
                         include_declaration: options.include_declaration,
                     };
                     // Validate each request independently; reuse the running service.
-                    if !lsp.has_server(request.target.language) {
+                    if !lsp.has_server(request.target.language, cwd) {
                         return Err((
                             2,
                             format!(
@@ -1064,7 +1064,7 @@ fn run_requests(
         })
         .collect::<Vec<_>>();
     for request in &requests {
-        let result = if lsp.has_server(request.target.language) {
+        let result = if lsp.has_server(request.target.language, cwd) {
             execute_one(request, &mut service, cwd, output)
         } else {
             Err((

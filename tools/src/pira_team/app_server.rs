@@ -29,9 +29,16 @@ struct Endpoint {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
+    token: String,
+    turn: Arc<std::sync::Mutex<Option<String>>>,
 }
 impl Endpoint {
-    fn start(run: &Path, turn: &str, sender: mpsc::SyncSender<Event>) -> Result<Self, String> {
+    fn start(
+        run: &Path,
+        revision: &Value,
+        sender: mpsc::SyncSender<Event>,
+        mut controls: File,
+    ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
         let mut bytes = [0_u8; 32];
@@ -39,6 +46,9 @@ impl Endpoint {
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let turn = Arc::new(std::sync::Mutex::new(None::<String>));
+        let current_turn = turn.clone();
+        let revision = revision.clone();
         let thread = std::thread::spawn({
             let token = token.clone();
             move || {
@@ -73,9 +83,32 @@ impl Endpoint {
                             return Err("too many pending control acknowledgements".into());
                         }
                         let (reply, receiver) = mpsc::channel();
-                        sender
-                            .try_send(Event::Control(request, reply))
-                            .map_err(|_| "run owner stopped")?;
+                        // Startup has no backend turn ID yet. Accept only authenticated
+                        // interruption locally, including while native schema generation waits.
+                        let turn = current_turn.lock().unwrap();
+                        if turn.is_none() {
+                            if !request["turn_id"].is_null()
+                                || request["operation"] != "interrupt"
+                                || crate::CANCELLED.load(Ordering::SeqCst)
+                            {
+                                return Err(
+                                    "worker has no active turn, or startup is stopping".into()
+                                );
+                            }
+                            let response = json!({"status":"accepted","operation":"interrupt","turn_id":null,"revision":revision});
+                            writeln!(
+                                controls,
+                                "{}",
+                                json!({"operation":"interrupt","turn_id":null,"response":response})
+                            )
+                            .map_err(|e| format!("record startup interruption: {e}"))?;
+                            crate::CANCELLED.store(true, Ordering::SeqCst);
+                            let _ = reply.send(response);
+                        } else {
+                            sender
+                                .try_send(Event::Control(request, reply))
+                                .map_err(|_| "run owner stopped")?;
+                        }
                         Ok(receiver)
                     })();
                     match outcome {
@@ -103,12 +136,25 @@ impl Endpoint {
             stop,
             thread: Some(thread),
             path: run.join("control.json"),
+            token,
+            turn,
         };
-        lifecycle::save_json(
-            &endpoint.path,
-            &json!({"address":address.to_string(),"token":token,"turn_id":turn}),
-        )?;
+        endpoint.publish(None)?;
         Ok(endpoint)
+    }
+
+    fn publish(&self, turn: Option<&str>) -> Result<(), String> {
+        lifecycle::save_json(
+            &self.path,
+            &json!({"address":self.address.to_string(),"token":self.token,"turn_id":turn}),
+        )
+    }
+
+    fn activate(&self, id: &str) -> Result<(), String> {
+        let mut turn = self.turn.lock().unwrap();
+        self.publish(Some(id))?;
+        *turn = Some(id.to_owned());
+        Ok(())
     }
 }
 impl Drop for Endpoint {
@@ -273,7 +319,6 @@ struct Server {
     writer_thread: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
     events: mpsc::Receiver<Event>,
-    sender: mpsc::SyncSender<Event>,
     pending: VecDeque<Value>,
     next_id: u64,
     requests: File,
@@ -281,10 +326,26 @@ struct Server {
     fault: Arc<std::sync::Mutex<Option<String>>>,
     watchdog: Option<std::thread::JoinHandle<()>>,
     finished: Option<mpsc::Sender<()>>,
+    pipe_stop: Arc<AtomicBool>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    start_pending: Option<usize>,
+    text: Option<String>,
+    usage: Option<Value>,
 }
 impl Server {
-    fn new(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Result<Self, String> {
+    fn new(
+        options: &Options,
+        run: &Path,
+        dir: &Path,
+        handoff: &Path,
+        sender: mpsc::SyncSender<Event>,
+        events: mpsc::Receiver<Event>,
+    ) -> Result<Self, String> {
         let request_schema = crate::backend::preflight(options, run, dir)?;
+        if crate::CANCELLED.load(Ordering::SeqCst) {
+            return Err("interrupted before app-server launch".into());
+        }
         let mut cmd = command(options, run, dir, handoff);
         cmd.stdout(Stdio::piped())
             .stderr(create(&dir.join("stderr.log"))?);
@@ -294,8 +355,28 @@ impl Server {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("launch Codex app-server: {e}"))?;
-        let writer = child.stdin.take().ok_or("missing app-server stdin")?;
-        let stdout = child.stdout.take().ok_or("missing app-server stdout")?;
+        let pipe_stop = Arc::new(AtomicBool::new(false));
+        let pipes = (|| {
+            Ok::<_, String>((
+                StoppablePipe::new(
+                    child.stdin.take().ok_or("missing app-server stdin")?,
+                    pipe_stop.clone(),
+                )?,
+                StoppablePipe::new(
+                    child.stdout.take().ok_or("missing app-server stdout")?,
+                    pipe_stop.clone(),
+                )?,
+            ))
+        })();
+        let (writer, stdout) = match pipes {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                terminate(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let fault = Arc::new(std::sync::Mutex::new(None));
         let watchdog_fault = fault.clone();
         let (finished, finish_rx) = mpsc::channel();
@@ -322,7 +403,6 @@ impl Server {
                 }
             }
         });
-        let (sender, events) = mpsc::sync_channel(64);
         let (writer, writer_thread) = request_writer(writer, fault.clone(), sender.clone());
         let reader_fault = fault.clone();
         let output = sender.clone();
@@ -368,7 +448,6 @@ impl Server {
             writer_thread: Some(writer_thread),
             reader: Some(reader),
             events,
-            sender,
             pending: VecDeque::new(),
             next_id: 1,
             requests,
@@ -376,6 +455,12 @@ impl Server {
             fault,
             watchdog: Some(watchdog),
             finished: Some(finished),
+            pipe_stop,
+            thread_id: None,
+            turn_id: None,
+            start_pending: None,
+            text: None,
+            usage: None,
         })
     }
     fn send(&mut self, value: Value) -> Result<(), String> {
@@ -399,7 +484,13 @@ impl Server {
         Ok(id)
     }
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        if crate::CANCELLED.load(Ordering::SeqCst) {
+            return Err("interrupted during worker startup".into());
+        }
         let id = self.send_request(method, params)?;
+        if method == "turn/start" {
+            self.start_pending = Some(self.pending.len());
+        }
         loop {
             if crate::CANCELLED.load(Ordering::SeqCst) {
                 return Err("interrupted during worker startup".into());
@@ -407,6 +498,7 @@ impl Server {
             match self.events.recv_timeout(Duration::from_millis(100)) {
                 Ok(Event::Protocol(value)) => {
                     if value.get("method").is_some() && value.get("id").is_some() {
+                        self.send(json!({"id":value["id"],"error":{"code":-32601,"message":"unexpected request refused by coding-worker launcher"}}))?;
                         return Err("unexpected app-server request refused".into());
                     }
                     if value["id"].as_u64() == Some(id) {
@@ -437,9 +529,56 @@ impl Server {
             }
         }
     }
+    fn observe(&mut self, value: &Value) {
+        let Some(thread_id) = self.thread_id.as_deref() else {
+            return;
+        };
+        let p = &value["params"];
+        if value.get("id").is_some()
+            || p["threadId"].as_str() != Some(thread_id)
+            || self
+                .turn_id
+                .as_deref()
+                .is_some_and(|id| p["turnId"].as_str().is_some_and(|reported| reported != id))
+        {
+            return;
+        }
+        match value["method"].as_str() {
+            Some("item/completed")
+                if p["item"]["type"] == "agentMessage"
+                    && (p["item"]["phase"].is_null() || p["item"]["phase"] == "final_answer") =>
+            {
+                self.text = p["item"]["text"].as_str().map(str::to_owned);
+            }
+            Some("thread/tokenUsage/updated") => {
+                self.usage = Some(normalize_usage(&p["tokenUsage"]["total"]));
+            }
+            _ => {}
+        }
+    }
+
+    fn retain_pending_evidence(&mut self) {
+        let Some(offset) = self.start_pending else {
+            return;
+        };
+        // Before the start ACK, only evidence received after our own turn/start
+        // request is attributable. After the ACK, enforce its exact turn ID too.
+        let pending = std::mem::take(&mut self.pending);
+        for value in pending.into_iter().skip(offset) {
+            self.observe(&value);
+        }
+        while let Ok(event) = self.events.try_recv() {
+            if let Event::Protocol(value) = event {
+                self.observe(&value);
+            }
+        }
+    }
 }
-impl Drop for Server {
-    fn drop(&mut self) {
+impl Server {
+    fn shutdown(&mut self) {
+        if self.finished.is_none() {
+            return;
+        }
         self.writer.take();
         let pid = self.child.id();
         let (done, rx) = mpsc::channel();
@@ -452,6 +591,9 @@ impl Drop for Server {
         let _ = done.send(());
         let _ = watchdog.join();
         terminate(pid);
+        // Detached descendants are not ours to kill, but must not hold our
+        // reader/writer joins hostage by retaining inherited pipe descriptors.
+        self.pipe_stop.store(true, Ordering::SeqCst);
         if let Some(finished) = self.finished.take() {
             let _ = finished.send(());
         }
@@ -464,6 +606,101 @@ impl Drop for Server {
         if let Some(writer) = self.writer_thread.take() {
             let _ = writer.join();
         }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct StoppablePipe<T> {
+    pipe: T,
+    stop: Arc<AtomicBool>,
+    drain_remaining: usize,
+}
+impl<T> StoppablePipe<T> {
+    #[cfg(unix)]
+    fn new(pipe: T, stop: Arc<AtomicBool>) -> Result<Self, String>
+    where
+        T: std::os::fd::AsRawFd,
+    {
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(format!(
+                "configure cancellable app-server pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            pipe,
+            stop,
+            drain_remaining: RPC_LIMIT as usize + 1,
+        })
+    }
+    #[cfg(not(unix))]
+    fn new(pipe: T, stop: Arc<AtomicBool>) -> Result<Self, String> {
+        // PIRA: Non-Unix retains process-tree termination for blocking pipe cleanup.
+        Ok(Self {
+            pipe,
+            stop,
+            drain_remaining: RPC_LIMIT as usize + 1,
+        })
+    }
+}
+impl<T: Read> Read for StoppablePipe<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let stopping = self.stop.load(Ordering::SeqCst);
+            // Drain buffered output after the owned process exits, but a detached
+            // writer cannot extend shutdown past the existing maximum frame size.
+            let size = if stopping {
+                bytes.len().min(self.drain_remaining)
+            } else {
+                bytes.len()
+            };
+            if size == 0 {
+                return Ok(0);
+            }
+            match self.pipe.read(&mut bytes[..size]) {
+                Ok(size) => {
+                    if stopping {
+                        self.drain_remaining -= size;
+                    }
+                    return Ok(size);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stopping {
+                        return Ok(0);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+impl<T: Write> Write for StoppablePipe<T> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            match self.pipe.write(bytes) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.pipe.flush()
     }
 }
 
@@ -504,234 +741,245 @@ pub fn turn(
     options.execution.require_writable(handoff)?;
     manifest["build_roots"] = json!(build_roots);
     let repair = manifest["repairs"].as_u64().ok_or("missing repair state")? > 0;
-    let mut server = Server::new(options, run, dir, handoff)?;
-    server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}))
-        .map_err(|e| format!("native Codex strict-config stdio initialization failed: {e}; inspect stderr.log and update Codex/Team to compatible builds. This is separate from the interactive shared daemon"))?;
-    server.send(json!({"method":"initialized"}))?;
-    let policy = fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?;
-    let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
+    let (sender, events) = mpsc::sync_channel(64);
+    let mut controls = create(&dir.join("controls.jsonl"))?;
+    let endpoint = Endpoint::start(
+        run,
+        &manifest["revision"],
+        sender.clone(),
+        controls.try_clone().map_err(|e| e.to_string())?,
+    )?;
+    let mut server = Server::new(options, run, dir, handoff, sender, events)?;
+    let mut stopping: Option<(&str, Instant)> = None;
+    let outcome = (|| -> Result<(String, Option<String>), String> {
+        server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}))
+        .map_err(|e| if crate::CANCELLED.load(Ordering::SeqCst) { e } else { format!("native Codex strict-config stdio initialization failed: {e}; inspect stderr.log and update Codex/Team to compatible builds. This is separate from the interactive shared daemon") })?;
+        server.send(json!({"method":"initialized"}))?;
+        let policy = fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?;
+        let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
         "approvalPolicy":"never","baseInstructions":policy,"developerInstructions":""});
-    let thread = if let Some(id) = manifest["thread_id"].as_str() {
-        params["threadId"] = json!(id);
-        let result = server.request("thread/resume", params)?;
-        if result["thread"]["id"].as_str() != Some(id) {
-            return Err("Codex resumed a different thread".into());
+        let thread = if let Some(id) = manifest["thread_id"].as_str() {
+            params["threadId"] = json!(id);
+            let result = server.request("thread/resume", params)?;
+            if result["thread"]["id"].as_str() != Some(id) {
+                return Err("Codex resumed a different thread".into());
+            }
+            result
+        } else {
+            params["ephemeral"] = json!(false);
+            server.request("thread/start", params)?
+        };
+        if thread["sandbox"] != options.execution.sandbox || thread["approvalPolicy"] != "never" {
+            return Err(format!(
+                "Codex did not confirm {}/approval-never exact caller permissions",
+                options.execution.mode
+            ));
         }
-        result
-    } else {
-        params["ephemeral"] = json!(false);
-        server.request("thread/start", params)?
-    };
-    if thread["sandbox"] != options.execution.sandbox || thread["approvalPolicy"] != "never" {
-        return Err(format!(
-            "Codex did not confirm {}/approval-never exact caller permissions",
-            options.execution.mode
-        ));
-    }
-    let thread_id = thread["thread"]["id"]
-        .as_str()
-        .ok_or("missing Codex thread ID")?
-        .to_owned();
-    manifest["thread_id"] = json!(thread_id);
-    lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    let phase = fs::read_to_string(dir.join("phase.md")).map_err(|e| e.to_string())?;
-    if manifest["phase_instructions"].as_str() != Some(phase.as_str()) {
-        server.request(
+        let thread_id = thread["thread"]["id"]
+            .as_str()
+            .ok_or("missing Codex thread ID")?
+            .to_owned();
+        server.thread_id = Some(thread_id.clone());
+        manifest["thread_id"] = json!(thread_id);
+        lifecycle::save_json(&run.join("manifest.json"), manifest)?;
+        let phase = fs::read_to_string(dir.join("phase.md")).map_err(|e| e.to_string())?;
+        if manifest["phase_instructions"].as_str() != Some(phase.as_str()) {
+            server.request(
             "thread/inject_items",
             json!({"threadId":thread_id,"items":[{
                 "type":"message","role":"developer","content":[{"type":"input_text","text":phase}]
             }]}),
         )?;
-        manifest["phase_instructions"] = json!(phase);
+            manifest["phase_instructions"] = json!(phase);
+            lifecycle::save_json(&run.join("manifest.json"), manifest)?;
+        }
+        // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
+        manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+        manifest["inject_review"] = json!(guidance.0);
+        manifest["inject_implement"] = json!(guidance.1);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    }
-    // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
-    manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
-    manifest["inject_review"] = json!(guidance.0);
-    manifest["inject_implement"] = json!(guidance.1);
-    lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    let started = server.request(
-        "turn/start",
-        json!({"threadId":thread_id,"input":[{"type":"text","text":task}],
+        let started = server.request(
+            "turn/start",
+            json!({"threadId":thread_id,"input":[{"type":"text","text":task}],
         "model":options.model,"effort":options.effort,"cwd":options.cwd,"approvalPolicy":"never",
         "sandboxPolicy":options.execution.sandbox}),
-    )?;
-    let turn_id = started["turn"]["id"]
-        .as_str()
-        .ok_or("missing Codex turn ID")?
-        .to_owned();
-    manifest["active_turn"] = json!(turn_id);
-    lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    let _endpoint = Endpoint::start(run, &turn_id, server.sender.clone())?;
-    eprintln!(
-        "pira_team active: {} (revision {}; repair={repair})",
-        manifest["run_id"].as_str().unwrap_or("?"),
-        manifest["revision"]
-    );
-    let mut controls = create(&dir.join("controls.jsonl"))?;
-    let mut pending_controls: HashMap<u64, (String, String, String, mpsc::Sender<Value>)> =
-        HashMap::new();
-    let (mut text, mut usage) = (None, None);
-    let mut stopping: Option<(&str, Instant)> = None;
-    loop {
-        if stopping.is_none() && crate::CANCELLED.load(Ordering::SeqCst) {
-            let status = "interrupted";
-            let _ = server.send_request(
-                "turn/interrupt",
-                json!({"threadId":thread_id,"turnId":turn_id}),
-            );
-            stopping = Some((status, Instant::now() + Duration::from_secs(5)));
-        }
-        if let Some((status, deadline)) = stopping
-            && Instant::now() >= deadline
-        {
-            terminate(server.child.id());
-            return Ok(Turn {
-                status: status.into(),
-                text,
-                usage,
-                error: Some("cancellation did not settle; owned backend processes terminated (Unix process group; detached descendants excluded)".into()),
-            });
-        }
-        let event = if let Some(value) = server.pending.pop_front() {
-            Event::Protocol(value)
-        } else {
-            match server.events.recv_timeout(Duration::from_millis(100)) {
-                Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(error) = server.fault.lock().unwrap().clone() {
-                        Event::Closed(error)
-                    } else {
-                        continue;
-                    }
-                }
-                Err(_) => return Err("app-server event channel closed".into()),
+        )?;
+        let turn_id = started["turn"]["id"]
+            .as_str()
+            .ok_or("missing Codex turn ID")?
+            .to_owned();
+        server.turn_id = Some(turn_id.clone());
+        server.start_pending = Some(0);
+        manifest["active_turn"] = json!(turn_id);
+        lifecycle::save_json(&run.join("manifest.json"), manifest)?;
+        endpoint.activate(&turn_id)?;
+        eprintln!(
+            "pira_team active: {} (revision {}; repair={repair})",
+            manifest["run_id"].as_str().unwrap_or("?"),
+            manifest["revision"]
+        );
+
+        let mut pending_controls: HashMap<u64, (String, String, String, mpsc::Sender<Value>)> =
+            HashMap::new();
+        loop {
+            if stopping.is_none() && crate::CANCELLED.load(Ordering::SeqCst) {
+                let status = "interrupted";
+                let _ = server.send_request(
+                    "turn/interrupt",
+                    json!({"threadId":thread_id,"turnId":turn_id}),
+                );
+                stopping = Some((status, Instant::now() + Duration::from_secs(5)));
             }
-        };
-        match event {
-            Event::Closed(error) => {
-                if let Some((status, _)) = stopping {
-                    return Ok(Turn {
-                        status: status.into(),
-                        text,
-                        usage,
-                        error: Some(error),
-                    });
-                }
-                return Ok(Turn {
-                    status: "failed".into(),
-                    text,
-                    usage,
-                    error: Some(error),
-                });
+            if let Some((status, deadline)) = stopping
+                && Instant::now() >= deadline
+            {
+                terminate(server.child.id());
+                return Ok((status.into(), Some("cancellation did not settle; owned backend processes terminated (Unix process group; detached descendants excluded)".into())));
             }
-            Event::Control(request, reply) => {
-                let op = request["operation"].as_str().unwrap_or("");
-                let task = request["task"].as_str().unwrap_or("");
-                let gate = request["completion_gate"].as_str().unwrap_or("");
-                if request["turn_id"] != turn_id
-                    || stopping.is_some()
-                    || !["steer", "interrupt"].contains(&op)
-                    || (op == "steer"
-                        && (repair
-                            || task.trim().is_empty()
-                            || gate.trim().is_empty()
-                            || gate.contains('\0')))
-                {
-                    let _ = reply.send(json!({"status":"rejected","error":"stale/inactive turn, or steering unavailable during repair"}));
-                    continue;
-                }
-                let (method, params) = if op == "steer" {
-                    (
-                        "turn/steer",
-                        json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":format!("{task}\n\nReplacement completion gate: {gate}")}]}),
-                    )
-                } else {
-                    (
-                        "turn/interrupt",
-                        json!({"threadId":thread_id,"turnId":turn_id}),
-                    )
-                };
-                if op == "interrupt" {
-                    stopping = Some(("interrupted", Instant::now() + Duration::from_secs(5)));
-                }
-                let id = match server.send_request(method, params) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        let _ = reply.send(json!({"status":"rejected","error":error}));
-                        return Ok(Turn {
-                            status: stopping.map_or("failed", |s| s.0).into(),
-                            text,
-                            usage,
-                            error: Some(error),
-                        });
-                    }
-                };
-                writeln!(controls,"{}",json!({"request_id":id,"operation":op,"task":task,"turn_id":turn_id,"status":"sent"})).map_err(|e|e.to_string())?;
-                pending_controls.insert(id, (op.into(), task.into(), gate.into(), reply));
-            }
-            Event::Protocol(value) => {
-                if value.get("method").is_some() && value.get("id").is_some() {
-                    server.send(json!({"id":value["id"],"error":{"code":-32601,"message":"unexpected request refused by coding-worker launcher"}}))?;
-                    return Err("unexpected approval/tool request refused".into());
-                }
-                if let Some(id) = value["id"].as_u64() {
-                    if let Some((op, task, gate, reply)) = pending_controls.remove(&id) {
-                        let response = if let Some(error) = value.get("error") {
-                            json!({"status":"rejected","error":error.to_string()})
-                        } else if value.get("result").is_none() {
-                            json!({"status":"rejected","error":"missing control acknowledgement"})
-                        } else if op == "steer" && value["result"]["turnId"] != turn_id {
-                            json!({"status":"rejected","error":"steer acknowledgement has wrong turn ID"})
+            let event = if let Some(value) = server.pending.pop_front() {
+                Event::Protocol(value)
+            } else {
+                match server.events.recv_timeout(Duration::from_millis(100)) {
+                    Ok(event) => event,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(error) = server.fault.lock().unwrap().clone() {
+                            Event::Closed(error)
                         } else {
-                            if op == "steer" {
-                                manifest["task"] = json!(task);
-                                manifest["completion_gate"] = json!(gate);
-                                lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-                            }
-                            if op == "interrupt" {
-                                stopping =
-                                    Some(("interrupted", Instant::now() + Duration::from_secs(5)));
-                            }
-                            json!({"status":"accepted","operation":op,"turn_id":turn_id,"revision":manifest["revision"]})
-                        };
-                        writeln!(controls, "{}", json!({"request_id":id,"response":response}))
-                            .map_err(|e| e.to_string())?;
-                        let _ = reply.send(response);
-                    }
-                    continue;
-                }
-                let p = &value["params"];
-                if p["threadId"] != thread_id
-                    || p["turnId"].as_str().is_some_and(|id| id != turn_id)
-                {
-                    continue;
-                }
-                match value["method"].as_str() {
-                    Some("item/completed") if p["item"]["type"] == "agentMessage" => {
-                        if p["item"]["phase"].is_null() || p["item"]["phase"] == "final_answer" {
-                            text = p["item"]["text"].as_str().map(str::to_owned);
+                            continue;
                         }
                     }
-                    Some("thread/tokenUsage/updated") => {
-                        usage = Some(normalize_usage(&p["tokenUsage"]["total"]));
+                    Err(_) => return Err("app-server event channel closed".into()),
+                }
+            };
+            match event {
+                Event::Closed(error) => {
+                    if let Some((status, _)) = stopping {
+                        return Ok((status.into(), Some(error)));
                     }
-                    Some("turn/completed") if p["turn"]["id"] == turn_id => {
-                        let native = p["turn"]["status"].as_str().unwrap_or("failed");
-                        let status = stopping.map(|s| s.0).unwrap_or(native).to_owned();
-                        return Ok(Turn {
-                            status,
-                            text,
-                            usage,
-                            error: (!p["turn"]["error"].is_null())
-                                .then(|| p["turn"]["error"].to_string()),
-                        });
+                    return Ok(("failed".into(), Some(error)));
+                }
+                Event::Control(request, reply) => {
+                    let op = request["operation"].as_str().unwrap_or("");
+                    let task = request["task"].as_str().unwrap_or("");
+                    let gate = request["completion_gate"].as_str().unwrap_or("");
+                    if request["turn_id"] != turn_id
+                        || stopping.is_some()
+                        || !["steer", "interrupt"].contains(&op)
+                        || (op == "steer"
+                            && (repair
+                                || task.trim().is_empty()
+                                || gate.trim().is_empty()
+                                || gate.contains('\0')))
+                    {
+                        let _ = reply.send(json!({"status":"rejected","error":"stale/inactive turn, or steering unavailable during repair"}));
+                        continue;
                     }
-                    _ => {}
+                    let (method, params) = if op == "steer" {
+                        (
+                            "turn/steer",
+                            json!({"threadId":thread_id,"expectedTurnId":turn_id,"input":[{"type":"text","text":format!("{task}\n\nReplacement completion gate: {gate}")}]}),
+                        )
+                    } else {
+                        (
+                            "turn/interrupt",
+                            json!({"threadId":thread_id,"turnId":turn_id}),
+                        )
+                    };
+                    if op == "interrupt" {
+                        stopping = Some(("interrupted", Instant::now() + Duration::from_secs(5)));
+                    }
+                    let id = match server.send_request(method, params) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            let _ = reply.send(json!({"status":"rejected","error":error}));
+                            return Ok((stopping.map_or("failed", |s| s.0).into(), Some(error)));
+                        }
+                    };
+                    writeln!(controls,"{}",json!({"request_id":id,"operation":op,"task":task,"turn_id":turn_id,"status":"sent"})).map_err(|e|e.to_string())?;
+                    pending_controls.insert(id, (op.into(), task.into(), gate.into(), reply));
+                }
+                Event::Protocol(value) => {
+                    server.observe(&value);
+                    if value.get("method").is_some() && value.get("id").is_some() {
+                        server.send(json!({"id":value["id"],"error":{"code":-32601,"message":"unexpected request refused by coding-worker launcher"}}))?;
+                        return Err("unexpected approval/tool request refused".into());
+                    }
+                    if let Some(id) = value["id"].as_u64() {
+                        if let Some((op, task, gate, reply)) = pending_controls.remove(&id) {
+                            let response = if let Some(error) = value.get("error") {
+                                json!({"status":"rejected","error":error.to_string()})
+                            } else if value.get("result").is_none() {
+                                json!({"status":"rejected","error":"missing control acknowledgement"})
+                            } else if op == "steer" && value["result"]["turnId"] != turn_id {
+                                json!({"status":"rejected","error":"steer acknowledgement has wrong turn ID"})
+                            } else {
+                                if op == "steer" {
+                                    manifest["task"] = json!(task);
+                                    manifest["completion_gate"] = json!(gate);
+                                    lifecycle::save_json(&run.join("manifest.json"), manifest)?;
+                                }
+                                if op == "interrupt" {
+                                    stopping = Some((
+                                        "interrupted",
+                                        Instant::now() + Duration::from_secs(5),
+                                    ));
+                                }
+                                json!({"status":"accepted","operation":op,"turn_id":turn_id,"revision":manifest["revision"]})
+                            };
+                            writeln!(controls, "{}", json!({"request_id":id,"response":response}))
+                                .map_err(|e| e.to_string())?;
+                            let _ = reply.send(response);
+                        }
+                        continue;
+                    }
+                    let p = &value["params"];
+                    if p["threadId"] != thread_id
+                        || p["turnId"].as_str().is_some_and(|id| id != turn_id)
+                    {
+                        continue;
+                    }
+                    match value["method"].as_str() {
+                        Some("turn/completed") if p["turn"]["id"] == turn_id => {
+                            let native = p["turn"]["status"].as_str().unwrap_or("failed");
+                            let status = stopping.map(|s| s.0).unwrap_or(native).to_owned();
+                            return Ok((
+                                status,
+                                (!p["turn"]["error"].is_null())
+                                    .then(|| p["turn"]["error"].to_string()),
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+    })();
+    drop(endpoint);
+    // Quiesce the transport before harvesting failure evidence: a startup
+    // interruption can race notifications already emitted before the start ACK.
+    server.shutdown();
+    let (status, error) = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let status = stopping.map(|s| s.0).unwrap_or_else(|| {
+                if crate::CANCELLED.load(Ordering::SeqCst) {
+                    "interrupted"
+                } else {
+                    "failed"
+                }
+            });
+            (status.to_owned(), Some(error))
+        }
+    };
+    if error.is_some() {
+        server.retain_pending_evidence();
     }
+    Ok(Turn {
+        status,
+        text: server.text.take(),
+        usage: server.usage.take(),
+        error,
+    })
 }
 
 fn normalize_usage(value: &Value) -> Value {
@@ -754,6 +1002,50 @@ fn normalize_usage(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_reader_drains_existing_bytes_without_waiting_for_peer_eof() {
+        let (input, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut input = StoppablePipe::new(input, stop.clone()).unwrap();
+        peer.write_all(b"observed\n").unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"observed\n");
+        // The other descriptor is still open: EOF came from owned shutdown.
+        peer.write_all(b"late").unwrap();
+        input.drain_remaining = 0;
+        assert_eq!(input.read(&mut [0; 4]).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_writer_does_not_wait_for_peer_to_drain_a_full_pipe() {
+        let (mut output, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        output.set_nonblocking(true).unwrap();
+        loop {
+            match output.write(&[0; 8192]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                result => panic!("fill pipe: {result:?}"),
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut output = StoppablePipe::new(output, stop.clone()).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            output.write_all(b"blocked")
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            thread.join().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn writer_preserves_wire_order_and_drains_on_shutdown() {

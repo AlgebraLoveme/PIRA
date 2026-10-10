@@ -219,10 +219,13 @@ impl Renderer {
                             "SVG exceeds the embedded SVG nesting limit (4)".into(),
                         ))
                     } else {
-                        xml::render_depth(&data, parent_depth)
+                        xml::render_depth(&data, parent_depth).and_then(|depth| {
+                            xml::validate_resources(&data)?;
+                            Ok((depth, xml::renderer_source(&data)?))
+                        })
                     };
-                    let depth = match checked {
-                        Ok(depth) => depth,
+                    let (depth, data) = match checked {
+                        Ok(checked) => checked,
                         Err(error) => {
                             resource_state.lock().unwrap().2 = Some(error);
                             return None;
@@ -233,7 +236,7 @@ impl Renderer {
                         state.0 = depth;
                         state.1 = layers + 1;
                     }
-                    let image = data_resolver(mime, data, options);
+                    let image = data_resolver(mime, data.into(), options);
                     let mut state = resource_state.lock().unwrap();
                     state.0 = parent_depth;
                     state.1 = layers;
@@ -879,7 +882,10 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
     match real_run(args) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("pira_svg_check: error: {error}");
+            eprintln!(
+                "pira_svg_check: error: {}",
+                display_text(&error.to_string())
+            );
             2
         }
     }
@@ -957,19 +963,35 @@ fn real_run(args: impl IntoIterator<Item = OsString>) -> Result<i32, GuardError>
         for item in report.warnings {
             let subject = item
                 .text_element
-                .map(|value| format!(" {value}"))
+                .map(|value| format!(" {}", display_text(&value)))
                 .unwrap_or_default();
             let interference = item
                 .interfering_element
-                .map(|value| format!("; interfering element {value}"))
+                .map(|value| format!("; interfering element {}", display_text(&value)))
                 .unwrap_or_default();
             println!(
                 "- [{}]{}: {}{}",
-                item.code, subject, item.message, interference
+                item.code,
+                subject,
+                display_text(&item.message),
+                interference
             );
         }
     }
     Ok(0)
+}
+
+// Escape only presentation: structured reports and library values stay intact.
+fn display_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_control() {
+            output.extend(ch.escape_default());
+        } else {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn parse_number<T>(value: &str, option: &str) -> Result<T, GuardError>

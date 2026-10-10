@@ -4,12 +4,12 @@ use tree_sitter::{Node, Point, Tree};
 
 use crate::document;
 use crate::language::Language;
-use crate::model::{ParseBackend, Symbol, SymbolPath};
+use crate::model::{MAX_SYMBOL_TEXT_BYTES, ParseBackend, Symbol, SymbolPath};
 use crate::util::{hash16, one_line, percent_encode, read_source, source_slice};
 
 const MAX_SYNTAX_DEPTH: usize = 256;
 pub const MAX_CODE_SYMBOLS: usize = 20_000;
-const MAX_CODE_SYMBOL_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CODE_SYMBOL_TEXT_BYTES: usize = MAX_SYMBOL_TEXT_BYTES;
 
 pub struct ParsedFile {
     pub path: PathBuf,
@@ -116,9 +116,7 @@ fn parse_source_symbols_state(
         .iter()
         .take(MAX_CODE_SYMBOLS)
         .take_while(|symbol| {
-            let next = text_bytes
-                .saturating_add(symbol.qualified_name.len())
-                .saturating_add(symbol.signature.len());
+            let next = text_bytes.saturating_add(symbol.text_bytes());
             if next > MAX_CODE_SYMBOL_TEXT_BYTES {
                 false
             } else {
@@ -219,11 +217,7 @@ impl SymbolCollector {
         if self.truncated {
             return;
         }
-        let text_bytes = self
-            .text_bytes
-            .saturating_add(symbol.qualified_name.len())
-            .saturating_add(symbol.legacy_qualified_name.len())
-            .saturating_add(symbol.signature.len());
+        let text_bytes = self.text_bytes.saturating_add(symbol.text_bytes());
         if self.symbols.len() >= MAX_CODE_SYMBOLS || text_bytes > MAX_CODE_SYMBOL_TEXT_BYTES {
             self.truncated = true;
             return;
@@ -242,11 +236,35 @@ fn push_symbol(
     depth: usize,
     output: &mut SymbolCollector,
 ) -> String {
-    let name = one_line(&source_slice(
-        source,
-        name_node.start_byte(),
-        name_node.end_byte(),
-    ));
+    if cpp_path_name(name_node) {
+        let name_path = cpp_name_path(name_node);
+        let names = name_path
+            .parts
+            .into_iter()
+            .map(|name| cpp_name_spelling(name, source))
+            .collect::<Vec<_>>();
+        let parent_path = qualification.0.filter(|_| !name_path.global).map_or_else(
+            SymbolPath::default,
+            |parent| {
+                SymbolPath::parse_canonical(parent).expect("internal parent path must be canonical")
+            },
+        );
+        // AST scope/name fields define hierarchy. `::` inside template arguments
+        // is part of one segment, not another owner of this declaration.
+        let path = parent_path.extend_names(names);
+        let qualified = path.canonical();
+        let legacy = path.legacy_code(qualification.1);
+        return push_symbol_path(
+            node,
+            (path, qualified, legacy),
+            declaration_name_position(name_node).map(|point| (point.row, point.column)),
+            source,
+            kind,
+            depth,
+            output,
+        );
+    }
+    let name = source_slice(source, name_node.start_byte(), name_node.end_byte());
     push_symbol_name(
         node,
         (&name, declaration_name_position(name_node)),
@@ -260,6 +278,13 @@ fn push_symbol(
 
 // Keep qualified display names, but query the declared member rather than its owner.
 fn declaration_name_position(node: Node<'_>) -> Option<Point> {
+    if matches!(node.kind(), "operator_name" | "operator_cast") {
+        return Some(node.start_position());
+    }
+    if node.kind() == "destructor_name" {
+        return named_child_with_kind(&node, &["identifier", "type_identifier"])
+            .map(|name| name.start_position());
+    }
     for field in ["name", "field", "method"] {
         if let Some(name) = node.child_by_field_name(field) {
             return declaration_name_position(name);
@@ -290,6 +315,27 @@ fn push_symbol_name(
     let name = one_line(name.0);
     let (path, qualified, legacy_qualified_name) =
         qualified_names(qualification.0, &name, qualification.1, output);
+    push_symbol_path(
+        node,
+        (path, qualified, legacy_qualified_name),
+        name_position,
+        source,
+        kind,
+        depth,
+        output,
+    )
+}
+
+fn push_symbol_path(
+    node: Node<'_>,
+    names: (SymbolPath, String, String),
+    name_position: Option<(usize, usize)>,
+    source: &str,
+    kind: &'static str,
+    depth: usize,
+    output: &mut SymbolCollector,
+) -> String {
+    let (path, qualified, legacy_qualified_name) = names;
     output.push(Symbol {
         kind,
         path,
@@ -306,6 +352,92 @@ fn push_symbol_name(
         depth,
     });
     qualified
+}
+
+fn push_literal_symbol(
+    node: Node<'_>,
+    name: (Node<'_>, &str),
+    source: &str,
+    parent: Option<&str>,
+    kind: &'static str,
+    depth: usize,
+    output: &mut SymbolCollector,
+) -> String {
+    let (name_node, name) = name;
+    let path = qualified_path(parent, name, "");
+    let qualified = path.canonical();
+    let legacy = path.legacy_code(".");
+    let position = declaration_name_position(name_node).map(|point| (point.row, point.column));
+    push_symbol_path(
+        node,
+        (path, qualified, legacy),
+        position,
+        source,
+        kind,
+        depth,
+        output,
+    )
+}
+
+fn add_pattern_bindings(
+    declaration: Node<'_>,
+    target: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    kind: &'static str,
+    depth: usize,
+    output: &mut SymbolCollector,
+) {
+    match target.kind() {
+        "identifier" | "simple_identifier" | "shorthand_property_identifier_pattern" => {
+            if target.kind() != "simple_identifier"
+                || source_slice(source, target.start_byte(), target.end_byte()) != "_"
+            {
+                push_symbol(
+                    declaration,
+                    target,
+                    source,
+                    (parent, "."),
+                    kind,
+                    depth,
+                    output,
+                );
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = target.child_by_field_name("value") {
+                add_pattern_bindings(declaration, value, source, parent, kind, depth, output);
+            }
+        }
+        "typed_pattern" => {
+            if let Some(pattern) = target.child_by_field_name("pattern") {
+                add_pattern_bindings(declaration, pattern, source, parent, kind, depth, output);
+            }
+        }
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = target.child_by_field_name("left") {
+                add_pattern_bindings(declaration, left, source, parent, kind, depth, output);
+            }
+        }
+        "pattern"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "pattern_list"
+        | "array_pattern"
+        | "object_pattern"
+        | "rest_pattern"
+        | "list_splat_pattern"
+        | "multi_variable_declaration"
+        | "variable_declaration"
+        | "identifiers"
+        | "tuple"
+        | "list" => {
+            walk_named_children(target, |child| {
+                add_pattern_bindings(declaration, child, source, parent, kind, depth, output);
+            });
+        }
+        _ => {}
+    }
 }
 
 fn walk_java(
@@ -372,6 +504,124 @@ fn walk_java(
     });
 }
 
+// Qualified C++ names are recursive scope/name nodes, not raw strings split on `::`.
+struct CppNamePath<'tree> {
+    parts: Vec<Node<'tree>>,
+    global: bool,
+}
+
+fn cpp_path_name(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "qualified_identifier"
+            | "nested_namespace_specifier"
+            | "destructor_name"
+            | "template_type"
+            | "template_function"
+    )
+}
+
+fn cpp_name_path(node: Node<'_>) -> CppNamePath<'_> {
+    fn collect<'tree>(node: Node<'tree>, path: &mut CppNamePath<'tree>) {
+        if node.kind() == "nested_namespace_specifier" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor).filter(|child| {
+                matches!(
+                    child.kind(),
+                    "namespace_identifier" | "nested_namespace_specifier"
+                )
+            }) {
+                collect(child, path);
+            }
+        } else if node.kind() == "qualified_identifier" {
+            if let Some(scope) = node.child_by_field_name("scope") {
+                collect(scope, path);
+            } else if node.child(0).is_some_and(|token| token.kind() == "::") {
+                // The grammar represents a leading global `::` without a scope field.
+                path.global = true;
+            }
+            if let Some(name) = node.child_by_field_name("name") {
+                collect(name, path);
+            }
+        } else {
+            // Template arguments (including their own `::` or literals) stay inside
+            // one atom; only syntactic qualification adds declaration ancestry.
+            path.parts.push(node);
+        }
+    }
+    let mut path = CppNamePath {
+        parts: Vec::new(),
+        global: false,
+    };
+    collect(node, &mut path);
+    path
+}
+
+fn cpp_name_spelling(node: Node<'_>, source: &str) -> String {
+    fn tokens<'tree>(node: Node<'tree>, output: &mut Vec<Node<'tree>>) {
+        if node.kind() == "comment" {
+            return;
+        }
+        // Literal contents and escapes are semantic spelling, not name trivia.
+        if node.child_count() == 0
+            || matches!(
+                node.kind(),
+                "string_literal" | "raw_string_literal" | "char_literal"
+            )
+        {
+            output.push(node);
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            tokens(child, output);
+        }
+    }
+    let mut leaves = Vec::new();
+    tokens(node, &mut leaves);
+    let compact = matches!(node.kind(), "destructor_name" | "operator_name");
+    let mut spelling = String::new();
+    let mut previous_end = None;
+    for token in leaves {
+        let text = source_slice(source, token.start_byte(), token.end_byte());
+        let word_boundary = spelling.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+            && text.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+        if previous_end.is_some_and(|end| end < token.start_byte()) && (!compact || word_boundary) {
+            spelling.push(' ');
+        }
+        spelling.push_str(&text);
+        previous_end = Some(token.end_byte());
+    }
+    spelling
+}
+
+fn c_family_function_kind(node: Node<'_>, name: Node<'_>, source: &str, cpp: bool) -> &'static str {
+    if !cpp {
+        return "function";
+    }
+    let names = cpp_name_path(name).parts;
+    let class = enclosing_class_like(node);
+    if names.len() < 2 && class.is_none() {
+        return "function";
+    }
+    let leaf = names
+        .last()
+        .map(|name| cpp_name_spelling(name.child_by_field_name("name").unwrap_or(*name), source));
+    let owner_node = names.iter().rev().nth(1).copied().or_else(|| {
+        class
+            .and_then(|class| class.child_by_field_name("name"))
+            .and_then(|name| cpp_name_path(name).parts.last().copied())
+    });
+    // A constructor names its class, not the class's template arguments.
+    let owner = owner_node
+        .map(|owner| cpp_name_spelling(owner.child_by_field_name("name").unwrap_or(owner), source));
+    if owner.is_some() && owner == leaf {
+        "constructor"
+    } else {
+        "method"
+    }
+}
+
 fn walk_c_family(
     node: Node<'_>,
     source: &str,
@@ -418,58 +668,33 @@ fn walk_c_family(
         && let Some(declarator) = node.child_by_field_name("declarator")
         && let Some(name_node) = declarator_name(declarator)
     {
-        let raw_name = one_line(&source_slice(
-            source,
-            name_node.start_byte(),
-            name_node.end_byte(),
-        ));
-        let final_name = raw_name.rsplit("::").next().unwrap_or(&raw_name);
-        let explicit_owner = raw_name.rsplit_once("::").map(|(owner, _)| owner);
-        let owner = explicit_owner.or(parent);
-        let member_context = explicit_owner.is_some() || inside_class_like(node);
-        let kind = if cpp && member_context {
-            if owner.is_some_and(|value| value.rsplit("::").next() == Some(final_name)) {
-                "constructor"
-            } else {
-                "method"
-            }
-        } else {
-            "function"
-        };
+        let kind = c_family_function_kind(node, name_node, source, cpp);
         push_symbol(node, name_node, source, (parent, "::"), kind, depth, output);
         return;
     }
     if matches!(node.kind(), "declaration" | "field_declaration") {
-        if let Some(function) = descendant_with_kind(node, "function_declarator")
-            && let Some(name_node) = declarator_name(function)
+        let mut cursor = node.walk();
+        let mut declared = false;
+        for declarator in node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter(Node::is_named)
         {
-            let name = source_slice(source, name_node.start_byte(), name_node.end_byte());
-            let leaf = name.rsplit("::").next().unwrap_or(name.as_ref());
-            let owner_leaf = parent.and_then(|value| value.rsplit("::").next());
-            let member_context = name.contains("::") || inside_class_like(node);
-            let kind = if cpp && member_context && owner_leaf == Some(leaf) {
-                "constructor"
-            } else if cpp && member_context {
-                "method"
+            let Some(name_node) = declarator_name(declarator) else {
+                continue;
+            };
+            let function = declarator.kind() == "function_declarator"
+                || descendant_with_kind(declarator, "function_declarator").is_some();
+            let kind = if function {
+                c_family_function_kind(node, name_node, source, cpp)
+            } else if parent.is_some() {
+                "field"
             } else {
-                "function"
+                continue;
             };
             push_symbol(node, name_node, source, (parent, "::"), kind, depth, output);
-            return;
+            declared = true;
         }
-        if parent.is_some()
-            && let Some(declarator) = node.child_by_field_name("declarator")
-            && let Some(name_node) = declarator_name(declarator)
-        {
-            push_symbol(
-                node,
-                name_node,
-                source,
-                (parent, "::"),
-                "field",
-                depth,
-                output,
-            );
+        if declared {
             return;
         }
     }
@@ -477,17 +702,7 @@ fn walk_c_family(
         && node.kind() == "function_declarator"
         && let Some(name_node) = declarator_name(node)
     {
-        let name = source_slice(source, name_node.start_byte(), name_node.end_byte());
-        let leaf = name.rsplit("::").next().unwrap_or(name.as_ref());
-        let owner_leaf = parent.and_then(|value| value.rsplit("::").next());
-        let member_context = name.contains("::") || inside_class_like(node);
-        let kind = if member_context && owner_leaf == Some(leaf) {
-            "constructor"
-        } else if member_context {
-            "method"
-        } else {
-            "function"
-        };
+        let kind = c_family_function_kind(node, name_node, source, cpp);
         let item = node
             .parent()
             .filter(|candidate| candidate.kind() == "template_declaration")
@@ -604,19 +819,25 @@ fn walk_go(
         );
         return;
     }
-    if matches!(node.kind(), "const_spec" | "var_spec")
-        && parent.is_none()
-        && let Some(name_node) = node.child_by_field_name("name")
-    {
-        push_symbol(
-            node,
-            name_node,
-            source,
-            (None, "."),
-            "binding",
-            depth,
-            output,
-        );
+    if matches!(node.kind(), "const_spec" | "var_spec") && parent.is_none() {
+        let mut cursor = node.walk();
+        for name_node in node
+            .children_by_field_name("name", &mut cursor)
+            .filter(Node::is_named)
+        {
+            if source_slice(source, name_node.start_byte(), name_node.end_byte()) == "_" {
+                continue;
+            }
+            push_symbol(
+                node,
+                name_node,
+                source,
+                (None, "."),
+                "binding",
+                depth,
+                output,
+            );
+        }
         return;
     }
     if node.kind() == "field_declaration" && parent.is_some() {
@@ -658,7 +879,8 @@ fn walk_ecmascript(
     if let Some(kind) = container_kind
         && let Some(name_node) = node.child_by_field_name("name")
     {
-        let qualified = push_symbol(node, name_node, source, (parent, "."), kind, depth, output);
+        let qualified =
+            push_ecmascript_symbol(node, name_node, source, parent, kind, depth, output);
         if let Some(body) = node.child_by_field_name("body") {
             walk_named_children(body, |child| {
                 walk_ecmascript(
@@ -689,7 +911,8 @@ fn walk_ecmascript(
         } else {
             kind
         };
-        let qualified = push_symbol(node, name_node, source, (parent, "."), kind, depth, output);
+        let qualified =
+            push_ecmascript_symbol(node, name_node, source, parent, kind, depth, output);
         if matches!(
             node.kind(),
             "function_declaration"
@@ -718,15 +941,7 @@ fn walk_ecmascript(
             node.named_children(&mut cursor).next()
         })
     {
-        push_symbol(
-            node,
-            name_node,
-            source,
-            (parent, "."),
-            "variant",
-            depth,
-            output,
-        );
+        push_ecmascript_symbol(node, name_node, source, parent, "variant", depth, output);
         return;
     }
     if matches!(
@@ -735,15 +950,7 @@ fn walk_ecmascript(
     ) && parent.is_some()
         && let Some(name_node) = node.child_by_field_name("name")
     {
-        push_symbol(
-            node,
-            name_node,
-            source,
-            (parent, "."),
-            "field",
-            depth,
-            output,
-        );
+        push_ecmascript_symbol(node, name_node, source, parent, "field", depth, output);
         return;
     }
     if node.kind() == "variable_declarator" {
@@ -756,13 +963,17 @@ fn walk_ecmascript(
         if (is_program_level(node) || function_value)
             && let Some(name_node) = node.child_by_field_name("name")
         {
+            if name_node.kind() != "identifier" {
+                add_pattern_bindings(node, name_node, source, parent, "binding", depth, output);
+                return;
+            }
             let kind = if function_value {
                 "function"
             } else {
                 "binding"
             };
             let qualified =
-                push_symbol(node, name_node, source, (parent, "."), kind, depth, output);
+                push_ecmascript_symbol(node, name_node, source, parent, kind, depth, output);
             if function_value
                 && let Some(value) = node.child_by_field_name("value")
                 && let Some(body) = value.child_by_field_name("body")
@@ -784,6 +995,39 @@ fn walk_ecmascript(
     walk_named_children(node, |child| {
         walk_ecmascript(child, source, parent, depth, typescript, output)
     });
+}
+
+fn push_ecmascript_symbol(
+    node: Node<'_>,
+    name_node: Node<'_>,
+    source: &str,
+    parent: Option<&str>,
+    kind: &'static str,
+    depth: usize,
+    output: &mut SymbolCollector,
+) -> String {
+    if name_node.kind() == "string" {
+        let raw = source_slice(source, name_node.start_byte(), name_node.end_byte());
+        let Some(name) = document::decode_quoted_scalar(&raw, Language::JavaScript) else {
+            output.truncated = true;
+            return String::new();
+        };
+        let kind = if kind == "method" && name == "constructor" {
+            "constructor"
+        } else {
+            kind
+        };
+        return push_literal_symbol(
+            node,
+            (name_node, &name),
+            source,
+            parent,
+            kind,
+            depth,
+            output,
+        );
+    }
+    push_symbol(node, name_node, source, (parent, "."), kind, depth, output)
 }
 
 fn walk_csharp_root(node: Node<'_>, source: &str, output: &mut SymbolCollector) {
@@ -976,6 +1220,10 @@ fn walk_php_root(root: Node<'_>, source: &str, output: &mut SymbolCollector) {
             continue;
         }
         let Some(name) = child.child_by_field_name("name") else {
+            if let Some(body) = child.child_by_field_name("body") {
+                walk_php(body, source, None, 0, output);
+            }
+            namespace = None;
             continue;
         };
         let namespace_name = push_symbol(child, name, source, (None, "\\"), "namespace", 0, output);
@@ -1037,6 +1285,20 @@ fn walk_kotlin(
     depth: usize,
     output: &mut SymbolCollector,
 ) {
+    if node.kind() == "property_declaration"
+        && let Some(target) = named_child_with_kind(&node, &["multi_variable_declaration"])
+    {
+        add_pattern_bindings(
+            node,
+            target,
+            source,
+            parent,
+            if parent.is_some() { "field" } else { "binding" },
+            depth,
+            output,
+        );
+        return;
+    }
     let (name, kind, separator) = match node.kind() {
         "class_declaration" => {
             let head = signature(node, source, node.start_byte());
@@ -1069,8 +1331,7 @@ fn walk_kotlin(
         ),
         "property_declaration" => (
             named_child_with_kind(&node, &["variable_declaration"])
-                .and_then(|child| descendant_with_kind(child, "simple_identifier"))
-                .or_else(|| named_child_with_kind(&node, &["simple_identifier"])),
+                .and_then(|child| descendant_with_kind(child, "simple_identifier")),
             if parent.is_some() { "field" } else { "binding" },
             ".",
         ),
@@ -1186,22 +1447,22 @@ fn walk_hcl(
             .named_children(&mut cursor)
             .filter(|child| matches!(child.kind(), "identifier" | "string_lit"))
             .map(|child| {
-                source_slice(source, child.start_byte(), child.end_byte())
-                    .trim_matches(['\'', '"'])
-                    .to_owned()
+                let raw = source_slice(source, child.start_byte(), child.end_byte());
+                if child.kind() == "string_lit" {
+                    document::decode_quoted_scalar(&raw, Language::Toml)
+                } else {
+                    Some(raw.into_owned())
+                }
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>();
+        let Some(segments) = segments else {
+            output.truncated = true;
+            return;
+        };
         if !segments.is_empty() {
-            let name = segments.join(".");
-            let qualified = push_symbol_name(
-                node,
-                (&name, None),
-                source,
-                (parent, "."),
-                "block",
-                depth,
-                output,
-            );
+            let path = qualified_path(parent, "", "::").extend_names(segments);
+            let names = (path.clone(), path.canonical(), path.legacy_code("."));
+            let qualified = push_symbol_path(node, names, None, source, "block", depth, output);
             if let Some(body) = named_child_with_kind(&node, &["body"]) {
                 walk_hcl(body, source, Some(&qualified), depth + 1, output);
             }
@@ -1254,8 +1515,25 @@ fn walk_r(
             && function.kind() == "function_definition"
             && matches!(name.kind(), "identifier" | "string")
         {
-            let qualified =
-                push_symbol(node, name, source, (parent, "."), "function", depth, output);
+            let raw = source_slice(source, name.start_byte(), name.end_byte());
+            let value = if name.kind() == "string" || raw.starts_with('`') {
+                document::decode_quoted_scalar(&raw, Language::R)
+            } else {
+                Some(raw.into_owned())
+            };
+            let Some(value) = value else {
+                output.truncated = true;
+                return;
+            };
+            let qualified = push_literal_symbol(
+                node,
+                (name, &value),
+                source,
+                parent,
+                "function",
+                depth,
+                output,
+            );
             if let Some(body) = function.child_by_field_name("body") {
                 walk_r(body, source, Some(&qualified), depth + 1, output);
             }
@@ -1408,26 +1686,26 @@ fn walk_swift(
     if matches!(
         node.kind(),
         "property_declaration" | "protocol_property_declaration"
-    ) && let Some(container) = node.child_by_field_name("name")
-        && let Some(name) = if container.kind() == "simple_identifier" {
-            Some(container)
-        } else {
-            descendant_with_kind(container, "simple_identifier")
+    ) {
+        let mut cursor = node.walk();
+        for target in node
+            .children_by_field_name("name", &mut cursor)
+            .filter(Node::is_named)
+        {
+            add_pattern_bindings(
+                node,
+                target,
+                source,
+                parent,
+                if parent.is_some() {
+                    "property"
+                } else {
+                    "binding"
+                },
+                depth,
+                output,
+            );
         }
-    {
-        push_symbol(
-            node,
-            name,
-            source,
-            (parent, "."),
-            if parent.is_some() {
-                "property"
-            } else {
-                "binding"
-            },
-            depth,
-            output,
-        );
         return;
     }
     if node.kind() == "enum_entry"
@@ -1490,20 +1768,21 @@ fn walk_scala(
         push_symbol(node, name, source, (parent, "."), "type", depth, output);
         return;
     }
-    if matches!(node.kind(), "val_definition" | "var_definition")
-        && let Some(name) = node
+    if matches!(node.kind(), "val_definition" | "var_definition") {
+        if let Some(target) = node
             .child_by_field_name("pattern")
             .or_else(|| named_child_with_kind(&node, &["identifier"]))
-    {
-        push_symbol(
-            node,
-            name,
-            source,
-            (parent, "."),
-            if parent.is_some() { "field" } else { "binding" },
-            depth,
-            output,
-        );
+        {
+            add_pattern_bindings(
+                node,
+                target,
+                source,
+                parent,
+                if parent.is_some() { "field" } else { "binding" },
+                depth,
+                output,
+            );
+        }
         return;
     }
     if node.kind() == "class_parameter"
@@ -2076,10 +2355,7 @@ fn walk_named_children(node: Node<'_>, mut visit: impl FnMut(Node<'_>)) {
 }
 
 fn declarator_name(node: Node<'_>) -> Option<Node<'_>> {
-    if matches!(
-        node.kind(),
-        "identifier" | "field_identifier" | "qualified_identifier"
-    ) {
+    if matches!(node.kind(), "identifier" | "field_identifier") || cpp_path_name(node) {
         return Some(node);
     }
     if let Some(declarator) = node.child_by_field_name("declarator")
@@ -2119,18 +2395,18 @@ fn descendant_with_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tr
     None
 }
 
-fn inside_class_like(node: Node<'_>) -> bool {
+fn enclosing_class_like(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
             "class_specifier" | "struct_specifier" | "union_specifier"
         ) {
-            return true;
+            return Some(parent);
         }
         current = parent.parent();
     }
-    false
+    None
 }
 
 fn inspect_tree(root: Node<'_>) -> Result<usize, usize> {
@@ -2169,8 +2445,15 @@ fn walk_python(
     output: &mut SymbolCollector,
 ) {
     if parent.is_none() && node.kind() == "assignment" {
-        if let Some(left) = node.child_by_field_name("left") {
-            add_python_bindings(node, left, source, depth, output);
+        let mut assignment = node;
+        loop {
+            if let Some(left) = assignment.child_by_field_name("left") {
+                add_python_bindings(node, left, source, depth, output);
+            }
+            match assignment.child_by_field_name("right") {
+                Some(right) if right.kind() == "assignment" => assignment = right,
+                _ => break,
+            }
         }
         return;
     }
@@ -2222,24 +2505,7 @@ fn add_python_bindings(
     depth: usize,
     output: &mut SymbolCollector,
 ) {
-    if target.kind() == "identifier" {
-        push_symbol(
-            assignment,
-            target,
-            source,
-            (None, "."),
-            "binding",
-            depth,
-            output,
-        );
-        return;
-    }
-    if matches!(target.kind(), "pattern_list" | "tuple" | "list") {
-        let mut cursor = target.walk();
-        for child in target.named_children(&mut cursor) {
-            add_python_bindings(assignment, child, source, depth, output);
-        }
-    }
+    add_pattern_bindings(assignment, target, source, None, "binding", depth, output);
 }
 
 fn add_python_definition(
@@ -2567,5 +2833,766 @@ mod symbol_limit_tests {
         assert_eq!(defects, 0);
         assert_eq!(symbols.len(), MAX_CODE_SYMBOLS);
         assert!(truncated);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn names(language: Language, source: &str) -> Vec<String> {
+        let (symbols, defects) =
+            parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+        assert_eq!(defects, 0, "{language:?}: {source}");
+        symbols.into_iter().map(|s| s.qualified_name).collect()
+    }
+
+    #[test]
+    fn scala_identifier_lists_bind_top_level_and_member_val_var_names() {
+        assert_eq!(
+            names(
+                Language::Scala,
+                "val one, two = rhs\nvar three, four: Int = rhs\nobject O { val five, six = rhs; var seven, eight: Int = rhs; val ordinary = rhs; val (nine, ten) = rhs }"
+            ),
+            [
+                "one",
+                "two",
+                "three",
+                "four",
+                "O",
+                "O::five",
+                "O::six",
+                "O::seven",
+                "O::eight",
+                "O::ordinary",
+                "O::nine",
+                "O::ten"
+            ]
+        );
+    }
+
+    #[test]
+    fn r_backtick_identifiers_use_r_escapes_and_remain_literal_segments() {
+        for (source, name) in [
+            (r#"`a\`b` <- function() {}"#, "a`b"),
+            (r#"`a\\b` <- function() {}"#, r"a\b"),
+            (r#"`a\x60b` <- function() {}"#, "a`b"),
+            (r#"`a\\\`b` <- function() {}"#, r"a\`b"),
+            (r#"(function() {}) -> `a\\b`"#, r"a\b"),
+            (r#"`plain.dot` <- function() {}"#, "plain.dot"),
+            (r#""a`b" <- function() {}"#, "a`b"),
+            (r#"plain.dot <- function() {}"#, "plain.dot"),
+        ] {
+            assert_eq!(
+                names(Language::R, source),
+                [SymbolPath::from_names([name.to_owned()]).canonical()],
+                "{source}"
+            );
+        }
+        assert_eq!(
+            document::decode_quoted_scalar(r#"`a\u0062`"#, Language::R),
+            None
+        );
+        assert_eq!(
+            document::decode_quoted_scalar(r#""a\u0062""#, Language::R).as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn cpp_destructor_tokens_ignore_spacing_comments_and_keep_name_coordinates() {
+        let source = "struct C { C(); ~ C(); };\nstruct D { D(); ~ /*between*/ D() {} };\nnamespace N { struct E { ~E(); }; E::~ /*between*/ E() {} }\n";
+        for language in [Language::Cpp, Language::Cuda] {
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            let destructors = symbols
+                .iter()
+                .filter(|s| s.qualified_name.contains('~'))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                destructors
+                    .iter()
+                    .map(|s| s.qualified_name.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    r#"C::["~C"]"#,
+                    r#"D::["~D"]"#,
+                    r#"N::E::["~E"]"#,
+                    r#"N::E::["~E"]"#
+                ]
+            );
+            for symbol in destructors {
+                assert_eq!(symbol.kind, "method");
+                let (row, column) = symbol
+                    .name_position
+                    .expect("comments must not hide name position");
+                assert!(matches!(
+                    source.lines().nth(row).unwrap().as_bytes()[column],
+                    b'C' | b'D' | b'E'
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn cpp_direct_template_names_keep_atomic_spelling_and_containing_ancestry() {
+        for (prefix, declaration, suffix, atom) in [
+            (
+                "namespace N { struct Tag {}; template<class T> struct Box; template<> ",
+                "struct Box<N::Tag> { Box() {} ~Box() {} void run() {} }",
+                "; }",
+                "Box<N::Tag>",
+            ),
+            (
+                "namespace N { struct Tag {}; template<class T> struct Box; } template<> ",
+                "struct N::Box<N::Tag> { Box() {} ~Box() {} void run() {} }",
+                ";",
+                "Box<N::Tag>",
+            ),
+            (
+                "namespace N { struct Tag {}; template<class T> struct Box; template<> ",
+                "struct Box< ::N::Tag > { Box() {} ~Box() {} void run() {} }",
+                "; }",
+                "Box< ::N::Tag >",
+            ),
+            (
+                "namespace N { template<int> struct Box; template<> ",
+                r#"struct Box<R"(a  b::c)"[0]> { Box() {} ~Box() {} void run() {} }"#,
+                "; }",
+                r#"Box<R"(a  b::c)"[0]>"#,
+            ),
+        ] {
+            let source = format!("{prefix}{declaration}{suffix}");
+            let owner = SymbolPath::from_names(["N".to_owned(), atom.to_owned()]);
+            for language in [Language::Cpp, Language::Cuda] {
+                let (symbols, defects) =
+                    parse_source_symbols(Path::new("fixture"), language, &source).unwrap();
+                assert_eq!(defects, 0, "{source}");
+                let container = symbols
+                    .iter()
+                    .find(|symbol| symbol.path == owner)
+                    .expect("atomic specialization");
+                assert_eq!(
+                    (container.start_byte, container.end_byte),
+                    (prefix.len(), prefix.len() + declaration.len())
+                );
+                assert_eq!(
+                    container.name_position,
+                    Some((0, source.find(atom).unwrap()))
+                );
+                for (name, kind, body) in [
+                    ("Box", "constructor", "Box() {}"),
+                    ("~Box", "method", "~Box() {}"),
+                    ("run", "method", "void run() {}"),
+                ] {
+                    let symbol = symbols
+                        .iter()
+                        .find(|symbol| symbol.path == owner.child_name(name))
+                        .expect("specialization member");
+                    assert_eq!(symbol.kind, kind);
+                    assert_eq!(&source[symbol.start_byte..symbol.end_byte], body);
+                }
+            }
+        }
+        for (opening, closing, scopes) in [
+            ("namespace Outer { namespace N {", "} }", vec!["Outer", "N"]),
+            ("namespace Outer::N {", "}", vec!["Outer", "N"]),
+            ("namespace Outer /*scope*/ :: N {", "}", vec!["Outer", "N"]),
+            (
+                "namespace Outer::Middle /*scope*/ :: N {",
+                "}",
+                vec!["Outer", "Middle", "N"],
+            ),
+        ] {
+            let atom = format!("Box<{}::Tag>", scopes.join("::"));
+            let source = format!(
+                "{opening} struct Tag {{}}; template<class T> struct Box; template<> struct {atom} {{ struct Inner {{ Inner() {{}} ~Inner() {{}} }}; }}; {closing}"
+            );
+            for language in [Language::Cpp, Language::Cuda] {
+                let owner = SymbolPath::from_names(scopes.iter().map(|s| (*s).to_owned()))
+                    .child_name(&atom)
+                    .child_name("Inner");
+                let (symbols, defects) =
+                    parse_source_symbols(Path::new("fixture"), language, &source).unwrap();
+                assert_eq!(defects, 0);
+                assert!(symbols.iter().any(|symbol| symbol.path == owner));
+                assert!(
+                    symbols
+                        .iter()
+                        .any(|symbol| symbol.path == owner.child_name("Inner")
+                            && symbol.kind == "constructor")
+                );
+                assert!(
+                    symbols
+                        .iter()
+                        .any(|symbol| symbol.path == owner.child_name("~Inner")
+                            && symbol.kind == "method")
+                );
+            }
+        }
+        // The same direct-template identity boundary applies to callable declarators.
+        for (source, path, body) in [
+            (
+                "namespace N { struct Tag {}; template<class T> void f(); template<> void f<N::Tag>() {} }",
+                r#"N::["f<N::Tag>"]"#,
+                "void f<N::Tag>() {}",
+            ),
+            (
+                "namespace N { struct Tag {}; template<class T> void f(); } template<> void N::f<N::Tag>() {}",
+                r#"N::["f<N::Tag>"]"#,
+                "void N::f<N::Tag>() {}",
+            ),
+            (
+                "namespace N { template<int> void f(); template<> void f<R\"(a  b::c)\"[0]>() {} }",
+                r#"N::["f<R\"(a  b::c)\"[0]>"]"#,
+                "void f<R\"(a  b::c)\"[0]>() {}",
+            ),
+        ] {
+            for language in [Language::Cpp, Language::Cuda] {
+                let (symbols, defects) =
+                    parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+                assert_eq!(defects, 0);
+                let symbol = symbols
+                    .iter()
+                    .find(|symbol| symbol.qualified_name == path)
+                    .expect("atomic callable specialization");
+                assert_eq!(&source[symbol.start_byte..symbol.end_byte], body);
+                assert_eq!(
+                    symbol.name_position,
+                    Some((0, source.find(body).unwrap() + body.find('f').unwrap()))
+                );
+                assert!(symbols.iter().any(|symbol| symbol.qualified_name == "N::f"));
+            }
+        }
+        for language in [Language::Cpp, Language::Cuda] {
+            let source = "template<class T> struct Box { Box<T>() {} };";
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            let constructor = symbols
+                .iter()
+                .find(|symbol| symbol.qualified_name == r#"Box::["Box<T>"]"#)
+                .expect("atomic constructor template-id");
+            assert_eq!(constructor.kind, "constructor");
+            assert_eq!(
+                &source[constructor.start_byte..constructor.end_byte],
+                "Box<T>() {}"
+            );
+            assert_eq!(
+                constructor.name_position,
+                Some((0, source.find("Box<T>").unwrap()))
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_global_anchor_is_not_containing_ancestry_or_template_argument_punctuation() {
+        for language in [Language::Cpp, Language::Cuda] {
+            for first in ["::N::C::~C() {}", "C::~C() {}"] {
+                let source = format!("namespace N {{ {first} namespace N {{ C::~C() {{}} }} }}");
+                let (symbols, defects) =
+                    parse_source_symbols(Path::new("fixture"), language, &source).unwrap();
+                assert_eq!(defects, 0);
+                let members = symbols
+                    .iter()
+                    .filter(|symbol| symbol.kind == "method")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    members
+                        .iter()
+                        .map(|s| s.qualified_name.as_str())
+                        .collect::<Vec<_>>(),
+                    [r#"N::C::["~C"]"#, r#"N::N::C::["~C"]"#]
+                );
+                assert_eq!(&source[members[0].start_byte..members[0].end_byte], first);
+                assert_eq!(
+                    members[0].name_position,
+                    Some((0, source.find(first).unwrap() + first.rfind('C').unwrap()))
+                );
+            }
+            let source =
+                "namespace N { ::N::C::C() {} ::N::C::~ /*leaf*/ C() {} void ::N::C::run() {} }";
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            assert_eq!(
+                symbols
+                    .iter()
+                    .filter(|symbol| matches!(symbol.kind, "constructor" | "method"))
+                    .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind))
+                    .collect::<Vec<_>>(),
+                [
+                    ("N::C::C", "constructor"),
+                    (r#"N::C::["~C"]"#, "method"),
+                    ("N::C::run", "method")
+                ]
+            );
+            // Containers and their descendants use the same global anchor as callables.
+            let source = "namespace N { struct C; struct ::N::C { C() {} ~C() {} }; struct Tag {}; template<class T> struct Box; template<> struct ::N::Box<N::Tag> { Box() {} ~Box() {} }; }";
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            assert!(
+                symbols
+                    .iter()
+                    .all(|symbol| !symbol.qualified_name.starts_with("N::N::"))
+            );
+            assert!(symbols.iter().any(|symbol| symbol.qualified_name
+                == r#"N::["Box<N::Tag>"]::Box"#
+                && symbol.kind == "constructor"));
+            assert!(
+                symbols.iter().any(
+                    |symbol| symbol.qualified_name == "N::C::C" && symbol.kind == "constructor"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_qualified_destructors_use_ast_paths_at_each_depth_and_trivia_boundary() {
+        for language in [Language::Cpp, Language::Cuda] {
+            for scopes in [vec!["Plain"], vec!["N", "C"], vec!["N", "Inner", "D"]] {
+                let class = scopes.last().unwrap();
+                for (separator, tilde_gap) in [
+                    ("::", ""),
+                    (" :: ", " "),
+                    ("::", " /*leaf*/ "),
+                    (" /*scope*/ :: /*next*/ ", ""),
+                    ("\n:: // next scope\n", " // class name\n"),
+                ] {
+                    let source = format!("{}::~{tilde_gap}{class}() {{}}", scopes.join(separator));
+                    let expected = SymbolPath::from_names(
+                        scopes
+                            .iter()
+                            .map(|s| (*s).to_owned())
+                            .chain([format!("~{class}")]),
+                    );
+                    let (symbols, defects) =
+                        parse_source_symbols(Path::new("fixture"), language, &source).unwrap();
+                    assert_eq!(defects, 0, "{source}");
+                    assert_eq!(symbols.len(), 1, "{source}");
+                    let symbol = &symbols[0];
+                    assert_eq!(symbol.path, expected, "{source}");
+                    assert_eq!(symbol.kind, "method", "{source}");
+                    assert_eq!((symbol.start_byte, symbol.end_byte), (0, source.len()));
+                    let offset = source.rfind(class).unwrap();
+                    let prefix = &source[..offset];
+                    let row = prefix.bytes().filter(|b| *b == b'\n').count();
+                    let column = prefix.rsplit('\n').next().unwrap().len();
+                    assert_eq!(symbol.name_position, Some((row, column)), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpp_qualified_names_preserve_members_templates_operators_and_literal_tokens() {
+        for (source, names, kind, name_token) in [
+            ("::N::C::~C() {}", vec!["N", "C", "~C"], "method", "C"),
+            (
+                "void N::C::run() {}",
+                vec!["N", "C", "run"],
+                "method",
+                "run",
+            ),
+            (
+                "void N /*x*/ :: C /*y*/ :: run() {}",
+                vec!["N", "C", "run"],
+                "method",
+                "run",
+            ),
+            ("N::C::C() {}", vec!["N", "C", "C"], "constructor", "C"),
+            (
+                "N /*x*/ :: C /*y*/ :: C() {}",
+                vec!["N", "C", "C"],
+                "constructor",
+                "C",
+            ),
+            (
+                "template<class T> N::Box< T >::~ /*leaf*/ Box() {}",
+                vec!["N", "Box< T >", "~Box"],
+                "method",
+                "Box",
+            ),
+            (
+                "template<class T> N::Box< T >::Box() {}",
+                vec!["N", "Box< T >", "Box"],
+                "constructor",
+                "Box",
+            ),
+            (
+                "template<> void N::Box< unsigned int >::run() {}",
+                vec!["N", "Box< unsigned int >", "run"],
+                "method",
+                "run",
+            ),
+            (
+                "template<> void N::Box< N::Tag >::run() {}",
+                vec!["N", "Box< N::Tag >", "run"],
+                "method",
+                "run",
+            ),
+            (
+                r#"template<> void N::ValueBox< ("a  b"[0]) >::run() {}"#,
+                vec!["N", r#"ValueBox< ("a  b"[0]) >"#, "run"],
+                "method",
+                "run",
+            ),
+            (
+                r#"template<> void N::ValueBox< (R"(a  b /*literal*/)"[0]) >::run() {}"#,
+                vec!["N", r#"ValueBox< (R"(a  b /*literal*/)"[0]) >"#, "run"],
+                "method",
+                "run",
+            ),
+            (
+                "template<> void N::ValueBox< (' ') >::run() {}",
+                vec!["N", "ValueBox< (' ') >", "run"],
+                "method",
+                "run",
+            ),
+            (
+                "template<> void N::ValueBox< (1 + +2) >::run() {}",
+                vec!["N", "ValueBox< (1 + +2) >", "run"],
+                "method",
+                "run",
+            ),
+            (
+                "void N::C::operator()() const {}",
+                vec!["N", "C", "operator()"],
+                "method",
+                "operator",
+            ),
+            (
+                "void N /*x*/ :: C :: operator /*op*/ ()() const {}",
+                vec!["N", "C", "operator()"],
+                "method",
+                "operator",
+            ),
+            (
+                "void* N::C::operator /*op*/ new(unsigned long) { throw 0; }",
+                vec!["N", "C", "operator new"],
+                "method",
+                "operator",
+            ),
+            (
+                "N::C::operator N::Tag() const { return {}; }",
+                vec!["N", "C", "operator N::Tag() const"],
+                "method",
+                "operator",
+            ),
+            // Retain the native grammar's existing conversion-name extent and type spelling.
+            (
+                "N::C::operator const char*() const { return nullptr; }",
+                vec!["N", "C", "operator const char*() const"],
+                "method",
+                "operator",
+            ),
+        ] {
+            for language in [Language::Cpp, Language::Cuda] {
+                let (symbols, defects) =
+                    parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+                assert_eq!(defects, 0, "{source}");
+                assert_eq!(symbols.len(), 1, "{source}");
+                let symbol = &symbols[0];
+                let path = SymbolPath::from_names(names.iter().map(|s| (*s).to_owned()));
+                assert_eq!(symbol.path, path, "{source}");
+                assert_eq!(symbol.qualified_name, path.canonical());
+                assert_eq!(symbol.legacy_qualified_name, names.join("::"));
+                assert_eq!(symbol.kind, kind, "{source}");
+                assert_eq!(
+                    symbol.name_position,
+                    Some((0, source.rfind(name_token).unwrap())),
+                    "{source}"
+                );
+                let start = if source.starts_with("template") {
+                    source.find("> ").unwrap() + 2
+                } else {
+                    0
+                };
+                assert_eq!(
+                    (symbol.start_byte, symbol.end_byte),
+                    (start, source.len()),
+                    "{source}"
+                );
+            }
+        }
+        // Enclosing specialized-class ownership comes from AST names too.
+        let source = "namespace N { template<class T> struct Box; } template<> struct N::Box<int> { Box() {} ~Box() {} void run() {} };";
+        for language in [Language::Cpp, Language::Cuda] {
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            let members = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, "constructor" | "method"))
+                .map(|s| (s.qualified_name.as_str(), s.kind))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                members,
+                [
+                    (r#"N::["Box<int>"]::Box"#, "constructor"),
+                    (r#"N::["Box<int>"]::["~Box"]"#, "method"),
+                    (r#"N::["Box<int>"]::run"#, "method"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_destructors_keep_tilde_and_are_not_constructor_overloads() {
+        let source = "struct C { C(); C(int); virtual ~C() noexcept; void ordinary(); }; struct D { D() {} ~D() {} }; namespace N { struct E { E(); ~E(); }; E::~E() = default; } template<class T> struct Box { Box() = default; ~Box() = default; };";
+        for language in [Language::Cpp, Language::Cuda] {
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            let rows = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, "constructor" | "method"))
+                .map(|s| (s.qualified_name.as_str(), s.kind))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                [
+                    ("C::C", "constructor"),
+                    ("C::C", "constructor"),
+                    (r#"C::["~C"]"#, "method"),
+                    ("C::ordinary", "method"),
+                    ("D::D", "constructor"),
+                    (r#"D::["~D"]"#, "method"),
+                    ("N::E::E", "constructor"),
+                    (r#"N::E::["~E"]"#, "method"),
+                    (r#"N::E::["~E"]"#, "method"),
+                    ("Box::Box", "constructor"),
+                    (r#"Box::["~Box"]"#, "method")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn native_text_budget_includes_owned_path_segments() {
+        let owner = "A".repeat(4096);
+        let source = format!(
+            "struct {owner} {{ {} }};",
+            (0..600)
+                .map(|i| format!("int field{i};"))
+                .collect::<String>()
+        );
+        let (symbols, defects, truncated) =
+            parse_source_symbols_state(Path::new("fixture.cpp"), Language::Cpp, &source).unwrap();
+        assert_eq!(defects, 0);
+        assert!(truncated);
+        assert!(symbols.len() < 601);
+        assert!(symbols.iter().map(Symbol::text_bytes).sum::<usize>() <= MAX_SYMBOL_TEXT_BYTES);
+    }
+
+    #[test]
+    fn go_declaration_names_exclude_punctuation_and_initializers() {
+        assert_eq!(
+            names(
+                Language::Go,
+                "package p\nvar one, two = rhs1, rhs2\nconst three, four = 3, 4\n"
+            ),
+            ["one", "two", "three", "four"]
+        );
+    }
+
+    #[test]
+    fn php_anonymous_namespace_keeps_global_declarations() {
+        assert_eq!(
+            names(
+                Language::Php,
+                "<?php\nnamespace Named { function visible() {} }\nnamespace { function global_fn() {} class GlobalClass {} }\n"
+            ),
+            ["Named", "Named::visible", "global_fn", "GlobalClass"]
+        );
+        assert_eq!(
+            names(
+                Language::Php,
+                "<?php\nnamespace Named; function visible() {}"
+            ),
+            ["Named", "Named::visible"]
+        );
+    }
+
+    #[test]
+    fn python_chains_and_nested_patterns_bind_only_target_names() {
+        for source in [
+            "one = (two, *three) = value",
+            "one = [two, three] = value",
+            "one, (two, three) = value",
+            "(one, two, three) = value",
+        ] {
+            assert_eq!(
+                names(Language::Python, source),
+                ["one", "two", "three"],
+                "{source}"
+            );
+        }
+        assert_eq!(
+            names(
+                Language::Python,
+                "obj.attr = index[slot] = one = value\ndef f():\n    local = rhs\n"
+            ),
+            ["one", "f"]
+        );
+    }
+
+    #[test]
+    fn c_family_keeps_all_field_and_function_declarators() {
+        for language in [Language::C, Language::Cpp, Language::Cuda] {
+            assert_eq!(
+                names(
+                    language,
+                    "struct Pair { int one, two; }; int first(void), second(void);"
+                ),
+                ["Pair", "Pair::one", "Pair::two", "first", "second"]
+            );
+        }
+    }
+
+    #[test]
+    fn ecmascript_patterns_do_not_invent_key_or_rhs_bindings() {
+        for language in [Language::JavaScript, Language::TypeScript] {
+            assert_eq!(
+                names(
+                    language,
+                    "const {one, key: [two = fallback, ...three]} = rhs;"
+                ),
+                ["one", "two", "three"]
+            );
+            assert_eq!(
+                names(language, "const [one, {key: two}, ...three] = rhs;"),
+                ["one", "two", "three"]
+            );
+            assert_eq!(
+                names(
+                    language,
+                    "const one = 1, two = 2; function f() { let local = rhs; }"
+                ),
+                ["one", "two", "f"]
+            );
+        }
+    }
+
+    #[test]
+    fn scala_swift_and_kotlin_tuple_bindings_keep_each_declared_name() {
+        for (language, source, ordinary) in [
+            (
+                Language::Scala,
+                "val (one, (_, two)) = rhs",
+                "val one = 1\nval two = 2",
+            ),
+            (
+                Language::Swift,
+                "let (one, (_, two)) = rhs",
+                "let one = 1\nlet two = 2",
+            ),
+            (
+                Language::Kotlin,
+                "val (one, _, two) = rhs",
+                "val one = 1\nval two = 2",
+            ),
+        ] {
+            assert_eq!(names(language, source), ["one", "two"]);
+            assert_eq!(names(language, ordinary), ["one", "two"]);
+        }
+    }
+
+    #[test]
+    fn typed_tuple_bindings_do_not_harvest_type_names() {
+        let source = "val (one: Int, two: Int) = rhs";
+        let mut parser = Language::Scala.parser(Path::new("fixture.scala")).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert_eq!(
+            names(Language::Scala, source),
+            ["one", "two"],
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(
+            names(Language::Swift, "let (one, two): (Int, Int) = rhs"),
+            ["one", "two"]
+        );
+        assert_eq!(
+            names(Language::Kotlin, "val (one: Int, two: Int) = rhs"),
+            ["one", "two"]
+        );
+        assert_eq!(
+            names(
+                Language::Go,
+                "package p\nvar one, _ = 1, 2\nconst _, two = 1, 2\n"
+            ),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn pattern_wildcards_do_not_hide_real_underscore_bindings() {
+        assert_eq!(
+            names(Language::Python, "_ = (one, two) = value"),
+            ["_", "one", "two"]
+        );
+        for language in [Language::JavaScript, Language::TypeScript] {
+            assert_eq!(names(language, "const [_, one] = rhs;"), ["_", "one"]);
+        }
+    }
+
+    #[test]
+    fn decoded_literals_keep_language_identity_and_semantic_name_positions() {
+        assert_eq!(
+            names(Language::R, r#""\U00000041" <- function() {}"#),
+            ["A"]
+        );
+        assert_eq!(names(Language::R, r#"'\x41' <- function() {}"#), ["A"]);
+        assert_eq!(names(Language::R, r#""\303\251" <- function() {}"#), ["é"]);
+        for language in [Language::JavaScript, Language::TypeScript] {
+            let source = "class C { \"a\\\r\nb\"() {} \"constructor\"() {} }";
+            let (symbols, defects) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(defects, 0);
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|s| s.qualified_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["C", "C::ab", "C::constructor"]
+            );
+            assert_eq!(symbols[2].kind, "constructor");
+            let source = r#"class C { "a.b"() {} }"#;
+            let (symbols, _) =
+                parse_source_symbols(Path::new("fixture"), language, source).unwrap();
+            assert_eq!(symbols[1].name_position, Some((0, 11)));
+        }
+    }
+
+    #[test]
+    fn literal_code_names_remain_atomic_canonical_segments() {
+        assert_eq!(
+            names(Language::R, "foo.bar <- function() { 1 }"),
+            [r#"["foo.bar"]"#]
+        );
+        assert_eq!(
+            names(Language::Hcl, r#"resource "type" "a.b" { x = 1 }"#),
+            [
+                r#"resource::type::["a.b"]"#,
+                r#"resource::type::["a.b"]::x"#
+            ]
+        );
+        for language in [Language::JavaScript, Language::TypeScript] {
+            assert_eq!(
+                names(language, r#"class C { "a.b"() {} 'a  b'() {} }"#),
+                ["C", r#"C::["a.b"]"#, r#"C::["a  b"]"#]
+            );
+        }
+        assert_eq!(
+            names(Language::Cpp, "namespace A { struct B { void f(); }; }"),
+            ["A", "A::B", "A::B::f"]
+        );
+        assert_eq!(
+            names(Language::Kotlin, "val one = object { fun member() {} }"),
+            ["one", "one::member"]
+        );
     }
 }

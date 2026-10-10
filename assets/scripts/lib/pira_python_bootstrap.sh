@@ -90,6 +90,14 @@ pira_require_python3() {
 pira_bootstrap_python3() {
   py=$(pira_find_python3 11 || true)
   if [ -z "${py:-}" ]; then
+    for arg in "$@"; do
+      case "$arg" in
+        --dry-run|--verify)
+          printf '%s\n' 'ERROR: Python 3.11+ is required; read-only setup will not install it. Install Python separately and retry.' >&2
+          return 1
+          ;;
+      esac
+    done
     pira_offer_python_install "$@" || true
     py=$(pira_find_python3 11 || true)
   fi

@@ -252,9 +252,45 @@ struct LiveManifest {
     checkpoint_unix_ms: u128,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_path_native: Option<crate::native_path::NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_path_native: Option<crate::native_path::NativePath>,
     #[serde(default)]
     owner_lock: bool,
     metadata: Metadata,
+}
+
+impl LiveManifest {
+    fn stream_paths(&self) -> Result<(PathBuf, PathBuf), String> {
+        let expected_schema =
+            if self.stdout_path_native.is_some() || self.stderr_path_native.is_some() {
+                4
+            } else if self
+                .metadata
+                .cwd_native
+                .as_ref()
+                .is_some_and(|path| path.requires_native())
+            {
+                3
+            } else if self.metadata.redirected_stream.is_some() {
+                2
+            } else {
+                1
+            };
+        if self.schema != expected_schema {
+            return Err("unsupported live checkpoint schema".into());
+        }
+        // Legacy strings stay exact, including actual Unicode replacement characters.
+        // Native fields are authoritative; display strings must never retarget a spool.
+        let resolve = |native: Option<&crate::native_path::NativePath>, legacy: &Path| {
+            native.map_or_else(|| Ok(legacy.to_path_buf()), |path| path.to_path())
+        };
+        Ok((
+            resolve(self.stdout_path_native.as_ref(), &self.stdout_path)?,
+            resolve(self.stderr_path_native.as_ref(), &self.stderr_path)?,
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -438,8 +474,14 @@ pub fn write_live_checkpoint(
         stderr_sha256: String::new(),
         timeline_truncated: snapshot.timeline_truncated || retention_truncated,
     };
+    let stdout_native = crate::native_path::NativePath::from_path(snapshot.stdout_path);
+    let stderr_native = crate::native_path::NativePath::from_path(snapshot.stderr_path);
+    let stdout_path_native = stdout_native.requires_native().then_some(stdout_native);
+    let stderr_path_native = stderr_native.requires_native().then_some(stderr_native);
     let mut manifest = LiveManifest {
-        schema: if snapshot.cwd_native.requires_native() {
+        schema: if stdout_path_native.is_some() || stderr_path_native.is_some() {
+            4
+        } else if snapshot.cwd_native.requires_native() {
             3
         } else if snapshot.redirected_stream.is_some() {
             2
@@ -448,8 +490,11 @@ pub fn write_live_checkpoint(
         },
         generation,
         checkpoint_unix_ms,
-        stdout_path: snapshot.stdout_path.to_path_buf(),
-        stderr_path: snapshot.stderr_path.to_path_buf(),
+        // These legacy fields are display-only when the native counterpart is present.
+        stdout_path: PathBuf::from(snapshot.stdout_path.to_string_lossy().as_ref()),
+        stderr_path: PathBuf::from(snapshot.stderr_path.to_string_lossy().as_ref()),
+        stdout_path_native,
+        stderr_path_native,
         owner_lock,
         metadata,
     };
@@ -994,18 +1039,8 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
     let bytes = crate::util::read_file_limited(path, MAX_METADATA_BYTES, "live checkpoint")?;
     let manifest: LiveManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid live checkpoint: {error}"))?;
-    if manifest.schema
-        != if manifest.metadata.cwd_native.as_ref().is_some_and(|path| path.requires_native()) {
-            3
-        } else if manifest.metadata.redirected_stream.is_some() {
-            2
-        } else {
-            1
-        }
-    {
-        return Err("unsupported live checkpoint schema".into());
-    }
-    for stream_path in [&manifest.stdout_path, &manifest.stderr_path] {
+    let (stdout_path, stderr_path) = manifest.stream_paths()?;
+    for stream_path in [&stdout_path, &stderr_path] {
         let valid_name = stream_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -1014,10 +1049,10 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
             return Err("invalid live checkpoint stream path".into());
         }
     }
-    let stdout_length = fs::metadata(&manifest.stdout_path)
+    let stdout_length = fs::metadata(&stdout_path)
         .map_err(|error| format!("open live stdout: {error}"))?
         .len();
-    let stderr_length = fs::metadata(&manifest.stderr_path)
+    let stderr_length = fs::metadata(&stderr_path)
         .map_err(|error| format!("open live stderr: {error}"))?
         .len();
     if manifest.metadata.stdout_bytes > stdout_length
@@ -1044,8 +1079,8 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
             generation: manifest.generation,
             checkpoint_unix_ms: manifest.checkpoint_unix_ms,
             owner_lock: manifest.owner_lock,
-            stdout_path: manifest.stdout_path,
-            stderr_path: manifest.stderr_path,
+            stdout_path,
+            stderr_path,
         }),
     })
 }
@@ -1894,7 +1929,7 @@ pub(crate) fn resolve_current_live_capture(store_dir: &Path) -> Result<String, S
     }
 }
 
-fn live_result_is_active(store_dir: &Path, stored: &StoredResult) -> bool {
+pub(crate) fn live_result_is_active(store_dir: &Path, stored: &StoredResult) -> bool {
     let Some(live) = stored.live.as_ref() else {
         return false;
     };
@@ -1990,8 +2025,7 @@ fn update_index(store_dir: &Path, entry: &ListedEntry, current_dirty: &Path) -> 
     if !indexes.join(INDEX_COMPLETE).is_file() || indexes_dirty_except(&indexes, current_dirty) {
         rebuild_indexes_locked(store_dir, &indexes)?;
     } else {
-        let path = indexes.join(format!("{}.jsonl", entry.workspace_hash));
-        append_index(&path, entry)?;
+        append_index(&indexes, entry)?;
     }
     // Other publishers may not yet have published their captures. Keep their markers.
     match fs::remove_file(current_dirty) {
@@ -2039,17 +2073,31 @@ fn rebuild_indexes_locked(store_dir: &Path, indexes: &Path) -> Result<(), String
             .or_default()
             .push(entry);
     }
-    for (workspace, entries) in grouped {
-        let path = indexes.join(format!("{workspace}.jsonl"));
+    for entries in grouped.into_values() {
         for entry in entries {
-            append_index(&path, &entry)?;
+            append_index(indexes, &entry)?;
         }
     }
     write_private_file(&indexes.join(INDEX_COMPLETE), b"2\n")?;
     Ok(())
 }
 
-fn append_index(path: &Path, entry: &ListedEntry) -> Result<(), String> {
+fn append_index(indexes: &Path, entry: &ListedEntry) -> Result<(), String> {
+    // Accept generated identities and empty legacy ownership, not filesystem names
+    // supplied by capture metadata (including Windows device/alternate-stream names).
+    let hash = &entry.workspace_hash;
+    let hex = |value: &str, length: usize| {
+        value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if !hash.is_empty()
+        && !hex(hash, 16)
+        && !hash
+            .strip_prefix("native-v1-")
+            .is_some_and(|value| hex(value, 64))
+    {
+        return Err("invalid workspace identity for capture index".into());
+    }
+    let path = indexes.join(format!("{hash}.jsonl"));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -2267,8 +2315,14 @@ pub fn prune_store(
     max_store_bytes: Option<u64>,
 ) -> Result<PruneResult, String> {
     ensure_private_dir(store_dir)?;
-    let mut entries = scan_store(store_dir, None)?;
-    entries.retain(|entry| !entry.running);
+    // Destructive decisions must use authoritative headers, never derived cache ages.
+    let mut entries = scan_result_headers(store_dir, None)?;
+    let completed_ids: HashSet<_> = entries.iter().map(|entry| entry.id.clone()).collect();
+    entries.extend(
+        scan_live_headers(store_dir, None)
+            .into_iter()
+            .filter(|entry| !entry.running && !completed_ids.contains(&entry.id)),
+    );
     entries.sort_by_key(|entry| entry.start_ms);
     let now = util::millis(SystemTime::now());
     let cutoff = max_age_days.map(|days| now.saturating_sub(days as u128 * 86_400_000));
@@ -2669,6 +2723,157 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_checkpoint_paths_preserve_ordinary_schemas_and_native_units() {
+        use crate::native_path::NativePath;
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-native-checkpoint-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stdout = std::env::temp_dir().join(".pira_ctx-spool-unicode-�-é-stdout");
+        let stderr = std::env::temp_dir().join(".pira_ctx-spool-unicode-�-é-stderr");
+        let cwd = NativePath::Utf8("ordinary".into());
+        let mut snapshot = LiveCheckpoint {
+            redirected_stream: None,
+            command: &[],
+            cwd: "ordinary",
+            cwd_native: &cwd,
+            start_ms: 0,
+            duration_ms: 0,
+            stdout_path: &stdout,
+            stderr_path: &stderr,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            observed_stdout_bytes: 0,
+            observed_stderr_bytes: 0,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            total_lines: 0,
+            timeline: &[],
+            timeline_truncated: false,
+        };
+        for redirected in [None, Some(StreamKind::Stderr)] {
+            snapshot.redirected_stream = redirected;
+            let id = write_live_checkpoint(&dir, None, 1, true, &snapshot).unwrap();
+            let bytes = fs::read(live_manifest_path(&dir, &id)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["schema"], if redirected.is_some() { 2 } else { 1 });
+            assert!(json.get("stdout_path_native").is_none());
+            assert!(json.get("stderr_path_native").is_none());
+            let manifest: LiveManifest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (stdout.clone(), stderr.clone())
+            );
+        }
+        #[cfg(unix)]
+        let native = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(
+                b"/native-\xff/.pira_ctx-spool-test".to_vec(),
+            ))
+        };
+        #[cfg(windows)]
+        let native = {
+            use std::os::windows::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_wide(&[
+                67, 58, 92, 0xd800, 92, 46, 112,
+            ]))
+        };
+        #[cfg(any(unix, windows))]
+        {
+            let native_cwd = NativePath::from_path(&native);
+            snapshot.redirected_stream = None;
+            snapshot.cwd_native = &native_cwd;
+            let id = write_live_checkpoint(&dir, None, 2, true, &snapshot).unwrap();
+            let mut manifest: LiveManifest =
+                serde_json::from_slice(&fs::read(live_manifest_path(&dir, &id)).unwrap()).unwrap();
+            assert_eq!(manifest.schema, 3);
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (stdout.clone(), stderr.clone())
+            );
+            // Invalid native units need no filesystem creation for the codec/publication test.
+            snapshot.cwd_native = &cwd;
+            snapshot.stdout_path = &native;
+            let id = write_live_checkpoint(&dir, None, 3, true, &snapshot).unwrap();
+            let bytes = fs::read(live_manifest_path(&dir, &id)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["schema"], 4);
+            assert!(json.get("stdout_path_native").is_some());
+            assert!(json.get("stderr_path_native").is_none());
+            manifest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (native.clone(), stderr.clone())
+            );
+            assert_ne!(manifest.stdout_path, native);
+            manifest.stdout_path = PathBuf::from("untrusted-display-alias");
+            assert_eq!(manifest.stream_paths().unwrap().0, native);
+            manifest.schema = 1;
+            assert!(manifest.stream_paths().is_err());
+            manifest.schema = 4;
+            #[cfg(unix)]
+            {
+                manifest.stdout_path_native = Some(NativePath::WindowsWide(vec![0xd800]));
+            }
+            #[cfg(windows)]
+            {
+                manifest.stdout_path_native = Some(NativePath::UnixBytes(vec![255]));
+            }
+            assert!(manifest.stream_paths().is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn index_destinations_accept_generated_and_legacy_identities_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-index-identity-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let mut entry = ListedEntry {
+            id: "fixture".into(),
+            filename: "fixture.piractx".into(),
+            timestamp: String::new(),
+            start_ms: 0,
+            exit: 0,
+            bytes: 0,
+            lines: 0,
+            command: String::new(),
+            path: dir.join("fixture.piractx"),
+            workspace_hash: String::new(),
+            kind: "capture".into(),
+            state: "complete".into(),
+            running: false,
+        };
+        for hash in [
+            String::new(),
+            "0123456789abcdef".into(),
+            format!("native-v1-{}", "a".repeat(64)),
+        ] {
+            entry.workspace_hash = hash.clone();
+            append_index(&dir, &entry).unwrap();
+            assert!(dir.join(format!("{hash}.jsonl")).is_file());
+        }
+        for hash in [
+            "../../sentinel",
+            "CON",
+            "foo:bar",
+            "a/b",
+            "a\\b",
+            "native-v1-bad",
+        ] {
+            entry.workspace_hash = hash.into();
+            assert!(append_index(&dir, &entry).is_err());
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_snapshot_publication_never_hides_or_locks_current_path() {

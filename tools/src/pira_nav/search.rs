@@ -1047,6 +1047,11 @@ fn render_counts(
     Ok(shown_query_files(&shown, options.patterns.len()))
 }
 
+struct RenderedBlock {
+    text: String,
+    source_bytes: usize,
+}
+
 fn render_snippets(
     scans: &[Scan],
     options: &Options,
@@ -1073,7 +1078,7 @@ fn render_snippets(
     let share = options.max_bytes / active;
     // Keep only the highest-ranked round-robin blocks that fit, not a buffer per input file.
     let mut pending =
-        std::collections::BTreeMap::<usize, (Vec<usize>, String, Option<Snippet>)>::new();
+        std::collections::BTreeMap::<usize, (Vec<usize>, RenderedBlock, Option<Snippet>)>::new();
     let mut pending_bytes = 0usize;
     let mut byte_limited = false;
     let mut context_reduced = 0usize;
@@ -1108,27 +1113,30 @@ fn render_snippets(
                 cwd,
             ));
             let mut block = snippet.as_ref().unwrap().render();
-            if block.len() > share {
+            if block.source_bytes > share {
                 if options.before_context > 0 || options.after_context > 0 {
                     context_reduced += 1;
                 }
                 snippet = Some(Snippet::new(scan, &lines, &hit, &symbols, 0, 0, cwd));
                 block = snippet.as_ref().unwrap().render();
             }
-            if block.len() > share {
+            if block.source_bytes > share {
                 byte_limited = true;
                 snippet = None;
-                block = format!(
-                    "match file={} line={} column={} queries={} source_omitted=byte_budget\n",
-                    quote_metadata(&display_path(&scan.path, cwd)),
-                    hit.row + 1,
-                    hit.column + 1,
-                    hit.queries
-                        .iter()
-                        .map(|q| (q + 1).to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                block = RenderedBlock {
+                    source_bytes: 0,
+                    text: format!(
+                        "match file={} line={} column={} queries={} source_omitted=byte_budget\n",
+                        quote_metadata(&display_path(&scan.path, cwd)),
+                        hit.row + 1,
+                        hit.column + 1,
+                        hit.queries
+                            .iter()
+                            .map(|q| (q + 1).to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                };
             }
             let mut merged_into = None;
             if let Some(candidate) = &snippet {
@@ -1147,8 +1155,8 @@ fn render_snippets(
                             .copied()
                             .collect::<BTreeSet<_>>()
                             .len();
-                        if text.len() <= share.saturating_mul(participating)
-                            && text.len() <= prior_text.len() + block.len()
+                        if text.source_bytes <= share.saturating_mul(participating)
+                            && text.source_bytes <= prior_text.source_bytes + block.source_bytes
                         {
                             merged_into = Some((*key, joined, text));
                             break;
@@ -1158,20 +1166,25 @@ fn render_snippets(
             }
             if let Some((key, joined, text)) = merged_into {
                 let entry = pending.get_mut(&key).expect("admitted snippet");
-                pending_bytes -= entry.1.len();
-                pending_bytes += text.len();
+                pending_bytes -= entry.1.source_bytes;
+                pending_bytes += text.source_bytes;
                 entry.0.extend(hit.queries);
                 entry.1 = text;
                 entry.2 = Some(joined);
             } else {
-                pending_bytes += block.len();
+                pending_bytes += block.source_bytes;
                 pending.insert(order, (hit.queries, block, snippet));
             }
             while pending_bytes > options.max_bytes {
-                if let Some((_, (_, removed, _))) = pending.pop_last() {
-                    pending_bytes -= removed.len();
-                    byte_limited = true;
-                }
+                let key = *pending
+                    .iter()
+                    .rev()
+                    .find(|(_, (_, block, _))| block.source_bytes > 0)
+                    .expect("source bytes exceed budget")
+                    .0;
+                let (_, removed, _) = pending.remove(&key).expect("admitted block");
+                pending_bytes -= removed.source_bytes;
+                byte_limited = true;
             }
         }
     }
@@ -1193,7 +1206,7 @@ fn render_snippets(
         }
     }
     snippets.sort_by(|a, b| (&a.1.path, a.1.start).cmp(&(&b.1.path, b.1.start)));
-    let mut merged: Vec<(usize, Snippet, String)> = Vec::new();
+    let mut merged: Vec<(usize, Snippet, RenderedBlock)> = Vec::new();
     for (order, snippet, block) in snippets {
         if let Some((first_order, previous, rendered)) = merged.last_mut()
             && previous.path == snippet.path
@@ -1202,8 +1215,8 @@ fn render_snippets(
             let mut candidate = previous.clone();
             candidate.merge(&snippet);
             let text = candidate.render();
-            // A newly detected cross-line warning must not overflow the admitted budget.
-            if text.len() <= rendered.len() + block.len() {
+            // Merged source must fit the already admitted source payload.
+            if text.source_bytes <= rendered.source_bytes + block.source_bytes {
                 *first_order = (*first_order).min(order);
                 *previous = candidate;
                 *rendered = text;
@@ -1215,7 +1228,9 @@ fn render_snippets(
     locations.extend(merged.into_iter().map(|(order, _, block)| (order, block)));
     locations.sort_by_key(|(order, _)| *order);
     for (_, block) in locations {
-        output.write_all(block.as_bytes()).map_err(output_error)?;
+        output
+            .write_all(block.text.as_bytes())
+            .map_err(output_error)?;
     }
     let omitted = scans
         .iter()
@@ -1335,7 +1350,7 @@ impl Snippet {
         }
     }
 
-    fn render(&self) -> String {
+    fn render(&self) -> RenderedBlock {
         use std::fmt::Write as _;
         let hits = self
             .hits
@@ -1388,7 +1403,10 @@ impl Snippet {
         block.push_str("--- begin ---\n");
         block.push_str(&escaped);
         block.push_str("--- end ---\n");
-        block
+        RenderedBlock {
+            text: block,
+            source_bytes: escaped.len(),
+        }
     }
 }
 

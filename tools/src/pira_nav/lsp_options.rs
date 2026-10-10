@@ -54,7 +54,7 @@ impl LspOptions {
         self.root.as_deref().unwrap_or(default_root)
     }
 
-    pub fn has_server(&self, language: Language) -> bool {
+    pub fn has_server(&self, language: Language, default_root: &Path) -> bool {
         self.languages
             .get(&language)
             .and_then(|server| server.executable.as_ref())
@@ -62,7 +62,7 @@ impl LspOptions {
             || self.default.executable.is_some()
             || (self.default.executable.is_none()
                 && !self.languages.contains_key(&language)
-                && auto_server_available(language))
+                && auto_server_available(language, self.root(default_root)))
     }
 
     pub fn config(&self, default_root: &Path) -> Result<LspConfigs, CommandError> {

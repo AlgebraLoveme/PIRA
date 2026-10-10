@@ -453,7 +453,8 @@ impl LspClient {
             let mut total_ranges = 0usize;
             for item in items {
                 let value = self.request(method, json!({"item": item}))?;
-                let next = parse_calls(&value, incoming, &uri, self.encoding)?;
+                let caller_uri = item["uri"].as_str().expect("validated call item URI");
+                let next = parse_calls(&value, incoming, caller_uri, self.encoding)?;
                 if calls.len().saturating_add(next.len()) > MAX_CALL_ITEMS {
                     return Err("LSP call hierarchy result exceeds the safety limit".into());
                 }

@@ -68,6 +68,19 @@ class ShellBootstrapTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("Python 3.11+", result.stderr)
 
+    def test_readonly_missing_python_never_installs_or_prompts(self):
+        self.executable("uname", "#!/bin/sh\nprintf 'Darwin\\n'\n")
+        self.executable("brew", "#!/bin/sh\nprintf 'UNEXPECTED_INSTALL\\n' >&2\n")
+        for flag in ("--dry-run", "--verify"):
+            for assume in ("0", "1"):
+                with self.subTest(flag=flag, assume=assume):
+                    self.env["PIRA_SETUP_ASSUME_YES"] = assume
+                    result = self.run_shell("pira_bootstrap_python3 --yes " + flag)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("UNEXPECTED_INSTALL", result.stderr)
+                    self.assertNotIn("now with Homebrew?", result.stderr)
+                    self.assertIn("Python 3.11+", result.stderr)
+
     def test_audio_keeps_python3_requirement(self):
         path = self.python("python3", (3, 10))
         result = self.run_shell("pira_require_python3")
@@ -122,6 +135,31 @@ if (($script:captured -join '|') -ne $expected) {{ throw 'Unexpected winget argu
 if ($result.Count -ne 0) {{ throw 'Installer output leaked into interpreter result' }}
 """
         result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", code], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_powershell_readonly_guard_precedes_installer(self):
+        source = (LIB / "pira_python_bootstrap.ps1").read_text()
+        bootstrap = source.split("function Bootstrap-PiraPython3", 1)[1]
+        self.assertLess(bootstrap.index('"--dry-run"'), bootstrap.index("Install-PiraPythonHint"))
+        self.assertLess(bootstrap.index('"--verify"'), bootstrap.index("Install-PiraPythonHint"))
+        self.assertIn("throw", bootstrap[:bootstrap.index("Install-PiraPythonHint")])
+
+    @unittest.skipUnless(shutil.which("pwsh"), "native PowerShell unavailable")
+    def test_readonly_missing_python_never_calls_mocked_installer(self):
+        path = str(LIB / "pira_python_bootstrap.ps1").replace("'", "''")
+        code = f"""
+$ErrorActionPreference = 'Stop'
+. '{path}'
+function Find-PiraPython3 {{ return $null }}
+function Install-PiraPythonHint {{ throw 'UNEXPECTED_INSTALL' }}
+$env:PIRA_SETUP_ASSUME_YES = '1'
+foreach ($flag in '--dry-run', '--verify') {{
+    try {{ Bootstrap-PiraPython3 -Args @('--yes', $flag); throw 'unexpected success' }}
+    catch {{ if ($_.Exception.Message -notlike '*read-only setup*') {{ throw }} }}
+}}
+"""
+        result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", code],
+                                capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_probe_expression_boundary(self):

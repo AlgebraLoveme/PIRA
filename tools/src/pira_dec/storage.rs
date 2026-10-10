@@ -25,8 +25,8 @@ impl Layout {
     pub fn current(store_option: Option<&Path>) -> Result<Self, String> {
         let root = effective_store_dir(store_option)?;
         let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        let workspace = nearest_git_root(&cwd).unwrap_or(cwd);
-        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let anchor = std::env::var_os("PIRA_DEC_WORKSPACE_DIR").map(PathBuf::from);
+        let workspace = workspace_for_cwd(&cwd, anchor.as_deref())?;
         Self::for_workspace(&root, &workspace)
     }
 
@@ -471,6 +471,39 @@ fn workspace_identity(root: &Path) -> (String, Option<String>) {
     let native = root.as_os_str().as_encoded_bytes().to_vec();
     let digest = Sha256::digest(&native);
     (format!("native-v1-{}", util::hex(&digest)), Some(legacy))
+}
+
+fn workspace_for_cwd(cwd: &Path, anchor: Option<&Path>) -> Result<PathBuf, String> {
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("decision cwd: {error}"))?;
+    let anchor = anchor
+        .map(|path| -> Result<PathBuf, String> {
+            if !path.is_absolute() {
+                return Err("PIRA_DEC_WORKSPACE_DIR must be an absolute directory".into());
+            }
+            let physical = path
+                .canonicalize()
+                .map_err(|error| format!("PIRA_DEC_WORKSPACE_DIR: {error}"))?;
+            if physical != path {
+                return Err("PIRA_DEC_WORKSPACE_DIR must remain a canonical directory".into());
+            }
+            if !physical.is_dir() {
+                return Err("PIRA_DEC_WORKSPACE_DIR must be a directory".into());
+            }
+            Ok(physical)
+        })
+        .transpose()?;
+    let git = nearest_git_root(&cwd);
+    // Physical ancestry prevents symlink escapes; Git identity prevents crossing
+    // into nested repositories. Outside that scope retain ordinary cwd scoping.
+    if let Some(anchor) = anchor
+        && cwd.starts_with(&anchor)
+        && nearest_git_root(&anchor) == git
+    {
+        return Ok(git.unwrap_or(anchor));
+    }
+    Ok(git.unwrap_or(cwd))
 }
 
 fn nearest_git_root(start: &Path) -> Option<PathBuf> {

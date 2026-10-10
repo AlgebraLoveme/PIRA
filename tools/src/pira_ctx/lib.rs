@@ -371,7 +371,7 @@ fn run_check(config: &Config) -> Result<i32, String> {
     score_capture(config, &mut capture, &ranking)?;
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
-    let retention = if capture.drain_truncated {
+    let mut retention = if capture.drain_truncated {
         " | drain_truncated=1 observed_bytes_are_lower_bounds=1".to_string()
     } else if capture.retention_truncated {
         format!(
@@ -382,6 +382,9 @@ fn run_check(config: &Config) -> Result<i32, String> {
     } else {
         String::new()
     };
+    if capture.timeline_truncated {
+        retention.push_str(" | index_truncated=1");
+    }
     record_event(
         config,
         capture.exit_code,
@@ -992,50 +995,59 @@ fn run_search(config: &Config) -> Result<i32, String> {
     let mut byte_limited = vec![false; queries.len()];
     let mut rendered = Vec::new();
     let mut remaining = 56 * 1024usize; // Status and warnings share the remaining 8 KiB.
-    while queues.iter().any(|q| !q.is_empty()) {
-        for (qi, queue) in queues.iter_mut().enumerate() {
-            let Some((index, hit)) = queue.pop_front() else {
-                continue;
-            };
-            let line = &lines[index];
-            let (raw, risk) = if hit {
-                reader.read_search_line(line)?
-            } else {
-                let raw = reader.read_security_line(line)?;
-                let risk = security::inspect(&raw);
-                (raw, risk)
-            };
-            let text = if hit && !lexical[qi] {
-                queries[qi].matcher.find(&raw).map_or_else(
-                    || prepare_program_display(&raw).0,
-                    |m| util::clip_match_display(&raw, m.start(), m.end()),
-                )
-            } else {
-                prepare_program_display(&raw).0
-            };
-            let prefix = if queries.len() > 1 {
-                format!("q{} ", qi + 1)
-            } else {
-                String::new()
-            };
-            let row = format!("{prefix}L{} {}: {}", line.line, line.stream, text);
-            let bytes = row.len() + 1;
-            if bytes > remaining {
-                byte_limited[qi] = true;
-                continue;
-            }
-            remaining -= bytes;
-            if hit {
-                shown[qi] += 1;
-            } else {
-                context_shown[qi] += 1;
-            }
-            rendered.push((line.line, row, risk));
-        }
-        if remaining < 64 {
+    // Exhaust every query's selected hits before admitting any context.
+    for phase in [true, false] {
+        while queues
+            .iter()
+            .any(|q| q.front().is_some_and(|(_, hit)| *hit == phase))
+        {
             for (qi, queue) in queues.iter_mut().enumerate() {
-                byte_limited[qi] |= !queue.is_empty();
-                queue.clear();
+                if !queue.front().is_some_and(|(_, hit)| *hit == phase) {
+                    continue;
+                }
+                let Some((index, hit)) = queue.pop_front() else {
+                    continue;
+                };
+                let line = &lines[index];
+                let (raw, risk) = if hit {
+                    reader.read_search_line(line)?
+                } else {
+                    let raw = reader.read_security_line(line)?;
+                    let risk = security::inspect(&raw);
+                    (raw, risk)
+                };
+                let text = if hit && !lexical[qi] {
+                    queries[qi].matcher.find(&raw).map_or_else(
+                        || prepare_program_display(&raw).0,
+                        |m| util::clip_match_display(&raw, m.start(), m.end()),
+                    )
+                } else {
+                    prepare_program_display(&raw).0
+                };
+                let prefix = if queries.len() > 1 {
+                    format!("q{} ", qi + 1)
+                } else {
+                    String::new()
+                };
+                let row = format!("{prefix}L{} {}: {}", line.line, line.stream, text);
+                let bytes = row.len() + 1;
+                if bytes > remaining {
+                    byte_limited[qi] = true;
+                    continue;
+                }
+                remaining -= bytes;
+                if hit {
+                    shown[qi] += 1;
+                } else {
+                    context_shown[qi] += 1;
+                }
+                rendered.push((line.line, row, risk));
+            }
+            if remaining < 64 {
+                for (qi, queue) in queues.iter_mut().enumerate() {
+                    byte_limited[qi] |= !queue.is_empty();
+                    queue.clear();
+                }
             }
         }
     }

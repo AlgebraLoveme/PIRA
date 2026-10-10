@@ -7,9 +7,19 @@ import select
 import sys
 import time
 
+def pause_at(stage):
+    if os.environ.get("TEAM_PAUSE_AT") == stage and os.environ.get("TEAM_PAUSE_DIRECTORY", Path.cwd().name) == Path.cwd().name:
+        os.write(int(os.environ["TEAM_BOUNDARY_READY_FD"]), b"1")
+        assert os.read(int(os.environ["TEAM_BOUNDARY_RELEASE_FD"]), 1) == b"1"
+
+
 args = sys.argv[1:]
 if args[:2] == ["app-server", "generate-json-schema"]:
     import runpy
+    pause_at("schema")
+    if os.environ.get("TEAM_SCHEMA_FAIL"):
+        print("fixture schema process failure", file=sys.stderr)
+        sys.exit(7)
     contract = json.loads(Path(os.environ["TEAM_TEST_BACKEND_CONTRACT"]).read_text())
     fixture = runpy.run_path(os.environ["TEAM_TEST_BACKEND_FIXTURE"])
     fixture["write_schemas"](args[args.index("--out") + 1], contract, os.environ.get("TEAM_BAD_BACKEND", ""))
@@ -92,6 +102,23 @@ def send(value):
 def notify(method, params):
     send({"method": method, "params": {"threadId": state["thread"], "turnId": active, **params}})
 
+def partial_evidence(*, acknowledged):
+    notify("thread/tokenUsage/updated", {"tokenUsage": {"total": {"inputTokens": 11, "cachedInputTokens": 3, "outputTokens": 2}}})
+    notify("item/completed", {"item": {"type": "agentMessage", "phase": "final_answer", "text": "partial diagnostic"}})
+    # Foreign observations must not contaminate accounting or the retained candidate.
+    for ids in [{"threadId": "foreign-thread"}] + ([{"turnId": "foreign-turn"}] if acknowledged else []):
+        notify("thread/tokenUsage/updated", {**ids, "tokenUsage": {"total": {"inputTokens": 999, "cachedInputTokens": 9, "outputTokens": 99}}})
+        notify("item/completed", {**ids, "item": {"type": "agentMessage", "phase": "final_answer", "text": "foreign diagnostic"}})
+    notify("item/completed", {"item": {"type": "agentMessage", "phase": "commentary", "text": "not final"}})
+
+
+def refuse_request():
+    send({"id": "backend-1", "method": "item/tool/request", "params": {}})
+    reply = json.loads(sys.stdin.readline())
+    assert reply["id"] == "backend-1" and reply["error"]["code"] == -32601
+    sys.exit(0)
+
+
 def finish(status="completed"):
     global active, due
     if status == "completed":
@@ -104,6 +131,29 @@ def finish(status="completed"):
             candidate = {"filename":"review.md", "format":"markdown", "content":"ANSWER " + task}
             if task == "recall":
                 candidate["content"] = json.dumps(state["history"])
+            if task == "decision-probe":
+                import fnmatch
+                import subprocess
+                excluded = json.loads(next(a.split("=", 1)[1] for a in args
+                                           if a.startswith("shell_environment_policy.exclude=")))
+                shell = {k: v for k, v in os.environ.items()
+                         if not any(fnmatch.fnmatchcase(k.upper(), pat.upper()) for pat in excluded)}
+                prefix = "shell_environment_policy.set."
+                for arg in args:
+                    if arg.startswith(prefix):
+                        key, value = arg[len(prefix):].split("=", 1)
+                        shell[key] = json.loads(value)
+                shell["CODEX_THREAD_ID"] = state["thread"]
+                results = []
+                for request in json.loads(os.environ["TEAM_DEC_COMMANDS"]):
+                    command = request["args"] if isinstance(request, dict) else request
+                    cwd = request.get("cwd", state["cwd"]) if isinstance(request, dict) else state["cwd"]
+                    proc = subprocess.run([os.environ["TEAM_DEC_BIN"], *command],
+                                          cwd=cwd, env=shell, capture_output=True,
+                                          text=True, timeout=5)
+                    results.append({"returncode": proc.returncode, "stdout": proc.stdout,
+                                    "stderr": proc.stderr})
+                candidate["content"] = json.dumps(results)
             if os.environ.get("TEAM_CANDIDATE"):
                 candidate = json.loads(os.environ["TEAM_CANDIDATE"])
             if handoff.name == "review-checkpoint.md" and os.environ.get("TEAM_REVIEW_CANDIDATE"):
@@ -149,6 +199,7 @@ while True:
         continue
     result = {}
     if method in ("thread/start", "thread/resume"):
+        state["cwd"] = params["cwd"]
         assert params["approvalPolicy"] == "never" and params["sandbox"] == sandbox
         assert params["baseInstructions"] == policy and params["developerInstructions"] == ""
         if "base_policy" in state and os.environ.get("TEAM_ASSERT_PREFIX"):
@@ -227,7 +278,27 @@ while True:
         continue
     elif method != "initialize":
         raise AssertionError(method)
+    failure = os.environ.get("TEAM_PARTIAL_FAILURE", "")
+    if method == "turn/start" and failure.startswith("before-"):
+        partial_evidence(acknowledged=False)
+        if failure == "before-refusal":
+            refuse_request()
+        if failure == "before-crash":
+            sys.exit(9)
+        if failure == "before-rpc-error":
+            due = None  # A rejected startup cannot later complete successfully.
+            send({"id": request["id"], "error": {"message": "fixture turn/start error"}})
+            continue
+    pause_at(method)
     send({"id":request["id"], "result":result})
+    if method == "turn/start" and failure == "after-refusal":
+        partial_evidence(acknowledged=True)
+        refuse_request()
+    if method == "turn/start" and os.environ.get("TEAM_DETACHED_PIPE"):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], start_new_session=True)
+        (home / "detached-fixture.pid").write_text(str(child.pid))
+        os.write(int(os.environ["TEAM_BOUNDARY_READY_FD"]), b"1")
     if method == "turn/start" and task == "partial-crash":
         notify("thread/tokenUsage/updated", {"tokenUsage": {"total": {"inputTokens": 11, "cachedInputTokens": 3, "outputTokens": 2}}})
         notify("item/completed", {"item": {"type": "agentMessage", "phase": "final_answer", "text": "partial diagnostic"}})

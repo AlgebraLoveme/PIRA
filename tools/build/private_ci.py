@@ -20,7 +20,7 @@ import tempfile
 import sys
 
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team")
-POLICIES = ("main.md", "implementation.md", "review.md", "backend_contract.json")
+POLICIES = ("main.md", "implementation.md", "review.md", "backend_contract.json", "worker_profiles.json")
 BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
 
 NATIVE_CODEX_VERSION = "0.161.0"
@@ -250,8 +250,10 @@ def selected(root: Path) -> list[Path]:
     paths.append(Path("tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf"))
     paths.extend(Path(name) for name in (
         "assets/scripts/setup_pira.py", "assets/scripts/test_setup_pira.py",
+        "assets/scripts/retire_pira_audio.py", "assets/scripts/test_retire_pira_audio.py",
         "assets/scripts/setup_pira_tools.py", "assets/scripts/test_setup_pira_tools.py",
         "assets/scripts/setup_pira_stores.py", "assets/scripts/test_setup_pira_stores.py",
+        "assets/scripts/setup_migration_choices.py", "assets/scripts/test_setup_migration_choices.py",
         "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
         "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
     paths.append(Path("tools/build/private_ci.py"))

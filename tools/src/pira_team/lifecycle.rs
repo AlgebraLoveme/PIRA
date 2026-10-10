@@ -6,6 +6,44 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+pub(crate) fn decision_workspace(cwd: &Path) -> Result<PathBuf, String> {
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|e| format!("Dec workspace: {e}"))?;
+    if !cwd.is_dir() {
+        return Err("Dec workspace must be a directory".into());
+    }
+    let workspace = cwd
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(&cwd);
+    if workspace.to_str().is_none() {
+        return Err(
+            "Team Dec workspace must be UTF-8 for retained metadata and shell configuration".into(),
+        );
+    }
+    Ok(workspace.to_path_buf())
+}
+
+fn retained_dec_workspace(manifest: &Value) -> Result<Option<PathBuf>, String> {
+    let path = match manifest.get("dec_workspace") {
+        // Old runs cannot reconstruct their original caller's workspace safely.
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(path)) => PathBuf::from(path),
+        Some(_) => return Err("invalid persisted dec_workspace".into()),
+    };
+    if !path.is_absolute() {
+        return Err("persisted dec_workspace must be absolute".into());
+    }
+    let physical = path
+        .canonicalize()
+        .map_err(|e| format!("persisted dec_workspace: {e}"))?;
+    if physical != path || !physical.is_dir() {
+        return Err("persisted dec_workspace must remain the same canonical directory".into());
+    }
+    Ok(Some(path))
+}
+
 pub fn private_path(path: &Path, directory: bool) -> Result<(), String> {
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
@@ -202,7 +240,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     private_path(&run, true)?;
     if op != "resume" {
         let mut receipt = app_server::control(&run, op, &task, gate.as_deref())?;
-        receipt["run_id"] = json!(positional[0]);
+        receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
         println!("{receipt}");
         return Ok(());
     }
@@ -268,6 +306,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| crate::tool_store("dec", &cwd))?;
+    let dec_workspace = retained_dec_workspace(&manifest)?;
     for path in [&run, &cwd, &ctx_store, &dec_store] {
         execution.require_writable(path)?;
     }
@@ -279,6 +318,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         profile_sources: sources,
         execution,
         task,
+        label: None,
         output,
         navigation: text("navigation")?,
         completion_gate,
@@ -286,6 +326,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         inject_implement: inject_implement.unwrap_or(false),
         ctx_store,
         dec_store,
+        dec_workspace,
         contract: artifact::Contract::restore(&manifest["contract"])?,
     };
     manifest["schema_version"] = json!(4);
@@ -361,7 +402,7 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     }
     for (key,value) in json!({"status":"running","model":options.model,"effort":options.effort,
         "profile_sources":options.profile_sources,"cwd":options.cwd,"task":options.task,
-        "contract":options.contract.description(),"navigation":options.navigation,"completion_gate":options.completion_gate,"ctx_store":options.ctx_store,"dec_store":options.dec_store,"output":options.output,
+        "contract":options.contract.description(),"navigation":options.navigation,"completion_gate":options.completion_gate,"ctx_store":options.ctx_store,"dec_store":options.dec_store,"dec_workspace":options.dec_workspace,"output":options.output,
         "sandbox":options.execution.mode,"execution_permissions":{"source":"verified-caller-turn-context","caller_thread_id":options.execution.caller_thread_id,"sandbox_policy":options.execution.sandbox,"approval_policy":"never"},"timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
         manifest[key] = value.clone();
     }
@@ -369,7 +410,29 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     eprintln!("pira_team run_id: {}", manifest["run_id"].as_str().unwrap());
     eprintln!("pira_team logs: {}", dir.display());
     let start = Instant::now();
-    let outcome = generate_artifact(options, run, &dir, manifest, &baseline);
+    // Attach only after a valid run has its initial durable manifest. Metadata never
+    // enters worker inputs; failure follows the normal failed-run accounting path.
+    let bookmark = if number == 1 {
+        options
+            .label
+            .as_deref()
+            .map(|label| {
+                crate::bookmarks::assign(
+                    &options.store,
+                    manifest["run_id"].as_str().unwrap(),
+                    label,
+                )
+            })
+            .transpose()
+    } else {
+        Ok(None)
+    };
+    let outcome = bookmark.and_then(|receipt| {
+        if let Some(receipt) = receipt {
+            eprintln!("pira_team bookmark: {receipt}");
+        }
+        generate_artifact(options, run, &dir, manifest, &baseline)
+    });
     manifest["elapsed_seconds"] = json!(start.elapsed().as_secs_f64());
     manifest["active_turn"] = Value::Null;
     match &outcome {
@@ -582,7 +645,13 @@ fn generate_stage(
         ) {
             Ok(turn) => turn,
             Err(error) => {
-                manifest["attempts"][attempt]["status"] = json!("failed");
+                manifest["attempts"][attempt]["status"] = json!(if crate::CANCELLED
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    "interrupted"
+                } else {
+                    "failed"
+                });
                 manifest["attempts"][attempt]["error"] = json!(error);
                 manifest["usage_complete"] = json!(false);
                 return Err(error);
@@ -697,6 +766,45 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn decision_anchor_capture_and_retention_preserve_canonical_scope() {
+        let dir = TestDir::new();
+        let root = dir.0.canonicalize().unwrap();
+        let child = root.join("child");
+        private_dir(&child).unwrap();
+        assert_eq!(decision_workspace(&child).unwrap(), child);
+        private_dir(&root.join(".git")).unwrap();
+        assert_eq!(decision_workspace(&child).unwrap(), root);
+        assert_eq!(
+            retained_dec_workspace(&json!({"dec_workspace":root})).unwrap(),
+            Some(root)
+        );
+        assert_eq!(retained_dec_workspace(&json!({})).unwrap(), None);
+        assert_eq!(
+            retained_dec_workspace(&json!({"dec_workspace":null})).unwrap(),
+            None
+        );
+        for value in [json!("relative"), json!([]), json!(dir.0.join("missing"))] {
+            assert!(retained_dec_workspace(&json!({"dec_workspace":value})).is_err());
+        }
+        assert!(retained_dec_workspace(&json!({"dec_workspace":child.join("..")})).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_dec_workspace_rejects_symlink_rebinding() {
+        let dir = TestDir::new();
+        let root = dir.0.canonicalize().unwrap();
+        let original = root.join("original");
+        let other = root.join("other");
+        private_dir(&original).unwrap();
+        private_dir(&other).unwrap();
+        let manifest = json!({"dec_workspace":decision_workspace(&original).unwrap()});
+        fs::remove_dir(&original).unwrap();
+        std::os::unix::fs::symlink(&other, &original).unwrap();
+        assert!(retained_dec_workspace(&manifest).is_err());
     }
 
     #[test]

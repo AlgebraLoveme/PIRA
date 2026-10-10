@@ -81,6 +81,9 @@ function Bootstrap-PiraPython3 {
     param([string[]]$Args = @())
     $python = Find-PiraPython3 -MinimumMinor 11
     if (-not $python) {
+        if (@($Args) -contains "--dry-run" -or @($Args) -contains "--verify") {
+            throw "Python 3.11+ is required; read-only setup will not install it. Install Python separately and retry."
+        }
         Install-PiraPythonHint -Args $Args
         $python = Find-PiraPython3 -MinimumMinor 11
     }

@@ -59,15 +59,33 @@ class TeamTests(unittest.TestCase):
         if ready != b"1":
             self.fail_startup(proc, f"worker readiness returned {ready!r}, expected b'1'")
 
-    def wait_stderr_notice(self, proc: subprocess.Popen[str], notice: str) -> str:
+    def wait_stderr_notice(self, proc: subprocess.Popen[str], notice: str, timeout: float = 5) -> str:
+        import queue
+        import threading
         consumed = []
-        while True:
-            line = proc.stderr.readline()
+        result = queue.Queue(maxsize=1)
+        def read_notice():
+            while True:
+                line = proc.stderr.readline()
+                consumed.append(line)
+                if not line or notice in line:
+                    result.put(line)
+                    return
+        reader = threading.Thread(target=read_notice, daemon=True)
+        reader.start()
+        try:
+            try:
+                line = result.get(timeout=timeout)
+            except queue.Empty:
+                if proc.poll() is None:
+                    proc.terminate()
+                reader.join(timeout=8)
+                self.fail_startup(proc, f"launcher notice timed out: {notice}", "".join(consumed))
             if not line:
                 self.fail_startup(proc, f"launcher exited before {notice}", "".join(consumed))
-            consumed.append(line)
-            if notice in line:
-                return line
+            return line
+        finally:
+            reader.join(timeout=1)
 
     def metadata(self, receipt: dict) -> dict:
         self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
@@ -292,22 +310,80 @@ class TeamTests(unittest.TestCase):
             "--cwd", str(self.root), *extra, "review"], env=self.env, capture_output=True, text=True, timeout=10)
 
     def test_inherits_latest_parent_settings_and_not_transcript(self) -> None:
-        self.parent([{"model":"previous-model", "effort":"low"}, {"model":"active-model", "effort":"high"}])
-        self.env.update(TEAM_EXPECT_MODEL="active-model", TEAM_EXPECT_EFFORT="high")
+        self.parent([{"model":"gpt-6-luna", "effort":"low"}, {"model":"gpt-6-sol", "effort":"high"}])
+        self.env.update(TEAM_EXPECT_MODEL="gpt-6-sol", TEAM_EXPECT_EFFORT="high")
         result = self.launch_inherited()
         self.assertEqual(result.returncode, 0, result.stderr)
         run = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
         manifest = json.loads((run / "manifest.json").read_text())
-        self.assertEqual((manifest["model"],manifest["effort"]), ("active-model","high"))
+        self.assertEqual((manifest["model"],manifest["effort"]), ("gpt-6-sol","high"))
         self.assertEqual(manifest["profile_sources"], {"model":"parent","effort":"parent"})
         for name in ["policy.md", "task.txt", "manifest.json", "events.jsonl"]:
             self.assertNotIn("PARENT_TRANSCRIPT_MUST_NOT_BE_FORWARDED", (run / name).read_text())
 
+    def test_astra_mapping_and_partial_overrides_reach_backend(self) -> None:
+        self.parent([{"model":"gpt-6-astra", "effort":"ultra"}])
+        for flags, model, effort, sources in [
+            ([], "gpt-6.1-sol", "high", {"model":"mapping", "effort":"mapping"}),
+            (["--model","custom"], "custom", "high", {"model":"explicit", "effort":"mapping"}),
+            (["--effort","low"], "gpt-6.1-sol", "low", {"model":"mapping", "effort":"explicit"}),
+            (["--model","custom","--effort","low"], "custom", "low", {"model":"explicit", "effort":"explicit"}),
+        ]:
+            with self.subTest(flags=flags):
+                self.env.update(TEAM_EXPECT_MODEL=model, TEAM_EXPECT_EFFORT=effort)
+                result = self.launch_inherited(*flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest = self.metadata(json.loads(result.stdout))
+                self.assertEqual((manifest["model"], manifest["effort"]), (model, effort))
+                self.assertEqual(manifest["profile_sources"], sources)
+
+    def test_unknown_caller_fallback_and_partial_overrides_reach_backend(self) -> None:
+        self.parent([{"model":"claude", "effort":"ultra"}])
+        for flags, model, effort, sources in [
+            ([], "gpt-6.1-sol", "high", {"model":"fallback", "effort":"fallback"}),
+            (["--model","custom"], "custom", "high", {"model":"explicit", "effort":"fallback"}),
+            (["--effort","low"], "gpt-6.1-sol", "low", {"model":"fallback", "effort":"explicit"}),
+            (["--model","custom","--effort","low"], "custom", "low", {"model":"explicit", "effort":"explicit"}),
+        ]:
+            with self.subTest(flags=flags):
+                self.env.update(TEAM_EXPECT_MODEL=model, TEAM_EXPECT_EFFORT=effort)
+                result = self.launch_inherited(*flags)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                manifest = self.metadata(json.loads(result.stdout))
+                self.assertEqual((manifest["model"], manifest["effort"]), (model, effort))
+                self.assertEqual(manifest["profile_sources"], sources)
+
+    def test_resume_retains_profile_despite_caller_defaults_and_partial_overrides(self) -> None:
+        for initial_model, initial_effort, caller_model in [
+            ("stored-model", "medium", "gpt-6-astra"),
+            ("gpt-6-astra", "ultra", "claude"),
+            ("stored-model", "medium", None),
+        ]:
+            with self.subTest(initial_model=initial_model):
+                first = self.launch("retain", "--model", initial_model, "--effort", initial_effort)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                receipt = json.loads(first.stdout)
+                self.parent([{"model":caller_model, "effort":"low"}])
+                for flags, model, effort, sources in [
+                    ([], initial_model, initial_effort, {"model":"run", "effort":"run"}),
+                    (["--effort","high"], initial_model, "high", {"model":"run", "effort":"explicit"}),
+                    (["--model","replacement"], "replacement", "high", {"model":"explicit", "effort":"run"}),
+                ]:
+                    with self.subTest(flags=flags):
+                        self.env.update(TEAM_EXPECT_MODEL=model, TEAM_EXPECT_EFFORT=effort)
+                        result = self.access("resume", receipt["run_id"], *flags)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        manifest = self.metadata(json.loads(result.stdout))
+                        self.assertEqual((manifest["model"], manifest["effort"]), (model, effort))
+                        self.assertEqual(manifest["profile_sources"], sources)
+                self.env.pop("TEAM_EXPECT_MODEL")
+                self.env.pop("TEAM_EXPECT_EFFORT")
+
     def test_each_override_is_independent(self) -> None:
-        self.parent([{"model":"parent-model", "effort":"medium"}])
+        self.parent([{"model":"gpt-6-luna", "effort":"medium"}])
         for flags,model,effort,sources in [
             (["--model","other-model"],"other-model","medium",{"model":"explicit","effort":"parent"}),
-            (["--effort","low"],"parent-model","low",{"model":"parent","effort":"explicit"}),
+            (["--effort","low"],"gpt-6-luna","low",{"model":"parent","effort":"explicit"}),
             (["--model","other-model","--effort","high"],"other-model","high",{"model":"explicit","effort":"explicit"})]:
             self.env.update(TEAM_EXPECT_MODEL=model, TEAM_EXPECT_EFFORT=effort)
             result = self.launch_inherited(*flags)
@@ -315,17 +391,37 @@ class TeamTests(unittest.TestCase):
             manifest = json.loads((Path(json.loads(result.stdout)["handoff_path"]).parent.parent / "manifest.json").read_text())
             self.assertEqual(manifest["profile_sources"],sources)
 
-    def test_no_parent_or_unknown_latest_field_never_uses_defaults(self) -> None:
+    def test_missing_model_falls_back_but_recognized_missing_effort_requires_override(self) -> None:
+        self.env.update(TEAM_EXPECT_MODEL="gpt-6.1-sol", TEAM_EXPECT_EFFORT="high")
+        result = self.launch_inherited()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.metadata(json.loads(result.stdout))
+        self.assertEqual(manifest["profile_sources"], {"model":"fallback", "effort":"fallback"})
+        self.env.pop("TEAM_EXPECT_MODEL")
+        self.env.pop("TEAM_EXPECT_EFFORT")
+        self.parent([{"model":"gpt-6-luna", "effort":"high"}, {"model":"gpt-6-sol", "effort":None}])
         result = self.launch_inherited()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--model", result.stderr)
-        self.assertFalse((self.root / "logs").exists())
-        self.parent([{"model":"old", "effort":"high"}, {"model":"current", "effort":None}])
-        result = self.launch_inherited()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.root / "logs").exists())
+        self.assertIn("--effort", result.stderr)
+        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
         result = self.launch_inherited("--effort","low")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fallback_cannot_bypass_missing_permissions_or_caller_discovery(self) -> None:
+        for context in [
+            {"model":"claude", "sandbox_policy":None},
+            {"model":None, "approval_policy":None},
+        ]:
+            with self.subTest(context=context):
+                self.parent([context])
+                result = self.launch_inherited()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "logs").exists())
+        self.env.pop("CODEX_THREAD_ID")
+        result = self.launch_inherited()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CODEX_THREAD_ID", result.stderr)
+        self.assertFalse((self.root / "logs").exists())
 
     def test_parent_identity_partial_record_and_ambiguous_files_fail_closed(self) -> None:
         path = self.parent([{"model":"parent", "effort":"high"}], identity="different-session")
@@ -1003,7 +1099,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 13)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1022,12 +1118,44 @@ class TeamTests(unittest.TestCase):
             self.assertNotIn("# Implementation", phase)
             self.assertEqual((run / "policy.md").read_bytes(), prefix)
 
+    def test_version_fifteen_dec_guidance_migrates_once_without_replacing_prefix(self):
+        result = self.launch("review")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = json.loads(result.stdout)
+        run = Path(first["run_root"])
+        manifest = run / "manifest.json"
+        state = json.loads(manifest.read_text())
+        state["worker_policy_version"] = 15
+        state.pop("dec_workspace")  # Legacy runs must not acquire a new Dec anchor.
+        manifest.write_text(json.dumps(state))
+        policy = run / "policy.md"
+        rules = [line for line in policy.read_text().splitlines()
+                 if line.startswith("- Main and Team workers using the same store")]
+        self.assertEqual(len(rules), 1)
+        rule = rules[0]
+        self.assertIn("PIRA_DEC_WORKSPACE_DIR", rule)
+        prefix = policy.read_bytes().replace((rule + "\n").encode(), b"")
+        policy.write_bytes(prefix)  # Model a version-15 cached prefix without the new rule.
+        for migrated in (True, False):
+            result = self.access("resume", first["run_id"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
+            phase = (latest / "phase.md").read_text()
+            self.assertEqual(phase.count(rule), 1 if migrated else 0)
+            self.assertNotIn("# Review", phase)
+            self.assertNotIn("# Implementation", phase)
+            self.assertEqual((latest / "policy.md").read_bytes(), prefix)
+            self.assertEqual(policy.read_bytes(), prefix)
+            updated = json.loads(manifest.read_text())
+            self.assertEqual(updated["worker_policy_version"], 16)
+            self.assertIsNone(updated.get("dec_workspace"))
+
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
         guides = (
             ("--inject-implement", "Before fixing, trace the affected behavior", "# Review"),
             ("--inject-review", "Review the full assigned scope across consequential contracts", "# Implementation"),
         )
-        for version in (7, 8, 9, 10, 11):
+        for version in (7, 8, 9, 10, 11, 12, 13, 14, 15):
             for flag, rule, absent in guides:
                 with self.subTest(version=version, flag=flag):
                     first = json.loads(self.launch("assigned task", flag).stdout)
@@ -1052,7 +1180,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 13)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
@@ -1717,13 +1845,8 @@ class TeamTests(unittest.TestCase):
         os.close(write_fd)
         steer = None
         try:
-            deadline = time.monotonic() + 5
-            endpoints = []
-            while time.monotonic() < deadline:
-                endpoints = list((self.root / "logs").glob("*/control.json"))
-                if endpoints or proc.poll() is not None:
-                    break
-                time.sleep(.01)
+            self.wait_stderr_notice(proc, "pira_team active:")
+            endpoints = list((self.root / "logs").glob("*/control.json"))
             self.assertEqual(len(endpoints), 1)
             run = endpoints[0].parent
             steer = subprocess.Popen([str(self.bin), "steer", run.name, "--task", "replacement",
@@ -1803,16 +1926,9 @@ class TeamTests(unittest.TestCase):
                 proc.kill()
                 proc.communicate(timeout=3)
         self.addCleanup(cleanup)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            endpoints = list((self.root / "logs").glob("*/control.json"))
-            if endpoints:
-                endpoint, = endpoints
-                return proc, endpoint.parent, json.loads(endpoint.read_text())
-            if proc.poll() is not None:
-                self.fail(proc.communicate(timeout=1)[1])
-            time.sleep(.01)
-        self.fail("control endpoint not created")
+        self.wait_stderr_notice(proc, "pira_team active:")
+        endpoint, = (self.root / "logs").glob("*/control.json")
+        return proc, endpoint.parent, json.loads(endpoint.read_text())
 
     @unittest.skipUnless(os.name == "posix", "POSIX lifecycle fixture")
     def test_interrupt_retains_admission_when_steer_replies_are_saturated(self) -> None:
@@ -1924,18 +2040,10 @@ class TeamTests(unittest.TestCase):
             os.close(write_fd)
             try:
                 self.assert_worker_ready(proc, read_fd)
-                # Read the launcher's advertised ID, then synchronize with endpoint creation.
+                # Endpoint creation now precedes schema/startup; wait for the active turn.
                 run_id = self.wait_stderr_notice(proc, "pira_team run_id:").strip().split(": ", 1)[1]
                 run = self.root / "logs" / run_id
-                # A native response precedes endpoint creation; keep the wait bounded.
-                import time
-                deadline = time.monotonic() + 3
-                while not (run / "control.json").exists() and time.monotonic() < deadline:
-                    if proc.poll() is not None:
-                        self.wait_stderr_notice(proc, "pira_team active:")
-                    time.sleep(.01)
-                if not (run / "control.json").exists():
-                    self.fail_startup(proc, "control endpoint readiness timed out")
+                self.wait_stderr_notice(proc, "pira_team active:")
                 endpoint = json.loads((run / "control.json").read_text())
                 self.assertIn("active owner", self.access("resume", run_id, "collision").stderr)
                 self.assertNotEqual(self.access("read", run_id, "control.json").returncode, 0)

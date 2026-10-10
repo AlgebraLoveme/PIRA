@@ -518,7 +518,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stores.add_migration_arguments(parser)
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
-    parser.add_argument("--no-team", action="store_true", help="Exclude Team and its backend/login setup; preserve existing binaries and configuration.")
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
     parser.add_argument(
         "--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
@@ -552,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def selected_tools(index: dict[str, object], requested: list[str] | None, *, no_team: bool = False) -> list[str]:
+def selected_tools(index: dict[str, object], requested: list[str] | None) -> list[str]:
     released = sorted(
         tool
         for tool in index["tools"]
@@ -560,11 +559,9 @@ def selected_tools(index: dict[str, object], requested: list[str] | None, *, no_
     )
     if not released:
         raise RuntimeError("no PIRA tools were found in the latest release")
-    if no_team:
-        released = [name for name in released if name != "pira_team"]
-        if requested and "pira_team" in requested:
-            raise RuntimeError("--no-team conflicts with --tool pira_team")
     if requested is None:
+        if "pira_team" not in released:
+            raise RuntimeError("ordinary PIRA tools setup requires a release containing pira_team; use --tool only for partial maintenance")
         return released
     tools = sorted(set(requested))
     missing = [name for name in tools if name not in released]
@@ -653,7 +650,7 @@ def tool_selection(
     )
     action = (
         "unchanged"
-        if existing_hash == expected.lower()
+        if existing_hash == expected.lower() and (os.name == "nt" or os.access(destination, os.X_OK))
         else ("refresh" if destination.exists() or destination.is_symlink() else "install")
     )
     return ToolSelection(
@@ -1064,12 +1061,12 @@ def main(argv: list[str] | None = None) -> int:
     install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
     index = release_index()
     platform_key = selector.current_platform()
-    tools = selected_tools(index, args.tools, no_team=args.no_team)
+    tools = selected_tools(index, args.tools)
     requested_versions = parse_versions(args.version)
     unselected_versions = sorted(set(requested_versions) - set(tools))
     if unselected_versions:
         raise RuntimeError(
-            "version specified for tool excluded by --tool or --no-team: "
+            "version specified for tool excluded by --tool: "
             + ", ".join(unselected_versions)
         )
     if "pira_team" in tools:
@@ -1119,7 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
         stores.apply_store_environment(store_plan, dry_run=True, verify=True)
         failures: list[str] = []
         for selection in selections:
-            if selection.existing_hash != selection.expected_hash:
+            if selection.action != "unchanged":
                 failures.append(f"{selection.name}: installed binary is missing or stale")
                 continue
             version = direct_version(selection.destination)

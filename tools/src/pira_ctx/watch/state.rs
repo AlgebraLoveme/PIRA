@@ -248,18 +248,16 @@ pub fn acquire_owner(store: &Path, id: &str) -> Result<OwnerLock, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&path).map_err(|error| error.to_string())?;
+    let file = options.open(&path).map_err(|error| error.to_string())?;
     file.try_lock_exclusive()
         .map_err(|_| format!("watch {id} already has an active owner"))?;
-    file.set_len(0).map_err(|e| e.to_string())?;
-    writeln!(file, "{}", std::process::id()).map_err(|e| e.to_string())?;
     Ok(OwnerLock { _file: file })
 }
 
 pub fn update_control(
     store: &Path,
     id: &str,
-    update: impl FnOnce(&mut ControlState),
+    update: impl FnOnce(&mut ControlState) -> Result<(), String>,
 ) -> Result<(), String> {
     validate_id(id)?;
     let lock_path = control_lock_path(store, id);
@@ -278,7 +276,7 @@ pub fn update_control(
         .map_err(|error| format!("lock watch control: {error}"))?;
     let path = control_path(store, id);
     let mut control = read(&path, "watch control")?;
-    update(&mut control);
+    update(&mut control)?;
     let result = write(&path, &control);
     let _ = lock.unlock();
     result
@@ -310,5 +308,38 @@ pub fn resolve(store: &Path, target: &str) -> Result<String, String> {
         [id] => Ok(id.clone()),
         [] => Err(format!("no watch matches {target}")),
         _ => Err(format!("ambiguous watch ID {target}")),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn owner_lock_never_rewrites_linked_targets_and_keeps_exclusion() {
+        let dir = std::env::temp_dir().join(format!("ctx-owner-links-{}", std::process::id()));
+        storage::ensure_private_dir(&dir).unwrap();
+        for kind in ["ordinary", "symlink", "hardlink"] {
+            let id = format!("watch-{kind}");
+            let sentinel = dir.join(kind);
+            fs::write(&sentinel, b"preserve me").unwrap();
+            let path = owner_path(&dir, &id);
+            storage::ensure_private_dir(path.parent().unwrap()).unwrap();
+            match kind {
+                "symlink" => symlink(&sentinel, &path).unwrap(),
+                "hardlink" => fs::hard_link(&sentinel, &path).unwrap(),
+                _ => fs::write(&path, b"legacy pid").unwrap(),
+            }
+            let owner = acquire_owner(&dir, &id).unwrap();
+            assert!(acquire_owner(&dir, &id).is_err());
+            assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+            if kind == "ordinary" {
+                assert_eq!(fs::read(&path).unwrap(), b"legacy pid");
+            }
+            drop(owner);
+            drop(acquire_owner(&dir, &id).unwrap());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

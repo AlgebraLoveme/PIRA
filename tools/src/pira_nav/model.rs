@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const MAX_SYMBOL_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolPath {
     segments: Vec<SymbolPathSegment>,
@@ -12,6 +14,16 @@ pub enum SymbolPathSegment {
 }
 
 impl SymbolPath {
+    pub fn text_bytes(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                SymbolPathSegment::Name(name) => name.len(),
+                SymbolPathSegment::Index(_) => 0,
+            })
+            .sum()
+    }
+
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
         Self {
             segments: names.into_iter().map(SymbolPathSegment::Name).collect(),
@@ -264,6 +276,14 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    pub fn text_bytes(&self) -> usize {
+        self.path
+            .text_bytes()
+            .saturating_add(self.qualified_name.len())
+            .saturating_add(self.legacy_qualified_name.len())
+            .saturating_add(self.signature.len())
+    }
+
     pub fn name_matches(&self, query: &str) -> bool {
         match SymbolPath::parse_canonical(query) {
             Some(path) => self.path == path,

@@ -482,3 +482,190 @@ fn stale_semantic_selectors_use_exit_four_for_changed_renamed_and_removed_items(
         "stale identities must fail before definition requests"
     );
 }
+
+#[test]
+fn outgoing_calls_use_each_prepared_callers_document_and_encoding() {
+    let f = Fixture::new();
+    f.write("a.py", "x\nx\n");
+    f.write("b.py", "x\n😀abc target\n");
+    f.write("c.py", "x\n");
+    f.write("d.py", "x\ncalledtarget\n");
+    let uri = |name: &str| {
+        format!(
+            "file://{}",
+            f.0.join(name).to_string_lossy().replace(' ', "%20")
+        )
+    };
+    let range = |line, start, end| json!({"start":{"line":line,"character":start},"end":{"line":line,"character":end}});
+    let item = |file: &str, name: &str| json!({"uri":uri(file),"name":name,"kind":12,"range":range(0,0,1),"selectionRange":range(0,0,1)});
+    let mut config = json!({
+        "capabilities": {"callHierarchyProvider":true,"positionEncoding":"utf-16"},
+        "prepared_calls":[item("b.py","caller_b"),item("d.py","caller_d")],
+        "outgoing_calls": {
+            (uri("b.py")):[{"to":item("c.py","callee"),"fromRanges":[range(1,6,12)]}],
+            (uri("d.py")):[{"to":item("c.py","callee"),"fromRanges":[range(1,0,6)]}]
+        },
+        "incoming_calls": {
+            (uri("b.py")):[{"from":item("d.py","caller"),"fromRanges":[range(1,0,6)]}]
+        }
+    });
+    let text = f.run(&["callees", "a.py:2:1"], config.clone());
+    assert!(
+        text.contains("count=2")
+            && text.contains("b.py:L2:9-2:15")
+            && text.contains("d.py:L2:1-2:7"),
+        "{text}"
+    );
+    assert!(!text.contains("callsites=\"a.py:"));
+    config["prepared_calls"] = json!([item("b.py", "caller_b")]);
+    let same_file = f.run(&["callees", "b.py:2:1"], config.clone());
+    assert!(same_file.contains("b.py:L2:9-2:15"));
+    let incoming = f.run(&["callers", "a.py:2:1"], config);
+    assert!(
+        incoming.contains("callsites=\"d.py:L2:1-2:7\""),
+        "{incoming}"
+    );
+}
+
+#[test]
+fn hover_escapes_lone_cr_but_preserves_crlf() {
+    let f = Fixture::new();
+    f.write("x.py", "x\n");
+    let text = f.run(
+        &["hover", "x.py:1:1"],
+        json!({"hovers":{"x.py:0:0":{"kind":"plaintext","value":"a\rX\r\n"}}}),
+    );
+    assert!(
+        text.contains(r"a\u{d}X") && text.contains("controls_escaped=1"),
+        "{text:?}"
+    );
+    assert_eq!(text.matches('\r').count(), 1);
+    assert!(text.contains("X\r\n"));
+}
+
+#[test]
+fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = Fixture::new();
+    let external = Fixture::new();
+    f.write("broken.c", "int broken( {\n");
+    f.write("sub/broken.c", "int broken( {\n");
+    fs::create_dir(f.0.join(".git")).unwrap();
+    let python = Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; print(os.path.realpath(sys.executable))",
+        ])
+        .output()
+        .unwrap();
+    assert!(python.status.success());
+    let python = String::from_utf8(python.stdout).unwrap();
+    let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/semantic_server.py");
+    let config = json!({"startup_log":f.0.join("started"),"symbols":[]});
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let script = format!(
+        "#!/bin/sh\nexec {} {} {}\n",
+        quote(python.trim()),
+        quote(server.to_str().unwrap()),
+        quote(&config.to_string())
+    );
+    for root in [&f.0, &external.0] {
+        fs::write(root.join("clangd"), &script).unwrap();
+        fs::set_permissions(root.join("clangd"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for path in [
+        ".".to_owned(),
+        "".to_owned(),
+        f.0.to_str().unwrap().to_owned(),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+            .current_dir(&f.0)
+            .env("PATH", path)
+            .args(["outline", "broken.c"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        assert!(!f.0.join("started").exists());
+    }
+    let explicit = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", ".")
+        .args(["outline", "broken.c", "--lsp"])
+        .arg(f.0.join("clangd"))
+        .output()
+        .unwrap();
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert_eq!(fs::read_to_string(f.0.join("started")).unwrap(), "started");
+    fs::remove_file(f.0.join("started")).unwrap();
+    let allowed = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", &external.0)
+        .args(["outline", "broken.c"])
+        .output()
+        .unwrap();
+    assert!(allowed.status.success(), "{allowed:?}");
+    assert!(f.0.join("started").exists());
+    fs::remove_file(f.0.join("started")).unwrap();
+    fs::rename(external.0.join("clangd"), external.0.join("outside-peer")).unwrap();
+    symlink(f.0.join("clangd"), external.0.join("clangd")).unwrap();
+    let linked = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", &external.0)
+        .args(["outline", "broken.c"])
+        .output()
+        .unwrap();
+    assert_eq!(linked.status.code(), Some(3), "{linked:?}");
+    assert!(!f.0.join("started").exists());
+    let ancestor = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(f.0.join("sub"))
+        .env("PATH", &f.0)
+        .args(["outline", "broken.c"])
+        .output()
+        .unwrap();
+    assert_eq!(ancestor.status.code(), Some(3), "{ancestor:?}");
+    assert!(!f.0.join("started").exists());
+    fs::remove_file(f.0.join("clangd")).unwrap();
+    symlink(external.0.join("outside-peer"), f.0.join("clangd")).unwrap();
+    let launcher = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", ".")
+        .args(["outline", "broken.c"])
+        .output()
+        .unwrap();
+    assert_eq!(launcher.status.code(), Some(3), "{launcher:?}");
+    assert!(!f.0.join("started").exists());
+    symlink(&f.0, external.0.join("alias")).unwrap();
+    fs::create_dir(f.0.join("child")).unwrap();
+    for path in [external.0.join("alias"), external.0.join("alias/child/..")] {
+        let hidden = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+            .current_dir(&f.0)
+            .env("PATH", path)
+            .args(["outline", "broken.c"])
+            .output()
+            .unwrap();
+        assert_eq!(hidden.status.code(), Some(3), "{hidden:?}");
+        assert!(!f.0.join("started").exists());
+    }
+    let explicit_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", "")
+        .args(["outline", "broken.c", "--lsp"])
+        .arg(external.0.join("alias/clangd"))
+        .output()
+        .unwrap();
+    assert!(explicit_alias.status.success(), "{explicit_alias:?}");
+    assert!(f.0.join("started").exists());
+    fs::remove_file(f.0.join("started")).unwrap();
+    fs::remove_file(external.0.join("clangd")).unwrap();
+    symlink(external.0.join("outside-peer"), external.0.join("clangd")).unwrap();
+    let third = Fixture::new();
+    symlink(&external.0, third.0.join("external-alias")).unwrap();
+    let external_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        .current_dir(&f.0)
+        .env("PATH", third.0.join("external-alias"))
+        .args(["outline", "broken.c"])
+        .output()
+        .unwrap();
+    assert!(external_alias.status.success(), "{external_alias:?}");
+    assert!(f.0.join("started").exists());
+}

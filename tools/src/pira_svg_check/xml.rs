@@ -50,7 +50,6 @@ struct Frame {
     name: String,
     started_target: bool,
     text_index: Option<usize>,
-    css: Option<String>,
 }
 
 // PIRA: conservative recursion ceiling before entering usvg. Supporting deeper
@@ -98,7 +97,68 @@ pub(crate) fn render_depth(source: &[u8], parent_depth: usize) -> Result<usize, 
     Ok(maximum)
 }
 
+// Resource policy applies to every parsed document, independently of outer-only
+// annotation keys and text discovery beneath foreign ancestors.
+pub(crate) fn validate_resources(source: &[u8]) -> Result<(), GuardError> {
+    let mut reader = NsReader::from_reader(source);
+    let mut styles: Vec<Option<String>> = Vec::new();
+    let mut nodes = 0;
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|error| GuardError(format!("invalid SVG XML: {error}")))?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                nodes += 1;
+                check_node_limit(nodes)?;
+                let name = svg_name(element.name(), &reader)?;
+                validate_element_resources(element, &reader, !name.is_empty())?;
+                if matches!(event, Event::Start(_)) {
+                    styles.push((name == "style").then(String::new));
+                }
+            }
+            Event::Text(text) => {
+                if let Some(css) = styles.last_mut().and_then(Option::as_mut) {
+                    css.push_str(&String::from_utf8_lossy(text.as_ref()));
+                }
+            }
+            Event::CData(text) => {
+                if let Some(css) = styles.last_mut().and_then(Option::as_mut) {
+                    css.push_str(&String::from_utf8_lossy(text.as_ref()));
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(css) = styles.last_mut().and_then(Option::as_mut) {
+                    let encoded = format!("&{};", String::from_utf8_lossy(reference.as_ref()));
+                    let decoded = quick_xml::escape::unescape(&encoded).map_err(|error| {
+                        GuardError(format!("invalid SVG entity reference: {error}"))
+                    })?;
+                    css.push_str(&decoded);
+                }
+            }
+            Event::End(_) => {
+                if let Some(Some(css)) = styles.pop() {
+                    css::validate_urls(&css)?;
+                }
+            }
+            Event::DocType(_) => {
+                return Err(GuardError("SVG document types are not allowed".to_string()));
+            }
+            Event::PI(ref instruction)
+                if instruction.target().eq_ignore_ascii_case(b"xml-stylesheet") =>
+            {
+                return Err(GuardError(
+                    "external SVG stylesheets are not allowed".to_string(),
+                ));
+            }
+            Event::Eof => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
+    validate_resources(source)?;
     let mut reader = NsReader::from_reader(source);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::with_capacity(source.len() + 1024));
@@ -120,11 +180,6 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                 node_count += 1;
                 check_node_limit(node_count)?;
                 let mut name = svg_name(element.name(), &reader)?;
-                // A local <use> can reach SVG IDs beneath foreign ancestors.
-                // Resource validation depends on this element's namespace, not
-                // whether ordinary discovery traverses its parent subtree.
-                validate_element_resources(&element, &reader, !name.is_empty())?;
-                let is_stylesheet = name == "style";
                 if stack.last().is_some_and(|frame| frame.name.is_empty()) {
                     name.clear();
                 }
@@ -154,7 +209,6 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                     name: name.clone(),
                     started_target: false,
                     text_index,
-                    css: is_stylesheet.then(String::new),
                 });
                 if is_definition_container(&name) {
                     defs_depth += 1;
@@ -167,10 +221,6 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                 node_count += 1;
                 check_node_limit(node_count)?;
                 let mut name = svg_name(element.name(), &reader)?;
-                // A local <use> can reach SVG IDs beneath foreign ancestors.
-                // Resource validation depends on this element's namespace, not
-                // whether ordinary discovery traverses its parent subtree.
-                validate_element_resources(&element, &reader, !name.is_empty())?;
                 if stack.last().is_some_and(|frame| frame.name.is_empty()) {
                     name.clear();
                 }
@@ -189,9 +239,6 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                     .map_err(write_error)?;
             }
             Event::Text(text) => {
-                if let Some(css) = stack.last_mut().and_then(|frame| frame.css.as_mut()) {
-                    css.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
                 if let Some(index) = stack
                     .iter()
                     .rev()
@@ -207,9 +254,6 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                     .map_err(write_error)?;
             }
             Event::CData(text) => {
-                if let Some(css) = stack.last_mut().and_then(|frame| frame.css.as_mut()) {
-                    css.push_str(&String::from_utf8_lossy(text.as_ref()));
-                }
                 if let Some(index) = stack
                     .iter()
                     .rev()
@@ -237,30 +281,14 @@ pub(crate) fn annotate(source: &[u8]) -> Result<AnnotatedSvg, GuardError> {
                 {
                     texts[index].text.push_str(&decoded);
                 }
-                if let Some(css) = stack.last_mut().and_then(|frame| frame.css.as_mut()) {
-                    css.push_str(&decoded);
-                }
                 writer
                     .write_event(Event::GeneralRef(reference.into_owned()))
                     .map_err(write_error)?;
-            }
-            Event::DocType(_) => {
-                return Err(GuardError("SVG document types are not allowed".to_string()));
-            }
-            Event::PI(ref instruction)
-                if instruction.target().eq_ignore_ascii_case(b"xml-stylesheet") =>
-            {
-                return Err(GuardError(
-                    "external SVG stylesheets are not allowed".to_string(),
-                ));
             }
             Event::End(end) => {
                 let frame = stack
                     .pop()
                     .ok_or_else(|| GuardError("malformed SVG element stack".to_string()))?;
-                if let Some(css) = frame.css {
-                    css::validate_urls(&css)?;
-                }
                 if frame.name == "text" {
                     text_depth = text_depth.saturating_sub(1);
                 }
@@ -295,6 +323,11 @@ pub(crate) fn rewrite(
     target_key: &str,
     variant: Variant,
 ) -> Result<Vec<u8>, GuardError> {
+    let target_path = if matches!(variant, Variant::IsolateText | Variant::IsolateStroke) {
+        target_path(source, target_key)?
+    } else {
+        HashSet::new()
+    };
     let mut reader = NsReader::from_reader(source);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::with_capacity(source.len() + 1024));
@@ -302,6 +335,7 @@ pub(crate) fn rewrite(
     let mut stack: Vec<Frame> = Vec::new();
     let mut defs_depth = 0_usize;
     let mut target_depth = 0_usize;
+    let mut node_count = 0;
 
     loop {
         let event = reader
@@ -309,6 +343,7 @@ pub(crate) fn rewrite(
             .map_err(|error| GuardError(format!("cannot rewrite SVG variant: {error}")))?;
         match event {
             Event::Start(element) => {
+                node_count += 1;
                 let mut name = svg_name(element.name(), &reader)?;
                 if stack.last().is_some_and(|frame| frame.name.is_empty()) {
                     name.clear();
@@ -317,7 +352,14 @@ pub(crate) fn rewrite(
                     == Some(target_key);
                 let inside_target = target_depth > 0 || is_target;
                 let inside_defs = defs_depth > 0 || is_definition_container(&name);
-                let style = variant_style(&name, inside_defs, inside_target, is_target, variant);
+                let style = variant_style(
+                    &name,
+                    inside_defs,
+                    inside_target,
+                    is_target,
+                    target_path.contains(&node_count),
+                    variant,
+                );
                 let rewritten = with_style(element, style.as_deref(), &reader)?;
                 writer
                     .write_event(Event::Start(rewritten))
@@ -326,7 +368,6 @@ pub(crate) fn rewrite(
                     name: name.clone(),
                     started_target: is_target,
                     text_index: None,
-                    css: None,
                 });
                 if is_definition_container(&name) {
                     defs_depth += 1;
@@ -336,6 +377,7 @@ pub(crate) fn rewrite(
                 }
             }
             Event::Empty(element) => {
+                node_count += 1;
                 let mut name = svg_name(element.name(), &reader)?;
                 if stack.last().is_some_and(|frame| frame.name.is_empty()) {
                     name.clear();
@@ -344,7 +386,14 @@ pub(crate) fn rewrite(
                     == Some(target_key);
                 let inside_defs = defs_depth > 0 || is_definition_container(&name);
                 let inside_target = target_depth > 0 || is_target;
-                let style = variant_style(&name, inside_defs, inside_target, is_target, variant);
+                let style = variant_style(
+                    &name,
+                    inside_defs,
+                    inside_target,
+                    is_target,
+                    target_path.contains(&node_count),
+                    variant,
+                );
                 let rewritten = with_style(element, style.as_deref(), &reader)?;
                 writer
                     .write_event(Event::Empty(rewritten))
@@ -372,6 +421,37 @@ pub(crate) fn rewrite(
         buffer.clear();
     }
     Ok(writer.into_inner())
+}
+
+// Hiding only leaves does not suppress a sibling container's generated filter
+// output. Retain target ancestors, but hide unrelated scene containers as units.
+fn target_path(source: &[u8], target_key: &str) -> Result<HashSet<usize>, GuardError> {
+    let mut reader = NsReader::from_reader(source);
+    let mut path = Vec::new();
+    let mut nodes = 0;
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|error| GuardError(format!("cannot rewrite SVG variant: {error}")))?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                nodes += 1;
+                if attribute_value(element, KEY_ATTRIBUTE, &reader)?.as_deref() == Some(target_key)
+                {
+                    path.push(nodes);
+                    return Ok(path.into_iter().collect());
+                }
+                if matches!(event, Event::Start(_)) {
+                    path.push(nodes);
+                }
+            }
+            Event::End(_) => {
+                path.pop();
+            }
+            Event::Eof => return Ok(HashSet::new()),
+            _ => {}
+        }
+    }
 }
 
 // usvg recognizes some foreign attributes by local name. Only pass attributes
@@ -437,6 +517,12 @@ fn annotate_element<'a>(
     index: usize,
     reader: &NsReader<&[u8]>,
 ) -> Result<(BytesStart<'static>, Option<ElementMeta>), GuardError> {
+    if attribute_value(&element, KEY_ATTRIBUTE, reader)?.is_some() {
+        return Err(GuardError(format!(
+            "reserved SVG attribute is not allowed: {}",
+            String::from_utf8_lossy(KEY_ATTRIBUTE)
+        )));
+    }
     let name = svg_name(element.name(), reader)?;
     let id = attribute_value(&element, b"id", reader)?;
     let key = format!("n{index}");
@@ -504,8 +590,13 @@ fn variant_style(
     inside_defs: bool,
     inside_target: bool,
     is_target: bool,
+    on_target_path: bool,
     variant: Variant,
 ) -> Option<String> {
+    let hide_sibling = !inside_defs
+        && !inside_target
+        && (is_paintable(name)
+            || (matches!(name, "g" | "svg" | "a" | "switch") && !on_target_path));
     match variant {
         // Only coverage loses paint opacity. Actual composited colors and the
         // loss/not-rendered probes still use the unmodified isolated artwork.
@@ -524,24 +615,16 @@ fn variant_style(
         Variant::Unclip => None,
         Variant::Remove if is_target => Some("display:none!important".to_string()),
         Variant::Remove => None,
-        Variant::IsolateText => {
-            if !inside_defs && is_paintable(name) && !inside_target {
-                Some("display:none!important".to_string())
-            } else if inside_target && matches!(name, "text" | "tspan") {
-                Some("stroke:none!important;filter:none!important".to_string())
-            } else {
-                None
-            }
+        Variant::IsolateText | Variant::IsolateStroke if hide_sibling => {
+            Some("display:none!important".to_string())
         }
-        Variant::IsolateStroke => {
-            if !inside_defs && is_paintable(name) && !inside_target {
-                Some("display:none!important".to_string())
-            } else if inside_target {
-                Some("fill:none!important;filter:none!important".to_string())
-            } else {
-                None
-            }
+        Variant::IsolateText if inside_target && matches!(name, "text" | "tspan") => {
+            Some("stroke:none!important;filter:none!important".to_string())
         }
+        Variant::IsolateStroke if inside_target => {
+            Some("fill:none!important;filter:none!important".to_string())
+        }
+        Variant::IsolateText | Variant::IsolateStroke => None,
     }
 }
 
@@ -627,12 +710,6 @@ fn validate_element_resources(
                 .decode_and_unescape_value(reader.decoder())
                 .map_err(|error| GuardError(format!("invalid SVG CSS value: {error}")))?;
             css::validate_urls(&value)?;
-        }
-        if attribute.key.as_ref() == KEY_ATTRIBUTE {
-            return Err(GuardError(format!(
-                "reserved SVG attribute is not allowed: {}",
-                String::from_utf8_lossy(KEY_ATTRIBUTE)
-            )));
         }
     }
     Ok(())

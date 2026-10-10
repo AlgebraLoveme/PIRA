@@ -332,16 +332,22 @@ pub fn sanitize_metadata(value: &str) -> String {
 }
 
 pub fn escape_untrusted_text(value: &str) -> (Cow<'_, str>, usize) {
-    let unsafe_control =
-        |character: char| character.is_control() && !matches!(character, '\n' | '\r' | '\t');
-    if !value.chars().any(unsafe_control) {
+    let unsafe_control = |index: usize, character: char| {
+        character.is_control()
+            && !matches!(character, '\n' | '\t')
+            && !(character == '\r' && value.as_bytes().get(index + 1) == Some(&b'\n'))
+    };
+    if !value
+        .char_indices()
+        .any(|(index, character)| unsafe_control(index, character))
+    {
         return (Cow::Borrowed(value), 0);
     }
 
     let mut escaped = 0;
     let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        if unsafe_control(character) {
+    for (index, character) in value.char_indices() {
+        if unsafe_control(index, character) {
             use std::fmt::Write as _;
             let _ = write!(output, "\\u{{{:x}}}", character as u32);
             escaped += 1;
