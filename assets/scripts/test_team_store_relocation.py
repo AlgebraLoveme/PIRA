@@ -98,10 +98,25 @@ class RelocationTests(unittest.TestCase):
             path=self.source/name; path.mkdir()
             with self.assertRaises(helper.RelocationError): self.plan()
             path.rmdir()
-        (self.source/'auth.json').write_text('synthetic sentinel')
-        with patch.object(Path,'open',side_effect=AssertionError('must not read credentials')):
-            # Direct inventory encounters root credential before traversing sessions.
-            with self.assertRaises(helper.RelocationError): helper._inventory(self.source)
+        original_open = Path.open
+        def guarded_open(path, *args, **kwargs):
+            self.assertNotIn(path.name, {'auth.json', 'config.toml', '.env'})
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', guarded_open):
+            self.assertEqual(helper._inventory(self.source)[0], self.original)
+        for name in ('auth.json', 'config.toml', '.env'):
+            path = self.source/name
+            path.write_text('synthetic sentinel')
+            for sensitive_first in (False, True):
+                entries = list(os.walk(self.source))
+                entries[0][2].sort(key=lambda item: item == name, reverse=sensitive_first)
+                with self.subTest(name=name, sensitive_first=sensitive_first), \
+                     patch.object(Path, 'open', guarded_open), \
+                     patch.object(helper.os, 'walk', return_value=iter(entries)):
+                    with self.assertRaises(helper.RelocationError) as error:
+                        helper._inventory(self.source)
+                    self.assertEqual(error.exception.code, 'unsupported_contents')
+            path.unlink()
     def test_fork_and_media_rejected(self):
         p=self.source/self.rollout; original=p.read_text()
         for extra in [{'forked_from_id':THREAD},None]:

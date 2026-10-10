@@ -220,14 +220,23 @@ class MigrationTests(unittest.TestCase):
         for parser in (setup_pira.build_parser(), setup_pira_tools.build_parser()):
             args = parser.parse_args(["--completed-ctx-only", "--fresh-team"])
             self.assertTrue(args.completed_ctx_only and args.fresh_team)
-        with patch.dict(os.environ, {"HOME": str(self.root), "LOCALAPPDATA": str(self.root)}, clear=True), \
-             patch.object(setup, "historical_store_paths", return_value=[self.source]), \
-             patch.object(migration, "preflight_team_relocation", side_effect=AssertionError("must not inspect")):
-            self.put(self.source, "live/pending.live.json", b"{}")
-            plan = setup.plan_store_environment(["pira_ctx", "pira_team"], profile_paths=[],
-                                               completed_ctx_only=True, fresh_team=True)
-            self.assertTrue(plan.migrations[0].completed_only)
-            self.assertEqual(plan.team_migrations, [])
+        self.put(self.source, "live/pending.live.json", b"{}")
+        for platform in dict.fromkeys((sys.platform, "win32")):
+            registry = MagicMock()
+            registry.OpenKey.side_effect = FileNotFoundError
+            with self.subTest(platform=platform), \
+                 patch.dict(os.environ, {"HOME": str(self.root), "LOCALAPPDATA": str(self.root)}, clear=True), \
+                 patch.dict(sys.modules, {"winreg": registry}), \
+                 patch.object(setup.sys, "platform", platform), \
+                 patch.object(setup, "historical_store_paths", return_value=[self.source]), \
+                 patch.object(migration, "preflight_team_relocation", side_effect=AssertionError("must not inspect")):
+                plan = setup.plan_store_environment(["pira_ctx", "pira_team"], profile_paths=[],
+                                                   completed_ctx_only=True, fresh_team=True)
+                self.assertTrue(plan.migrations[0].completed_only)
+                self.assertEqual(plan.team_migrations, [])
+                if platform == "win32":
+                    registry.OpenKey.assert_called_once()
+                registry.SetValueEx.assert_not_called()
 
     def test_ctx_states_and_derived_indexes_do_not_hide_merged_records(self):
         state = self.put(self.source, "watch/state/id.json", b'{"monitor":"active"}')

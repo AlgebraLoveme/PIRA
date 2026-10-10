@@ -316,6 +316,8 @@ with tempfile.TemporaryDirectory(prefix="pira-ctx-repair-") as temporary:
     spool = ROOT / "spools"
     spool.mkdir()
     ENV = {**os.environ, "TMPDIR": str(spool), "PIRA_CTX_STORE_DIR": str(ROOT / "unused"), "PIRA_CTX_THREAD_ID": "repair-regression"}
+    # Both capture and exec children must emit UTF-8, including on CP1252 hosts.
+    ENV["PYTHONIOENCODING"] = "utf-8"
     {"search": search, "check": check, "history": history, "index": index,
      "prune": prune, "exec": exec_case, "attention": attention,
      "controls": controls, "checkpoints": checkpoints, "interrupted": interrupted}[CASE]()

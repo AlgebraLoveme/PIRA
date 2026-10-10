@@ -3,7 +3,7 @@ use crate::{IsolatedHome, Options, app_server, artifact, create, private_dir, pr
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 pub(crate) fn decision_workspace(cwd: &Path) -> Result<PathBuf, String> {
@@ -34,6 +34,13 @@ fn retained_dec_workspace(manifest: &Value) -> Result<Option<PathBuf>, String> {
     };
     if !path.is_absolute() {
         return Err("persisted dec_workspace must be absolute".into());
+    }
+    // Windows verbatim paths can retain parent components through canonicalization.
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err("persisted dec_workspace must remain the same canonical directory".into());
     }
     let physical = path
         .canonicalize()
@@ -775,6 +782,10 @@ mod tests {
         let child = root.join("child");
         private_dir(&child).unwrap();
         assert_eq!(decision_workspace(&child).unwrap(), child);
+        assert_eq!(
+            retained_dec_workspace(&json!({"dec_workspace":child})).unwrap(),
+            Some(child.clone())
+        );
         private_dir(&root.join(".git")).unwrap();
         assert_eq!(decision_workspace(&child).unwrap(), root);
         assert_eq!(
@@ -790,6 +801,16 @@ mod tests {
             assert!(retained_dec_workspace(&json!({"dec_workspace":value})).is_err());
         }
         assert!(retained_dec_workspace(&json!({"dec_workspace":child.join("..")})).is_err());
+    }
+
+    #[test]
+    fn retained_dec_workspace_rejects_parent_components_before_io() {
+        let dir = TestDir::new();
+        let path = dir.0.canonicalize().unwrap().join("missing").join("..");
+        assert_eq!(
+            retained_dec_workspace(&json!({"dec_workspace":path})).unwrap_err(),
+            "persisted dec_workspace must remain the same canonical directory"
+        );
     }
 
     #[cfg(unix)]

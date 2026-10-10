@@ -7,6 +7,7 @@ import tomllib
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from test_migrate_pira_stores import native_ctx_environment
 
 
 import os
@@ -26,7 +27,7 @@ class AutoRecapTests(unittest.TestCase):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         physical_home = str(Path(home.name).resolve())
-        environment = patch.dict(setup.os.environ, {"HOME": physical_home, "LOCALAPPDATA": physical_home, "USERPROFILE": physical_home, "SHELL": "/bin/sh"}, clear=True)
+        environment = patch.dict(setup.os.environ, {**native_ctx_environment(Path(physical_home)), "SHELL": "/bin/sh"}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
         profiles = patch.object(setup.audio_retirement, "default_profiles", return_value=[Path(physical_home) / ".zshrc"])
@@ -53,6 +54,26 @@ class AutoRecapTests(unittest.TestCase):
             notification = patch.object(setup.stores, "notify_windows_environment")
             notification.start()
             self.addCleanup(notification.stop)
+
+    def test_setup_environment_preserves_only_execution_inputs(self):
+        execution = {key: "fixture-" + key for key in
+                     ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "SystemDrive")}
+        with patch.dict(os.environ, {**execution, "HOME": "do-not-inherit",
+                                    "OPENAI_API_KEY": "synthetic-do-not-inherit",
+                                    "CODEX_HOME": "do-not-inherit"}, clear=True):
+            fixture = AutoRecapTests()
+            try:
+                fixture.setUp()
+                for key, value in execution.items():
+                    self.assertEqual(os.environ[key], value)
+                home = os.environ["HOME"]
+                self.assertNotEqual(home, "do-not-inherit")
+                for key in ("USERPROFILE", "LOCALAPPDATA", "APPDATA", "TMPDIR", "TMP", "TEMP"):
+                    self.assertEqual(os.environ[key], home)
+                for key in ("OPENAI_API_KEY", "CODEX_HOME"):
+                    self.assertNotIn(key, os.environ)
+            finally:
+                fixture.doCleanups()
 
     def test_keep_optional_files_setup_and_verify(self):
         root = Path(setup.os.environ["HOME"])
@@ -304,13 +325,15 @@ class AutoRecapTests(unittest.TestCase):
         root = Path(setup.os.environ["HOME"])
         config = root / "config.toml"
         config.write_bytes(b"\xff not UTF-8")
-        with patch.object(setup.stores, "plan_store_environment", wraps=setup.stores.plan_store_environment) as plan, \
+        with patch.object(setup, "migration_codex_binary", return_value=None) as backend, \
+             patch.object(setup.stores, "plan_store_environment", wraps=setup.stores.plan_store_environment) as plan, \
              patch.object(setup.stores, "apply_store_migrations", side_effect=RuntimeError("stop before install")), \
              patch.object(setup, "configure_codex") as publish, \
              patch.object(setup, "configure_tools") as tools:
             self.assertEqual(setup.main(["--agent-dir", str(root), "--codex-config", str(config),
                                          "--skip-codex"]), 1)
             self.assertIsNone(plan.call_args.kwargs["codex_text"])
+            backend.assert_called_once()
             publish.assert_not_called()
             tools.assert_not_called()
         self.assertEqual(config.read_bytes(), b"\xff not UTF-8")
@@ -471,7 +494,6 @@ class AutoRecapTests(unittest.TestCase):
     @unittest.skipUnless(NATIVE_CTX_BINARY, "isolated native Ctx fixture requires explicit binary")
     def test_fresh_ctx_capture_blocks_full_setup_retained_migration(self):
         import subprocess
-        from test_migrate_pira_stores import native_ctx_environment
         root = Path(setup.os.environ["HOME"])
         binary = NATIVE_CTX_BINARY
         env = native_ctx_environment(root)
@@ -485,8 +507,11 @@ class AutoRecapTests(unittest.TestCase):
         (agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
         config = root / "config.toml"
         config.write_text('model = "custom"\n')
-        code = ("import sys; from pathlib import Path; from unittest.mock import patch; "
+        code = ("import sys; from pathlib import Path; from unittest.mock import patch, MagicMock; "
                 + "sys.path.insert(0," + repr(str(SCRIPT.parent.resolve())) + "); import setup_pira as s; "
+                + "registry=MagicMock(); registry.OpenKey.side_effect=FileNotFoundError; "
+                + "winreg=patch.dict(sys.modules,{'winreg':registry}); winreg.start(); "
+                + "notify=patch.object(s.stores,'notify_windows_environment'); notify.start(); "
                 + "historical=lambda tool: [Path(" + repr(str(old)) + ")] if tool=='pira_ctx' else []; "
                 + "ctx=patch.object(s.stores,'historical_store_paths',side_effect=historical); ctx.start(); "
                 + "backend=patch.object(s,'migration_codex_binary',return_value=None); backend.start(); "
@@ -494,7 +519,8 @@ class AutoRecapTests(unittest.TestCase):
                 + "paths=" + repr({"PIRA_CTX_STORE_DIR": str(destination), "PIRA_DEC_STORE_DIR": str(root / "dec"), "PIRA_TEAM_DIR": str(root / "team")}) + "; "
                 + "choose=lambda tools,*a,**kw: {s.stores.STORE_ENV_KEYS[t]:paths[s.stores.STORE_ENV_KEYS[t]] for t in tools if t in s.stores.STORE_ENV_KEYS}; "
                 + "selection=patch.object(s.stores,'selected_store_paths',side_effect=choose); selection.start(); "
-                + "raise SystemExit(s.main(" + repr(["--agent-dir", str(root / "agent"), "--codex-config", str(config), "--skip-tools", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]) + "))")
+                + "result=s.main(" + repr(["--agent-dir", str(root / "agent"), "--codex-config", str(config), "--skip-tools", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]) + "); "
+                + "registry.SetValueEx.assert_not_called(); s.stores.notify_windows_environment.assert_not_called(); raise SystemExit(result)")
         env.update(PIRA_CTX_STORE_DIR=str(destination), PIRA_DEC_STORE_DIR=str(root / "dec"), PIRA_TEAM_DIR=str(root / "team"))
         captured = subprocess.run([binary, "capture", "--interest", "(?i)active|error", "--intent", "probe fresh captured setup", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)
         self.assertIn("Unfinished capture requires recovery", captured.stdout + captured.stderr, f"wrapper exit={captured.returncode}: {captured.stdout} {captured.stderr}")
