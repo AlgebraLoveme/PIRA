@@ -1582,7 +1582,11 @@ fn read_v4(path: &Path, mut file: File, file_length: u64) -> Result<StoredResult
     let mut metadata: Metadata = serde_json::from_slice(&metadata_bytes)
         .map_err(|e| format!("invalid result metadata: {e}"))?;
     if metadata.compat_version
-        != if metadata.cwd_native.as_ref().is_some_and(|path| path.requires_native()) {
+        != if metadata
+            .cwd_native
+            .as_ref()
+            .is_some_and(|path| path.requires_native())
+        {
             7
         } else if metadata.drain_truncated {
             6

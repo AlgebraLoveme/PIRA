@@ -66,6 +66,8 @@ jobs:
 
       - name: Check source and tests
         run: |
+          # Use physical fixture paths; Nav intentionally rejects symlink ancestors.
+          export TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
           python3 -m unittest \
             assets.scripts.test_setup_pira \
             assets.scripts.test_setup_pira_tools \
