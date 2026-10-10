@@ -23,6 +23,7 @@ PIRA follows five principles:
 ## PIRA blogs
 
 - [Making Reliable Research Agents Accessible](https://algebraloveme.github.io/2026-07-23-pira-design-and-use/) — PIRA’s design, research workflow, and practical use.
+- [Working with PIRA Team](https://algebraloveme.github.io/2026-10-10-working-with-pira-team/) — Parallel collaboration, worker configuration, and getting started.
 
 ## Tested compatibility
 
