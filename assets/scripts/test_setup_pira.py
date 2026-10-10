@@ -7,7 +7,6 @@ import tomllib
 import unittest
 from unittest.mock import patch
 from pathlib import Path
-from test_migrate_pira_stores import native_ctx_environment
 
 
 import os
@@ -15,6 +14,7 @@ NATIVE_CTX_BINARY = os.environ.get("PIRA_TEST_CTX_BINARY")
 
 SCRIPT = Path(__file__).with_name("setup_pira.py")
 sys.path.insert(0, str(SCRIPT.parent.resolve()))
+from test_migrate_pira_stores import native_ctx_environment
 SPEC = importlib.util.spec_from_file_location("pira_setup_test", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 setup = importlib.util.module_from_spec(SPEC)

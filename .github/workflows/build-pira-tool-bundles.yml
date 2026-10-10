@@ -144,6 +144,7 @@ jobs:
             assets.scripts.test_retire_pira_audio `
             tools.build.test_build_pira_ctx_platform_bins `
             tools.build.test_package_github_release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --manifest-path tools/Cargo.toml --workspace --locked
 
   publish:
