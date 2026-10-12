@@ -5,7 +5,8 @@ use crate::command::{CommandError, input_error, lsp_error};
 use crate::language::Language;
 use crate::lsp::{LspConfigs, LspService};
 use crate::model::ParseBackend;
-use crate::parse::{ParsedFile, parse_file};
+use crate::parse::{ParsedFile, parse_file, parse_file_source};
+use crate::util::read_source;
 
 pub struct StructuralResolver {
     service: LspService,
@@ -29,8 +30,17 @@ impl StructuralResolver {
         }
     }
 
-    pub fn lsp_only(configs: LspConfigs) -> Self {
-        Self::new(configs, false, true, BTreeSet::new())
+    /// Load a forced-server input without invoking the native parser.
+    pub fn load_for_lsp(path: &Path, language: Language) -> Result<ParsedFile, String> {
+        Ok(ParsedFile {
+            path: path.to_path_buf(),
+            language,
+            source: read_source(path)?,
+            symbols: Vec::new(),
+            backend: ParseBackend::Lsp,
+            syntax_defects: 0,
+            symbols_truncated: false,
+        })
     }
 
     pub fn resolve_path(
@@ -38,7 +48,34 @@ impl StructuralResolver {
         path: &Path,
         language: Language,
     ) -> Result<ParsedFile, CommandError> {
-        let parsed = parse_file(path, language).map_err(input_error)?;
+        let parsed = if self.force_all_lsp || self.forced_languages.contains(&language) {
+            Self::load_for_lsp(path, language)
+        } else {
+            parse_file(path, language)
+        }
+        .map_err(input_error)?;
+        self.resolve_parsed(parsed)
+    }
+
+    pub fn resolve_source(
+        &mut self,
+        path: &Path,
+        language: Language,
+        source: String,
+    ) -> Result<ParsedFile, CommandError> {
+        let parsed = if self.force_all_lsp || self.forced_languages.contains(&language) {
+            ParsedFile {
+                path: path.to_path_buf(),
+                language,
+                source,
+                symbols: Vec::new(),
+                backend: ParseBackend::Lsp,
+                syntax_defects: 0,
+                symbols_truncated: false,
+            }
+        } else {
+            parse_file_source(path, language, source).map_err(input_error)?
+        };
         self.resolve_parsed(parsed)
     }
 
@@ -65,26 +102,11 @@ impl StructuralResolver {
             };
             return Err(lsp_error(message));
         }
-        let native_clean = parsed.syntax_defects == 0;
-        let symbols_truncated = native_clean && parsed.symbols_truncated;
-        let native_symbols = parsed.symbols;
         let source = parsed.source;
-        let mut symbols = self
+        let symbols = self
             .service
             .document_symbols(&path, language, &source)
             .map_err(lsp_error)?;
-        if native_clean {
-            let lsp_names = symbols
-                .iter()
-                .map(|symbol| symbol.qualified_name.clone())
-                .collect::<BTreeSet<_>>();
-            symbols.extend(
-                native_symbols
-                    .into_iter()
-                    .filter(|symbol| !lsp_names.contains(&symbol.qualified_name)),
-            );
-            symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
-        }
         Ok(ParsedFile {
             path,
             language,
@@ -92,7 +114,7 @@ impl StructuralResolver {
             symbols,
             backend: ParseBackend::Lsp,
             syntax_defects: 0,
-            symbols_truncated,
+            symbols_truncated: false,
         })
     }
 

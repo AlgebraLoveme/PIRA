@@ -9,16 +9,23 @@ keeps all writes explicit, backed up, and verifiable.
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Literal
+
+import setup_pira_stores as stores
+import setup_pira_tools as tool_setup
+import retire_pira_audio as audio_retirement
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
@@ -44,7 +51,23 @@ PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
 PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
 
 Creating a sandbox requires explicit user approval. Prefer fully cleaning a stale task sandbox and reusing it; never use the global `sbx reset` command for routine cleanup. For sandbox tests, copy only the explicit source, configuration, and test files required for the run; never recursively copy a repository/tool root or any build, cache, or artifact tree. Remove task-local temporary test artifacts after each run.
+
+## Tool file tracking
+
+Follow the existing tools by file purpose, not merely by extension or directory name.
+- Commit production source and required runtime policies, Cargo manifests/lockfile, deterministic regression tests and necessary fixtures under the tool crate, public usage documentation, and setup/build/release integration with its tests.
+- Keep local development/benchmark harnesses, paid live-run utilities, generated reports/logs/session stores, exploratory design/review notes, build outputs/toolchains/caches, credentials, personal profiles, and workbooks untracked and ignored. Do not add tool-specific tracking exceptions for a purpose other tools leave local.
+- Keep CI dependent only on committed inputs; place maintainable regression tests in the existing crate test layout rather than tracking an entire development tree. A distinct new file purpose requires explicit justification.
+- Keep this generated guard ignored; edit its setup template and regenerate it, rather than committing or manually editing the generated file.
 """
+
+
+# Exact shipped templates, not a header-based license to overwrite custom policy.
+LEGACY_GUARD_HASHES = {
+    "4051c65f7e4eb39e5c34ab76bbafe1201bb064c5a470828186bd564c99d756dd",
+    "5195e528d093df4c0398c62db9cb370b258d6e1bbf1fd858c997fabb2089661f",
+    "787f2df9b405b5c29e001fbb7aded9fdc6d4e9eafd9a133435e330151f049837",
+}
 
 
 @dataclass
@@ -53,6 +76,9 @@ class SetupState:
     agent_dir: Path
     dry_run: bool
     yes: bool
+    completed_ctx_only: bool = False
+    fresh_team: bool = False
+    exclude_ctx_records: tuple[str, ...] = ()
     changed: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     verification: list[tuple[str, bool, str]] = field(default_factory=list)
@@ -353,12 +379,89 @@ def disable_auto_recap(text: str) -> str:
     return upsert_top_level(text, {"tui.auto_recap": "false"})
 
 
-def configure_codex(
+def disable_multi_agent_hint(text: str) -> str:
+    """Suppress the mode hint, preserving unrelated TOML text and settings."""
+    target = ("features", "multi_agent_v2", "multi_agent_mode_hint_text")
+    # PIRA: multiline strings require a full TOML editor to locate keys safely.
+    if '"""' in text or "'''" in text:
+        raise RuntimeError("Team hint setup cannot safely edit multiline TOML strings; use single-line strings before setup")
+
+    def parts(key: str) -> tuple[str, ...]:
+        token = r'''(?:[A-Za-z0-9_-]+|"[^"\\]*"|'[^']*')'''
+        if not re.fullmatch(rf"\s*{token}(?:\s*\.\s*{token})*\s*", key):
+            return ("<other key>",)
+        return tuple(part.strip("\"'") for part in re.findall(token, key))
+
+    lines = text.splitlines(keepends=True)
+    section: tuple[str, ...] = ()
+    insert_at = 0
+    insert_key = ".".join(target)
+    insert_depth = 0
+    for index, line in enumerate(lines):
+        header = re.fullmatch(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?", line.strip())
+        if header:
+            section = parts(header.group(1))
+            if section == target[:len(section)] and insert_depth <= len(section) < len(target):
+                insert_at = index + 1
+                insert_key = ".".join(target[len(section):])
+                insert_depth = len(section)
+            continue
+        if line.lstrip().startswith("["):
+            section = ("<other table>",)
+        assignment = re.match(r"^(\s*)([^=#]+?)\s*=\s*(.*)$", line.rstrip("\r\n"))
+        if not assignment:
+            continue
+        path = section + parts(assignment.group(2))
+        if path == target:
+            lines[index] = f'{assignment.group(1)}{assignment.group(2)} = ""\n'
+            return "".join(lines)
+        if path == target[:len(path)]:
+            # PIRA: fail closed on inline tables rather than rewrite user settings.
+            raise RuntimeError("Team feature uses an inline table or scalar; expand it to [features.multi_agent_v2] before setup")
+    lines.insert(insert_at, f'{insert_key} = ""\n')
+    if insert_at and not lines[insert_at - 1].endswith("\n"):
+        lines[insert_at - 1] += "\n"
+    return "".join(lines)
+
+
+def instructions_path(state: SetupState, config_path: Path) -> Path:
+    return state.agent_dir / "AGENTS.md"
+
+
+def project_agents_guard(state: SetupState, config_path: Path) -> str:
+    return PROJECT_AGENTS_GUARD
+
+
+def store_tools(state: SetupState) -> list[str]:
+    return ["pira_ctx", "pira_dec", "pira_team"]
+
+
+def migration_codex_binary(state: SetupState, install_dir: str | None = None, *, prepare_missing: bool = False) -> str | None:
+    """Select/check a backend; only full mutating tools setup may prepare a missing one."""
+    directory = expand_path(install_dir) if install_dir else tool_setup.default_install_dir()
+    binary = tool_setup.selected_codex_binary(directory)
+    if binary is None and prepare_missing:
+        tool_setup.prepare_team_runtime(["pira_team"], directory,
+                                        tool_setup.load_selector().current_platform(),
+                                        verify=False, dry_run=False)
+        binary = tool_setup.selected_codex_binary(directory)
+        if binary is None:
+            raise RuntimeError("Prepared Codex backend is not available for retained-store migration")
+        return binary  # The preparer already checked it; authentication remains in tools setup.
+    if binary:
+        tool_setup.check_team_runtime(["pira_team"], binary)
+    return binary
+
+
+def plan_codex_configuration(
     state: SetupState,
     config_path: Path,
     execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
     replace_permissions: bool,
-) -> None:
+    store_paths: dict[str, str] | None = None,
+    *, include_stores: bool = True,
+) -> str:
+    stores.configuration_toml()
     if execution_mode == "ask":
         if state.yes or not sys.stdin.isatty():
             execution_mode = "keep"
@@ -372,9 +475,11 @@ def configure_codex(
             execution_mode = {"": "safe", "1": "safe", "2": "soft-safe", "3": "keep"}.get(choice, "safe")  # type: ignore[assignment]
 
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    keys = top_level_keys(existing)
-    instructions_path = state.agent_dir / "AGENTS.md"
-    instructions_ref = config_path_string(instructions_path)
+    existing = audio_retirement.clean_config(existing, config_path.parent / "hooks")
+    parsed = stores.parse_configuration(existing)
+    keys = parsed
+    policy_path = instructions_path(state, config_path)
+    instructions_ref = config_path_string(policy_path)
     updates = {
         "model_instructions_file": toml_string(instructions_ref),
         "project_doc_max_bytes": DEFAULT_PROJECT_DOC_MAX_BYTES,
@@ -395,20 +500,76 @@ def configure_codex(
         else:
             remove_keys.append("default_permissions")
 
+    expected = copy.deepcopy(parsed)
+    for key in remove_keys:
+        expected.pop(key, None)
+    expected.update({key: stores.parse_configuration("v = " + value)["v"] for key, value in updates.items()})
+    if not isinstance(expected.setdefault("tui", {}), dict):
+        raise RuntimeError("Codex tui must be a table")
+    expected["tui"]["auto_recap"] = False
     new_text = disable_auto_recap(upsert_top_level(existing, updates, remove_keys=remove_keys))
-    write_text(state, config_path, new_text, "Codex config.toml")
-    ensure_project_agents_guard(state)
-    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", instructions_path)
+    new_text = disable_multi_agent_hint(new_text)
+    features = expected.setdefault("features", {})
+    if not isinstance(features, dict) or not isinstance(features.setdefault("multi_agent_v2", {}), dict):
+        raise RuntimeError("Codex features.multi_agent_v2 must be a table")
+    features["multi_agent_v2"]["multi_agent_mode_hint_text"] = ""
+    if stores.parse_configuration(new_text) != expected:
+        raise RuntimeError("Cannot safely preserve Codex settings with this TOML layout; use ordinary table/key syntax before setup")
+    if not include_stores:
+        # Validate existing store scopes without adding defaults before actual planning.
+        stores.codex_store_configuration(new_text, store_tools(state))
+        return new_text
+    if store_paths is None:
+        store_paths = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state), completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records).stores
+    new_text = stores.codex_store_configuration(new_text, store_tools(state), store_paths)
+    return new_text
 
 
-def ensure_project_agents_guard(state: SetupState) -> None:
-    """Prevent the configured global policy from being rediscovered in the PIRA repo."""
+def configure_codex(
+    state: SetupState, config_path: Path,
+    execution_mode: Literal["ask", "safe", "soft-safe", "keep"],
+    replace_permissions: bool,
+    *, plan: str | None = None,
+) -> None:
+    check_project_agents_guard(state.agent_dir / "AGENTS.override.md", config_path)
+    if plan is None:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=migration_codex_binary(state), completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records)
+        plan = plan_codex_configuration(state, config_path, execution_mode, replace_permissions, store_plan.stores)
+        stores.apply_store_migrations(store_plan, dry_run=state.dry_run)
+    # A supplied plan has already crossed the migration barrier in main.
+    write_text(state, config_path, plan, "Codex config.toml")
+    ensure_project_agents_guard(state, config_path)
+    remove_duplicate_global_agents(state, config_path.parent / "AGENTS.md", state.agent_dir / "AGENTS.md")
+
+
+def check_project_agents_guard(path: Path, config_path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or getattr(info, "st_file_attributes", 0) & 0x400):
+        raise RuntimeError(f"Unsafe PIRA repository guard: {path}; preserve and move its alias/conflict before setup")
+    text = path.read_text(encoding="utf-8")
+    # Recognize old Team-free generated guards only for safe upgrades.
+    # New installations always use canonical Team-enabled instructions.
+    reference = f"`{config_path_string(config_path.parent / 'pira' / 'AGENTS.md')}`"
+    normalized = text.replace(reference, "`AGENTS.md`")
+    if (normalized != PROJECT_AGENTS_GUARD
+            and hashlib.sha256(normalized.encode()).hexdigest() not in LEGACY_GUARD_HASHES):
+        raise RuntimeError(f"Custom PIRA repository guard: {path}; preserve and move it before setup")
+
+
+def ensure_project_agents_guard(state: SetupState, config_path: Path) -> None:
+    """Prevent rediscovery without overwriting independent local instructions."""
+    check_project_agents_guard(state.agent_dir / "AGENTS.override.md", config_path)
     write_text(
         state,
         state.agent_dir / "AGENTS.override.md",
-        PROJECT_AGENTS_GUARD,
+        project_agents_guard(state, config_path),
         "local PIRA repository AGENTS guard",
-        backup=False,
+        backup=True,
     )
 
 
@@ -427,58 +588,14 @@ def remove_duplicate_global_agents(state: SetupState, global_path: Path, pira_pa
     state.note_change(f"removed duplicate {global_label} symlink")
 
 
-def configure_audio(
-    state: SetupState,
-    audio: Literal["ask", "yes", "no"],
-    config_path: Path,
-    audio_dir: Path | None,
-    force_audio: bool,
-) -> None:
-    system = platform.system().lower()
-    supported = system in {"darwin", "windows"}
-    if audio == "ask":
-        if not supported:
-            print("OK: audio notifications are supported only on macOS and Windows; skipping")
-            return
-        if state.yes or not sys.stdin.isatty():
-            print("OK: audio notifications not enabled by default")
-            return
-        audio = "yes" if prompt_yes_no("Enable optional Codex audio notifications?", default=False) else "no"
-    if audio == "no":
-        print("OK: audio notifications skipped")
-        return
-    if not supported:
-        raise RuntimeError("Audio setup is supported only on macOS and Windows")
-
-    if audio_dir is None:
-        audio_dir = state.agent_dir / "PIRA_Voice" / "Samantha"
-    for name in ["complete_msg.m4a", "waiting_msg.m4a"]:
-        candidate = audio_dir / name
-        if not candidate.exists():
-            raise RuntimeError(f"Audio file missing: {candidate}")
-
-    script = state.agent_dir / "assets" / "scripts" / "setup_codex_audio_mode.py"
-    platform_name = "macos" if system == "darwin" else "windows"
-    cmd = [sys.executable, str(script), "--platform", platform_name, "--config", str(config_path), "--audio-dir", str(audio_dir)]
-    if force_audio:
-        cmd.append("--force")
-
-    if state.dry_run:
-        print("DRY-RUN: would run audio setup command:")
-        print("  " + " ".join(sh_quote(part) for part in cmd))
-        state.note_change("would configure Codex audio notifications")
-        return
-    subprocess.run(cmd, check=True)
-    state.note_change("configured Codex audio notifications")
-
-
 def sh_quote(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=+-]+", value):
         return value
     return "'" + value.replace("'", "'\\''") + "'"
 
 
-def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
+def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary: str | None = None,
+           *, user_mode: str = "placeholder", legacy_mode: str = "remove") -> None:
     def add(name: str, passed: bool, detail: str) -> None:
         state.verification.append((name, passed, detail))
         label = "PASS" if passed else "FAIL"
@@ -487,31 +604,39 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool) -> None:
     agents = state.agent_dir / "AGENTS.md"
     add("AGENTS.md exists", agents.exists(), display_path(agents))
     user = state.agent_dir / "USER.md"
-    add("USER.md exists", user.exists(), display_path(user))
+    if user_mode != "keep":
+        add("USER.md exists", user.exists(), display_path(user))
     token_ok = agents.exists() and VERIFY_TOKEN in agents.read_text(encoding="utf-8")
     add("verification token", token_ok, VERIFY_TOKEN)
     legacy_existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
-    add("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
+    if legacy_mode != "keep":
+        add("legacy files absent", not legacy_existing, ", ".join(display_path(p) for p in legacy_existing) or "none")
 
     if not skip_codex:
         if not config_path.exists():
             add("Codex config exists", False, display_path(config_path))
         else:
             text = config_path.read_text(encoding="utf-8")
+            defaults = stores.plan_store_environment(store_tools(state), codex_text=text, codex_binary=codex_binary, completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records).stores
+            add("Codex physical store paths", stores.codex_store_configuration(text, store_tools(state), defaults) == text, display_path(config_path))
             keys = top_level_keys(text)
-            expected_instructions = toml_string(config_path_string(state.agent_dir / "AGENTS.md"))
+            expected_instructions = toml_string(config_path_string(instructions_path(state, config_path)))
             add("Codex config points to PIRA", keys.get("model_instructions_file") == expected_instructions, f"{display_path(config_path)} -> {expected_instructions}")
             add("Codex project_doc_max_bytes", keys.get("project_doc_max_bytes") == DEFAULT_PROJECT_DOC_MAX_BYTES, keys.get("project_doc_max_bytes", "missing"))
             guard = state.agent_dir / "AGENTS.override.md"
-            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == PROJECT_AGENTS_GUARD, display_path(guard))
+            add("PIRA repository duplicate guard", guard.exists() and guard.read_text(encoding="utf-8") == project_agents_guard(state, config_path), display_path(guard))
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
+    stores.add_migration_arguments(parser)
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
+    parser.add_argument("--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
+                        help="Missing Team authentication: auto selects browser or device flow; "
+                             "skip disables login. Verify/dry-run never start login.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument(
         "--tools-version",
@@ -519,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Pin a native tool as ctx=VERSION, dec=VERSION, nav=VERSION, or "
-            "svg=VERSION; repeatable."
+            "svg=VERSION or team=VERSION; repeatable."
         ),
     )
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
@@ -527,12 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
     parser.add_argument("--legacy", choices=["ask", "remove", "keep"], default="ask", help="How to handle paths listed in assets/LEGACY_LIST.md.")
     parser.add_argument("--force-agent-link", action="store_true", help="Move a conflicting --agent-dir aside and symlink this repo there.")
-    parser.add_argument("--audio", choices=["ask", "yes", "no"], default="ask", help="Whether to install optional Codex audio notifications.")
-    parser.add_argument("--audio-dir", default=None, help="Audio set directory for optional Codex audio notifications.")
-    parser.add_argument("--force-audio", action="store_true", help="Allow the audio helper to replace an existing notify entry.")
     parser.add_argument("--verify", action="store_true", help="Only verify the current setup; do not write.")
     parser.add_argument("--dry-run", action="store_true", help="Print planned changes without writing.")
-    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations; does not enable audio unless --audio yes is set.")
+    parser.add_argument("--yes", action="store_true", help="Assume yes for setup confirmations.")
     return parser
 
 
@@ -542,11 +664,18 @@ def configure_tools(
     versions: list[str] | None,
     *,
     verify_only: bool,
+    codex_login: str = "auto",
 ) -> None:
     script = state.repo_root / "assets" / "scripts" / "setup_pira_tools.py"
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
-    command = [sys.executable, str(script)]
+    command = [sys.executable, str(script), "--codex-login", codex_login]
+    for name in state.exclude_ctx_records:
+        command.extend(["--exclude-ctx-record", name])
+    if state.completed_ctx_only:
+        command.append("--completed-ctx-only")
+    if state.fresh_team:
+        command.append("--fresh-team")
     if install_dir:
         command.extend(["--install-dir", str(expand_path(install_dir))])
     for version in versions or []:
@@ -561,9 +690,8 @@ def configure_tools(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
-    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes)
+    state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team, exclude_ctx_records=tuple(args.exclude_ctx_record))
     config_path = expand_path(args.codex_config)
-    audio_dir = expand_path(args.audio_dir) if args.audio_dir else None
 
     print("PIRA setup")
     print(f"Repository: {display_path(repo_root)}")
@@ -571,32 +699,64 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry run:    {state.dry_run}")
 
     try:
+        codex_plan = None
+        codex_binary = None
+        audio_plan = None
+        if not args.skip_codex:
+            guard_root = state.agent_dir
+            if (not same_location(state.agent_dir, state.repo_root)
+                    and (args.force_agent_link or not (state.agent_dir.exists() or state.agent_dir.is_symlink()))):
+                guard_root = state.repo_root  # The future symlink target, not the directory moved into backup.
+            check_project_agents_guard(guard_root / "AGENTS.override.md", config_path)
+            audio_plan = audio_retirement.plan_retirement(config_path, audio_retirement.default_profiles())
+            if args.verify:
+                audio_retirement.apply_retirement(audio_plan, verify=True)
+        if not args.skip_codex or not args.skip_tools:
+            stores.configuration_toml()
+            existing = config_path.read_text(encoding="utf-8") if not args.skip_codex and config_path.exists() else None
+            if not args.skip_codex and not args.verify:
+                codex_plan = plan_codex_configuration(state, config_path, args.execution_mode,
+                                                     args.replace_permissions, include_stores=False)
+            codex_binary = migration_codex_binary(state, args.tools_install_dir,
+                                                 prepare_missing=not args.skip_tools and not state.dry_run)
+            store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=codex_binary, completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records)
+            store_paths = store_plan.stores
+            if codex_plan is not None:
+                codex_plan = stores.codex_store_configuration(codex_plan, store_tools(state), store_paths)
+            for notice in store_plan.notices:
+                print(notice)
+            # Includes --skip-tools: Codex must not point at uncopied historical data.
+            stores.apply_store_migrations(store_plan, dry_run=state.dry_run, verify=args.verify)
         if not args.verify:
+            if audio_plan is not None:
+                audio_retirement.apply_retirement(audio_plan, dry_run=state.dry_run)
             ensure_agent_dir(state, force_agent_link=args.force_agent_link)
             ensure_user_md(state, args.user_mode)
             remove_legacy_files(state, args.legacy)
             if not args.skip_codex:
-                configure_codex(state, config_path, args.execution_mode, args.replace_permissions)
-            configure_audio(state, args.audio, config_path, audio_dir, args.force_audio)
+                configure_codex(state, config_path, args.execution_mode, args.replace_permissions, plan=codex_plan)
             if not args.skip_tools:
                 configure_tools(
                     state,
                     args.tools_install_dir,
                     args.tools_version,
                     verify_only=False,
+                    codex_login=args.codex_login,
                 )
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
-            verify(state, config_path, skip_codex=args.skip_codex)
+            verify(state, config_path, skip_codex=args.skip_codex, codex_binary=codex_binary,
+                   user_mode=args.user_mode, legacy_mode=args.legacy)
             if args.verify and not args.skip_tools:
                 configure_tools(
                     state,
                     args.tools_install_dir,
                     args.tools_version,
                     verify_only=True,
+                    codex_login=args.codex_login,
                 )
-    except (RuntimeError, subprocess.CalledProcessError, OSError) as exc:
+    except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

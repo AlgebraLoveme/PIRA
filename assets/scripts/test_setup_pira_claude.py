@@ -22,6 +22,18 @@ CLAUDE_VERSION = setup.claude_version
 
 
 class ClaudeSetupTests(unittest.TestCase):
+    def test_tool_setup_selects_shared_tools_without_codex_team(self) -> None:
+        with patch.object(setup.subprocess, "run") as run:
+            setup.tools_setup(Path("/pira"), verify=False, dry_run=True)
+        command = run.call_args.args[0]
+        selected = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--tool"]
+        self.assertEqual(
+            selected,
+            ["pira_ctx", "pira_dec", "pira_nav", "pira_svg_check"],
+        )
+        self.assertNotIn("pira_team", command)
+        self.assertIn("--dry-run", command)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

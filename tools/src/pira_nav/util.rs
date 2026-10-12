@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -7,15 +7,57 @@ use sha2::{Digest, Sha256};
 
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-pub fn read_source(path: &Path) -> Result<String, String> {
-    let file =
-        File::open(path).map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
+/// Reject stable symlink components; this is not a race-proof directory walk.
+pub fn reject_symlink_components(path: &Path) -> Result<(), String> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if std::fs::symlink_metadata(&prefix)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(format!(
+                "pira_nav does not follow symlinks: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Open a regular, non-symlink source/config file without blocking on Unix FIFOs.
+pub fn open_regular_file(path: &Path) -> Result<File, String> {
+    reject_symlink_components(path)?;
+    let metadata = std::fs::metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!("not a regular file: {}", path.display()));
     }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Also avoid blocking if the leaf is replaced with a FIFO after validation.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err(format!("not a regular file: {}", path.display()));
+    }
+    Ok(file)
+}
+
+pub fn read_source(path: &Path) -> Result<String, String> {
+    let file = open_regular_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if metadata.len() > MAX_FILE_BYTES {
         return Err(format!(
             "source file exceeds the {} MiB safety limit: {}",
@@ -40,8 +82,7 @@ pub fn read_source(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
-    String::from_utf8(bytes.to_vec()).map_err(|error| {
+    decode_source(bytes).map_err(|error| {
         format!(
             "source is not valid UTF-8 or cannot be read: {}: {error}",
             path.display()
@@ -49,14 +90,24 @@ pub fn read_source(path: &Path) -> Result<String, String> {
     })
 }
 
-pub fn display_path(path: &Path, cwd: &Path) -> String {
-    let shown = path.strip_prefix(cwd).unwrap_or(path);
-    let text = shown.to_string_lossy().replace('\\', "/");
-    if text.is_empty() {
-        ".".into()
-    } else {
-        sanitize_metadata(&text)
+/// Decode source text, removing one leading UTF-8 BOM and reusing the read buffer.
+pub(crate) fn decode_source(mut bytes: Vec<u8>) -> Result<String, std::string::FromUtf8Error> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
     }
+    String::from_utf8(bytes)
+}
+
+pub fn identity_path(path: &Path, cwd: &Path) -> String {
+    let shown = path.strip_prefix(cwd).unwrap_or(path);
+    let text = shown.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
+    if text.is_empty() { ".".into() } else { text }
+}
+
+pub fn display_path(path: &Path, cwd: &Path) -> String {
+    sanitize_metadata(&identity_path(path, cwd))
 }
 
 pub fn normalize_lexically(path: &Path) -> PathBuf {
@@ -74,10 +125,16 @@ pub fn normalize_lexically(path: &Path) -> PathBuf {
 }
 
 pub fn absolute_lexical(path: &Path, cwd: &Path) -> PathBuf {
-    if path.is_absolute() {
-        normalize_lexically(path)
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        normalize_lexically(&cwd.join(path))
+        cwd.join(path)
+    };
+    // Preserve forbidden components so later boundary checks can reject them.
+    if reject_symlink_components(&absolute).is_err() {
+        absolute
+    } else {
+        normalize_lexically(&absolute)
     }
 }
 
@@ -275,16 +332,22 @@ pub fn sanitize_metadata(value: &str) -> String {
 }
 
 pub fn escape_untrusted_text(value: &str) -> (Cow<'_, str>, usize) {
-    let unsafe_control =
-        |character: char| character.is_control() && !matches!(character, '\n' | '\r' | '\t');
-    if !value.chars().any(unsafe_control) {
+    let unsafe_control = |index: usize, character: char| {
+        character.is_control()
+            && !matches!(character, '\n' | '\t')
+            && !(character == '\r' && value.as_bytes().get(index + 1) == Some(&b'\n'))
+    };
+    if !value
+        .char_indices()
+        .any(|(index, character)| unsafe_control(index, character))
+    {
         return (Cow::Borrowed(value), 0);
     }
 
     let mut escaped = 0;
     let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        if unsafe_control(character) {
+    for (index, character) in value.char_indices() {
+        if unsafe_control(index, character) {
             use std::fmt::Write as _;
             let _ = write!(output, "\\u{{{:x}}}", character as u32);
             escaped += 1;

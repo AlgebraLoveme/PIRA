@@ -172,8 +172,11 @@ pub fn score_timeline(
             capture.exit_code,
             keywords,
         );
-        if interest.is_some_and(|pattern| pattern.is_match(&clean)) {
-            flags |= line_flag::INTEREST;
+        if let Some(pattern) = interest {
+            let full = readers.read_full_display_line(line)?;
+            if pattern.is_match(&full) {
+                flags |= line_flag::INTEREST;
+            }
         }
         line.score = score;
         line.flags = flags;
@@ -1237,6 +1240,57 @@ fn is_stopword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interest_matches_complete_lines_beyond_display_and_search_ceilings() {
+        use crate::model::CapturedStream;
+        let interest = regex::Regex::new("MIDDLE").unwrap();
+        for half in [
+            util::MAX_DISPLAY_READ_BYTES / 2 + 1,
+            util::MAX_SEARCH_LINE_BYTES / 2 + 1,
+        ] {
+            let text = format!(
+                "{}MID\x1b[31mDLE{}",
+                "x".repeat(half as usize),
+                "y".repeat(half as usize)
+            );
+            let length = text.len() as u64;
+            let mut line = ranked_line(1, 0, false);
+            line.length = length;
+            let mut capture = CaptureResult {
+                redirected_stream: None,
+                stdout: CapturedStream::memory(text.into_bytes(), length, [0; 32], false, false),
+                stderr: CapturedStream::memory(vec![], 0, [0; 32], false, false),
+                timeline: vec![line],
+                total_lines: 1,
+                stdout_lines: 1,
+                stderr_lines: 0,
+                timeline_truncated: false,
+                retention_truncated: false,
+                drain_truncated: false,
+                cancelled: false,
+                exit_code: 0,
+                start_ms: 0,
+                end_ms: 0,
+                duration_ms: 0,
+                cwd: String::new(),
+                cwd_native: crate::native_path::NativePath::from_path(std::path::Path::new(".")),
+                live_id: None,
+                live_store_dir: None,
+                _live_owner: None,
+            };
+            assert!(
+                !capture
+                    .readers()
+                    .unwrap()
+                    .read_display_line(&capture.timeline[0])
+                    .unwrap()
+                    .contains("MIDDLE")
+            );
+            score_timeline(&mut capture, &[], Some(&interest)).unwrap();
+            assert!(capture.timeline[0].has(line_flag::INTEREST), "half={half}");
+        }
+    }
 
     fn ranked_line(line: usize, score: i64, interested: bool) -> LineMeta {
         LineMeta {

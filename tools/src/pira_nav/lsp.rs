@@ -56,6 +56,7 @@ impl LspConfig {
                 executable.display()
             ));
         }
+        crate::util::reject_symlink_components(&root)?;
         if !root.is_dir() {
             return Err(format!("LSP root is not a directory: {}", root.display()));
         }
@@ -109,7 +110,7 @@ impl LspService {
             .then_some(language);
         if key.is_none() && self.configs.default.is_none() {
             return Err(format!(
-                "no LSP server is configured for {}",
+                "no LSP server is configured for {}; install a conventional server on PATH or pass --lsp LANGUAGE=ABSOLUTE_SERVER_PATH",
                 language.name()
             ));
         }
@@ -144,7 +145,7 @@ impl LspService {
                 .configs
                 .auto_root
                 .as_deref()
-                .is_some_and(|_| auto_server_available(language))
+                .is_some_and(|root| auto_server_available(language, root))
     }
 
     pub fn document_symbols(
@@ -153,8 +154,35 @@ impl LspService {
         language: Language,
         source: &str,
     ) -> Result<Vec<Symbol>, String> {
+        let root = self
+            .configs
+            .languages
+            .get(&language)
+            .or(self.configs.default.as_ref())
+            .map(|config| &config.root)
+            .or(self.configs.auto_root.as_ref());
+        if let Some(root) = root {
+            crate::util::reject_symlink_components(root)?;
+            crate::util::reject_symlink_components(path)?;
+            let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+            let source = fs::canonicalize(path).map_err(|error| error.to_string())?;
+            if !source.starts_with(&root) {
+                return Err("structural target is outside the selected LSP root".into());
+            }
+        }
         self.client(language)?
             .document_symbols(path, language, source)
+    }
+
+    pub fn require_definitions(&mut self, language: Language) -> Result<(), String> {
+        self.client(language)?
+            .require_definitions()
+            .map_err(|error| {
+                format!(
+                    "{error}; import resolution needs textDocument/definition for {}",
+                    language.name()
+                )
+            })
     }
 
     pub fn definition(
@@ -251,25 +279,25 @@ impl LspService {
     }
 }
 
-pub fn auto_server_available(language: Language) -> bool {
-    discover_executable(language).is_some()
+pub fn auto_server_available(language: Language, root: &Path) -> bool {
+    discover_executable(language, root).is_some()
 }
 
 pub fn auto_server_name(language: Language) -> Option<String> {
-    discover_executable(language).and_then(|(path, _)| {
+    discover_executable(language, &env::current_dir().ok()?).and_then(|(path, _)| {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
     })
 }
 
 fn discover_config(language: Language, root: &Path) -> Result<Option<LspConfig>, String> {
-    let Some((executable, arguments)) = discover_executable(language) else {
+    let Some((executable, arguments)) = discover_executable(language, root) else {
         return Ok(None);
     };
     LspConfig::new(executable, arguments, root.to_path_buf(), None, None).map(Some)
 }
 
-fn discover_executable(language: Language) -> Option<(PathBuf, Vec<String>)> {
+fn discover_executable(language: Language, root: &Path) -> Option<(PathBuf, Vec<String>)> {
     let candidates: &[(&str, &[&str])] = match language {
         Language::Python => &[
             ("basedpyright-langserver", &["--stdio"]),
@@ -305,7 +333,7 @@ fn discover_executable(language: Language) -> Option<(PathBuf, Vec<String>)> {
         | Language::Markdown => &[],
     };
     candidates.iter().find_map(|(name, arguments)| {
-        executable_in_path(name).map(|executable| {
+        executable_in_path(name, root).map(|executable| {
             (
                 executable,
                 arguments.iter().map(|value| (*value).to_string()).collect(),
@@ -314,15 +342,38 @@ fn discover_executable(language: Language) -> Option<(PathBuf, Vec<String>)> {
     })
 }
 
-fn executable_in_path(name: &str) -> Option<PathBuf> {
+fn executable_in_path(name: &str, root: &Path) -> Option<PathBuf> {
+    let root = fs::canonicalize(root).ok()?;
+    let cwd = env::current_dir().ok()?;
+    let repository = |path: &Path| {
+        path.ancestors()
+            .find(|ancestor| ancestor.join(".git").exists())
+            .unwrap_or(path)
+            .to_path_buf()
+    };
+    let roots = [repository(&root), repository(&cwd)];
     let path = env::var_os("PATH")?;
     let names = executable_names(name);
     env::split_paths(&path)
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .find_map(|candidate| {
-            is_executable_file(&candidate)
-                .then(|| fs::canonicalize(candidate).ok())
-                .flatten()
+            if !is_executable_file(&candidate) {
+                return None;
+            }
+            let resolved = fs::canonicalize(&candidate).ok()?;
+            // Resolve directory links without hiding ownership of the executable link itself.
+            let parent = candidate
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(&cwd);
+            let launcher = fs::canonicalize(parent).ok()?.join(candidate.file_name()?);
+            let lexical = crate::util::absolute_lexical(&candidate, &cwd);
+            (!roots.iter().any(|root| {
+                lexical.starts_with(root)
+                    || launcher.starts_with(root)
+                    || resolved.starts_with(root)
+            }))
+            .then_some(resolved)
         })
 }
 

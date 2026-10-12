@@ -71,9 +71,32 @@ pub fn io_error(error: io::Error) -> String {
     }
 }
 
+pub(crate) fn open_regular_file(path: &Path, label: &str) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    // Check both sides of open: nonblocking open also closes the FIFO replacement race.
+    if !std::fs::metadata(path)
+        .map_err(|e| format!("inspect {label}: {e}"))?
+        .is_file()
+    {
+        return Err(format!("{label} is not a regular file"));
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("open {label} {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!("{label} is not a regular file"));
+    }
+    Ok(file)
+}
+
 pub fn read_file_limited(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+    let file = open_regular_file(path, label)?;
     let mut bytes = Vec::new();
     file.take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -475,11 +498,68 @@ pub fn stderr_is_data_destination() -> bool {
     }
 }
 
+fn escape_diagnostic(text: &str) -> String {
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        if ch == '\\'
+            || ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 /// Do not append wrapper diagnostics to a caller's redirected data stream.
 pub fn diagnostic_line(text: &str) {
+    let text = escape_diagnostic(text);
     if !stderr_is_data_destination() {
         let _ = writeln!(io::stderr().lock(), "{text}");
     } else if !stdout_is_data_destination() {
         let _ = writeln!(io::stdout().lock(), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_controls_are_escaped_without_erasing_identity() {
+        assert_eq!(
+            escape_diagnostic("x\x1b[31m\u{202e}\n\\"),
+            r"x\u{1b}[31m\u{202e}\n\\"
+        );
+        assert_eq!(escape_diagnostic("plain café"), "plain café");
+        assert_ne!(escape_diagnostic("\x1b"), escape_diagnostic(r"\u{1b}"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bounded_inputs_reject_fifo_and_directory_and_accept_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("ctx-input-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for path in [&dir, &fifo] {
+            assert!(
+                read_file_limited(path, 5, "input")
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+            assert!(
+                crate::storage::read_result_path(path)
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+        }
+        let file = dir.join("plain");
+        std::fs::write(&file, b"hello").unwrap();
+        assert_eq!(read_file_limited(&file, 5, "input").unwrap(), b"hello");
+        assert!(read_file_limited(&file, 4, "input").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

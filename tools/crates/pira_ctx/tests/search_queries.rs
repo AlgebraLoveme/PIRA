@@ -14,7 +14,7 @@ impl Sandbox {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(path.join(".git")).unwrap();
         Self(path)
     }
 
@@ -94,6 +94,8 @@ fn repeatable_queries_rank_independently_and_keep_long_line_match_local() {
 
 fn capture_fixture(sandbox: &Sandbox, code: &str) -> (String, String) {
     let output = Command::new(binary())
+        // Piped Python output otherwise uses the Windows locale code page, not UTF-8.
+        .env("PYTHONIOENCODING", "utf-8")
         .current_dir(sandbox.path())
         .args([
             "capture",
@@ -149,13 +151,73 @@ fn long_line_middles_are_searched_and_oversized_lines_are_disclosed() {
             "{text}"
         );
     }
-    let (id, _) = capture_fixture(&sandbox, "print('x'*(17*1024*1024))");
+    // One byte above the 16 MiB search-line ceiling; no oversized stress fixture needed.
+    let (id, _) = capture_fixture(
+        &sandbox,
+        "import sys; sys.stdout.write('x'*(16*1024*1024+1))",
+    );
     let output = retrieve(&sandbox, "search", &[&id, "absent", "--regex"]);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
         text.contains("complete=0") && text.contains("skipped_lines=1"),
         "{text}"
     );
+}
+
+#[test]
+fn direct_count_composes_after_tail_and_other_filters() {
+    let sandbox = Sandbox::new();
+    let (id, _) = capture_fixture(&sandbox, "print('a\\na\\nb\\nc')");
+    for (options, expected) in [
+        (vec!["--tail", "0", "--count"], "0\n"),
+        (vec!["--tail", "2", "--count"], "2\n"),
+        (vec!["--tail", "99", "--count"], "4\n"),
+        (
+            vec!["--unique", "--head", "2", "--tail", "1", "--count"],
+            "1\n",
+        ),
+        (
+            vec!["--match", "a|b", "--exclude", "b", "--tail", "1", "--count"],
+            "1\n",
+        ),
+    ] {
+        let mut args = vec![id.as_str()];
+        args.extend(options);
+        let output = retrieve(&sandbox, "transform", &args);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn search_hits_preserve_warnings_for_sanitized_controls() {
+    let sandbox = Sandbox::new();
+    let (id, _) = capture_fixture(
+        &sandbox,
+        "print('\\x1b[31mANSI_HIT\\x1b[0m'); print('x'*17000+'BIDI_HIT\\u202e')",
+    );
+    let raw = retrieve(&sandbox, "raw", &[&id, "--stdout"]);
+    assert!(raw.status.success());
+    for expected in [
+        &b"\x1b[31mANSI_HIT\x1b[0m"[..],
+        "BIDI_HIT\u{202e}".as_bytes(),
+    ] {
+        assert!(
+            raw.stdout
+                .windows(expected.len())
+                .any(|bytes| bytes == expected),
+            "fixture did not emit the required control bytes"
+        );
+    }
+    for query in ["ANSI_HIT", "BIDI_HIT"] {
+        let output = retrieve(&sandbox, "search", &[&id, query]);
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("1 hits"), "{text}");
+        assert!(text.contains(query), "{text}");
+        assert!(text.contains("display-control characters"), "{text}");
+        assert!(!text.contains(['\u{1b}', '\u{202e}']), "{text}");
+    }
 }
 
 #[test]
@@ -1051,4 +1113,350 @@ fn mixed_short_output_and_spawn_errors_never_pollute_redirected_files() {
             }
         }
     }
+}
+
+#[test]
+fn unique_head_stops_before_processing_a_value_beyond_the_limit() {
+    let sandbox = Sandbox::new();
+    let (id, _) = capture_fixture(&sandbox, "print('\\n'.join(map(str, range(100001))))");
+    for (head, expected) in [("100000", "100000\n"), ("0", "0\n"), ("1", "1\n")] {
+        let output = retrieve(
+            &sandbox,
+            "transform",
+            &[&id, "--unique", "--head", head, "--count"],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    let output = retrieve(&sandbox, "transform", &[&id, "--unique", "--count"]);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("100000 distinct values"));
+}
+
+#[test]
+fn search_extreme_persisted_scores_do_not_overflow() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.path().join("score.piractx");
+    for score in [i64::MIN, i64::MAX] {
+        let text = format!("needle {}", "x".repeat(9000));
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "stdout_bytes": text.len(), "total_bytes": text.len(), "total_lines": 1,
+            "stdout_lines": 1, "line_timeline": [{"line": 1, "stream": "stdout",
+                "offset": 0, "length": text.len(), "score": score}],
+        }))
+        .unwrap();
+        let mut bytes = b"PIRACTX1".to_vec();
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&metadata);
+        bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        for query in ["needle", "needle missing"] {
+            let output = retrieve(
+                &sandbox,
+                "search",
+                &[path.to_str().unwrap(), query, "--approximate"],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = if query == "needle" {
+                "1 hits"
+            } else {
+                "1 lexical hits"
+            };
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(expected),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn live_spool_reopens_reject_fifos_without_blocking_even_at_zero_length() {
+    let sandbox = Sandbox::new();
+    // Python's native subprocess timeout kills/reaps a regressed blocking reader.
+    let output = Command::new(python())
+        .args([
+            "-c",
+            r#"
+import json, os, pathlib, subprocess, sys
+binary, root = sys.argv[1], pathlib.Path(sys.argv[2])
+env = dict(os.environ, TMPDIR=str(root))
+regular = root / '.pira_ctx-spool-regular'
+fifo = root / '.pira_ctx-spool-fifo'
+regular.write_bytes(b'hello')
+os.mkfifo(fifo)
+manifest = root / 'fixture.live.json'
+for out, err, size, expected in [(regular, regular, 0, b''), (regular, regular, 5, b'hello'),
+                                  (fifo, regular, 0, None), (regular, fifo, 0, None)]:
+    manifest.write_text(json.dumps({'schema':1, 'generation':1, 'checkpoint_unix_ms':0,
+        'stdout_path':str(out), 'stderr_path':str(err),
+        'metadata':{'stdout_bytes':size, 'total_bytes':size}}))
+    result = subprocess.run([binary, 'raw', '--store-dir', str(root / 'store'),
+        str(manifest), '--stdout'], env=env, capture_output=True, timeout=3)
+    if expected is None:
+        assert result.returncode == 125, result
+        assert b'not a regular file' in result.stderr, result
+    else:
+        assert result.returncode == 0 and result.stdout == expected, result
+"#,
+            binary(),
+            sandbox.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_event_warnings_escape_controls_for_failed_and_completed_children() {
+    use std::os::unix::fs::symlink;
+    let sandbox = Sandbox::new();
+    let spec = sandbox.path().join("batch.json");
+    let store = sandbox.path().join("store-\u{1b}[31m-\u{202e}");
+    let foreign = sandbox.path().join("foreign");
+    fs::create_dir(&foreign).unwrap();
+    symlink(&foreign, &store).unwrap();
+    let missing = sandbox
+        .path()
+        .join("missing-program")
+        .to_string_lossy()
+        .into_owned();
+    for (argv, expected_exit) in [
+        (vec![missing.clone()], 127),
+        (vec![python().into(), "-c".into(), "print('ok')".into()], 0),
+    ] {
+        if expected_exit == 0 {
+            fs::remove_file(&store).unwrap();
+            fs::create_dir(&store).unwrap();
+            fs::write(store.join(".events"), b"not a directory").unwrap();
+        }
+        fs::write(
+            &spec,
+            serde_json::json!({"commands":[{"intent":"Check warning boundary", "argv":argv}]})
+                .to_string(),
+        )
+        .unwrap();
+        let output = Command::new(binary())
+            .args(["batch", "--store-dir"])
+            .arg(&store)
+            .arg(&spec)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            text.contains("batch child completed but event recording failed"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+            "{text:?}"
+        );
+        assert!(text.contains(r"\u{1b}[31m-\u{202e}"), "{text}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!("1 | {expected_exit} |"))
+        );
+    }
+    // Ordinary missing programs retain 127 without a spurious event warning.
+    fs::write(&spec, serde_json::json!({"commands":[{"intent":"Check normal missing program", "argv":[missing]}]}).to_string()).unwrap();
+    let output = Command::new(binary())
+        .args(["batch", "--store-dir"])
+        .arg(sandbox.path().join("normal"))
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(127));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("event recording failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_return_normal_errors_without_panics() {
+    use std::os::unix::ffi::OsStringExt;
+    for invalid in [
+        vec![b'b', b'a', b'd', b'-', 0xff],
+        vec![0x1b, b'[', b'3', b'1', b'm', 0xfe],
+    ] {
+        let output = Command::new(binary())
+            .arg("range")
+            .arg(std::ffi::OsString::from_vec(invalid))
+            .arg("1:1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(125),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(text.contains("argument 2 is not valid UTF-8"), "{text}");
+        assert!(!text.contains("panicked") && !text.contains('\u{1b}'));
+    }
+    let output = Command::new(binary()).arg("--version").output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("pira_ctx "));
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_prefix_parent_traversal_rejects_before_store_mutation() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let mut violations = Vec::new();
+    for mode in ["batch", "capture"] {
+        for suffix in [
+            "missing/../alias",
+            "missing/../alias/nested",
+            "missing/child/../../alias/nested",
+            "alias",
+            "existing/../alias",
+            "physical/missing/nested",
+            "existing/../physical/nested",
+        ] {
+            let sandbox = Sandbox::new();
+            let target = sandbox.path().join("target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(target.join("sentinel"), b"keep").unwrap();
+            fs::create_dir(sandbox.path().join("existing")).unwrap();
+            symlink(&target, sandbox.path().join("alias")).unwrap();
+            let store = sandbox.path().join(suffix);
+            let mut command = Command::new(binary());
+            command.args([mode, "--store-dir"]).arg(&store);
+            if mode == "batch" {
+                let spec = sandbox.path().join("batch.json");
+                fs::write(&spec, serde_json::json!({"commands":[{
+                    "intent":"Check preflight side effects", "argv":[sandbox.path().join("missing-program")]
+                }]}).to_string()).unwrap();
+                command.arg(spec);
+            } else {
+                command.args([
+                    "--intent",
+                    "Check preflight side effects",
+                    "--",
+                    python(),
+                    "-c",
+                    "pass",
+                ]);
+            }
+            let output = command.output().unwrap();
+            let physical = suffix.contains("physical");
+            let expected_exit = if mode == "batch" {
+                127
+            } else if physical {
+                0
+            } else {
+                125
+            };
+            let error = String::from_utf8_lossy(&output.stderr);
+            let unchanged = fs::metadata(&target).unwrap().permissions().mode() & 0o777 == 0o755
+                && fs::read(target.join("sentinel")).unwrap() == b"keep"
+                && fs::read_dir(&target).unwrap().count() == 1;
+            let boundary_ok = if physical {
+                store.is_dir() && !error.contains("event recording failed")
+            } else {
+                !sandbox.path().join("missing").exists()
+                    && (error.contains("parent traversal after missing")
+                        || error.contains("symlinked"))
+            };
+            if output.status.code() != Some(expected_exit) || !unchanged || !boundary_ok {
+                violations.push(format!("{mode} {suffix}: exit={:?}, target_unchanged={unchanged}, boundary_ok={boundary_ok}, stderr={error}", output.status.code()));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn literal_search_never_substitutes_approximation() {
+    let sandbox = Sandbox::new();
+    let (id, _) = capture_fixture(
+        &sandbox,
+        "print('cache succeeded\\ncache not failed\\nÉTÉ [ok]')",
+    );
+    let raw = retrieve(&sandbox, "raw", &[&id, "--stdout"]);
+    assert!(raw.status.success());
+    let expected = "ÉTÉ [ok]".as_bytes();
+    assert!(
+        raw.stdout
+            .windows(expected.len())
+            .any(|bytes| bytes == expected),
+        "fixture did not emit UTF-8 Unicode bytes"
+    );
+    let miss = retrieve(
+        &sandbox,
+        "search",
+        &[
+            &id,
+            "cache failed",
+            "-e",
+            "été [ok]",
+            "-e",
+            "cache not failed",
+        ],
+    );
+    assert!(miss.status.success());
+    let text = String::from_utf8(miss.stdout).unwrap();
+    assert!(text.contains("0 hits"), "{text}");
+    assert!(!text.contains("lexical"), "{text}");
+    assert!(text.contains("ÉTÉ [ok]"), "{text}");
+    let approximate = retrieve(&sandbox, "search", &[&id, "cache failed", "--approximate"]);
+    assert!(approximate.status.success());
+    assert!(String::from_utf8_lossy(&approximate.stdout).contains("lexical hits"));
+    let conflict = retrieve(
+        &sandbox,
+        "search",
+        &[&id, "cache", "--approximate", "--regex"],
+    );
+    assert_eq!(conflict.status.code(), Some(125));
+}
+
+#[test]
+fn plan_validation_cannot_be_bypassed_by_direct_count() {
+    let sandbox = Sandbox::new();
+    let (id, _) = capture_fixture(&sandbox, "print('1\\n3')");
+    let plan = sandbox.path().join("plan.json");
+    for contents in [
+        r#"{"steps":[{"op":"count"},{"op":"head","n":0}]}"#,
+        r#"{"steps":[{"op":"head","n":0}]}"#,
+    ] {
+        fs::write(&plan, contents).unwrap();
+        let output = retrieve(
+            &sandbox,
+            "transform",
+            &[&id, "--count", "--plan", plan.to_str().unwrap()],
+        );
+        assert_eq!(output.status.code(), Some(125));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("terminal"));
+    }
+    fs::write(&plan, r#"{"steps":[{"op":"tail","n":1},{"op":"sum"}]}"#).unwrap();
+    let output = retrieve(
+        &sandbox,
+        "transform",
+        &[&id, "--plan", plan.to_str().unwrap()],
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "3\n");
 }

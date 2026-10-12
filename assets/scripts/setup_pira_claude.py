@@ -421,6 +421,9 @@ def remove_legacy(path: Path, remaining: bytes | None, *, dry_run: bool) -> None
 
 def tools_setup(repo_root: Path, *, verify: bool, dry_run: bool) -> None:
     command = [sys.executable, str(repo_root / "assets/scripts/setup_pira_tools.py")]
+    # Team is a Codex-specific backend. Claude-only setup must not require Codex.
+    for tool in ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check"):
+        command.extend(("--tool", tool))
     if verify:
         command.append("--verify")
     elif dry_run:

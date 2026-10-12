@@ -18,6 +18,10 @@ USAGE
 
 Records are scoped to the nearest Git root, otherwise the current directory.
 Reads are lock-free and may omit a decision published concurrently.
+macOS/Linux writes require private permissions, hard links and directory sync.
+Windows writes use private DACLs, owner locks, atomic no-overwrite publication and file flush;
+crash persistence of Windows file/directory entries is not promised.
+macOS ACL grants are rejected, not removed; deny-only ACLs are supported.
 Run `pira_dec COMMAND --help` for exact fields, options, and behavior.
 "#;
 
@@ -30,12 +34,14 @@ FIELDS
   --context TEXT    Concise problem and decisive constraints; exactly once.
   --choice TEXT     Seriously considered alternative; repeat for two or more unique choices.
   --decision N      One-based index selecting one listed choice.
-  --maker VALUE     Decision authority: human or agent; specify exactly once.
+  --maker VALUE     Decision authority: human or agent; required. Repeats are accepted;
+                    human takes precedence over agent regardless of order.
   --supersedes ID   Exact existing decision replaced by this decision; at most once.
   --related ID      Exact existing related decision; repeatable.
 
 OPTIONS
-  --store-dir PATH  Override the durable per-user store.
+  --store-dir PATH  Override the per-user store. Windows flushes contents, not directory entries.
+                   macOS ACL grants are rejected; deny-only ACLs are preserved.
   -h, --help        Show this help.
 "#;
 
@@ -70,8 +76,10 @@ USAGE
 Exports all workspace decisions by default, newest first. --since is inclusive; --until is exclusive;
 TIME accepts RFC 3339, `now`, or an age such as 30m, 24h, or 7d. An explicit --limit accepts 1..1000.
 The static HTML contains full context, alternatives, selected choice, maker, and timestamp. It uses no
-scripts or external resources and escapes stored text. FILE is created with private Unix permissions
-when supported and never overwritten.
+scripts or external resources and escapes stored text. FILE is private (Unix 0600; Windows protected
+process-user DACL), content-synced and never overwritten. macOS ACL grants are rejected before
+writing bytes; deny-only ACLs are preserved.
+Contents are synced; crash-durable publication of the output directory entry is not promised.
 "#;
 
 const SEARCH_HELP: &str = r#"pira_dec search — filter workspace decisions
@@ -115,7 +123,7 @@ USAGE
   pira_dec forget EXACT_ID --yes [--store-dir PATH]
 
 The complete ID and explicit --yes are required. Deletion removes the managed record but does not
-claim secure physical erasure.
+claim secure physical erasure. Windows deletion does not promise crash persistence of the directory-entry change.
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
