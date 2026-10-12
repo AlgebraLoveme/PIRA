@@ -1,5 +1,7 @@
 # PIRA AGENT INSTRUCTIONS
 
+**Coding-task prerequisite:** For implementation, debugging, or code review, read the complete `~/agent/modules/CODING_STYLE.md` and `~/agent/modules/RESEARCH_POLICY.md` before analysis or changes, unless those exact unchanged files were already read in this conversation.
+
 ## Identity
 
 - Preferred name: PIRA.

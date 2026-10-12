@@ -87,6 +87,24 @@ class ReadEvidenceTests(unittest.TestCase):
         events = claude_trace("Read", {"file_path": str(self.profile)}, [{"type": "text", "text": content}])
         self.assertEqual(native_read_evidence(events, {self.profile: self.profile_text}, self.root), {self.profile: True})
 
+    def test_native_read_resolves_equivalent_symlinked_parent(self) -> None:
+        real_parent = self.root / "real"
+        real_parent.mkdir()
+        alias = self.root / "alias"
+        try:
+            alias.symlink_to(real_parent, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"directory symlinks unavailable: {error}")
+        real_file = real_parent / "policy.md"
+        real_file.write_text("# Policy\nRead completely.\n", encoding="utf-8")
+        events = claude_trace("Read", {"file_path": str(real_file)}, real_file.read_text(encoding="utf-8"))
+        alias_file = alias / "policy.md"
+        self.assertTrue(native_read_evidence(events, {alias_file: real_file.read_text(encoding="utf-8")},
+                                             self.root)[alias_file])
+        unrelated = self.root / "other" / "policy.md"
+        self.assertFalse(native_read_evidence(events, {unrelated: real_file.read_text(encoding="utf-8")},
+                                              self.root)[unrelated])
+
     def test_native_profile_insufficient_or_failed_evidence(self) -> None:
         for defect in ("partial", "error", "unmatched", "absent", "early", "duplicate", "wrong-path", "offset", "limit"):
             with self.subTest(defect=defect):

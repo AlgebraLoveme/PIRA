@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def _path(value: str | Path, cwd: Path) -> str:
-    return os.path.normcase(os.path.normpath(os.path.join(str(cwd), str(value))))
+    return os.path.normcase(os.path.realpath(os.path.join(str(cwd), str(value))))
 
 
 def _texts(content: object) -> list[str]:
