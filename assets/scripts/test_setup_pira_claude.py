@@ -520,7 +520,7 @@ class ClaudeSetupTests(unittest.TestCase):
         setup.rollback_files(states, OSError("injected removal failure"))
         self.assertTrue(self.entry.is_symlink())
         self.assertTrue(setup.verify_entry(self.entry, policy, copy_policy=False))
-        self.assertEqual(os.readlink(self.entry), str(policy))
+        self.assertEqual(os.readlink(self.entry), states[self.entry])
 
     def test_copy_refresh_manifest_failure_restores_old_owned_rule(self) -> None:
         if os.name != "nt":
