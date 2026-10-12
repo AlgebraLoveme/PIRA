@@ -58,7 +58,7 @@ if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone ht
 Windows PowerShell:
 
 ```powershell
-if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
+if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; py -3 "$HOME/agent/assets/scripts/setup_pira.py" --yes --execution-mode soft-safe --audio no --user-mode placeholder --legacy remove
 ```
 
 If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-mode keep`:
@@ -72,7 +72,7 @@ cd ~/agent && git pull --ff-only && assets/scripts/setup_pira.sh --yes --executi
 Windows PowerShell:
 
 ```powershell
-Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
+Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; py -3 "$HOME/agent/assets/scripts/setup_pira.py" --yes --execution-mode soft-safe --audio no --user-mode keep --legacy remove
 ```
 
 `git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
@@ -91,17 +91,21 @@ assets/scripts/setup_pira.sh
 assets/scripts/setup_pira.sh --verify
 ```
 
-On Windows, invoke the same setup through `assets/scripts/setup_pira.ps1` from the repository directory:
+On Windows PowerShell, use Python directly after cloning to the expanded home path:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
+git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+py -3 "$HOME/agent/assets/scripts/setup_pira.py" --dry-run
+py -3 "$HOME/agent/assets/scripts/setup_pira.py"
+py -3 "$HOME/agent/assets/scripts/setup_pira.py" --verify
 ```
 
-The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
+The Python entry point and macOS/Linux and Windows wrappers support the same options. The direct Windows commands require Python 3 and its `py` launcher; the wrappers can offer Python installation help through Homebrew on macOS or winget on Windows.
 
 ## Quick start with Claude Code
 
-Claude Code v2.1.281 or later can load PIRA without a `CLAUDE.md` bridge. Keep one `master` checkout at `~/agent`, even if you use Claude Code without Codex. If you do not already have the checkout, run `git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent` first. If Codex already uses that checkout, do not switch its branch: simply run the Claude adapter from it.
+Claude Code v2.1.281 or later can load PIRA without a `CLAUDE.md` bridge. Keep one `master` checkout at `~/agent`, even if you use Claude Code without Codex. If you do not already have the checkout, run `git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent` on macOS/Linux, or `git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"` in Windows PowerShell. If Codex already uses that checkout, do not switch its branch: simply run the Claude adapter from it.
 
 On macOS or Linux:
 
@@ -111,9 +115,19 @@ python3 ~/agent/assets/scripts/setup_pira_claude.py
 python3 ~/agent/assets/scripts/setup_pira_claude.py --verify
 ```
 
-On Windows PowerShell, replace `python3` with `py -3`. If the shared native tools are already installed by Codex, pass `--skip-tools` to these commands. Use `--user-mode keep` if you do not want a separate Claude `USER.md` placeholder.
+On Windows PowerShell:
+
+```powershell
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py" --dry-run
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py"
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py" --verify
+```
+
+If the shared native tools are already installed by Codex, pass `--skip-tools` to these commands. Use `--user-mode keep` if you do not want a separate Claude `USER.md` placeholder.
 
 The policy's module paths assume the checkout is at `~/agent`; `--agent-dir` is intended for controlled tests, not a second production policy location.
+
+Use real directories for the checkout and Claude configuration: symlink/junction directory aliases, including parent aliases, are refused.
 
 The adapter makes three Claude-side changes:
 
@@ -123,13 +137,15 @@ The adapter makes three Claude-side changes:
 
 Claude shares PIRA policy, modules, and tool binaries with Codex. Its `~/.claude/pira/USER.md` stays private and independent. These allow rules grant tool access, not authority to disclose profile data; project instructions remain untrusted. The adapter preserves unrelated Claude settings and instructions, and removes only the old PIRA-managed `CLAUDE.md` import after the new rule is prepared.
 
+The adapter conservatively rejects potentially overlapping or unrecognized `Read` deny/ask rules in the settings file it manages. It does not evaluate managed, project, or session permission layers; installer verification is not a live permission test.
+
 Claude invokes PIRA tool binaries through Bash when no native integration exposes them. [Print mode](https://code.claude.com/docs/en/permission-modes#which-mode-a-session-starts-in) starts in Manual, so unattended `claude -p` runs that need these tools must explicitly authorize their Bash calls. Use narrowly scoped `--allowedTools` rules for the needed commands, or `--permission-mode auto` when its broader autonomy fits the task and is available. Interactive Claude Code v2.1.283+ normally starts in Auto unless settings override it. Do not grant blanket Bash access merely for PIRA.
 
 The setup is safe to rerun. It refuses to take over any existing target rule without its install manifest, backs up changed user files, supports `--dry-run` and `--verify`, and can remove its rule and only the read permissions it added with `--uninstall` while preserving `USER.md`. It leaves old `~/.claude/pira/` policy snapshots untouched but inactive; review them separately before removal. On Windows, rerun setup after updating the source checkout to refresh the managed policy copy. Check `/context` in a new Claude session to confirm PIRA is loaded.
 
-For an optional authenticated smoke test without changing your real PIRA installation, run `python3 assets/scripts/smoke_pira_claude.py` from this checkout. It uses synthetic profiles, the current Claude login, and installer-generated `--settings` to check both project instruction formats and profile reads. Its output distinguishes skipped `Read` calls from permission denials. It does not verify global rule loading from an isolated Claude configuration.
+Caught install/uninstall errors restore the previous managed-file state. If recovery itself fails, setup reports affected paths; inspect them before retrying. This recovery does not cover process termination, concurrent edits, or shared-tool installation.
 
-To compare natural module loading on the same synthetic code-review task, run `python3 assets/scripts/smoke_pira_routing.py --client both --repeats 2`. It reuses your existing CLI logins, places the same shared policy in a temporary project's `AGENTS.md`, gives Claude temporary installer-generated read settings, and runs Codex read-only. Each JSON line reports observed code/module reads and completion. This checks project-policy routing, not Claude's global user rule or review quality. Existing user-level instructions may still affect either client, so treat the results as a smoke test rather than a controlled benchmark. This smoke does not request full access.
+Offline evidence-parser regressions run from a clean checkout with `python3 -B -m unittest assets.scripts.test_smoke_pira_routing` (Windows: `py -3 -B -m unittest assets.scripts.test_smoke_pira_routing`). They check complete file content in successful CLI tool results, including native profile reads, without authenticated model calls. Authenticated smoke runners stay local and are not shipped. Parser tests and installer `--verify` checks do not establish live permission behavior, global rule loading, natural module routing, or review quality.
 
 ## Setup options
 
@@ -185,11 +201,10 @@ python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1
 On Windows PowerShell:
 
 ```powershell
-cd $HOME\agent
-py -3 assets/scripts/setup_pira_tools.py          # install or refresh
-py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
-py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py"          # install or refresh
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --force  # reinstall the selected release
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --verify # verify without writing
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --version ctx=1.7.0 --version svg=0.1.0
 ```
 
 The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, or `svg=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup needs network access; normal tool use does not. Restart the shell or agent process if setup says the new PATH is not active yet.
@@ -541,7 +556,7 @@ bash ~/agent/assets/scripts/setup_codex_audio_mode.sh \
 Windows PowerShell:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File "$HOME\agent\assets\scripts\setup_codex_audio_mode_windows.ps1" `
+powershell.exe -File "$HOME\agent\assets\scripts\setup_codex_audio_mode_windows.ps1" `
   -ConfigPath "$HOME\.codex\config.toml"
 ```
 

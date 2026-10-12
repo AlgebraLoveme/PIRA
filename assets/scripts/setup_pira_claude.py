@@ -80,6 +80,46 @@ def sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def file_states(paths: tuple[Path, ...]) -> dict[Path, bytes | str | None]:
+    return {path: (os.readlink(path) if path.is_symlink() else
+                   path.read_bytes() if path.exists() else None) for path in paths}
+
+
+def rollback_files(states: dict[Path, bytes | str | None], error: Exception) -> None:
+    """Restore preflight-validated files after a caught failure, attempting every path."""
+    failures = []
+    for path, content in reversed(list(states.items())):
+        try:
+            if content is None:
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+            elif isinstance(content, str):
+                if not path.is_symlink() or os.readlink(path) != content:
+                    if path.exists() or path.is_symlink():
+                        path.unlink()
+                    path.symlink_to(content)
+            else:
+                if not path.is_file() or path.is_symlink() or path.read_bytes() != content:
+                    write_bytes(path, content, dry_run=False)
+        except (OSError, RuntimeError) as rollback_error:
+            failures.append(f"{path}: {rollback_error}")
+    if failures:
+        raise RuntimeError(
+            f"{error}; rollback incomplete; inspect these paths before retrying: " +
+            "; ".join(failures)
+        ) from error
+    print("Rolled back installer file changes; safe to retry.", file=sys.stderr)
+
+
+def require_resolved_directory(directory: Path) -> None:
+    resolved = directory.resolve()
+    if directory != resolved:
+        raise RuntimeError(
+            f"unsupported symlink/junction directory: {directory}; "
+            f"use the resolved path {resolved} (also for parent directories) and retry"
+        )
+
+
 def source_policy(agent_dir: Path) -> Path:
     policy = agent_dir / "AGENTS.md"
     if not policy.is_file():
@@ -144,16 +184,18 @@ def permission_anchor(directory: Path) -> str:
     try:
         relative = directory.relative_to(Path.home())
     except ValueError:
-        absolute = directory.as_posix()
-        if os.name == "nt":
-            if ":" not in absolute:
-                raise RuntimeError(
-                    f"network paths are not supported for Claude permissions: {directory}"
-                )
-            drive, rest = absolute.split(":", 1)
-            absolute = f"/{drive.lower()}{rest}"
-        return "//" + absolute.lstrip("/")
+        return "/" + absolute_permission_path(directory)
     return "~/" + relative.as_posix()
+
+
+def absolute_permission_path(directory: Path) -> str:
+    absolute = directory.as_posix()
+    if os.name == "nt":
+        if ":" not in absolute:
+            raise RuntimeError(f"network paths are not supported for Claude permissions: {directory}")
+        drive, rest = absolute.split(":", 1)
+        absolute = f"/{drive.lower()}{rest}"
+    return "/" + absolute.lstrip("/")
 
 
 def module_read_rule(agent_dir: Path) -> str:
@@ -172,10 +214,53 @@ def settings_allow(data: dict[str, object]) -> list[str]:
     permissions = data.get("permissions", {})
     if not isinstance(permissions, dict):
         raise RuntimeError("Claude settings permissions must be an object")
-    allowed = permissions.get("allow", [])
-    if not isinstance(allowed, list) or any(not isinstance(rule, str) for rule in allowed):
-        raise RuntimeError("Claude settings permissions.allow must be a list of strings")
-    return allowed
+    for kind in ("allow", "deny", "ask"):
+        rules = permissions.get(kind, [])
+        if not isinstance(rules, list) or any(not isinstance(rule, str) for rule in rules):
+            raise RuntimeError(f"Claude settings permissions.{kind} must be a list of strings")
+    return permissions.get("allow", [])
+
+
+def read_pattern_prefix(pattern: str, claude_dir: Path) -> str | None:
+    # PIRA: Not a gitignore evaluator. Unknown syntax/anchors remain possible conflicts.
+    if "//" in pattern[2:] or any(char in pattern for char in "\\!{}()\n\r:") or any(
+        part in {".", ".."} for part in pattern.split("/")
+    ):
+        return None
+    if pattern.startswith("//"):
+        absolute = pattern[1:]
+    elif pattern.startswith("~/"):
+        absolute = absolute_permission_path(Path.home()).rstrip("/") + pattern[1:]
+    elif pattern.startswith("/"):
+        absolute = absolute_permission_path(claude_dir).rstrip("/") + pattern
+    else:
+        return None  # CWD/session-dependent rules cannot be proved disjoint here.
+    prefix = re.split(r"[*?\[]", absolute, maxsplit=1)[0]
+    return prefix.casefold() if os.name == "nt" else prefix
+
+
+def check_read_conflicts(data: dict[str, object], rules: tuple[str, ...], claude_dir: Path) -> None:
+    """Reject possible deny/ask overlap in this settings file, never override restrictions.
+
+    Only disjoint literal anchored prefixes are accepted; overlapping prefixes and
+    unknown Read syntax are conservatively refused, not fully evaluated. Other
+    tools are outside this Read check, as are managed/project/session settings.
+    """
+    settings_allow(data)
+    prefixes = [read_pattern_prefix(rule[5:-1], claude_dir) for rule in rules]
+    for kind in ("deny", "ask"):
+        for rule in data.get("permissions", {}).get(kind, []):
+            if rule == "Read" or rule.startswith("Read("):
+                prefix = read_pattern_prefix(rule[5:-1], claude_dir) if rule.endswith(")") else None
+                if rule == "Read" or prefix is None or any(
+                    target is None or prefix.startswith(target) or target.startswith(prefix)
+                    for target in prefixes
+                ):
+                    raise RuntimeError(
+                        f"permissions.{kind} rule {rule!r} may conflict with required PIRA Read access; "
+                        "preserved unchanged. Review this settings file's restriction before retrying "
+                        "(conservative check, not the full Claude permission evaluator)."
+                    )
 
 
 def set_module_rule(data: dict[str, object], rule: str, *, remove: bool = False) -> dict[str, object]:
@@ -263,10 +348,13 @@ def legacy_without_pira(path: Path) -> bytes | None:
     if text.count(LEGACY_START) != 1 or text.count(LEGACY_END) != 1:
         raise RuntimeError(f"ambiguous PIRA-managed CLAUDE.md block: {path}")
     start = text.index(LEGACY_START)
-    end = text.index(LEGACY_END, start) + len(LEGACY_END)
+    end_marker = text.index(LEGACY_END)
+    if end_marker < start:
+        raise RuntimeError(f"ambiguous PIRA-managed CLAUDE.md block: {path}")
+    end = end_marker + len(LEGACY_END)
     if text[end:] in {"\n", "\r\n"}:
         end = len(text)
-    body = text[start + len(LEGACY_START):text.index(LEGACY_END, start)].strip()
+    body = text[start + len(LEGACY_START):end_marker].strip()
     if not re.fullmatch(r"@(?:~|[^ \t\r\n]+)/\.claude/pira/AGENTS\.md", body):
         raise RuntimeError(f"PIRA-managed CLAUDE.md block was edited: {path}")
     remaining = text[:start] + text[end:]
@@ -348,6 +436,8 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
             "a custom --agent-dir is for controlled testing."
         )
     claude_dir = expand(args.claude_dir)
+    for directory in (agent_dir, agent_dir / "modules", claude_dir):
+        require_resolved_directory(directory)
     policy = source_policy(agent_dir)
     entry = claude_dir / "rules" / RULE_FILE
     settings_path = claude_dir / "settings.json"
@@ -355,6 +445,7 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
     profile_path = claude_dir / "pira" / "USER.md"
     manifest_path = claude_dir / "pira" / MANIFEST
     for directory in (claude_dir / "rules", claude_dir / "pira"):
+        require_resolved_directory(directory)
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise RuntimeError(f"unsafe Claude configuration directory: {directory}")
     copy_policy = os.name == "nt"
@@ -367,6 +458,8 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
     user_rule = profile_read_rule(claude_dir)
     shared_user_rule = shared_profile_read_rule(agent_dir)
     allowed = settings_allow(settings)
+    read_rules = (read_rule, user_rule, shared_user_rule)
+    check_read_conflicts(settings, read_rules, claude_dir)
     print(f"PIRA module read allowance: {read_rule}")
     print(f"Claude private profile read allowance: {user_rule}")
     print(f"Shared fallback profile read allowance: {shared_user_rule}")
@@ -408,6 +501,7 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
         if copy_policy:
             manifest["policy_sha256"] = sha256(policy.read_bytes())
     if args.verify:
+        print("Read permission checks cover only this settings.json, not managed/project/session settings.")
         checks = {
             "Claude PIRA user rule": verify_entry(entry, policy, copy_policy=copy_policy),
             "Claude both-files mode": prior_mode == MODE,
@@ -426,25 +520,32 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
         return
     if not args.skip_tools:
         tools_setup(repo_root, verify=False, dry_run=args.dry_run)
-    install_entry(entry, policy, read_manifest(manifest_path), dry_run=args.dry_run, copy_policy=copy_policy)
     configured = set_mode(settings, MODE)
-    for rule in (read_rule, user_rule, shared_user_rule):
+    for rule in read_rules:
         configured = set_module_rule(configured, rule)
-    if configured != settings:
-        write_bytes(settings_path, json_bytes(configured), dry_run=args.dry_run)
-    if not profile_path.exists() and args.user_mode == "placeholder":
-        write_bytes(profile_path, USER_PLACEHOLDER.encode("utf-8"), dry_run=args.dry_run)
-    remove_legacy(legacy_path, legacy, dry_run=args.dry_run)
-    write_bytes(manifest_path, json_bytes(manifest), dry_run=args.dry_run)
+    states = file_states((entry, settings_path, profile_path, legacy_path, manifest_path)) if not args.dry_run else {}
+    try:
+        install_entry(entry, policy, read_manifest(manifest_path), dry_run=args.dry_run, copy_policy=copy_policy)
+        if configured != settings:
+            write_bytes(settings_path, json_bytes(configured), dry_run=args.dry_run)
+        if not profile_path.exists() and args.user_mode == "placeholder":
+            write_bytes(profile_path, USER_PLACEHOLDER.encode("utf-8"), dry_run=args.dry_run)
+        remove_legacy(legacy_path, legacy, dry_run=args.dry_run)
+        write_bytes(manifest_path, json_bytes(manifest), dry_run=args.dry_run)
+    except (OSError, RuntimeError) as error:
+        rollback_files(states, error)
+        raise
     if not args.dry_run:
         print("PASS: Claude PIRA rule setup complete")
 
 
 def uninstall(args: argparse.Namespace) -> None:
     claude_dir = expand(args.claude_dir)
+    require_resolved_directory(claude_dir)
     entry = claude_dir / "rules" / RULE_FILE
     manifest_path = claude_dir / "pira" / MANIFEST
     for directory in (claude_dir / "rules", claude_dir / "pira"):
+        require_resolved_directory(directory)
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise RuntimeError(f"unsafe Claude configuration directory: {directory}")
     manifest = read_manifest(manifest_path)
@@ -477,13 +578,18 @@ def uninstall(args: argparse.Namespace) -> None:
     if args.dry_run:
         print(f"DRY-RUN: would remove {entry} and {manifest_path} and restore {settings_path}")
         return
-    if not manifest["settings_existed"] and not restored:
-        backup(settings_path)
-        settings_path.unlink()
-    else:
-        write_bytes(settings_path, json_bytes(restored), dry_run=False)
-    entry.unlink()
-    manifest_path.unlink()
+    states = file_states((entry, settings_path, manifest_path))
+    try:
+        if not manifest["settings_existed"] and not restored:
+            backup(settings_path)
+            settings_path.unlink()
+        else:
+            write_bytes(settings_path, json_bytes(restored), dry_run=False)
+        entry.unlink()
+        manifest_path.unlink()
+    except (OSError, RuntimeError) as error:
+        rollback_files(states, error)
+        raise
     print(f"Removed PIRA user rule; preserved {claude_dir / 'pira' / 'USER.md'}")
 
 

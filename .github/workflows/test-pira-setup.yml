@@ -25,9 +25,9 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run setup and routing parser tests
+      - name: Run setup and offline evidence parser tests
         run: >-
-          ${{ matrix.python }} -m unittest -q
+          ${{ matrix.python }} -B -m unittest -q
           assets.scripts.test_setup_pira
           assets.scripts.test_setup_pira_tools
           assets.scripts.test_setup_pira_claude

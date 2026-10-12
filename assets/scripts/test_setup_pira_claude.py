@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import sys
@@ -16,13 +18,14 @@ assert SPEC is not None and SPEC.loader is not None
 setup = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
+CLAUDE_VERSION = setup.claude_version
 
 
 class ClaudeSetupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        root = Path(self.temporary.name)
+        root = Path(self.temporary.name).resolve()
         self.agent = root / "agent"
         self.claude = root / ".claude"
         (self.agent / "modules").mkdir(parents=True)
@@ -305,6 +308,321 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(self.run_setup("--uninstall"), 0)
         self.assertFalse(self.entry.is_symlink())
         self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_install_manifest_failure_rolls_back_and_retries(self) -> None:
+        settings = self.claude / "settings.json"
+        settings.write_bytes(b'{"permissions":{"allow":["Bash(echo safe)"]},"theme":"dark"}\n')
+        legacy = self.claude / "CLAUDE.md"
+        legacy.write_bytes(
+            b"Local rules\r\n" + setup.LEGACY_START.encode() +
+            b"\n@~/.claude/pira/AGENTS.md\n" + setup.LEGACY_END.encode() + b"\n"
+        )
+        profile = self.claude / "pira" / "USER.md"
+        profile.parent.mkdir()
+        profile.write_bytes(b"My private profile\n")
+        before = {path: path.read_bytes() for path in (settings, legacy, profile)}
+        manifest = profile.parent / setup.MANIFEST
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists() or self.entry.is_symlink())
+        self.assertFalse(manifest.exists())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"]["allow"], ["Bash(echo safe)"])
+        self.assertEqual(profile.read_bytes(), before[profile])
+
+    def test_fresh_install_failure_removes_new_profile_and_settings(self) -> None:
+        manifest = self.claude / "pira" / setup.MANIFEST
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest):
+            self.assertEqual(self.run_setup(), 1)
+        for path in (self.entry, manifest, self.claude / "settings.json",
+                     self.claude / "pira" / "USER.md"):
+            self.assertFalse(path.exists() or path.is_symlink())
+        self.assertEqual(self.run_setup(), 0)
+
+    def test_uninstall_unlink_failure_rolls_back_and_retries(self) -> None:
+        for failed_name in (setup.RULE_FILE, setup.MANIFEST):
+            with self.subTest(failed_name=failed_name):
+                settings = self.claude / "settings.json"
+                settings.write_bytes(b'{"permissions":{"ask":["Bash(rm *)"]},"theme":"dark"}\n')
+                self.assertEqual(self.run_setup(), 0)
+                legacy = self.claude / "CLAUDE.md"
+                legacy.write_bytes(b"Unrelated local instructions\n")
+                profile = self.claude / "pira" / "USER.md"
+                profile.write_bytes(b"Private user changes\n")
+                manifest = profile.parent / setup.MANIFEST
+                before = {path: path.read_bytes() for path in (settings, manifest, profile, legacy)}
+                unlink = Path.unlink
+
+                def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                    if path.name == failed_name:
+                        raise OSError("injected unlink failure")
+                    unlink(path, *args, **kwargs)
+
+                with patch.object(Path, "unlink", new=fail_unlink):
+                    self.assertEqual(self.run_setup("--uninstall"), 1)
+                self.assertEqual(self.run_setup("--verify"), 0)
+                for path, content in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+                self.assertEqual(self.run_setup("--uninstall"), 0)
+                self.assertEqual(self.settings(), {"permissions": {"ask": ["Bash(rm *)"]}, "theme": "dark"})
+                self.assertEqual(profile.read_bytes(), before[profile])
+                self.assertEqual(legacy.read_bytes(), before[legacy])
+
+    def test_verify_rejects_deny_and_ask_read_conflicts(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings_path = self.claude / "settings.json"
+        installed = self.settings()
+        rules = [setup.module_read_rule(self.agent), setup.profile_read_rule(self.claude),
+                 setup.shared_profile_read_rule(self.agent)]
+        broader = [f"Read({setup.permission_anchor(self.agent)}/**)",
+                   f"Read({setup.permission_anchor(self.claude)}/**)", "Read", "Read(//**)"]
+        for kind in ("deny", "ask"):
+            for rule in [*rules, *broader, "Read(**/*.md)", "Read(path:unknown)"]:
+                with self.subTest(kind=kind, rule=rule):
+                    configured = json.loads(json.dumps(installed))
+                    configured["permissions"][kind] = [rule]
+                    content = setup.json_bytes(configured)
+                    settings_path.write_bytes(content)
+                    self.assertEqual(self.run_setup("--verify"), 1)
+                    self.assertEqual(settings_path.read_bytes(), content)
+
+    def test_install_read_conflicts_are_refused_before_mutation(self) -> None:
+        settings = self.claude / "settings.json"
+        for kind in ("deny", "ask"):
+            with self.subTest(kind=kind):
+                content = setup.json_bytes({"permissions": {kind: ["Read"]}})
+                settings.write_bytes(content)
+                self.assertEqual(self.run_setup(), 1)
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "pira").exists())
+                self.assertEqual(settings.read_bytes(), content)
+
+    def test_unrelated_restrictions_survive_install_verify_and_uninstall(self) -> None:
+        permissions = {"deny": ["Bash(rm *)", "Read(~/unrelated-private/**)"],
+                       "ask": ["Bash(git push *)", "Read(//unrelated-root/**)"],
+                       "allow": ["Bash(echo safe)"]}
+        (self.claude / "settings.json").write_bytes(setup.json_bytes({"permissions": permissions}))
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.settings()["permissions"]["deny"], permissions["deny"])
+        self.assertEqual(self.settings()["permissions"]["ask"], permissions["ask"])
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"], permissions)
+
+    def test_malformed_deny_and_ask_lists_are_refused(self) -> None:
+        for kind in ("deny", "ask"):
+            for value in ("Read", [123], None):
+                with self.subTest(kind=kind, value=value):
+                    path = self.claude / "settings.json"
+                    content = setup.json_bytes({"permissions": {kind: value}})
+                    path.write_bytes(content)
+                    self.assertEqual(self.run_setup(), 1)
+                    self.assertFalse(self.entry.exists())
+                    self.assertEqual(path.read_bytes(), content)
+
+    def test_reversed_legacy_markers_are_refused_before_mutation(self) -> None:
+        legacy = self.claude / "CLAUDE.md"
+        content = f"{setup.LEGACY_END}\nLocal\n{setup.LEGACY_START}\n".encode()
+        legacy.write_bytes(content)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("ambiguous PIRA-managed CLAUDE.md block", errors.getvalue())
+        self.assertEqual(legacy.read_bytes(), content)
+        self.assertFalse(self.entry.exists())
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_alias_checkout_is_refused_with_resolved_path_before_mutation(self) -> None:
+        resolve = Path.resolve
+        canonical = self.agent.parent / "canonical-agent"
+
+        def aliased(path: Path, *args: object, **kwargs: object) -> Path:
+            if path == self.agent:
+                return canonical
+            return resolve(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with patch.object(Path, "resolve", new=aliased), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("resolved path", errors.getvalue())
+        self.assertIn(str(canonical), errors.getvalue())
+        self.assertFalse(self.entry.exists())
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_native_directory_aliases_are_refused(self) -> None:
+        cases = [("--agent-dir", self.agent, self.agent.with_name("agent-alias")),
+                 ("--claude-dir", self.claude, self.claude.with_name("claude-alias")),
+                 (None, self.agent, self.claude / "rules"),
+                 (None, self.agent, self.claude / "pira")]
+        for argument, target, alias in cases:
+            with self.subTest(alias=alias):
+                if os.name == "nt":
+                    setup.subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+                        capture_output=True, check=True,
+                    )
+                else:
+                    alias.symlink_to(target, target_is_directory=True)
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.assertEqual(self.run_setup(*([argument, str(alias)] if argument else [])), 1)
+                self.assertIn("resolved path", errors.getvalue())
+                self.assertIn(str(target.resolve()), errors.getvalue())
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
+                if os.name == "nt":
+                    alias.rmdir()
+                else:
+                    alias.unlink()
+
+    def test_symlink_rule_snapshot_restoration(self) -> None:
+        self.entry.parent.mkdir()
+        policy = self.agent / "AGENTS.md"
+        try:
+            setup.install_entry(self.entry, policy, None, dry_run=False, copy_policy=False)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest(f"native symlink creation unavailable: {error}")
+            raise
+        self.assertTrue(self.entry.is_symlink())
+        states = setup.file_states((self.entry,))
+        self.entry.unlink()
+        setup.rollback_files(states, OSError("injected removal failure"))
+        self.assertTrue(self.entry.is_symlink())
+        self.assertTrue(setup.verify_entry(self.entry, policy, copy_policy=False))
+        self.assertEqual(os.readlink(self.entry), str(policy))
+
+    def test_copy_refresh_manifest_failure_restores_old_owned_rule(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows copy refresh; POSIX uses a live symlink")
+        self.assertEqual(self.run_setup(), 0)
+        manifest = self.claude / "pira" / setup.MANIFEST
+        before = {path: path.read_bytes() for path in (self.entry, manifest, self.claude / "settings.json")}
+        (self.agent / "AGENTS.md").write_bytes((setup.VERIFY_TOKEN + "\nUpdated\n").encode())
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        errors = io.StringIO()
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("safe to retry", errors.getvalue())
+        self.assertNotIn("rollback incomplete", errors.getvalue())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+
+    def test_rollback_failure_reports_failed_path_and_original_error(self) -> None:
+        manifest = self.claude / "pira" / setup.MANIFEST
+        write, unlink = setup.write_bytes, Path.unlink
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest failure")
+            write(path, content, dry_run=dry_run)
+
+        def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == self.entry:
+                raise OSError("injected rollback unlink failure")
+            unlink(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest), \
+                patch.object(Path, "unlink", new=fail_unlink), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("injected manifest failure", errors.getvalue())
+        self.assertIn("rollback incomplete", errors.getvalue())
+        self.assertIn(str(self.entry), errors.getvalue())
+        self.assertNotIn("safe to retry", errors.getvalue())
+        self.assertFalse((self.claude / "settings.json").exists())
+        self.assertFalse((self.claude / "pira" / "USER.md").exists())
+        # A leftover rule without a manifest is still unowned, never silently adopted.
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(manifest.exists())
+
+    def test_deleted_settings_are_restored_after_uninstall_failure(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.claude / "settings.json"
+        before = settings.read_bytes()
+        unlink = Path.unlink
+
+        def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == self.entry:
+                raise OSError("injected rule unlink failure")
+            unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=fail_unlink):
+            self.assertEqual(self.run_setup("--uninstall"), 1)
+        self.assertEqual(settings.read_bytes(), before)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertFalse(settings.exists())
+
+    def test_permission_prefix_normalization_and_unknown_syntax(self) -> None:
+        rules = (setup.module_read_rule(Path.home() / "agent"),
+                 setup.profile_read_rule(self.claude), setup.shared_profile_read_rule(self.agent))
+        conflicting = ["Read(/pira/**)", "Read(/pira/USER.md)", "Read(/pira/[A-Z]*.md)",
+                       f"Read(/{setup.absolute_permission_path(Path.home())}/agent/**)",
+                       "Read(~/agent/../agent/**)", "Read(~/agent//**)",
+                       "Read(~/agent/modules/[A-Z]*.md)", "Read(./USER.md)", "Read(broken"]
+        for rule in conflicting:
+            with self.subTest(rule=rule):
+                with self.assertRaisesRegex(RuntimeError, "may conflict"):
+                    setup.check_read_conflicts({"permissions": {"deny": [rule]}}, rules, self.claude)
+
+    def test_dry_run_and_verify_leave_all_files_unchanged(self) -> None:
+        settings = self.claude / "settings.json"
+        settings.write_bytes(b'{"theme":"dark"}\n')
+        legacy = self.claude / "CLAUDE.md"
+        legacy.write_bytes((setup.LEGACY_START + "\n@~/.claude/pira/AGENTS.md\n" + setup.LEGACY_END).encode())
+
+        def files() -> dict[str, bytes | str]:
+            return {str(path.relative_to(self.claude)): os.readlink(path) if path.is_symlink() else path.read_bytes()
+                    for path in self.claude.rglob("*") if path.is_file() or path.is_symlink()}
+
+        before = files()
+        self.assertEqual(self.run_setup("--dry-run"), 0)
+        self.assertEqual(files(), before)
+        self.assertEqual(self.run_setup(), 0)
+        installed = files()
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall", "--dry-run"), 0)
+        self.assertEqual(files(), installed)
+
+    def test_old_client_is_rejected_before_writes_without_live_client(self) -> None:
+        with patch.object(setup, "claude_version", CLAUDE_VERSION), \
+                patch.object(setup.subprocess, "run") as command:
+            for version in ("2.1.217", "2.1.280"):
+                with self.subTest(version=version):
+                    command.return_value.stdout = version + " (Claude Code)"
+                    self.assertEqual(self.run_setup(), 1)
+                    self.assertFalse(self.entry.exists())
+                    self.assertFalse((self.claude / "settings.json").exists())
+            command.return_value.stdout = "2.1.281 (Claude Code)"
+            self.assertEqual(self.run_setup(), 0)
 
 
 if __name__ == "__main__":
