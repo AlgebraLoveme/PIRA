@@ -192,7 +192,9 @@ class PrivateCITests(unittest.TestCase):
                      'retire_pira_audio.py', 'test_retire_pira_audio.py',
                      'team_store_relocation.py', 'test_team_store_relocation.py', 'team_relocation_fixture.py'):
             self.assertIn('assets/scripts/' + name, data)
-        self.assertIn('tests/test_team.py', workflow)
+        self.assertIn("unittest discover -s tools/crates/pira_team/tests -p 'test_*.py'", workflow)
+        self.assertIn('PIRA_DEC_BIN=', workflow)
+        self.assertIn('TEAM_TEST_SLOW_PREFLIGHT=1', workflow)
         self.assertNotIn('@CHECKOUT@', workflow)
 
     def test_setup_job_isolates_environment_and_requires_native_success(self):

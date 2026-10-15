@@ -110,6 +110,31 @@ class LaunchBoundaryTests(unittest.TestCase):
                 log = (run / "controls.jsonl").read_text()
                 self.assertIn('"status":"accepted"', log)
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "requires OS write denial")
+    def test_failed_resume_manifest_publication_removes_only_empty_allocation(self):
+        first = self.fixture.launch("initial")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        before = (run / "manifest.json").read_bytes()
+        handoff = Path(receipt["handoff_path"]).read_bytes()
+        run.chmod(0o500)  # revisions/ stays writable; manifest temp-file creation fails.
+        try:
+            failed = self.fixture.access("resume", run.name)
+        finally:
+            run.chmod(0o700)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Permission denied", failed.stderr)
+        self.assertEqual((run / "manifest.json").read_bytes(), before)
+        self.assertFalse((run / "revisions/000002").exists())
+        retried = self.fixture.access("resume", run.name)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(Path(receipt["handoff_path"]).read_bytes(), handoff)
+        current = json.loads((run / "manifest.json").read_text())
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["status"], "completed")
+        self.assertEqual(current["creator_main_session_id"], "parent-session")
+
     def test_active_notice_wait_is_bounded_with_a_paused_peer(self):
         rd, _, fds = self.gate("initialize")
         proc = self.start(pass_fds=fds)

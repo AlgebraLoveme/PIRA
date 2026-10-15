@@ -1,9 +1,9 @@
 //! Minimal native Codex transport; adapted from archived Team JSON-RPC patterns.
 use crate::{Options, command, create, isolate, lifecycle, terminate};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -19,9 +19,71 @@ const RPC_LIMIT: u64 = 16 * 1024 * 1024;
 const PENDING_CONTROLS: usize = 64;
 
 enum Event {
-    Protocol(Value),
+    Protocol(Value, std::ops::Range<u64>),
     Closed(String),
     Control(Value, mpsc::Sender<Value>),
+}
+
+fn relevant_event(value: &Value) -> bool {
+    value.get("id").is_some()
+        || match value["method"].as_str() {
+            Some("turn/completed" | "thread/tokenUsage/updated") => true,
+            Some("item/completed") => {
+                let item = &value["params"]["item"];
+                item["type"] == "agentMessage"
+                    && (item["phase"].is_null() || item["phase"] == "final_answer")
+            }
+            _ => false,
+        }
+}
+
+fn deliver_event(
+    sender: &mpsc::SyncSender<Event>,
+    mut event: Event,
+    stopped: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match sender.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(pending)) => event = pending,
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err("app-server event receiver closed".into());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// Startup can receive notifications before an RPC reply. Replay their existing
+// log range instead of retaining an unbounded queue or imposing a burst ceiling.
+fn logged_event(
+    log: &mut BufReader<File>,
+    range: &mut std::ops::Range<u64>,
+) -> Result<Option<Event>, String> {
+    while range.start < range.end {
+        log.seek(SeekFrom::Start(range.start))
+            .map_err(|e| format!("seek app-server events: {e}"))?;
+        let mut line = Vec::new();
+        let size = log
+            .by_ref()
+            .take((range.end - range.start).min(RPC_LIMIT + 1))
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("read app-server events: {e}"))?;
+        if size == 0 || size as u64 > RPC_LIMIT || line.last() != Some(&b'\n') {
+            return Err("invalid retained app-server frame".into());
+        }
+        let frame = range.start..range.start + size as u64;
+        range.start = frame.end;
+        let value: Value =
+            serde_json::from_slice(&line).map_err(|_| "invalid retained app-server event")?;
+        if relevant_event(&value) {
+            return Ok(Some(Event::Protocol(value, frame)));
+        }
+    }
+    Ok(None)
 }
 
 struct Endpoint {
@@ -31,11 +93,13 @@ struct Endpoint {
     path: PathBuf,
     token: String,
     turn: Arc<std::sync::Mutex<Option<String>>>,
+    sandbox: Value,
 }
 impl Endpoint {
     fn start(
         run: &Path,
         revision: &Value,
+        sandbox: &Value,
         sender: mpsc::SyncSender<Event>,
         mut controls: File,
     ) -> Result<Self, String> {
@@ -138,6 +202,7 @@ impl Endpoint {
             path: run.join("control.json"),
             token,
             turn,
+            sandbox: sandbox.clone(),
         };
         endpoint.publish(None)?;
         Ok(endpoint)
@@ -146,7 +211,8 @@ impl Endpoint {
     fn publish(&self, turn: Option<&str>) -> Result<(), String> {
         lifecycle::save_json(
             &self.path,
-            &json!({"address":self.address.to_string(),"token":self.token,"turn_id":turn}),
+            &json!({"address":self.address.to_string(),"token":self.token,"turn_id":turn,
+                "sandbox_policy":self.sandbox}),
         )
     }
 
@@ -273,6 +339,14 @@ fn control_request(
 ) -> Result<Value, String> {
     let endpoint = lifecycle::read_json(&run.join("control.json"))
         .map_err(|e| format!("run has no readable control endpoint: {e}"))?;
+    if operation == "steer" {
+        let caller = crate::profile::Execution::from_context(&crate::profile::load()?)?;
+        // Bind policy to the capability snapshot, not a manifest from another revision.
+        // PIRA: require the same represented policy; policy changes need interrupt/resume.
+        if endpoint["sandbox_policy"] != caller.sandbox {
+            return Err("current caller permissions differ from the active worker execution policy; interrupt then explicitly resume to inherit current permissions".into());
+        }
+    }
     let address: SocketAddr = endpoint["address"]
         .as_str()
         .ok_or("missing control address")?
@@ -319,7 +393,10 @@ struct Server {
     writer_thread: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
     events: mpsc::Receiver<Event>,
-    pending: VecDeque<Value>,
+    controls: mpsc::Receiver<Event>,
+    event_log: BufReader<File>,
+    pending: std::ops::Range<u64>,
+    received_end: u64,
     next_id: u64,
     requests: File,
     request_schema: jsonschema::Validator,
@@ -329,7 +406,7 @@ struct Server {
     pipe_stop: Arc<AtomicBool>,
     thread_id: Option<String>,
     turn_id: Option<String>,
-    start_pending: Option<usize>,
+    start_pending: Option<u64>,
     text: Option<String>,
     usage: Option<Value>,
 }
@@ -341,6 +418,7 @@ impl Server {
         handoff: &Path,
         sender: mpsc::SyncSender<Event>,
         events: mpsc::Receiver<Event>,
+        controls: mpsc::Receiver<Event>,
     ) -> Result<Self, String> {
         let request_schema = crate::backend::preflight(options, run, dir)?;
         if crate::CANCELLED.load(Ordering::SeqCst) {
@@ -350,6 +428,8 @@ impl Server {
         cmd.stdout(Stdio::piped())
             .stderr(create(&dir.join("stderr.log"))?);
         let mut log = create(&dir.join("events.jsonl"))?;
+        let event_log =
+            BufReader::new(File::open(dir.join("events.jsonl")).map_err(|e| e.to_string())?);
         let requests = create(&dir.join("requests.jsonl"))?;
         isolate(&mut cmd);
         let mut child = cmd
@@ -406,8 +486,10 @@ impl Server {
         let (writer, writer_thread) = request_writer(writer, fault.clone(), sender.clone());
         let reader_fault = fault.clone();
         let output = sender.clone();
+        let reader_stop = pipe_stop.clone();
         let reader = std::thread::spawn(move || {
             let mut input = BufReader::new(stdout);
+            let mut offset = 0;
             let result = (|| -> Result<(), String> {
                 loop {
                     let mut line = Vec::new();
@@ -423,24 +505,21 @@ impl Server {
                         return Err("app-server event exceeds 16 MiB".into());
                     }
                     log.write_all(&line).map_err(|e| e.to_string())?;
+                    let frame = offset..offset + size as u64;
+                    offset = frame.end;
                     let value: Value =
                         serde_json::from_slice(&line).map_err(|_| "invalid app-server event")?;
-                    // Persist all events, but only retain lifecycle messages in the control queue.
-                    if value.get("id").is_some()
-                        || matches!(
-                            value["method"].as_str(),
-                            Some("item/completed" | "turn/completed" | "thread/tokenUsage/updated")
-                        )
-                    {
-                        output
-                            .try_send(Event::Protocol(value))
-                            .map_err(|_| "app-server event queue overflow or receiver closed")?;
+                    // Persist everything, but commentary/tool completions have no
+                    // lifecycle effect. Required events retain wire order under backpressure.
+                    if relevant_event(&value) {
+                        deliver_event(&output, Event::Protocol(value, frame), &reader_stop)?;
                     }
                 }
             })();
-            let error = result.unwrap_err();
-            *reader_fault.lock().unwrap() = Some(error.clone());
-            let _ = output.try_send(Event::Closed(error));
+            if let Err(error) = result {
+                *reader_fault.lock().unwrap() = Some(error.clone());
+                let _ = output.try_send(Event::Closed(error));
+            }
         });
         Ok(Self {
             child,
@@ -448,7 +527,10 @@ impl Server {
             writer_thread: Some(writer_thread),
             reader: Some(reader),
             events,
-            pending: VecDeque::new(),
+            controls,
+            event_log,
+            pending: 0..0,
+            received_end: 0,
             next_id: 1,
             requests,
             request_schema,
@@ -489,14 +571,15 @@ impl Server {
         }
         let id = self.send_request(method, params)?;
         if method == "turn/start" {
-            self.start_pending = Some(self.pending.len());
+            self.start_pending = Some(self.received_end);
         }
         loop {
             if crate::CANCELLED.load(Ordering::SeqCst) {
                 return Err("interrupted during worker startup".into());
             }
             match self.events.recv_timeout(Duration::from_millis(100)) {
-                Ok(Event::Protocol(value)) => {
+                Ok(Event::Protocol(value, frame)) => {
+                    self.received_end = frame.end;
                     if value.get("method").is_some() && value.get("id").is_some() {
                         self.send(json!({"id":value["id"],"error":{"code":-32601,"message":"unexpected request refused by coding-worker launcher"}}))?;
                         return Err("unexpected app-server request refused".into());
@@ -510,10 +593,10 @@ impl Server {
                             .cloned()
                             .ok_or("missing RPC result".into());
                     }
-                    if self.pending.len() >= 64 {
-                        return Err("too many pending app-server events".into());
+                    if self.pending.is_empty() {
+                        self.pending.start = frame.start;
                     }
-                    self.pending.push_back(value);
+                    self.pending.end = frame.end;
                 }
                 Ok(Event::Closed(error)) => return Err(error),
                 Ok(Event::Control(_, reply)) => {
@@ -557,21 +640,25 @@ impl Server {
         }
     }
 
-    fn retain_pending_evidence(&mut self) {
+    fn retain_pending_evidence(&mut self) -> Result<(), String> {
         let Some(offset) = self.start_pending else {
-            return;
+            return Ok(());
         };
         // Before the start ACK, only evidence received after our own turn/start
         // request is attributable. After the ACK, enforce its exact turn ID too.
-        let pending = std::mem::take(&mut self.pending);
-        for value in pending.into_iter().skip(offset) {
+        // Shutdown has joined the writer of this file, including any event that
+        // was logged while waiting for queue space. Never lose that failure evidence.
+        let end = self
+            .event_log
+            .get_ref()
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .len();
+        let mut range = offset..end;
+        while let Some(Event::Protocol(value, _)) = logged_event(&mut self.event_log, &mut range)? {
             self.observe(&value);
         }
-        while let Ok(event) = self.events.try_recv() {
-            if let Event::Protocol(value) = event {
-                self.observe(&value);
-            }
-        }
+        Ok(())
     }
 }
 impl Server {
@@ -742,14 +829,17 @@ pub fn turn(
     manifest["build_roots"] = json!(build_roots);
     let repair = manifest["repairs"].as_u64().ok_or("missing repair state")? > 0;
     let (sender, events) = mpsc::sync_channel(64);
+    // Protocol backpressure must not prevent admission of authenticated controls.
+    let (control_sender, control_events) = mpsc::sync_channel(PENDING_CONTROLS + 1);
     let mut controls = create(&dir.join("controls.jsonl"))?;
     let endpoint = Endpoint::start(
         run,
         &manifest["revision"],
-        sender.clone(),
+        &options.execution.sandbox,
+        control_sender,
         controls.try_clone().map_err(|e| e.to_string())?,
     )?;
-    let mut server = Server::new(options, run, dir, handoff, sender, events)?;
+    let mut server = Server::new(options, run, dir, handoff, sender, events, control_events)?;
     let mut stopping: Option<(&str, Instant)> = None;
     let outcome = (|| -> Result<(String, Option<String>), String> {
         server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}))
@@ -809,7 +899,6 @@ pub fn turn(
             .ok_or("missing Codex turn ID")?
             .to_owned();
         server.turn_id = Some(turn_id.clone());
-        server.start_pending = Some(0);
         manifest["active_turn"] = json!(turn_id);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
         endpoint.activate(&turn_id)?;
@@ -836,8 +925,10 @@ pub fn turn(
                 terminate(server.child.id());
                 return Ok((status.into(), Some("cancellation did not settle; owned backend processes terminated (Unix process group; detached descendants excluded)".into())));
             }
-            let event = if let Some(value) = server.pending.pop_front() {
-                Event::Protocol(value)
+            let event = if let Ok(control) = server.controls.try_recv() {
+                control
+            } else if let Some(event) = logged_event(&mut server.event_log, &mut server.pending)? {
+                event
             } else {
                 match server.events.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => event,
@@ -898,7 +989,7 @@ pub fn turn(
                     writeln!(controls,"{}",json!({"request_id":id,"operation":op,"task":task,"turn_id":turn_id,"status":"sent"})).map_err(|e|e.to_string())?;
                     pending_controls.insert(id, (op.into(), task.into(), gate.into(), reply));
                 }
-                Event::Protocol(value) => {
+                Event::Protocol(value, _) => {
                     server.observe(&value);
                     if value.get("method").is_some() && value.get("id").is_some() {
                         server.send(json!({"id":value["id"],"error":{"code":-32601,"message":"unexpected request refused by coding-worker launcher"}}))?;
@@ -958,7 +1049,7 @@ pub fn turn(
     // Quiesce the transport before harvesting failure evidence: a startup
     // interruption can race notifications already emitted before the start ACK.
     server.shutdown();
-    let (status, error) = match outcome {
+    let (status, mut error) = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             let status = stopping.map(|s| s.0).unwrap_or_else(|| {
@@ -971,8 +1062,13 @@ pub fn turn(
             (status.to_owned(), Some(error))
         }
     };
-    if error.is_some() {
-        server.retain_pending_evidence();
+    if error.is_some()
+        && let Err(retain_error) = server.retain_pending_evidence()
+    {
+        error = Some(format!(
+            "{}; retain evidence: {retain_error}",
+            error.unwrap()
+        ));
     }
     Ok(Turn {
         status,
@@ -1002,6 +1098,70 @@ fn normalize_usage(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_events_wait_for_capacity_and_preserve_order() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(sender.try_send(Event::Protocol(json!(0), 0..1)).is_ok());
+        let (done, finished) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            for number in 1..=4 {
+                deliver_event(&sender, Event::Protocol(json!(number), 0..1), &stop).unwrap();
+            }
+            done.send(()).unwrap();
+        });
+        assert!(matches!(
+            finished.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        for number in 0..=4 {
+            let Event::Protocol(value, _) = receiver.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("required event lost");
+            };
+            assert_eq!(value, number);
+        }
+        finished.recv_timeout(Duration::from_secs(3)).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_releases_full_protocol_queue_without_blocking_control_admission() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(sender.try_send(Event::Protocol(json!(0), 0..1)).is_ok());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let (done, finished) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            done.send(deliver_event(
+                &sender,
+                Event::Protocol(json!(1), 1..2),
+                &stopped,
+            ))
+            .unwrap();
+        });
+        assert!(matches!(
+            finished.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (controls, requests) = mpsc::sync_channel(PENDING_CONTROLS + 1);
+        let (reply, _) = mpsc::channel();
+        assert!(
+            controls
+                .try_send(Event::Control(json!({"operation":"interrupt"}), reply))
+                .is_ok()
+        );
+        assert!(matches!(requests.try_recv(), Ok(Event::Control(_, _))));
+        stop.store(true, Ordering::SeqCst);
+        finished
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Event::Protocol(_, _))));
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[cfg(unix)]
     #[test]

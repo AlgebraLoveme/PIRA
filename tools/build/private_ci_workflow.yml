@@ -56,11 +56,11 @@ jobs:
         run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}
       - name: Build fake-backend test binary (Linux only)
         if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
-        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec
       - name: Fake-backend contracts (no model calls; POSIX fixture)
         if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
         shell: bash
-        run: PIRA_TEAM_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_team" python tools/crates/pira_team/tests/test_team.py
+        run: PIRA_TEAM_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_team" PIRA_DEC_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_dec" TEAM_TEST_SLOW_PREFLIGHT=1 python -B -m unittest discover -s tools/crates/pira_team/tests -p 'test_*.py' -v
   setup:
     if: github.event.repository.private == true
     strategy:

@@ -128,6 +128,9 @@ Run/resume block without an execution deadline. Stream stderr for run_id and act
 notice; await the original invocation, not log polling. A live hung worker can be interrupted.
 Controls acknowledge acceptance, not completion; never blindly retry unknown delivery.
 Steering is unavailable during startup/repair. Normal interruption retains the conversation.
+Steering validates current caller permissions and requires the same represented sandbox policy
+as the active endpoint; changed or unverifiable policies require interrupt then explicit resume.
+Interruption remains available with verified caller identity even if execution policy changes.
 Concurrent resumes and orphaned running state fail closed. Legacy ephemeral runs cannot resume.
 Legacy retained runs need an explicit completion gate on first migration; their history is kept.
 The original base prefix is retained; current worker instructions are directly injected on

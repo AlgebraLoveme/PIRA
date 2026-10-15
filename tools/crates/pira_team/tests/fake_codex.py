@@ -102,6 +102,19 @@ def send(value):
 def notify(method, params):
     send({"method": method, "params": {"threadId": state["thread"], "turnId": active, **params}})
 
+def notification_burst():
+    for index in range(int(os.environ.get("TEAM_BURST_COUNT", "0"))):
+        state["usage"] = {"inputTokens": index + 1, "cachedInputTokens": 0, "outputTokens": index + 1}
+        notify("thread/tokenUsage/updated", {"tokenUsage": {"total": state["usage"]}})
+        notify("item/completed", {"item": {"type": "agentMessage", "phase": "final_answer",
+                                           "text": f"burst-{index}"}})
+        notify("item/completed", {"item": {"type": "agentMessage", "phase": "commentary", "text": "progress"}})
+        if delay := float(os.environ.get("TEAM_BURST_DELAY", "0")):
+            time.sleep(delay)
+    if os.environ.get("TEAM_BURST_MALFORMED"):
+        print("not-json", flush=True)
+        sys.exit(9)
+
 def partial_evidence(*, acknowledged):
     notify("thread/tokenUsage/updated", {"tokenUsage": {"total": {"inputTokens": 11, "cachedInputTokens": 3, "outputTokens": 2}}})
     notify("item/completed", {"item": {"type": "agentMessage", "phase": "final_answer", "text": "partial diagnostic"}})
@@ -279,6 +292,8 @@ while True:
     elif method != "initialize":
         raise AssertionError(method)
     failure = os.environ.get("TEAM_PARTIAL_FAILURE", "")
+    if method == "turn/start" and os.environ.get("TEAM_BURST_AT") == "before-ack":
+        notification_burst()
     if method == "turn/start" and failure.startswith("before-"):
         partial_evidence(acknowledged=False)
         if failure == "before-refusal":
@@ -291,6 +306,8 @@ while True:
             continue
     pause_at(method)
     send({"id":request["id"], "result":result})
+    if method == "turn/start" and os.environ.get("TEAM_BURST_AT") == "after-ack":
+        notification_burst()
     if method == "turn/start" and failure == "after-refusal":
         partial_evidence(acknowledged=True)
         refuse_request()

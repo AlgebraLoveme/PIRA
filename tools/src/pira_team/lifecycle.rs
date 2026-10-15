@@ -385,6 +385,24 @@ fn usage_update(manifest: &mut Value, usage: Option<Value>, baseline: &Value) {
     // Incomplete accounting stays latched even if a later report is well formed.
 }
 
+fn begin_revision(
+    snapshot: &Path,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    private_dir(snapshot).map_err(|e| e.to_string())?;
+    if let Err(error) = publish() {
+        // Own only this new, uncommitted allocation. Never recursively remove payload.
+        return match fs::remove_dir(snapshot) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; uncommitted revision retained at {}: {cleanup}",
+                snapshot.display()
+            )),
+        };
+    }
+    Ok(())
+}
+
 fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
     let number = manifest["revision"].as_u64().ok_or("missing revision")?;
     let revisions = run.join("revisions");
@@ -393,7 +411,6 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     }
     private_path(&revisions, true)?;
     let snapshot = revisions.join(format!("{number:06}"));
-    private_dir(&snapshot).map_err(|e| e.to_string())?;
     let dir = if number == 1 {
         run.to_owned()
     } else {
@@ -416,7 +433,9 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
         "sandbox":options.execution.mode,"execution_permissions":{"source":"verified-caller-turn-context","caller_thread_id":options.execution.caller_thread_id,"sandbox_policy":options.execution.sandbox,"approval_policy":"never"},"timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
         manifest[key] = value.clone();
     }
-    save_json(&run.join("manifest.json"), manifest)?;
+    begin_revision(&snapshot, || {
+        save_json(&run.join("manifest.json"), manifest)
+    })?;
     eprintln!("pira_team run_id: {}", manifest["run_id"].as_str().unwrap());
     eprintln!("pira_team logs: {}", dir.display());
     let start = Instant::now();
@@ -878,6 +897,60 @@ mod tests {
                 .with_extension(format!("{}.tmp", std::process::id()))
                 .exists()
         );
+    }
+
+    #[test]
+    fn initial_revision_publication_failure_releases_empty_allocation_for_retry() {
+        let dir = TestDir::new();
+        let path = dir.0.join("manifest.json");
+        let snapshot = dir.0.join("000002");
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        save_json(&path, &json!({"revision":1,"status":"completed"})).unwrap();
+        let original = fs::read(&path).unwrap();
+        fs::write(&temporary, b"unrelated temporary file").unwrap();
+        let next = json!({"revision":2,"status":"running"});
+        assert!(begin_revision(&snapshot, || save_json(&path, &next)).is_err());
+        assert!(!snapshot.exists());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&temporary).unwrap(), b"unrelated temporary file");
+        fs::remove_file(&temporary).unwrap();
+        begin_revision(&snapshot, || save_json(&path, &next)).unwrap();
+        assert!(snapshot.is_dir());
+        assert_eq!(read_json(&path).unwrap(), next);
+    }
+
+    #[test]
+    fn initial_revision_publication_failure_preserves_newly_arrived_payload() {
+        let dir = TestDir::new();
+        let snapshot = dir.0.join("000002");
+        let payload = snapshot.join("keep");
+        let error = begin_revision(&snapshot, || {
+            fs::write(&payload, b"concurrent payload").unwrap();
+            Err("publication failed".into())
+        })
+        .unwrap_err();
+        assert!(error.starts_with("publication failed; uncommitted revision retained at "));
+        assert_eq!(fs::read(&payload).unwrap(), b"concurrent payload");
+    }
+
+    #[test]
+    fn revision_allocation_never_removes_preexisting_state_or_publishes_over_it() {
+        let dir = TestDir::new();
+        let snapshot = dir.0.join("000002");
+        private_dir(&snapshot).unwrap();
+        for populated in [false, true] {
+            if populated {
+                fs::write(snapshot.join("keep"), b"original payload").unwrap();
+            }
+            assert!(begin_revision(&snapshot, || panic!("must not publish")).is_err());
+            assert!(snapshot.is_dir());
+            if populated {
+                assert_eq!(
+                    fs::read(snapshot.join("keep")).unwrap(),
+                    b"original payload"
+                );
+            }
+        }
     }
 
     #[test]
