@@ -86,7 +86,7 @@ Older temporary-store runs require --store OLD_STORE or PIRA_TEAM_DIR until expl
 migrated. Retained runs embed absolute paths: do not simply move/merge run directories.
 Use the same store across commands. Read/path never launch a worker.
 Bookmarks are optional management metadata, never worker input. Labels are exact,
-case-sensitive, store-wide unique names (1..128 UTF-8 bytes, no edge whitespace,
+case-sensitive, main-session-scoped names (1..128 UTF-8 bytes, no edge whitespace,
 control characters, / or \; no leading @ or . / .. names). --label attaches after
 creation of the initial running manifest; later startup/worker failures retain the
 bookmark on that failed/interrupted run. Pre-run validation never moves a bookmark.
@@ -101,12 +101,20 @@ unbookmark LABEL removes only the mapping, never runs/artifacts; absence is a no
 bookmarks lists labels; search performs case-insensitive literal keyword matching on
 labels only. Both return JSON matches (label, run_id, run_root) and has_more, ordered
 by exact label ascending, with --limit 1..1000 (default 20). Invalid/unreadable metadata
-fails visibly, never resets or reports partial results. No runs/logs are scanned.
+fails visibly, never resets or reports partial results. Run ownership is verified before
+listing; logs are not searched. Inaccessible pointers are hidden from listings and
+previous/current receipts, but own dangling mappings may still be removed.
 Use @LABEL as RUN_REF for resume/steer/interrupt/read/path/bookmark. Aliases resolve once
 at invocation; plain run IDs are never interpreted as labels. Missing labels fail closed.
-Metadata commands and read/path require no caller session/auth and launch no workers.
-Run/resume still require verified caller permissions. Absent bookmark state means empty;
-old stores/runs require no migration.
+All run and bookmark operations require verified main caller identity, including literal
+IDs and explicit stores. A run belongs to its creating main session, not workspace or
+worker native thread. Resume preserves that creator. Same labels in different sessions
+are independent; no global fallback. Read/path and metadata operations launch no workers
+and require no backend authentication. Config remains store-wide and session-free.
+Legacy global bookmarks are preserved but hidden. Legacy runs require immutable creator
+metadata or an original first revision snapshot; an actively locked initial revision is
+also recognized. Ambiguous historical runs remain intact but inaccessible. Ownership
+checks provide Team-interface isolation only, not OS/filesystem/process security.
 
 --format auto lets the worker declare markdown/text/json/csv for its extensionless handoff.
 Explicit formats assign a matching extension. --schema requires json; --columns requires csv

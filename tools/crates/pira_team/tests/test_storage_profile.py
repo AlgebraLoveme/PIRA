@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -61,6 +62,8 @@ class StorageProfileTests(unittest.TestCase):
     def test_log_lookup_does_not_expand_private_or_traversal_routes(self) -> None:
         run = self.root / "logs" / "fixture-run"
         run.mkdir(parents=True)
+        (run / "manifest.json").write_text(json.dumps({"run_id": run.name,
+            "creator_main_session_id": "parent-session"}))
         for relative in ("codex-home/backend-check.log", "codex-home/auth.json",
                          "backend-schema/backend-check.log", "run.lock",
                          "repair/auth.json", "implementation/codex-home/backend-check.log",
@@ -80,6 +83,8 @@ class StorageProfileTests(unittest.TestCase):
     def test_log_lookup_rejects_symlinks_and_special_files(self) -> None:
         run = self.root / "logs" / "fixture-run"
         run.mkdir(parents=True)
+        (run / "manifest.json").write_text(json.dumps({"run_id": run.name,
+            "creator_main_session_id": "parent-session"}))
         target = self.root / "outside.log"
         target.write_bytes(b"must-not-read\n")
         (run / "backend-check.log").symlink_to(target)

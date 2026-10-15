@@ -143,7 +143,7 @@ pub fn launch(options: Options) -> Result<(), String> {
     let run = crate::prepare_store(&options.store)?;
     let _owner = owner(&run)?;
     let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
-        "revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
+        "creator_main_session_id":options.execution.caller_thread_id,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
         "sandbox":options.execution.mode,"pira_instructions":false});
     revision(&options, &run, &mut manifest)
 }
@@ -243,7 +243,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         )?
     };
     let root = root.map(Ok).unwrap_or_else(storage::default_root)?;
-    let run = storage::locate(&root, &positional[0])?;
+    let session = profile::caller_session()?;
+    let run = storage::locate_for(&root, &positional[0], &session)?;
     private_path(&run, true)?;
     if op != "resume" {
         let mut receipt = app_server::control(&run, op, &task, gate.as_deref())?;
@@ -256,6 +257,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     profile::Execution::from_context(&parent)?.require_writable(&run)?;
     let _owner = owner(&run)?;
     let mut manifest = read_json(&run.join("manifest.json"))?;
+    // Backfill only after original creator evidence passed the ownership gate.
+    manifest["creator_main_session_id"] = json!(session);
     if manifest["transport"] != "app-server" || manifest["thread_id"].as_str().is_none() {
         return Err(
             "run has no retained native conversation; legacy ephemeral runs cannot resume".into(),

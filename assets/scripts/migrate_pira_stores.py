@@ -693,22 +693,31 @@ def read_team_metadata(path: Path) -> dict:
             raise ValueError("metadata size limit exceeded")
         value = json.loads(data, object_pairs_hook=unique)
         if path.name == "bookmarks.json":
-            if (not isinstance(value, list) or len(value) != 2 or type(value[0]) is not int
-                    or value[0] != 1 or not isinstance(value[1], list)):
+            if (not isinstance(value, list) or not value or type(value[0]) is not int
+                    or not ((value[0] == 1 and len(value) == 2)
+                            or (value[0] == 2 and len(value) == 3))):
                 raise ValueError("invalid bookmark schema")
+            scoped, legacy = ([], value[1]) if value[0] == 1 else (value[1], value[2])
+            if not isinstance(scoped, list) or not isinstance(legacy, list):
+                raise ValueError("invalid bookmark entries")
             result = {}
-            for pair in value[1]:
-                if not isinstance(pair, list) or len(pair) != 2:
-                    raise ValueError("invalid bookmark entry")
-                label, run = pair
-                if (not isinstance(label, str) or not 0 < len(label.encode()) <= 128
-                        or label.strip() != label or label in (".", "..") or label.startswith("@")
-                        or any(c in label for c in ("/", "\\"))
-                        or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in label)
-                        or not isinstance(run, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run) is None
-                        or label in result):
-                    raise ValueError("invalid/duplicate bookmark")
-                result[label] = run
+            for entries, width in ((legacy, 2), (scoped, 3)):
+                for pair in entries:
+                    if not isinstance(pair, list) or len(pair) != width:
+                        raise ValueError("invalid bookmark entry")
+                    session, label, run = (None, *pair) if width == 2 else pair
+                    if (width == 3 and (not isinstance(session, str)
+                            or re.fullmatch(r"[A-Za-z0-9_-]{1,200}", session) is None)):
+                        raise ValueError("invalid bookmark session")
+                    key = (session, label) if isinstance(label, str) else None
+                    if (not isinstance(label, str) or not 0 < len(label.encode()) <= 128
+                            or label.strip() != label or label in (".", "..") or label.startswith("@")
+                            or any(c in label for c in ("/", "\\"))
+                            or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in label)
+                            or not isinstance(run, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", run) is None
+                            or key in result):
+                        raise ValueError("invalid/duplicate bookmark")
+                    result[key] = run
             return result
         if not isinstance(value, dict):
             raise ValueError("invalid worker defaults object")
@@ -782,7 +791,11 @@ def plan_team_metadata_images(plan: TeamMetadataMigration) -> dict:
         before = metadata_image(inventories[destination].get(name))
         after = before
         if template is not None and merged != current:
-            value = [1, sorted(merged.items())] if name == "bookmarks.json" else merged
+            value = merged
+            if name == "bookmarks.json":
+                legacy = sorted([label, run] for (session, label), run in merged.items() if session is None)
+                scoped = sorted([session, label, run] for (session, label), run in merged.items() if session is not None)
+                value = [2, scoped, legacy] if scoped else [1, legacy]
             data = (json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n").encode()
             if len(data) > limit:
                 raise RuntimeError(f"Merged Team metadata exceeds its published limit: {name}")

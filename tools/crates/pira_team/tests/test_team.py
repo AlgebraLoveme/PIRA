@@ -452,7 +452,7 @@ class TeamTests(unittest.TestCase):
         return subprocess.run([str(self.bin), command, run, *extra, "--store", str(self.root / "logs")],
             env=self.env, capture_output=True, text=True, timeout=5)
 
-    def test_run_id_reads_exact_artifact_and_resolves_paths_without_parent(self) -> None:
+    def test_run_id_reads_exact_artifact_and_resolves_paths_with_verified_parent(self) -> None:
         self.env["TEAM_CANDIDATE"] = self.candidate('line\r\nλ\n', "notes.txt", "text")
         launched = self.launch("review")
         self.assertEqual(launched.returncode, 0, launched.stderr)
@@ -468,7 +468,7 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(self.access("path", run, ".").stdout.strip(), str(Path(receipt["run_root"])))
         self.assertEqual(json.loads(self.access("read", run, "manifest.json").stdout)["run_id"], run)
         self.assertIn("turn/completed", self.access("read", run, "events.jsonl").stdout)
-        # Older completed manifests remain readable without new artifact/run_id fields.
+        # Immutable creator evidence allows older layouts without artifact/run_id fields.
         path = Path(receipt["run_root"]) / "manifest.json"
         manifest = json.loads(path.read_text()); manifest.pop("artifact"); manifest.pop("run_id")
         path.write_text(json.dumps(manifest))
@@ -533,6 +533,8 @@ class TeamTests(unittest.TestCase):
         override = self.root / "environment-store"
         for root in (default, explicit, override):
             (root / "fixture-run").mkdir(parents=True)
+            (root / "fixture-run/manifest.json").write_text(json.dumps({"run_id":"fixture-run",
+                "creator_main_session_id":"parent-session"}))
         def lookup(*extra):
             return subprocess.run([str(self.bin), "path", "fixture-run", ".", *extra],
                                   env=self.env, capture_output=True, text=True, timeout=5)
@@ -555,7 +557,7 @@ class TeamTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("cannot resolve persistent PIRA store", failed.stderr)
 
-    def test_missing_run_explains_old_store_access_without_migration(self):
+    def test_missing_run_is_generic_without_migration_or_disclosure(self):
         store = self.root / "empty-persistent-store"
         self.env["PIRA_TEAM_DIR"] = str(store)
         for create in (False, True):
@@ -564,8 +566,8 @@ class TeamTests(unittest.TestCase):
             result = subprocess.run([str(self.bin), "path", "old-run"], env=self.env,
                                     capture_output=True, text=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("--store OLD_STORE", result.stderr)
-            self.assertIn("absolute paths", result.stderr)
+            self.assertEqual(result.stderr, "pira_team: run unavailable to this main session\n")
+            self.assertEqual(result.stdout, "")
             self.assertEqual(store.exists(), create)
             if create:
                 self.assertEqual(list(store.iterdir()), [])
@@ -698,7 +700,8 @@ class TeamTests(unittest.TestCase):
             handoff.write_text("Final public handoff")
             (directory / "phase.md").write_text("stage instructions")
             (directory / "repair/validation.json").write_text('{"error":"fixture"}')
-            (run / "manifest.json").write_text(json.dumps({"status": "completed", "artifact": str(handoff.relative_to(run))}))
+            (run / "manifest.json").write_text(json.dumps({"status": "completed", "artifact": str(handoff.relative_to(run)),
+                "run_id":run.name, "creator_main_session_id":"parent-session"}))
             self.assertEqual(self.access("read", run.name).stdout, "Final public handoff")
             self.assertEqual(self.access("path", run.name).stdout.strip(), str(handoff))
             self.assertEqual(self.access("read", run.name, prefix + "/phase.md").stdout, "stage instructions")
@@ -1440,7 +1443,7 @@ class TeamTests(unittest.TestCase):
         run = self.root / "logs" / "stopped-run"
         run.mkdir(parents=True, mode=0o700)
         manifest = run / "manifest.json"
-        state = {}
+        state = {"run_id":run.name, "creator_main_session_id":"parent-session"}
         for status, turn, expected in (
             ("completed", None, "read the handoff; use explicit resume"),
             ("running", None, "starting or between turns"),
@@ -1462,7 +1465,7 @@ class TeamTests(unittest.TestCase):
 
         manifest.write_text("invalid JSON")
         result = self.access("interrupt", run.name)
-        self.assertIn("persisted lifecycle/revision unavailable", result.stderr)
+        self.assertEqual(result.stderr, "pira_team: run unavailable to this main session\n")
 
     def test_environment_inheritance_exclusions_and_resume(self) -> None:
         for key in ("CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR", "TMPDIR"):

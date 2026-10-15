@@ -109,6 +109,28 @@ fn validate_effort(effort: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn validate_session_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 200
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err("invalid main session identity".into());
+    }
+    Ok(())
+}
+
+/// Verify caller identity using the matching session log, without requiring worker writes.
+pub(crate) fn caller_session() -> Result<String, String> {
+    let context = load().map_err(|_| "verified main session identity is unavailable")?;
+    let id = context["caller_thread_id"]
+        .as_str()
+        .ok_or("missing main session identity")?;
+    validate_session_id(id)?;
+    Ok(id.to_owned())
+}
+
 pub fn load() -> Result<Value, String> {
     let thread = std::env::var("CODEX_THREAD_ID").map_err(|_| "CODEX_THREAD_ID is unavailable")?;
     if thread.is_empty()

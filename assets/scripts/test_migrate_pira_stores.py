@@ -578,6 +578,35 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(migration.inventory(self.destination, tool="pira_team"), used)
         self.assertEqual(migration.inventory(self.source, tool="pira_team"), original)
 
+    def test_team_scoped_bookmarks_merge_with_legacy_and_keep_session_collisions(self):
+        self.put(self.source, "bookmarks.json", b'[2, [["main-a", "same", "run-a"]], [["same", "legacy-run"]]]')
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.destination, "bookmarks.json", b'[2, [["main-b", "same", "run-b"]], [["other", "legacy-other"]]]')
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        target = self.destination / "bookmarks.json"
+        self.assertEqual(json.loads(target.read_bytes()), [2,
+            [["main-a", "same", "run-a"], ["main-b", "same", "run-b"]],
+            [["other", "legacy-other"], ["same", "legacy-run"]]])
+        target.write_bytes(b'[2, [["main-a", "same", "remapped"]], [["other", "legacy-other"]]]')
+        before = target.read_bytes()
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_team_scoped_bookmark_corruption_and_same_session_conflicts_fail(self):
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.source, "bookmarks.json", b'[2, [["main-a", "same", "run-a"]], []]')
+        for data in [b'[2, [["main-a", "same", "run-b"]], []]',
+                     b'[2, [["main-a", "same", "run-a"], ["main-a", "same", "run-a"]], []]',
+                     b'[2, [["bad/id", "same", "run-a"]], []]',
+                     b'[2, [["main-a", "same", "../run"]], []]']:
+            with self.subTest(data=data):
+                self.put(self.destination, "bookmarks.json", data)
+                source = (self.source / "bookmarks.json").read_bytes()
+                with self.assertRaises(RuntimeError):
+                    self.metadata_plan()
+                self.assertEqual((self.source / "bookmarks.json").read_bytes(), source)
+                self.assertEqual((self.destination / "bookmarks.json").read_bytes(), data)
+
     def test_team_metadata_conflicts_and_malformed_maps_preserve_stores(self):
         self.destination = self.root / ".local/share/pira/team"
         for name, source, target in (
