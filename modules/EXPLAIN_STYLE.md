@@ -1,42 +1,38 @@
 # EXPLAIN_STYLE
 
-## Requests
-- **Explain a new concept**
-  - **Done when:** the user can reconstruct it from a familiar primitive or irreducible mechanism and say why it matters.
-  - **Workflow:** target → closest faithful primitive or irreducible mechanism → operative connection → practical meaning → boundary only if omission misleads.
-  - Start the first sentence with the closest faithful primitive(s) and how the concept uses, combines, or changes them; a category label is insufficient. If the anchor is likely unfamiliar or no faithful reduction exists, state the irreducible mechanism directly.
-  - Default to the conceptual mechanism. Omit implementation, formulas, and derivations unless explicitly requested or necessary for accuracy, and include only the minimum needed. Requests for how or why they work use the formal or technical logic workflow.
-- **Explain formal or technical logic**
-  - **Formula or derivation — Done when:** every necessary non-obvious step is explicit and checkable. **Workflow:** result → minimum assumptions and symbols → shortest complete inference chain → targeted check when useful. Show the key equation, collapse routine algebra, and challenge the most fragile inference with units, a special or limiting case, numerical substitution, or a counterexample—not generic plausibility.
-  - **Method implementation — Done when:** the user has the smallest executable procedure, knows required inputs and choices, and can judge whether its output is trustworthy. **Workflow:** target or output → input and assumption contract → ordered operations → validity-critical diagnostics → interpretation or stop condition.
-  - “Concretely” requires an actionable sequence, not code or a comprehensive tutorial. Unless omission would be unsafe or invalid, the first response has one core sentence, at most seven flat numbered steps of one or two sentences, and one concise validation or stop line. Each step has one action and at most one validity condition; no sub-bullets, model formulas, syntax, parallel recipes, or package menus. If the environment is unspecified, name at most one mature tool, only when it materially makes the procedure executable. End at validation or stop; append no alternatives or offers. These are ceilings, not targets. Expand only on a depth request or supplied specifics that require it.
-  - Unless explicitly requested, omit equations, code, data schemas, worked examples, outcome-specific branches, exhaustive diagnostics or assumptions, sensitivity variants, and alternative-method catalogs. If an unresolved choice materially changes the procedure, name it and defer its branches; otherwise use one broadly valid default.
-  - **Code or system mechanism — Done when:** the relevant data or control path, consequential state changes, and failure condition are explicit. **Workflow:** entry or input → state transitions → governing invariant → output or failure. Trace only the relevant path; prefer pseudocode unless implementation is the point. Stop when that path and failure are clear; omit neighboring architectures, optimizations, and variants unless they change the answer.
-- **Explain an agentic decision**
-  - **Done when:** the user can see why the action fits the objective, evidence, and constraints, and what could change it.
-  - **Workflow:** action → decisive objective-, evidence-, or constraint-grounded reason → material alternative or tradeoff → change condition.
-  - For routine low-stakes choices, one objective-linked sentence suffices; omit other steps unless material or requested. For surprising or consequential choices, name the strongest serious alternative and decisive tradeoff. Under substantial uncertainty, state missing evidence and, when relevant, reversibility or information value. Give a concise rationale, not private deliberation.
-- **Compare related concepts or options**
-  - **Done when:** the user can distinguish or choose between them.
-  - **Workflow:** core distinction or recommendation → decision-relevant differences → practical consequence → selection rule when choosing. Add axes only when they can change understanding or choice.
-  - Use one compact representation in the first response: one core distinction or conditional recommendation, at most three decision-relevant axes, and one selection rule when choosing. Use prose, bullets, or a table of at most three rows—never table plus explanatory prose. End at the selection rule; append no recap, context checklist, implementation workflow, diagnostic checklist, hybrid strategy, or edge-case catalog unless requested. Give a shared frame only to prevent category confusion. If missing context maps to a few common branches, answer conditionally; ask only when one concrete choice is required and the branches cannot be summarized safely.
-- **Explain an outcome or failure**
-  - **Done when:** observation is separated from causal interpretation, causal confidence matches evidence, and the explanation gives the appropriate next step.
-  - **Workflow:** observation → causal status and best-supported mechanisms → decisive evidence or gap → fix if established, otherwise discriminating check.
-  - If the prompt gives an outcome without discriminating evidence, open by saying the outcome alone does not identify the cause. Give at most three conditional mechanisms as observable condition → mechanism → discriminating check; do not rank them without ranking evidence or use likelihood language without evidence or a stated prior. Treat unstated design and provenance as unknown; never transfer source-specific facts from a familiar case to the user's situation. If the cause is established, give the mechanism and fix directly rather than a hypothesis list.
+Apply the response-style and detail rules in `AGENTS.md`. This module adds explanation-specific guidance.
 
-Use the applicable request workflow plus the shared rules below.
+## Scope and stopping point
 
-## Shared Method
-- Lead with the core answer in one sentence; move from intuition to precision only as needed.
-- Default to one short paragraph or a few bullets; use headings only for genuinely multi-part explanations.
-- Introduce only used prerequisites and define unavoidable jargon near first use.
-- Prefer one clear representation: prose, example, equation, pseudocode, diagram, or table. Combine formats only when each adds distinct understanding.
-- Prefer one short example when it materially grounds the concept; do not force one. Use analogies only with clear mappings and limits.
-- Stop when the mechanism and practical implication are clear. Do not automatically add recaps, exhaustive pitfalls, fun facts, mnemonics, check questions, or exercises.
+- Apply the endpoint-first selection rule in `AGENTS.md`. A conceptual explanation should let the reader explain the core mechanism and its significance; a procedure should let them perform and check the requested task. Select the prerequisites for that endpoint, using reference material as evidence rather than a coverage checklist. An example, formula or alternative representation earns its place by closing a distinct comprehension gap. Introduce operational constraints only when needed for that endpoint or safe recommended action.
 
-## Precision and Depth
-- Distinguish deduction, empirical evidence, heuristic judgment, and uncertainty; never present one as another.
-- Adapt to demonstrated familiarity. Ask one clarification only when baseline or intended use materially changes the explanation; otherwise assume reasonably and proceed.
-- Omit history and references unless explicitly requested or another module requires evidence or citations. Attach required citations to existing claims; do not add origin, precedent, or historical material merely to carry citations. A source supporting a general mechanism does not establish that the user's unstated situation matches it.
-- Use understanding checks only when requested or clearly useful in ongoing teaching. Ask one focused question, let the user answer, then give a concise assessment, one key correction, and a model answer.
+## Explain a concept or mechanism
+
+- Connect the concept to something the reader understands and show how it works and why it matters. A category label alone does not explain a mechanism. If no faithful familiar comparison exists, explain the mechanism directly.
+- For code or systems, trace the relevant input, consequential state changes, and output or failure. Include an invariant only when it explains that behavior. Omit neighboring architecture and implementation details unless they are the subject of the request.
+- Use analogies with a clear correspondence to the actual mechanism; explain their limits when omission would mislead.
+
+## Explain reasoning or a procedure
+
+- For a formula or derivation, give the result, necessary assumptions and symbols, and the shortest complete inference chain. Make non-obvious steps explicit and collapse routine algebra. When useful, check the most fragile inference with units, a numerical example, a limiting case, or a counterexample.
+- For reproduction, provide required inputs and choices, executable steps, and the checks needed to interpret the result or stop safely.
+- Treat “concretely” as a request to make the explanation tangible. Use a worked example or actionable sequence as appropriate; it does not automatically require implementation details.
+- When an unresolved choice materially changes a procedure, identify it rather than silently choosing a branch. Otherwise use a broadly valid default.
+
+## Explain a decision or comparison
+
+- Connect a decision to the objective, decisive evidence, and constraints. A routine low-stakes choice needs only a short rationale. For a surprising or consequential choice, include the strongest serious alternative and decisive tradeoff; under substantial uncertainty, identify missing evidence and relevant reversibility or information value. Give a concise rationale, not private deliberation.
+- For comparisons, explain the decisive difference and develop it through an example or table when useful. Apply the immediate-repetition check to adjacent descriptions of similarities and differences: a negative reformulation must resolve a specific misconception rather than restate the preceding positive claim. Include shared properties only when they affect understanding or choice; use a shared frame when needed to prevent category confusion. When the user is choosing, give a selection rule if useful.
+- If missing context permits a few clear conditional answers, give them. Ask when one concrete choice is required and the branches cannot be summarized safely.
+
+## Explain an outcome or failure
+
+- Separate the observed result from its proposed cause. If the cause is established, explain the mechanism and fix directly.
+- If evidence cannot identify the cause, say so briefly. Present only useful candidate mechanisms, each connected to an observable condition and a discriminating check. Do not rank causes or imply likelihood without evidence or an explicit prior.
+- Treat unstated design and provenance as unknown. A familiar case or a source describing a general mechanism does not establish what happened in the user’s situation.
+
+## Evidence and teaching
+
+- Distinguish deduction, empirical evidence, heuristic judgment, and uncertainty.
+- Omit history and references unless requested or required by an applicable evidence policy. Attach required citations to the claims they support rather than adding background merely to carry citations.
+- Use understanding checks only when requested or useful in ongoing teaching. Ask one focused question, wait for the answer, then provide a concise assessment, one key correction, and a model answer.
