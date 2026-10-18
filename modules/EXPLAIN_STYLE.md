@@ -4,7 +4,7 @@ Apply the response-style and detail rules in `AGENTS.md`. This module adds expla
 
 ## Scope and stopping point
 
-- Apply the endpoint-first selection rule in `AGENTS.md`. A conceptual explanation should let the reader explain the core mechanism and its significance; a procedure should let them perform and check the requested task. Select the prerequisites for that endpoint, using reference material as evidence rather than a coverage checklist. An example, formula or alternative representation earns its place by closing a distinct comprehension gap. Introduce operational constraints only when needed for that endpoint or safe recommended action.
+- A conceptual explanation should let the reader explain the core mechanism and its significance; a procedure should let them perform and check the requested task. Use reference material as evidence rather than a coverage checklist. Explain operational constraints when they affect the requested understanding or safe recommended action.
 
 ## Explain a concept or mechanism
 
@@ -22,7 +22,7 @@ Apply the response-style and detail rules in `AGENTS.md`. This module adds expla
 ## Explain a decision or comparison
 
 - Connect a decision to the objective, decisive evidence, and constraints. A routine low-stakes choice needs only a short rationale. For a surprising or consequential choice, include the strongest serious alternative and decisive tradeoff; under substantial uncertainty, identify missing evidence and relevant reversibility or information value. Give a concise rationale, not private deliberation.
-- For comparisons, explain the decisive difference and develop it through an example or table when useful. Apply the immediate-repetition check to adjacent descriptions of similarities and differences: a negative reformulation must resolve a specific misconception rather than restate the preceding positive claim. Include shared properties only when they affect understanding or choice; use a shared frame when needed to prevent category confusion. When the user is choosing, give a selection rule if useful.
+- For comparisons, explain the decisive difference and develop it through an example or table when useful. In adjacent descriptions of similarities and differences, a negative reformulation must resolve a specific misconception rather than restate the preceding positive claim. Include shared properties only when they affect understanding or choice; use a shared frame when needed to prevent category confusion. When the user is choosing, give a selection rule if useful.
 - If missing context permits a few clear conditional answers, give them. Ask when one concrete choice is required and the branches cannot be summarized safely.
 
 ## Explain an outcome or failure
