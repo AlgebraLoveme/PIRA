@@ -67,6 +67,7 @@ Batch mutually independent actions whose targets, arguments, and scope are alrea
 - Never poll with repeated sleep/status commands. Normally await the original invocation or the service’s native blocking waiter; waiting on the same exec session is not polling. Use `watch` when no native waiter exists or stalled progress should return attention.
 - For authorized stopping of the current task’s active capture, prefer `pira_ctx cancel RESULT` over killing the wrapper or child directly; await the original invocation to finalize the cancelled record and retain partial output.
 - Target the intended result explicitly. Intent: prospective action + target + immediate purpose; one line, at most 256 UTF-8 bytes.
+- To find prior command purposes, call `pira_ctx history QUERY` directly; it searches recorded intents, not command output. Use `--regex` for alternatives, `--details` for selected command metadata, and workspace scope only for relevant cross-thread work. Do not wrap this internal-tool call or use `--interest` as a substitute for the history query.
 - Use displayed `@suffix` result handles for retrieval in the current workspace/session. They bind permanently to full IDs; collisions lengthen new handles, never reassign old ones. Use full IDs across sessions or in durable notes; `stats RESULT` reveals the full ID. Relative indices remain supported but are not recommended for batching or reuse.
 
 #### Recommended Forms
@@ -75,9 +76,10 @@ Batch mutually independent actions whose targets, arguments, and scope are alrea
 pira_ctx [auto|check|capture|exact] --intent TEXT -- PROGRAM [ARG...]
 pira_ctx search RESULT QUERY [-e QUERY]... [--regex] [--context N] [--limit N]
 pira_ctx range RESULT START:END
+pira_ctx history [QUERY] [--regex] [--scope current|workspace] [--since TIME] [--limit N] [--details]
 ```
 
-Search is case-insensitive literal by default; `-e` adds independently ranked queries, `--context` adds neighboring lines, and `--limit` bounds hits per query. No hits still returns exit 0. Search `--regex` and execution `--interest` use Rust regexes: case-sensitive unless prefixed with `(?i)`. Range bounds are inclusive, 1-based; negative positions count from the end (`-1` last), and zero is invalid.
+Search is case-insensitive literal by default; `-e` adds independently ranked queries, `--context` adds neighboring lines, and `--limit` bounds hits per query. No hits still returns exit 0. Search `--regex` and execution `--interest` use Rust regexes: case-sensitive unless prefixed with `(?i)`. Range bounds are inclusive, 1-based; negative positions count from the end (`-1` last), and zero is invalid. History queries also default to case-insensitive literal matching; for example, `pira_ctx history 'review|benchmark' --regex` searches intents for either term in the current thread.
 
 ### `pira_dec`: Decision Recorder
 

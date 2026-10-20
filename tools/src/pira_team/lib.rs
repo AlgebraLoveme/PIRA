@@ -28,9 +28,10 @@ const WORKER_POLICY_VERSION: u64 = 16;
 pub const POLICY: &str = include_str!("main.md");
 const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
 const REVIEW_POLICY: &str = include_str!("review.md");
+const FIGURE_POLICY: &str = include_str!("../../../modules/PUBLIC_FIGURE_STYLE.md");
 const HELP: &str = r#"pira_team — retained technical artifact workers for review and implementation
-Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inject-implement] [OPTIONS]
-       pira_team resume RUN_ID [--task TASK --completion-gate TEXT] [OPTIONS]
+Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inject-implement] [--inject-fig] [OPTIONS]
+       pira_team resume RUN_ID [--inject-review] [--inject-implement] [--inject-fig] [--task TASK --completion-gate TEXT] [OPTIONS]
        pira_team steer RUN_ID --task TASK --completion-gate TEXT [--store DIR]
        pira_team interrupt RUN_ID [--store DIR]
        pira_team read|path RUN_ID [RELATIVE_FILE] [--store DIR]
@@ -52,9 +53,11 @@ validation is performed. Completed means the worker reports the gate satisfied.
 Needs_decision and incomplete are distinct outcomes, not accepted completion.
 
 Workers always receive main guidance including ctx/nav/dec.
---inject-review and --inject-implement independently add task guidance on run/resume.
-Combined launches review first, then automatically append implementation guidance in the
-same thread only after a successful internal checkpoint. Neither flag grants edit authority.
+--inject-review, --inject-implement and --inject-fig independently add guidance on run/resume.
+--inject-fig adds public figure guidance only. No injection flag grants edit authority.
+Combining --inject-review and --inject-implement on a fresh run reviews first, then
+automatically appends implementation guidance in the same thread only after a successful
+internal checkpoint; --inject-fig does not change these stages.
 Resume continues the retained stage; standalone runs do not retroactively become staged.
 Resume retains guidance and adds
 only missing selections without replacing the cached base prefix. Native subagents and
@@ -191,6 +194,7 @@ struct Options {
     completion_gate: String,
     inject_review: bool,
     inject_implement: bool,
+    inject_fig: bool,
     ctx_store: PathBuf,
     dec_store: PathBuf,
     dec_workspace: Option<PathBuf>,
@@ -272,6 +276,7 @@ fn parse_using(
     let mut label = None;
     let mut inject_review = None;
     let mut inject_implement = None;
+    let mut inject_fig = None;
     let mut code_review = None;
     let mut allow_fix = None;
     let mut args = args[1..].iter();
@@ -306,6 +311,10 @@ fn parse_using(
         }
         if arg == "--inject-implement" {
             set_once(&mut inject_implement, true, "--inject-implement")?;
+            continue;
+        }
+        if arg == "--inject-fig" {
+            set_once(&mut inject_fig, true, "--inject-fig")?;
             continue;
         }
         if arg == "--allow-fix" {
@@ -395,6 +404,7 @@ fn parse_using(
         completion_gate,
         inject_review: inject_review.unwrap_or(false),
         inject_implement: inject_implement.unwrap_or(false),
+        inject_fig: inject_fig.unwrap_or(false),
         contract: artifact::Contract::new(format, schema.as_deref(), columns.as_deref())?,
     })
 }

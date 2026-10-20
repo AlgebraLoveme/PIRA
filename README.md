@@ -524,6 +524,8 @@ Use Team for substantial, self-contained work with clear ownership and acceptanc
 
 Keep small or closely coupled tasks with the main agent, where delegation overhead is unlikely to pay off.
 
+`run` and `resume` accept `--inject-fig` to add public figure guidance, alone or with `--inject-review` and `--inject-implement`. Resume retains received guidance and adds only missing selections. Figure guidance grants no edit authority and does not change the review-then-implementation workflow of a fresh run combining the review and implementation flags.
+
 #### How it differs from native subagents
 
 **Team is a CLI-controlled subagent mechanism specialized for PIRA.** It combines flexible worker control with a ready-to-use delegation workflow.

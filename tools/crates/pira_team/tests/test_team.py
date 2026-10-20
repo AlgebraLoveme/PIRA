@@ -973,7 +973,10 @@ class TeamTests(unittest.TestCase):
                 self.assertFalse((run / "implementation").exists())
 
     def test_guidance_selection_and_additive_resume(self):
-        for flags in ((), ("--inject-review",), ("--inject-implement",), ("--inject-review", "--inject-implement")):
+        for flags in ((), ("--inject-review",), ("--inject-implement",), ("--inject-review", "--inject-implement"),
+                      ("--inject-fig",), ("--inject-review", "--inject-fig"),
+                      ("--inject-implement", "--inject-fig"),
+                      ("--inject-review", "--inject-implement", "--inject-fig")):
             with self.subTest(flags=flags):
                 result = self.launch("Assess assigned artifact", *flags)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -981,21 +984,99 @@ class TeamTests(unittest.TestCase):
                 run = Path(receipt["run_root"])
                 prefix = (run / "policy.md").read_text()
                 self.assertEqual("# Review\n" in prefix, "--inject-review" in flags)
-                self.assertEqual("# Implementation\n" in prefix, flags == ("--inject-implement",))
-                resumed = self.access("resume", receipt["run_id"], "--inject-review", "--inject-implement")
+                self.assertEqual("# Implementation\n" in prefix, "--inject-implement" in flags and "--inject-review" not in flags)
+                figure = (Path(__file__).resolve().parents[4] / "modules/PUBLIC_FIGURE_STYLE.md").read_text()
+                self.assertEqual(figure in prefix, "--inject-fig" in flags)
+                initial = self.metadata(receipt)
+                self.assertEqual(initial["inject_fig"], "--inject-fig" in flags)
+                staged = "--inject-review" in flags and "--inject-implement" in flags
+                self.assertEqual(initial.get("stage"), "implementation" if staged else None)
+                state = json.loads((run / "codex-home/fixture-state.json").read_text())
+                self.assertEqual(len(state["turn_details"]), 2 if staged else 1)
+                for index, turn in enumerate(state["turn_details"]):
+                    self.assertEqual(figure in turn["policy"] + turn["phase"], "--inject-fig" in flags)
+                    self.assertIn("The assignment defines authority", turn["policy"])
+                    if staged and index == 0:
+                        self.assertIn("Do not edit project source, tests, configuration", turn["phase"])
+                    else:
+                        self.assertIn("Edit authority comes from the assigned task", turn["phase"])
+                resumed = self.access("resume", receipt["run_id"], "--inject-review", "--inject-implement", "--inject-fig")
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
                 latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
                 self.assertEqual((latest / "policy.md").read_text(), prefix)
                 phase = (latest / "phase.md").read_text()
                 self.assertEqual("# Review\n" in phase, "--inject-review" not in flags)
                 self.assertEqual("# Implementation\n" in phase, "--inject-implement" not in flags)
+                self.assertEqual(figure in phase, "--inject-fig" not in flags)
+                updated = self.metadata(json.loads(resumed.stdout))
+                self.assertTrue(updated["inject_fig"])
+                self.assertEqual(updated.get("stage"), initial.get("stage"))
                 again = self.access("resume", receipt["run_id"])
                 self.assertEqual(again.returncode, 0, again.stderr)
                 phase = (Path(json.loads(again.stdout)["handoff_path"]).parent.parent / "phase.md").read_text()
                 self.assertNotIn("# Review\n", phase)
                 self.assertNotIn("# Implementation\n", phase)
-        for flag in ("--inject-review", "--inject-implement"):
+                self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", phase)
+        for flag in ("--inject-review", "--inject-implement", "--inject-fig"):
             self.assertNotEqual(self.launch("review", flag, flag).returncode, 0)
+            before = (run / "manifest.json").read_bytes()
+            self.assertNotEqual(self.access("resume", receipt["run_id"], flag, flag).returncode, 0)
+            self.assertEqual((run / "manifest.json").read_bytes(), before)
+
+    def test_figure_guidance_missing_in_old_manifests_is_not_implied(self):
+        for version in (5, 16):
+            with self.subTest(version=version):
+                result = self.launch("Assess artifact")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                receipt = json.loads(result.stdout)
+                run = Path(receipt["run_root"])
+                path = run / "manifest.json"
+                manifest = json.loads(path.read_text())
+                manifest.pop("inject_fig")
+                manifest["worker_policy_version"] = version
+                path.write_text(json.dumps(manifest))
+                prefix = (run / "policy.md").read_bytes()
+                for flags, retained in (((), False), (("--inject-fig",), True), ((), True)):
+                    resumed = self.access("resume", receipt["run_id"], *flags)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+                    self.assertEqual((latest / "policy.md").read_bytes(), prefix)
+                    self.assertEqual("# PUBLIC_FIGURE_STYLE\n" in (latest / "phase.md").read_text(), bool(flags))
+                    self.assertEqual(json.loads(path.read_text())["inject_fig"], retained)
+
+    def test_figure_guidance_not_acknowledged_is_not_marked_received(self):
+        first = self.launch("Assess artifact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        self.env["TEAM_BAD_PERMISSION"] = "1"
+        failed = self.access("resume", receipt["run_id"], "--inject-fig")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Codex did not confirm", failed.stderr)
+        self.assertFalse(json.loads((run / "manifest.json").read_text())["inject_fig"])
+        self.env.pop("TEAM_BAD_PERMISSION")
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+        self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", (latest / "phase.md").read_text())
+
+    def test_figure_guidance_acknowledged_before_failed_turn_is_retained(self):
+        first = self.launch("Assess artifact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        self.env["TEAM_PARTIAL_FAILURE"] = "before-rpc-error"
+        failed = self.access("resume", receipt["run_id"], "--inject-fig")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fixture turn/start error", failed.stderr)
+        manifest = json.loads((run / "manifest.json").read_text())
+        self.assertTrue(manifest["inject_fig"])
+        self.assertIn("# PUBLIC_FIGURE_STYLE\n", manifest["phase_instructions"])
+        self.env.pop("TEAM_PARTIAL_FAILURE")
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+        self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", (latest / "phase.md").read_text())
 
     def test_fix_needs_no_prior_review_marker(self):
         first = self.launch("Review assigned module only")

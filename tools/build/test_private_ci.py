@@ -94,6 +94,7 @@ class PrivateCITests(unittest.TestCase):
         self.root.mkdir()
         files = {
             'AGENTS.md': b'fixture policy\r\n', 'modules/CODING_STYLE.md': b'fixture style',
+            'modules/PUBLIC_FIGURE_STYLE.md': b'canonical figure policy\r\n',
             'tools/Cargo.toml': b'[workspace]\n', 'tools/Cargo.lock': b'lock',
             '.github/workflows/build-pira-tool-bundles.yml':
                 b'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n',
@@ -123,7 +124,9 @@ class PrivateCITests(unittest.TestCase):
             files[f'tools/crates/{tool}/tests/check.rs'] = b'// test'
         for name in ci.POLICIES:
             files[f'tools/src/pira_team/{name}'] = b'policy'
-        files['tools/src/pira_team/lib.rs'] = b'const S: &str = include_str!("main.md");'
+        files['tools/src/pira_team/lib.rs'] = (
+            b'const S: &str = include_str!("main.md");\n'
+            b'const FIG: &str = include_str!("../../../modules/PUBLIC_FIGURE_STYLE.md");')
         self.files = files
         for name, content in files.items():
             self.write(name, content)
@@ -160,6 +163,7 @@ class PrivateCITests(unittest.TestCase):
         stage = self.stage(('pira_ctx',))
         data = ci.verify(stage)
         self.assertIn('tools/src/pira_team/worker_profiles.json', data)
+        self.assertIn('modules/PUBLIC_FIGURE_STYLE.md', data)
         for name in excluded:
             self.assertNotIn(name, data)
         expected_sources = set(self.files) - {'.github/workflows/build-pira-tool-bundles.yml'}

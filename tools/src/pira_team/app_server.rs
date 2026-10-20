@@ -819,7 +819,7 @@ pub fn turn(
     task: &str,
     manifest: &mut Value,
     handoff: &Path,
-    guidance: (bool, bool),
+    guidance: (bool, bool, bool),
 ) -> Result<Turn, String> {
     let build_roots = crate::build_roots::configured()?;
     for root in &build_roots {
@@ -887,6 +887,7 @@ pub fn turn(
         manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
         manifest["inject_review"] = json!(guidance.0);
         manifest["inject_implement"] = json!(guidance.1);
+        manifest["inject_fig"] = json!(guidance.2);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
         let started = server.request(
             "turn/start",

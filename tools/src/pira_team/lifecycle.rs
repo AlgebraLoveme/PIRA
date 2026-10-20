@@ -155,6 +155,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut allow_fix = None;
     let mut inject_review = None;
     let mut inject_implement = None;
+    let mut inject_fig = None;
     let mut gate = None;
     let (mut model, mut effort, mut output, mut task_file, mut task) =
         (None, None, None, None, None);
@@ -186,6 +187,10 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         }
         if op == "resume" && arg == "--inject-implement" {
             crate::set_once(&mut inject_implement, true, "--inject-implement")?;
+            continue;
+        }
+        if op == "resume" && arg == "--inject-fig" {
+            crate::set_once(&mut inject_fig, true, "--inject-fig")?;
             continue;
         }
         if op == "resume" && arg == "--allow-fix" {
@@ -334,6 +339,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         completion_gate,
         inject_review: inject_review.unwrap_or(false),
         inject_implement: inject_implement.unwrap_or(false),
+        inject_fig: inject_fig.unwrap_or(false),
         ctx_store,
         dec_store,
         dec_workspace,
@@ -583,6 +589,7 @@ fn generate_stage(
     let review = had_review || options.inject_review || review_stage;
     let implement = !review_stage
         && (had_implement || options.inject_implement || manifest["stage"] == "implementation");
+    let figure = manifest["inject_fig"].as_bool().unwrap_or(false) || options.inject_fig;
     let mut bundle = common.clone();
     if review {
         bundle.push_str("\n\n");
@@ -591,6 +598,10 @@ fn generate_stage(
     if implement {
         bundle.push_str("\n\n");
         bundle.push_str(crate::IMPLEMENTATION_POLICY);
+    }
+    if figure {
+        bundle.push_str("\n\n");
+        bundle.push_str(crate::FIGURE_POLICY);
     }
     let mut task = if manifest["stage"] == "implementation" && !review_stage {
         format!(
@@ -629,6 +640,9 @@ fn generate_stage(
             }
             if implement && !manifest["inject_implement"].as_bool().unwrap_or(false) {
                 migration.push_str(crate::IMPLEMENTATION_POLICY);
+            }
+            if figure && !manifest["inject_fig"].as_bool().unwrap_or(false) {
+                migration.push_str(crate::FIGURE_POLICY);
             }
         }
         let phase = format!(
@@ -670,7 +684,7 @@ fn generate_stage(
             &task,
             manifest,
             handoff,
-            (review, implement),
+            (review, implement, figure),
         ) {
             Ok(turn) => turn,
             Err(error) => {
