@@ -102,7 +102,7 @@ Load on demand (explicit or inferred):
 - `public_figure`: `~/agent/modules/PUBLIC_FIGURE_STYLE.md` for creating, styling, laying out, integrating, or releasing figures intended for external audiences or public artifacts, including papers, preprints, posters, talks, blogs, websites, documentation, READMEs, reports, repositories, and release assets.
 - `explain`: `~/agent/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
 - `guidance`: `~/agent/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
-- `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance, not project maintenance.
+- `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance and PIRA tool releases, not general project maintenance.
 
 Do not reload unchanged in-context modules unless the user asks or relevant context was lost.
 
@@ -236,7 +236,7 @@ pira_dec show ID
 - Before dash-prefixed positional paths/targets, use `--`; query instead pairs each operation option with its target.
 - Do not use nav for binary/non-UTF-8 data, multiline/PCRE-only matching, archives, broad ignored-tree overrides, or symlink traversal.
 
-#### Forms and Options
+#### Forms and Common Options
 
 ```text
 pira_nav search|symbols QUERY [PATH...] [OPTIONS]
@@ -244,24 +244,21 @@ pira_nav outline FILE... [OPTIONS]
 pira_nav show|SEMANTIC TARGET... [OPTIONS]
 pira_nav map [PATH...] [OPTIONS]
 pira_nav query --OPERATION TARGET [--OPERATION TARGET]... [OPTIONS]
+pira_nav languages                  # Supported formats and discovered LSP servers
+pira_nav help COMMAND [COMMAND...]  # Less-common syntax; batch help topics
 ```
 
 SEMANTIC includes `definition`, `references`, `callers`, `callees`, `hover`; OPERATION is show or semantic. Search defaults to case-sensitive literal; symbols to case-insensitive exact name/suffix, then substring fallback.
 
-
-| Option                  | Commands                                                 | Effect/scope                                                                                                                                                                           |
-| ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-e QUERY` (repeatable) | search, symbols                                          | Independent queries replacing the positional query.                                                                                                                                    |
-| `--regex`               | search, symbols                                          | Rust regex;`(?i)` ignores case.                                                                                                                                                        |
-| `-i`                    | search                                                   | Ignore case.                                                                                                                                                                           |
-| `-g GLOB` (repeatable)  | search, map                                              | Gitignore-style path filter;`!` excludes.                                                                                                                                              |
-| `-C N`                  | search                                                   | Context lines on each side.                                                                                                                                                            |
-| `--files-with-matches`  | search                                                   | Paths instead of snippets.                                                                                                                                                             |
-| `--max-depth N`         | map                                                      | Traversal depth; 0 visits specified paths only.                                                                                                                                        |
-| `--range START:END`     | show, query-show                                         | Slice preceding target.                                                                                                                                                                |
-| `--limit N`             | search; symbols; outline; map; non-hover semantics/query | Snippet lines/query (search: incompatible with`--files-with-matches` and `--count`); symbol rows/query; items across files; representative file rows; semantic rows/target or request. |
-| `--max-items N`         | search                                                   | Total displayed lines/file rows; use with`--files-with-matches` or `--count` instead of `--limit`.                                                                                     |
-| `--max-bytes N`         | search, show; hover, query                               | Shared source-block budget for search/show; per hover/query-show request. Shared caps may further limit search; oversized show blocks are omitted, not truncated.                      |
+- `-e QUERY` (search, symbols; repeatable): independent queries replacing the positional query.
+- `--regex` (search, symbols): Rust regex; `(?i)` ignores case. `-i` (search): ignore case.
+- `-g GLOB` (search, map; repeatable): gitignore-style path filter; `!` excludes.
+- `-C N` (search): context lines on each side. `--files-with-matches` (search): paths instead of snippets.
+- `--max-depth N` (map): traversal depth; 0 visits specified paths only.
+- `--range START:END` (show, including `query --show`): slice preceding target.
+- `--limit N`: search—snippet lines/query, incompatible with `--files-with-matches` and `--count`; symbols—rows/query; outline—items across files; map—representative file rows; non-hover semantics/query—semantic rows/target or request.
+- `--max-items N` (search): total displayed lines/file rows; use with `--files-with-matches` or `--count` instead of `--limit`.
+- `--max-bytes N` (search, show, hover, query): shared source-block budget for search/show; per hover or `query --show` request. Shared caps may further limit search; oversized show blocks are omitted, not truncated.
 
 No search matches succeeds. Query options with no applicable operation error.
 

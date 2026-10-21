@@ -1,8 +1,9 @@
 # MAINTENANCE
 
-Use only for PIRA configuration, module, and rule maintenance—not ordinary project work.
+Use only for PIRA configuration, module, and rule maintenance and PIRA tool releases—not ordinary project work.
 
 ## Maintenance Rules
+- After publishing a PIRA tool release, refresh the affected local installation and verify its installed version and release hash before reporting completion.
 - Keep memory defaults in `Memory System` in `~/agent/AGENTS.md`; this module maintains them but does not define ordinary memory handling.
 - Add files removed from the active scheme to `~/agent/assets/LEGACY_LIST.md`.
 - Overwrite with current policy only: no timestamps, question IDs, changelogs, or override chains.
