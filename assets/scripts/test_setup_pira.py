@@ -525,13 +525,20 @@ class AutoRecapTests(unittest.TestCase):
                 + "registry.SetValueEx.assert_not_called(); s.stores.notify_windows_environment.assert_not_called(); raise SystemExit(result)")
         env.update(PIRA_CTX_STORE_DIR=str(destination), PIRA_DEC_STORE_DIR=str(root / "dec"), PIRA_TEAM_DIR=str(root / "team"))
         captured = subprocess.run([binary, "capture", "--interest", "(?i)active|error", "--intent", "probe fresh captured setup", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)
-        self.assertIn("Unfinished capture requires recovery", captured.stdout + captured.stderr, f"wrapper exit={captured.returncode}: {captured.stdout} {captured.stderr}")
+        self.assertIn("rerun the same setup command directly without pira_ctx", captured.stdout + captured.stderr, f"wrapper exit={captured.returncode}: {captured.stdout} {captured.stderr}")
         self.assertEqual(config.read_text(), 'model = "custom"\n')
         self.assertFalse((agent / "AGENTS.override.md").exists())
         exact = subprocess.run([binary, "exact", "--intent", "inspect complete setup output", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)
-        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
-        self.assertIn("Verification passed", exact.stdout)
+        self.assertNotEqual(exact.returncode, 0)
+        self.assertIn("rerun the same setup command directly without pira_ctx", exact.stdout + exact.stderr)
+        self.assertEqual(config.read_text(), 'model = "custom"\n')
+        direct = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("Verification passed", direct.stdout)
         self.assertIn("PIRA_TEAM_DIR", config.read_text())
+        update = subprocess.run([binary, "capture", "--intent", "no-migration setup update", "--", sys.executable, "-c", code],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(update.returncode, 0, update.stdout + update.stderr)
         self.assertFalse(agent.is_symlink())
 
     def test_retired_options_are_rejected(self) -> None:

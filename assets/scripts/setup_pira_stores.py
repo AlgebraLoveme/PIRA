@@ -16,6 +16,7 @@ from types import ModuleType
 
 import migrate_pira_stores as migration
 import setup_migration_choices as choices
+from setup_ctx_wrapper import require_unwrapped_migration
 
 BLOCK_START = "# >>> PIRA tools PATH >>>"
 BLOCK_END = "# <<< PIRA tools PATH <<<"
@@ -456,6 +457,12 @@ def plan_store_environment(
             except RuntimeError:
                 # Explicit custom stores need not have a discoverable default.
                 pass
+    # A historical runtime/configuration choice still needs relocation even if
+    # its directory is currently empty: the enclosing wrapper can write later.
+    if (codex_legacy or any(physical_store_path(value) != Path(stores[key])
+                           for key in keys
+                           for value in ([os.environ[key]] if key in os.environ else persisted[key]))):
+        require_unwrapped_migration()
     for tool in tools:
         key = STORE_ENV_KEYS.get(tool)
         if key is None:
@@ -506,6 +513,11 @@ def apply_store_migrations(plan: StorePlan, *, dry_run: bool, verify: bool = Fal
     Unified setup must retain this exact plan through its configuration writes.
     Standalone tools setup gets the barrier via apply_store_environment below.
     """
+    if (any(item.copy_required for item in plan.migrations)
+            or any((migration.read_team_state(item) or {}).get("phase") != "complete"
+                   for item in plan.team_migrations)
+            or any(item.files for item in plan.team_metadata_migrations)):
+        require_unwrapped_migration()
     with choices.successful_choices(plan.choices, readonly=dry_run or verify):
         migration.apply_migrations(plan.migrations, dry_run=dry_run, verify=verify)
         migration.apply_team_migrations(plan.team_migrations, dry_run=dry_run, verify=verify)
