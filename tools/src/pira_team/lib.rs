@@ -23,7 +23,7 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-const WORKER_POLICY_VERSION: u64 = 16;
+const WORKER_POLICY_VERSION: u64 = 17;
 
 pub const POLICY: &str = include_str!("main.md");
 const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
@@ -774,7 +774,7 @@ mod tests {
         ] {
             assert!(safety.contains(expected), "{expected}");
         }
-        assert_eq!(WORKER_POLICY_VERSION, 16);
+        assert_eq!(WORKER_POLICY_VERSION, 17);
         assert!(!IMPLEMENTATION_POLICY.contains("exact prefix `Safety:`"));
     }
 

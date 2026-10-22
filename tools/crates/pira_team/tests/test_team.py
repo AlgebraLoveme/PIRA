@@ -645,15 +645,17 @@ class TeamTests(unittest.TestCase):
         manifest = json.loads(self.access("read", run.name, "manifest.json").stdout)
         self.assertFalse(manifest["usage_complete"])
 
-    def test_nav_rule_mirrors_main_policy(self):
+    def test_shared_rules_mirror_main_policy(self):
         root = Path(__file__).resolve().parents[4]
-        prefix = "- Let structural backends auto-select."
-        def rule(path):
-            with path.open() as source:
-                matches = [line.rstrip("\n") for line in source if line.startswith(prefix)]
-            self.assertEqual(len(matches), 1)
-            return matches[0]
-        self.assertEqual(rule(root / "AGENTS.md"), rule(root / "tools/src/pira_team/main.md"))
+        main = (root / "AGENTS.md").read_text()
+        worker = (root / "tools/src/pira_team/main.md").read_text()
+        for start, end in (("### Concurrency", "## Safety"),
+                           ("### `pira_nav`:", "### `pira_team`:")):
+            self.assertIn(main[main.index(start):main.index(end, main.index(start))].rstrip(), worker)
+        for prefix in ("- Minimize the content", "- Preserve requested coverage",
+                       "- Judge each passage", "- Do not narrate routine"):
+            rule = next(line for line in main.splitlines() if line.startswith(prefix))
+            self.assertIn(rule, worker)
 
     def test_injects_exact_technical_and_tool_guidance(self):
         result = self.launch("review", "--inject-review", "--inject-implement")
@@ -1174,7 +1176,7 @@ class TeamTests(unittest.TestCase):
         run = Path(first["run_root"])
         manifest = run / "manifest.json"
         state = json.loads(manifest.read_text())
-        state["worker_policy_version"] = 4
+        state["worker_policy_version"] = 16
         manifest.write_text(json.dumps(state))
         prefix = (run / "policy.md").read_bytes()
         for migrated in (True, False):
@@ -1183,7 +1185,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 17)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1231,7 +1233,7 @@ class TeamTests(unittest.TestCase):
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual(policy.read_bytes(), prefix)
             updated = json.loads(manifest.read_text())
-            self.assertEqual(updated["worker_policy_version"], 16)
+            self.assertEqual(updated["worker_policy_version"], 17)
             self.assertIsNone(updated.get("dec_workspace"))
 
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
@@ -1264,7 +1266,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 17)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
