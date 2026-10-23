@@ -27,9 +27,7 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Other models or agent platforms may work, but have not received the same level of testing.
-
-> **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. Claude branch features may lag behind. The instructions below install PIRA for Codex from `master`.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Claude Code v2.1.283 smoke tests confirmed global user-rule loading and project `AGENTS.md` loading alongside `CLAUDE.md`. In an Opus code-review control, a required module read was denied without a permission rule; with the narrow rule below, Claude read both coding and research modules. A separate explanation task read its explanation module. These are smoke tests, not proof of broad behavioral parity. Other models or agent platforms may work without equivalent testing.
 
 ## Quick start with Codex
 
@@ -105,13 +103,61 @@ assets/scripts/setup_pira.sh
 assets/scripts/setup_pira.sh --verify
 ```
 
-On Windows, invoke the same setup through `assets/scripts/setup_pira.ps1` from the repository directory:
+On Windows PowerShell, use Python directly after cloning to the expanded home path:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
+git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+py -3 "$HOME/agent/assets/scripts/setup_pira.py" --dry-run
+py -3 "$HOME/agent/assets/scripts/setup_pira.py"
+py -3 "$HOME/agent/assets/scripts/setup_pira.py" --verify
 ```
 
-The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
+The Python entry point and macOS/Linux and Windows wrappers support the same options. The direct Windows commands require Python 3 and its `py` launcher; the wrappers can offer Python installation help through Homebrew on macOS or winget on Windows.
+
+## Quick start with Claude Code
+
+Claude Code v2.1.281 or later can load PIRA without a `CLAUDE.md` bridge. Keep one `master` checkout at `~/agent`, even if you use Claude Code without Codex. If you do not already have the checkout, run `git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent` on macOS/Linux, or `git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"` in Windows PowerShell. If Codex already uses that checkout, do not switch its branch: simply run the Claude adapter from it.
+
+On macOS or Linux:
+
+```bash
+python3 ~/agent/assets/scripts/setup_pira_claude.py --dry-run
+python3 ~/agent/assets/scripts/setup_pira_claude.py
+python3 ~/agent/assets/scripts/setup_pira_claude.py --verify
+```
+
+On Windows PowerShell:
+
+```powershell
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py" --dry-run
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py"
+py -3 "$HOME/agent/assets/scripts/setup_pira_claude.py" --verify
+```
+
+The Claude adapter installs only the four shared native tools (Ctx, Dec, Nav and SVG); Codex's separate setup installs Team when needed. If the shared tools are already installed by Codex, pass `--skip-tools`. Use `--user-mode keep` if you do not want a separate Claude `USER.md` placeholder.
+
+The policy's module paths assume the checkout is at `~/agent`; `--agent-dir` is intended for controlled tests, not a second production policy location.
+
+Use real directories for the checkout and Claude configuration: symlink/junction directory aliases, including parent aliases, are refused.
+
+The adapter makes three Claude-side changes:
+
+1. Links the [global user rule](https://code.claude.com/docs/en/memory#user-level-rules) `~/.claude/rules/pira.md` to `~/agent/AGENTS.md` on macOS/Linux, or installs a checked managed copy on Windows. Claude Code does **not** load `~/.claude/AGENTS.md` globally.
+2. Sets [Project instructions](https://code.claude.com/docs/en/memory#choose-which-instruction-files-load) to `claude-md-and-agents-md`, so each project's `AGENTS.md` and `CLAUDE.md` load together. Resolve any contradictory project rules.
+3. Adds narrow `Read(~/agent/modules/*.md)`, `Read(~/.claude/pira/USER.md)`, and `Read(~/agent/USER.md)` [allow rules](https://code.claude.com/docs/en/permissions#read-and-edit), so it can load PIRA modules, its private profile, or the shared fallback profile from other projects without gaining edit access. Existing rules are preserved; deny rules still take precedence.
+
+Claude shares PIRA policy, modules, and the four common tool binaries with Codex. The new `pira_team` launches Codex workers and is installed by Codex setup, not by the Claude-only adapter; in Claude, use it only when that Codex backend is already configured, or use Claude's native delegation. Its `~/.claude/pira/USER.md` stays private and independent. These allow rules grant tool access, not authority to disclose profile data; project instructions remain untrusted. The adapter preserves unrelated Claude settings and instructions, and removes only the old PIRA-managed `CLAUDE.md` import after the new rule is prepared.
+
+The adapter conservatively rejects potentially overlapping or unrecognized `Read` deny/ask rules in the settings file it manages. It does not evaluate managed, project, or session permission layers; installer verification is not a live permission test.
+
+Claude invokes PIRA tool binaries through Bash when no native integration exposes them. [Print mode](https://code.claude.com/docs/en/permission-modes#which-mode-a-session-starts-in) starts in Manual, so unattended `claude -p` runs that need these tools must explicitly authorize their Bash calls. Use narrowly scoped `--allowedTools` rules for the needed commands, or `--permission-mode auto` when its broader autonomy fits the task and is available. Interactive Claude Code v2.1.283+ normally starts in Auto unless settings override it. Do not grant blanket Bash access merely for PIRA.
+
+The setup is safe to rerun. It refuses to take over any existing target rule without its install manifest, backs up changed user files, supports `--dry-run` and `--verify`, and can remove its rule and only the read permissions it added with `--uninstall` while preserving `USER.md`. It leaves old `~/.claude/pira/` policy snapshots untouched but inactive; review them separately before removal. On Windows, rerun setup after updating the source checkout to refresh the managed policy copy. Check `/context` in a new Claude session to confirm PIRA is loaded.
+
+Caught install/uninstall errors restore the previous managed-file state. If recovery itself fails, setup reports affected paths; inspect them before retrying. This recovery does not cover process termination, concurrent edits, or shared-tool installation.
+
+Offline evidence-parser regressions run from a clean checkout with `python3 -B -m unittest assets.scripts.test_smoke_pira_routing` (Windows: `py -3 -B -m unittest assets.scripts.test_smoke_pira_routing`). They check complete file content in successful CLI tool results, including native profile reads, without authenticated model calls. Authenticated smoke runners stay local and are not shipped. Parser tests and installer `--verify` checks do not establish live permission behavior, global rule loading, natural module routing, or review quality.
 
 ## Setup options
 
@@ -188,11 +234,10 @@ python3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1
 On Windows PowerShell:
 
 ```powershell
-cd $HOME\agent
-py -3 assets/scripts/setup_pira_tools.py          # install or refresh
-py -3 assets/scripts/setup_pira_tools.py --force  # reinstall the selected release
-py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
-py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py"          # install or refresh
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --force  # reinstall the selected release
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --verify # verify without writing
+py -3 "$HOME/agent/assets/scripts/setup_pira_tools.py" --version ctx=1.7.0 --version svg=0.1.0
 ```
 
 The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, `svg=VERSION`, or `team=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup and `pira_team` model calls need network access; the other tools operate locally. Restart the shell or agent process if setup says the new PATH is not active yet.

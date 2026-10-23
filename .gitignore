@@ -51,3 +51,7 @@ tools/build/*
 
 # Local ctx benchmark output
 /ctx_short_id_benchmark.json
+
+# Authenticated smoke runners stay local; offline parser/tests remain public.
+/assets/scripts/smoke_pira_claude.py
+/assets/scripts/smoke_pira_routing.py
