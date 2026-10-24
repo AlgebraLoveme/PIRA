@@ -5,7 +5,9 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 pub fn default_root() -> Result<PathBuf, String> {
-    configured_root("PIRA_TEAM_DIR", "team")
+    crate::subteam::default_store()?
+        .map(Ok)
+        .unwrap_or_else(|| configured_root("PIRA_TEAM_DIR", "team"))
 }
 
 pub fn configured_root(key: &str, leaf: &str) -> Result<PathBuf, String> {
@@ -81,6 +83,14 @@ pub fn access(args: &[String]) -> Result<(), String> {
     } else {
         if !path.is_file() {
             return Err("read requires a regular file".into());
+        }
+        if path == run.join("manifest.json") {
+            let mut manifest = crate::lifecycle::read_json(&path)?;
+            if manifest["allow_subteam"] == true {
+                manifest["descendants"] = crate::subteam::summary(&run)?;
+                println!("{manifest}");
+                return Ok(());
+            }
         }
         let mut file = File::open(&path).map_err(|e| format!("open managed file: {e}"))?;
         io::copy(&mut file, &mut io::stdout().lock())

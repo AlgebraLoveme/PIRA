@@ -1,5 +1,5 @@
 //! Native API inventory plus validation of the exact requests Team sends.
-use crate::{Options, create, isolate, terminate};
+use crate::{Options, create};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -20,7 +20,8 @@ pub fn preflight(
 ) -> Result<jsonschema::Validator, String> {
     let output = dir.join("backend-schema");
     fs::create_dir(&output).map_err(|e| format!("create backend schema directory: {e}"))?;
-    let mut cmd = Command::new("codex");
+    let mut cmd = Command::new(options.authentication.program());
+    options.authentication.apply(&mut cmd);
     cmd.args(["app-server", "generate-json-schema", "--out"])
         .arg(&output)
         .env("CODEX_HOME", run.join("codex-home"))
@@ -28,12 +29,10 @@ pub fn preflight(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(create(&dir.join("backend-check.log"))?);
-    isolate(&mut cmd);
     if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("interrupted before native schema generation".into());
     }
-    let mut child = cmd
-        .spawn()
+    let (mut child, scope) = crate::process::spawn(&mut cmd)
         .map_err(|e| format!("generate native Codex schema: {e}"))?;
     let status = loop {
         let result = if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -47,13 +46,15 @@ pub fn preflight(
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
-                terminate(child.id());
+                scope.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
             }
         }
     };
+    #[cfg(windows)]
+    scope.terminate();
     if !status.success() {
         return Err(format!(
             "native schema generation failed ({status}); see backend-check.log"

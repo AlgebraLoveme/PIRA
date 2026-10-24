@@ -1,11 +1,15 @@
 mod app_server;
 mod artifact;
+mod authentication;
 mod backend;
 mod bookmarks;
 mod build_roots;
 mod lifecycle;
+mod native;
+mod process;
 mod profile;
 mod storage;
+mod subteam;
 
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +27,7 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-const WORKER_POLICY_VERSION: u64 = 17;
+const WORKER_POLICY_VERSION: u64 = 19;
 
 pub const POLICY: &str = include_str!("main.md");
 const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
@@ -33,7 +37,7 @@ const HELP: &str = r#"pira_team — retained technical artifact workers for revi
 Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inject-implement] [--inject-fig] [OPTIONS]
        pira_team resume RUN_ID [--inject-review] [--inject-implement] [--inject-fig] [--task TASK --completion-gate TEXT] [OPTIONS]
        pira_team steer RUN_ID --task TASK --completion-gate TEXT [--store DIR]
-       pira_team interrupt RUN_ID [--store DIR]
+       pira_team interrupt [-r|--recursive] RUN_ID [--store DIR]
        pira_team read|path RUN_ID [RELATIVE_FILE] [--store DIR]
        pira_team bookmark RUN_REF --label LABEL [--store DIR]
        pira_team unbookmark LABEL [--store DIR]
@@ -44,6 +48,7 @@ Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inj
        pira_team config reset --main MODEL [--store DIR]
 
 Use one quoted --task (also --task=TEXT) or --task-file FILE; the file is INPUT.
+Root-only --allow-subteam on run/resume authorizes one coordinator level; children cannot delegate.
 Run options: --cwd DIR --store DIR --model MODEL --effort EFFORT --label LABEL
              --format auto|markdown|text|json|csv --schema FILE --columns JSON_ARRAY
              --output artifact|answer
@@ -178,6 +183,31 @@ Invalid explicit roots fail; unusable ambient roots grant nothing. Filesystem ro
 physical paths are deduplicated. Run/resume/repair use current invoking configuration and record
 build_roots in manifests. Other inherited variables grant no extra writes. No cache deletion is
 authorized; task/ownership constraints still apply. Unix cancellation excludes detached descendants.
+Subteams: exactly main -> coordinator -> ordinary children. Authorization is retained and
+bound to the actual native backend ancestry and verified thread, not environment assertions.
+A coordinator cannot grant --allow-subteam or change config, escape its retained store,
+or access siblings, ancestors or root runs. Tags and child content belong to the immediate
+parent only. Root read of a coordinator manifest includes descendant activity/usage summaries,
+not content. usage is own cumulative usage; descendants.usage is separate, summed once per
+retained child across resumes (usage_complete remains explicit).
+interrupt is target-only and reports active_children_left_running; -r/--recursive closes a
+subtree admission gate before stopping and confirms owner exit or reports explicit failures.
+Root recursive interrupt may control descendants but grants no read/tag access. A later
+explicit root resume clears the gate only after all owners settle; old children cannot clear
+it. A crashed owner with an unconfirmed backend is an explicit failure, never a PID-only kill.
+Coordinators must integrate and finish required child work; completed is rejected while any
+child remains active. Incomplete/needs_decision preserve child lifecycle visibility.
+Legacy runs gain no subteam permission without an explicit root grant. Original cached policy
+prefixes are preserved; migration injects current rules. These are Team-interface controls,
+not filesystem security against same-user manual tampering.
+Windows backend scopes use owned job handles; child launchers explicitly break away from
+the coordinator job without escaping caller-owned outer jobs. Backend authentication for
+children uses a local OS-peer-verified, one-time launcher handoff and remains in launcher
+memory/backend environments only. It is never a shell setting, task, policy, artifact or
+control/event-log value; file-backed authentication and shell exclusions are preserved.
+Delegated backend executable and provider/proxy/loader selectors remain coordinator-selected;
+a worker cannot redirect its inherited authentication through environment overrides. Ordinary
+task/build variables remain inherited.
 "#;
 
 struct Options {
@@ -195,10 +225,19 @@ struct Options {
     inject_review: bool,
     inject_implement: bool,
     inject_fig: bool,
+    allow_subteam: bool,
+    authentication: authentication::Authentication,
     ctx_store: PathBuf,
     dec_store: PathBuf,
     dec_workspace: Option<PathBuf>,
     contract: artifact::Contract,
+}
+
+// Children may intentionally outlive their coordinator. A closed diagnostic pipe
+// must not panic before managed lifecycle state is finalized.
+fn notice(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
 }
 
 fn completion_gate(value: Option<String>) -> Result<String, String> {
@@ -277,6 +316,7 @@ fn parse_using(
     let mut inject_review = None;
     let mut inject_implement = None;
     let mut inject_fig = None;
+    let mut allow_subteam = None;
     let mut code_review = None;
     let mut allow_fix = None;
     let mut args = args[1..].iter();
@@ -315,6 +355,10 @@ fn parse_using(
         }
         if arg == "--inject-fig" {
             set_once(&mut inject_fig, true, "--inject-fig")?;
+            continue;
+        }
+        if arg == "--allow-subteam" {
+            set_once(&mut allow_subteam, true, "--allow-subteam")?;
             continue;
         }
         if arg == "--allow-fix" {
@@ -405,17 +449,21 @@ fn parse_using(
         inject_review: inject_review.unwrap_or(false),
         inject_implement: inject_implement.unwrap_or(false),
         inject_fig: inject_fig.unwrap_or(false),
+        allow_subteam: allow_subteam.unwrap_or(false),
+        authentication: authentication::Authentication::Caller,
         contract: artifact::Contract::new(format, schema.as_deref(), columns.as_deref())?,
     })
 }
 
 fn private_dir(path: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(path)
 }
 
@@ -484,7 +532,7 @@ fn create(path: &Path) -> Result<File, String> {
 struct IsolatedHome(PathBuf);
 
 impl IsolatedHome {
-    fn new(run: &Path) -> Result<Self, String> {
+    fn new(run: &Path, authentication: &authentication::Authentication) -> Result<Self, String> {
         let path = run.join("codex-home");
         match private_dir(&path) {
             Ok(()) => {}
@@ -499,34 +547,22 @@ impl IsolatedHome {
             fs::remove_file(auth).map_err(|e| format!("remove stale auth link: {e}"))?;
         }
         let home = Self(path);
-        if std::env::var_os("CODEX_API_KEY").is_some_and(|value| !value.is_empty()) {
+        if authentication.uses_api_key() {
             return Ok(home);
         }
-        let source = std::env::var_os("CODEX_HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
-                    .map(|p| PathBuf::from(p).join(".codex"))
-            });
+        let source = match authentication.file_source() {
+            Some(source) => Some(source.to_owned()),
+            None if subteam::caller_run()?.is_none() => authentication::caller_file()?,
+            None => None,
+        };
         if let Some(source) = source {
-            let auth = source.join("auth.json");
-            match auth.canonicalize() {
-                Ok(auth) => {
-                    // Link only authentication, never configuration, instructions, skills or history.
-                    // Codex, not the model or Team, reads authentication material.
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&auth, home.0.join("auth.json"))
-                        .map_err(|e| format!("link Codex authentication: {e}"))?;
-                    #[cfg(not(unix))]
-                    fs::hard_link(&auth, home.0.join("auth.json"))
-                        .map_err(|e| format!("link Codex authentication: {e}; use CODEX_API_KEY if linking is unavailable"))?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("resolve Codex authentication: {e}")),
-            }
+            // Link authentication only, never configuration, skills or history.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&source, home.0.join("auth.json"))
+                .map_err(|_| "link selected Codex authentication")?;
+            #[cfg(windows)]
+            fs::hard_link(&source, home.0.join("auth.json"))
+                .map_err(|_| "link selected Codex authentication; use CODEX_API_KEY if linking is unavailable")?;
         }
         Ok(home)
     }
@@ -544,7 +580,8 @@ impl Drop for IsolatedHome {
 }
 
 fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command {
-    let mut cmd = Command::new("codex");
+    let mut cmd = Command::new(options.authentication.program());
+    options.authentication.apply(&mut cmd);
     cmd.args(["app-server", "--strict-config", "--stdio"]);
     for setting in backend::contract()["config"].as_array().unwrap() {
         cmd.arg("-c").arg(setting.as_str().unwrap());
@@ -586,6 +623,10 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
         "shell_environment_policy.set.PIRA_TEAM_HANDOFF={}",
         json!(handoff)
     ));
+    cmd.arg("-c").arg(format!(
+        "shell_environment_policy.set.PIRA_TEAM_CONTEXT={}",
+        json!(run)
+    ));
     // Keep unknown task configuration without serializing its values into argv/logs.
     // Backend authentication remains available to Codex, not to worker shells.
     cmd.arg("-c")
@@ -601,6 +642,7 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
             "PIRA_TEAM_DIR",
             "PIRA_TEAM_HANDOFF",
             "PIRA_TEAM_CHILD",
+            "PIRA_TEAM_CONTEXT",
             "PIRA_CTX_STORE_DIR",
             "PIRA_DEC_STORE_DIR",
             "PIRA_DEC_WORKSPACE_DIR",
@@ -648,38 +690,6 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     cmd
 }
 
-// Unix cancellation isolates/terminates the owned process group, excluding detached descendants.
-#[cfg(unix)]
-fn isolate(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-}
-#[cfg(not(unix))]
-fn isolate(_: &mut Command) {}
-
-fn terminate(pid: u32) {
-    #[cfg(unix)]
-    if let Ok(pid) = i32::try_from(pid) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
-}
-
 /// Execute the Team CLI and return its process exit code.
 pub fn run() -> i32 {
     #[cfg(unix)]
@@ -702,9 +712,21 @@ pub fn run() -> i32 {
         println!("pira_team {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
-    if std::env::var_os("PIRA_TEAM_CHILD").is_some() {
-        eprintln!("pira_team: nested delegation is forbidden");
+    if let Err(error) = subteam::authorize(&args) {
+        eprintln!("pira_team: {error}");
         return 1;
+    }
+    if matches!(args[0].as_str(), "run" | "resume")
+        && let Ok(Some(runtime)) = subteam::caller_runtime()
+    {
+        match process::isolate_launcher(&args, &runtime) {
+            Ok(Some(code)) => return code,
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("pira_team: {error}");
+                return 1;
+            }
+        }
     }
     let outcome = if matches!(args[0].as_str(), "read" | "path") {
         storage::access(&args)
@@ -774,7 +796,7 @@ mod tests {
         ] {
             assert!(safety.contains(expected), "{expected}");
         }
-        assert_eq!(WORKER_POLICY_VERSION, 17);
+        assert_eq!(WORKER_POLICY_VERSION, 19);
         assert!(!IMPLEMENTATION_POLICY.contains("exact prefix `Safety:`"));
     }
 

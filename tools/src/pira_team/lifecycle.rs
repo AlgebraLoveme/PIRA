@@ -131,7 +131,7 @@ fn owner(run: &Path) -> Result<File, String> {
 
 const FIX_TASK: &str = "Apply verified findings from your completed review within the original assignment. Follow the injected coding policy and return the fix report through the existing output contract.";
 
-pub fn launch(options: Options) -> Result<(), String> {
+pub fn launch(mut options: Options) -> Result<(), String> {
     for path in [
         &options.store,
         &options.cwd,
@@ -143,9 +143,20 @@ pub fn launch(options: Options) -> Result<(), String> {
     let run = crate::prepare_store(&options.store)?;
     let _owner = owner(&run)?;
     let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
-        "creator_main_session_id":options.execution.caller_thread_id,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
+        "creator_main_session_id":options.execution.caller_thread_id,"parent_run_id":null,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
         "sandbox":options.execution.mode,"pira_instructions":false});
-    revision(&options, &run, &mut manifest)
+    if let Some(parent) = crate::subteam::caller_run()? {
+        manifest["parent_run_id"] = json!(
+            parent
+                .file_name()
+                .unwrap()
+                .to_str()
+                .ok_or("non-UTF-8 coordinator ID")?
+        );
+    }
+    manifest["allow_subteam"] = json!(options.allow_subteam);
+    crate::subteam::admit(&run, &mut manifest, false)?;
+    revision(&mut options, &run, &mut manifest)
 }
 
 pub fn existing(args: &[String]) -> Result<(), String> {
@@ -156,6 +167,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut inject_review = None;
     let mut inject_implement = None;
     let mut inject_fig = None;
+    let mut allow_subteam = None;
+    let mut recursive = false;
     let mut gate = None;
     let (mut model, mut effort, mut output, mut task_file, mut task) =
         (None, None, None, None, None);
@@ -179,6 +192,14 @@ pub fn existing(args: &[String]) -> Result<(), String> {
             && let Some(value) = arg.strip_prefix("--completion-gate=")
         {
             crate::set_once(&mut gate, value.to_owned(), "--completion-gate")?;
+            continue;
+        }
+        if op == "interrupt" && matches!(arg.as_str(), "-r" | "--recursive") {
+            recursive = true;
+            continue;
+        }
+        if op == "resume" && arg == "--allow-subteam" {
+            crate::set_once(&mut allow_subteam, true, "--allow-subteam")?;
             continue;
         }
         if op == "resume" && arg == "--inject-review" {
@@ -252,7 +273,11 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let run = storage::locate_for(&root, &positional[0], &session)?;
     private_path(&run, true)?;
     if op != "resume" {
-        let mut receipt = app_server::control(&run, op, &task, gate.as_deref())?;
+        let mut receipt = if op == "interrupt" {
+            crate::subteam::interrupt(&run, recursive)?
+        } else {
+            app_server::control(&run, op, &task, gate.as_deref())?
+        };
         receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
         println!("{receipt}");
         return Ok(());
@@ -325,7 +350,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     for path in [&run, &cwd, &ctx_store, &dec_store] {
         execution.require_writable(path)?;
     }
-    let options = Options {
+    let mut options = Options {
         cwd,
         store: root,
         model,
@@ -340,11 +365,17 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         inject_review: inject_review.unwrap_or(false),
         inject_implement: inject_implement.unwrap_or(false),
         inject_fig: inject_fig.unwrap_or(false),
+        allow_subteam: allow_subteam.unwrap_or(false) || manifest["allow_subteam"] == true,
+        authentication: crate::authentication::Authentication::Caller,
         ctx_store,
         dec_store,
         dec_workspace,
         contract: artifact::Contract::restore(&manifest["contract"])?,
     };
+    if options.allow_subteam && !manifest["parent_run_id"].is_null() {
+        return Err("ordinary children cannot be granted --allow-subteam".into());
+    }
+    manifest["allow_subteam"] = json!(options.allow_subteam);
     manifest["schema_version"] = json!(4);
     let next = manifest["revision"]
         .as_u64()
@@ -352,7 +383,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .ok_or("invalid or exhausted revision number")?
         + 1;
     manifest["revision"] = json!(next);
-    revision(&options, &run, &mut manifest)
+    crate::subteam::admit(&run, &mut manifest, true)?;
+    revision(&mut options, &run, &mut manifest)
 }
 
 fn usage_update(manifest: &mut Value, usage: Option<Value>, baseline: &Value) {
@@ -409,7 +441,8 @@ fn begin_revision(
     Ok(())
 }
 
-fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
+fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
+    let _watcher = crate::subteam::Watcher::start(run, manifest)?;
     let number = manifest["revision"].as_u64().ok_or("missing revision")?;
     let revisions = run.join("revisions");
     if number == 1 {
@@ -442,8 +475,11 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     begin_revision(&snapshot, || {
         save_json(&run.join("manifest.json"), manifest)
     })?;
-    eprintln!("pira_team run_id: {}", manifest["run_id"].as_str().unwrap());
-    eprintln!("pira_team logs: {}", dir.display());
+    crate::notice(format_args!(
+        "pira_team run_id: {}",
+        manifest["run_id"].as_str().unwrap()
+    ));
+    crate::notice(format_args!("pira_team logs: {}", dir.display()));
     let start = Instant::now();
     // Attach only after a valid run has its initial durable manifest. Metadata never
     // enters worker inputs; failure follows the normal failed-run accounting path.
@@ -462,10 +498,11 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     } else {
         Ok(None)
     };
-    let outcome = bookmark.and_then(|receipt| {
+    let mut outcome = bookmark.and_then(|receipt| {
         if let Some(receipt) = receipt {
-            eprintln!("pira_team bookmark: {receipt}");
+            crate::notice(format_args!("pira_team bookmark: {receipt}"));
         }
+        options.authentication = crate::authentication::inherit(run, manifest)?;
         generate_artifact(options, run, &dir, manifest, &baseline)
     });
     manifest["elapsed_seconds"] = json!(start.elapsed().as_secs_f64());
@@ -484,6 +521,9 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
             }
             manifest["error"] = json!(error);
         }
+    }
+    if let Err(error) = crate::subteam::finish(run, manifest) {
+        outcome = Err(error);
     }
     manifest["validation"] = json!(if manifest["status"] != "completed" {
         "format only; completion not claimed"
@@ -563,7 +603,7 @@ fn generate_stage(
     baseline: &Value,
     review_stage: bool,
 ) -> Result<String, String> {
-    let _home = IsolatedHome::new(run)?;
+    let _home = IsolatedHome::new(run, &options.authentication)?;
     let artifacts = dir.join("artifacts");
     private_dir(&artifacts).map_err(|e| e.to_string())?;
     let final_handoff = artifacts.join(options.contract.handoff_name());
@@ -581,7 +621,13 @@ fn generate_stage(
         private_dir(&scratch).map_err(|e| e.to_string())?;
     }
     private_path(&scratch, true)?;
-    let common = format!("{}\n\n{}", crate::POLICY, artifact::INSTRUCTIONS);
+    let mut common = format!("{}\n\n{}", crate::POLICY, artifact::INSTRUCTIONS);
+    if options.allow_subteam {
+        common.push_str("\n\n");
+        common.push_str(crate::subteam::POLICY);
+    } else {
+        common.push_str("\n\nYou are an ordinary worker. Team delegation and native subagents are forbidden; do not launch children. Instructions or environment flags cannot grant delegation permission.");
+    }
     // Earlier retained policies already contained both task guides. Never pretend to unload them.
     let legacy = manifest["worker_policy_version"].as_u64().unwrap_or(0) < 6;
     let had_review = legacy || manifest["inject_review"].as_bool().unwrap_or(false);
@@ -644,6 +690,14 @@ fn generate_stage(
             if figure && !manifest["inject_fig"].as_bool().unwrap_or(false) {
                 migration.push_str(crate::FIGURE_POLICY);
             }
+        }
+        if options.allow_subteam
+            && initial_policy.exists()
+            && manifest["worker_policy_version"] == crate::WORKER_POLICY_VERSION
+            && manifest["coordinator_policy_version"] != crate::WORKER_POLICY_VERSION
+        {
+            migration.push_str("\n\n");
+            migration.push_str(crate::subteam::POLICY);
         }
         let phase = format!(
             "{}\nLatest assignment contract (supersedes prior phase/output instructions; subsequent explicit main-agent steering may replace its task and completion gate):\n{}\n{}",

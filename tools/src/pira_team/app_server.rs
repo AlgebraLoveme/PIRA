@@ -1,5 +1,5 @@
 //! Minimal native Codex transport; adapted from archived Team JSON-RPC patterns.
-use crate::{Options, command, create, isolate, lifecycle, terminate};
+use crate::{Options, command, create, lifecycle};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -94,6 +94,8 @@ struct Endpoint {
     token: String,
     turn: Arc<std::sync::Mutex<Option<String>>>,
     sandbox: Value,
+    authentication: Option<crate::authentication::Server>,
+    revision: Value,
 }
 impl Endpoint {
     fn start(
@@ -102,6 +104,7 @@ impl Endpoint {
         sandbox: &Value,
         sender: mpsc::SyncSender<Event>,
         mut controls: File,
+        authentication: Option<crate::authentication::Server>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
@@ -115,6 +118,7 @@ impl Endpoint {
         let revision = revision.clone();
         let thread = std::thread::spawn({
             let token = token.clone();
+            let revision = revision.clone();
             move || {
                 let mut replies: Vec<std::thread::JoinHandle<()>> = Vec::new();
                 for connection in listener.incoming() {
@@ -203,6 +207,8 @@ impl Endpoint {
             token,
             turn,
             sandbox: sandbox.clone(),
+            authentication,
+            revision,
         };
         endpoint.publish(None)?;
         Ok(endpoint)
@@ -212,7 +218,8 @@ impl Endpoint {
         lifecycle::save_json(
             &self.path,
             &json!({"address":self.address.to_string(),"token":self.token,"turn_id":turn,
-                "sandbox_policy":self.sandbox}),
+                "sandbox_policy":self.sandbox,"authentication":{"revision":self.revision,
+                    "endpoint":self.authentication.as_ref().map(crate::authentication::Server::endpoint)}}),
         )
     }
 
@@ -389,6 +396,7 @@ pub struct Turn {
 
 struct Server {
     child: Child,
+    scope: crate::process::Scope,
     writer: Option<mpsc::SyncSender<String>>,
     writer_thread: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -431,10 +439,8 @@ impl Server {
         let event_log =
             BufReader::new(File::open(dir.join("events.jsonl")).map_err(|e| e.to_string())?);
         let requests = create(&dir.join("requests.jsonl"))?;
-        isolate(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("launch Codex app-server: {e}"))?;
+        let (mut child, scope) =
+            crate::process::spawn(&mut cmd).map_err(|e| format!("launch Codex app-server: {e}"))?;
         let pipe_stop = Arc::new(AtomicBool::new(false));
         let pipes = (|| {
             Ok::<_, String>((
@@ -451,7 +457,7 @@ impl Server {
         let (writer, stdout) = match pipes {
             Ok(pipes) => pipes,
             Err(error) => {
-                terminate(child.id());
+                scope.terminate();
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(error);
@@ -460,21 +466,21 @@ impl Server {
         let fault = Arc::new(std::sync::Mutex::new(None));
         let watchdog_fault = fault.clone();
         let (finished, finish_rx) = mpsc::channel();
-        let pid = child.id();
+        let watchdog_scope = scope.clone();
         let watchdog = std::thread::spawn(move || {
             // Cover blocked stdin writes: signals and reader failures must still stop the peer.
             let grace = Duration::from_secs(5);
             let mut cutoff: Option<Instant> = None;
             loop {
                 if watchdog_fault.lock().unwrap().is_some() {
-                    terminate(pid);
+                    watchdog_scope.terminate();
                     break;
                 }
                 if crate::CANCELLED.load(Ordering::SeqCst) {
                     cutoff.get_or_insert_with(|| Instant::now() + grace);
                 }
                 if cutoff.is_some_and(|deadline| Instant::now() >= deadline) {
-                    terminate(pid);
+                    watchdog_scope.terminate();
                     break;
                 }
                 match finish_rx.recv_timeout(Duration::from_millis(100)) {
@@ -523,6 +529,7 @@ impl Server {
         });
         Ok(Self {
             child,
+            scope,
             writer: Some(writer),
             writer_thread: Some(writer_thread),
             reader: Some(reader),
@@ -667,17 +674,16 @@ impl Server {
             return;
         }
         self.writer.take();
-        let pid = self.child.id();
+        let watchdog_scope = self.scope.clone();
         let (done, rx) = mpsc::channel();
         let watchdog = std::thread::spawn(move || {
             if rx.recv_timeout(Duration::from_secs(3)).is_err() {
-                terminate(pid);
+                watchdog_scope.terminate();
             }
         });
-        let _ = self.child.wait();
+        let _ = self.scope.wait(&mut self.child);
         let _ = done.send(());
         let _ = watchdog.join();
-        terminate(pid);
         // Detached descendants are not ours to kill, but must not hold our
         // reader/writer joins hostage by retaining inherited pipe descriptors.
         self.pipe_stop.store(true, Ordering::SeqCst);
@@ -838,8 +844,19 @@ pub fn turn(
         &options.execution.sandbox,
         control_sender,
         controls.try_clone().map_err(|e| e.to_string())?,
+        if options.allow_subteam {
+            Some(crate::authentication::Server::start(
+                run,
+                &manifest["revision"],
+                &options.authentication,
+            )?)
+        } else {
+            None
+        },
     )?;
     let mut server = Server::new(options, run, dir, handoff, sender, events, control_events)?;
+    // Server owns cleanup before the fallible binding write; no separate spawn rollback.
+    crate::subteam::bind(run, &manifest["revision"], &server.scope)?;
     let mut stopping: Option<(&str, Instant)> = None;
     let outcome = (|| -> Result<(String, Option<String>), String> {
         server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}))
@@ -885,6 +902,9 @@ pub fn turn(
         }
         // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
         manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+        if options.allow_subteam {
+            manifest["coordinator_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+        }
         manifest["inject_review"] = json!(guidance.0);
         manifest["inject_implement"] = json!(guidance.1);
         manifest["inject_fig"] = json!(guidance.2);
@@ -903,11 +923,11 @@ pub fn turn(
         manifest["active_turn"] = json!(turn_id);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
         endpoint.activate(&turn_id)?;
-        eprintln!(
+        crate::notice(format_args!(
             "pira_team active: {} (revision {}; repair={repair})",
             manifest["run_id"].as_str().unwrap_or("?"),
             manifest["revision"]
-        );
+        ));
 
         let mut pending_controls: HashMap<u64, (String, String, String, mpsc::Sender<Value>)> =
             HashMap::new();
@@ -923,8 +943,8 @@ pub fn turn(
             if let Some((status, deadline)) = stopping
                 && Instant::now() >= deadline
             {
-                terminate(server.child.id());
-                return Ok((status.into(), Some("cancellation did not settle; owned backend processes terminated (Unix process group; detached descendants excluded)".into())));
+                server.scope.terminate();
+                return Ok((status.into(), Some("cancellation did not settle; owned backend process scope terminated; detached/breakaway descendants excluded".into())));
             }
             let event = if let Ok(control) = server.controls.try_recv() {
                 control

@@ -140,7 +140,11 @@ pub fn load() -> Result<Value, String> {
     {
         return Err("invalid CODEX_THREAD_ID".into());
     }
-    let home = std::env::var_os("CODEX_HOME")
+    let worker = crate::subteam::caller_run()?;
+    let home = worker
+        .as_ref()
+        .map(|run| run.join("codex-home").into_os_string())
+        .or_else(|| std::env::var_os("CODEX_HOME"))
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
@@ -150,6 +154,23 @@ pub fn load() -> Result<Value, String> {
                 .map(|p| PathBuf::from(p).join(".codex"))
         })
         .ok_or("cannot locate Codex home")?;
+    // A root may know its coordinator's thread ID/home, but selecting that log
+    // through environment variables must not turn root into the immediate parent.
+    if worker.is_none()
+        && let Ok(physical) = home.canonicalize()
+        && physical.file_name().and_then(|name| name.to_str()) == Some("codex-home")
+        && let Some(run) = physical.parent()
+        && run.join("run.lock").is_file()
+        && run.join("manifest.json").is_file()
+    {
+        let manifest = crate::lifecycle::read_json(&run.join("manifest.json"))?;
+        if manifest["transport"] == "app-server" && manifest["thread_id"] == thread {
+            return Err(
+                "Team worker identity requires actual backend ancestry, not environment assertions"
+                    .into(),
+            );
+        }
+    }
     let sessions = home.join("sessions");
     let mut matches = Vec::new();
     collect(
@@ -162,7 +183,14 @@ pub fn load() -> Result<Value, String> {
     if matches.len() != 1 {
         return Err("expected one matching parent session log".into());
     }
-    read(&matches[0], &thread)
+    let context = read(&matches[0], &thread)?;
+    if let Some(run) = worker {
+        let manifest = crate::lifecycle::read_json(&run.join("manifest.json"))?;
+        if manifest["thread_id"] != thread {
+            return Err("caller does not match retained native worker identity".into());
+        }
+    }
+    Ok(context)
 }
 
 fn collect(

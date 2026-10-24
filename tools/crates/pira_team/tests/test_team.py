@@ -19,7 +19,7 @@ class TeamTests(unittest.TestCase):
         home = self.root / "original-home"
         home.mkdir()
         (home / "AGENTS.md").write_text("global instructions must not be inherited")
-        self.env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", CODEX_HOME=str(home))
+        self.env = dict(os.environ, PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}", CODEX_HOME=str(home))
         self.env["PIRA_CTX_STORE_DIR"] = str(self.root / "ctx-store")
         self.env["PIRA_DEC_STORE_DIR"] = str(self.root / "dec-store")
         self.env["TEAM_TEST_BACKEND_CONTRACT"] = str(Path(__file__).resolve().parents[3] / "src/pira_team/backend_contract.json")
@@ -32,6 +32,11 @@ class TeamTests(unittest.TestCase):
         fake = self.root / "codex"
         fake.write_text(Path(__file__).with_name("fake_codex.py").read_text())
         fake.chmod(0o700)
+        if os.name == "nt":
+            import shutil
+            import sys
+            shutil.copyfile(os.environ["PIRA_TEAM_TEST_CODEX"], self.root / "codex.exe")
+            self.env.update(TEAM_FIXTURE_PYTHON=sys.executable, TEAM_FIXTURE_CODEX=str(fake))
         self.parent([{}])
 
     def launch(self, task: str, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -1185,7 +1190,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 17)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 19)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1233,7 +1238,7 @@ class TeamTests(unittest.TestCase):
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual(policy.read_bytes(), prefix)
             updated = json.loads(manifest.read_text())
-            self.assertEqual(updated["worker_policy_version"], 17)
+            self.assertEqual(updated["worker_policy_version"], 19)
             self.assertIsNone(updated.get("dec_workspace"))
 
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
@@ -1266,7 +1271,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 17)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 19)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
