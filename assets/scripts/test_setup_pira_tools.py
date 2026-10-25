@@ -161,6 +161,33 @@ else:
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.probe(mode)
 
+    def test_project_readback_requires_exact_key_and_disabled_layer(self):
+        peer = r'''
+import json, sys
+from pathlib import Path
+request = json.loads(sys.stdin.readline())
+print(json.dumps({"id": request["id"], "result": {"userAgent": "fixture"}}), flush=True)
+assert json.loads(sys.stdin.readline())["method"] == "initialized"
+request = json.loads(sys.stdin.readline())
+assert request["method"] == "config/read"
+project = request["params"]["cwd"]
+mode = sys.argv[1]
+key = '"' + project + '"' if mode == "quoted" else project
+result = {"config": {"projects": {key: {"trust_level": "untrusted"}}},
+          "layers": [{"name": {"type": "project", "dotCodexFolder": str(Path(project) / ".codex")},
+                      "disabledReason": None if mode == "loaded" else "untrusted"}]}
+print(json.dumps({"id": request["id"], "result": result}), flush=True)
+sys.stdin.read()
+'''
+        for mode in ("exact", "quoted", "loaded"):
+            with self.subTest(mode=mode):
+                command = [sys.executable, "-u", "-c", peer, mode]
+                if mode == "exact":
+                    setup.check_team_initialize(command, dict(os.environ), project="/project.path")
+                else:
+                    with self.assertRaisesRegex(ValueError, "exact untrusted cwd key|layer was not disabled"):
+                        setup.check_team_initialize(command, dict(os.environ), project="/project.path")
+
     def test_initialize_deadline_covers_silent_and_partial_output(self):
         for mode in ("silent", "partial"):
             with self.subTest(mode=mode), self.assertRaises(subprocess.TimeoutExpired):
@@ -497,7 +524,11 @@ class SetupPiraToolsTests(unittest.TestCase):
                 self.assertNotIn("--strict-config", command)
                 fixture["write_schemas"](command[command.index("--out") + 1], contract, fault)
                 return subprocess.CompletedProcess(command, 0, "", "")
-            def initialize(command, env):
+            def initialize(command, env, *, project):
+                self.assertIn(".path with spaces", project)
+                self.assertIn(f'projects={{{json.dumps(project, ensure_ascii=False)}={{trust_level="untrusted"}}}}', command)
+                self.assertTrue((Path(project) / ".codex/config.toml").is_file())
+                self.assertIn('trust_level="trusted"', (Path(env["CODEX_HOME"]) / "config.toml").read_text())
                 self.assertNotIn("daemon", command)
                 self.assertIn("--strict-config", command)
                 self.assertIn("--stdio", command)

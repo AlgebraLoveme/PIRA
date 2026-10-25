@@ -1,0 +1,62 @@
+# Team-only private validation; kept separate from unrelated CI prototypes.
+name: Native Team release validation
+on: [push]
+permissions:
+  contents: read
+jobs:
+  team:
+    if: github.event.repository.private == true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@@CHECKOUT@
+        with:
+          persist-credentials: false
+      - name: Verify exact reviewed snapshot
+        shell: bash
+        run: sha256sum --check SOURCE_SHA256SUMS
+      - name: Native Team Rust tests (including Windows jobs, pipes and ancestry)
+        run: cargo test --locked --manifest-path tools/Cargo.toml -p pira_team
+      - name: Build fake-backend behavior binaries
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec
+      - name: Build committed Ctx for required Linux wrapper integration
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_ctx
+      - name: Required native subteam lifecycle and authentication behavior
+        run: python -B tools/crates/pira_team/tests/native_ci.py
+      - name: Provision pinned native Codex (no authentication or inference)
+        shell: bash
+        run: python -B tools/build/private_ci.py provision-codex --directory "$RUNNER_TEMP/team-native-codex"
+      - name: Native Codex schema and outgoing Team request contract
+        shell: bash
+        run: |
+          python -B - <<'PY'
+          import json, os, pathlib, subprocess
+          # Resolve the already-built library test executable while Cargo still
+          # has its ordinary toolchain/cache context. Its native subprocess runs
+          # below with an isolated credential-free home and no rustup shim.
+          artifacts = subprocess.check_output(["cargo","test","--locked",
+              "--manifest-path","tools/Cargo.toml","-p","pira_team","--no-run",
+              "--message-format=json"], text=True)
+          harnesses = [item["executable"] for line in artifacts.splitlines()
+              if (item := json.loads(line)).get("reason") == "compiler-artifact"
+              and item.get("profile",{}).get("test") and item["target"]["kind"] == ["lib"]]
+          assert len(harnesses) == 1
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "team-native-codex"
+          if os.name == "nt":
+              os.link(directory / "codex-x86_64-pc-windows-msvc.exe", directory / "codex.exe")
+          environment = {key:value for key,value in os.environ.items()
+                         if key.upper() in {"PATH","SYSTEMROOT","WINDIR","COMSPEC","PATHEXT"}}
+          environment.update(HOME=str(directory), USERPROFILE=str(directory), LOCALAPPDATA=str(directory),
+              CODEX_HOME=str(directory), PATH=str(directory)+os.pathsep+environment["PATH"])
+          subprocess.run([harnesses[0], "--ignored", "--exact",
+              "backend::tests::installed_native_schema_supports_team_requests"],
+              env=environment, check=True)
+          PY

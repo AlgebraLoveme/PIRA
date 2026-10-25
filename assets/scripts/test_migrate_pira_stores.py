@@ -66,6 +66,39 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual((self.destination / "workspace/records/two.piradec").read_bytes(), b"two")
         self.assertEqual(len(migration.inventory(self.destination)), 3)
 
+    def test_identical_destination_still_requires_idle_writer_lease(self):
+        self.put(self.source, "record.piractx")
+        self.put(self.destination, "record.piractx")
+        lock = self.put(self.destination, "indexes/.index.owner-lock", b"lease")
+        before = migration.inventory(self.destination, tool="pira_ctx")
+        with migration.lease(lock), self.assertRaisesRegex(RuntimeError, "lease"):
+            self.plan("pira_ctx")
+        self.assertEqual(migration.inventory(self.destination, tool="pira_ctx"), before)
+
+    def test_identical_destination_addition_after_preflight_is_rejected(self):
+        self.put(self.source, "record")
+        self.put(self.destination, "record")
+        plan = self.plan()
+        late = self.put(self.destination, "late", b"late writer")
+        with self.assertRaisesRegex(RuntimeError, "changed after migration preflight"):
+            migration.apply_migrations([plan])
+        self.assertEqual(late.read_bytes(), b"late writer")
+
+    def test_destination_addition_during_copy_is_not_silently_accepted(self):
+        source = self.put(self.source, "record")
+        plan = self.plan()
+        copy = migration.shutil.copyfileobj
+        def concurrent_write(original, output, length):
+            copy(original, output, length)
+            self.put(self.destination, "late", b"late writer")
+        with patch.object(migration.shutil, "copyfileobj", side_effect=concurrent_write):
+            with self.assertRaisesRegex(RuntimeError, "Unexpected destination writes"):
+                migration.apply_migrations([plan])
+        self.assertEqual(source.read_bytes(), b"record\x00\xff")
+        self.assertEqual((self.destination / "late").read_bytes(), b"late writer")
+        migration.apply_migrations([self.plan()])
+        self.assertEqual((self.destination / "late").read_bytes(), b"late writer")
+
     def test_conflicting_content_or_modes_and_tree_collision_fail_before_writes(self):
         self.put(self.source, "record", b"source")
         for content, mode in ((b"different", 0o600), (b"source", 0o400)):
@@ -450,6 +483,138 @@ class MigrationTests(unittest.TestCase):
                 migration.transform_team_manifest(
                     self.team_manifest(old, attempts=[{field: str(path)}]), old, new)
 
+    def test_team_runtime_repair_history_layouts(self):
+        # Mirror lifecycle's per-revision attempt records and immutable snapshots.
+        for case, revision, repair_revision, terminal in (
+                ("initial", 1, 0, "completed"),
+                ("initial-repaired", 1, 1, "completed"),
+                ("initial-failed-repair", 1, 1, "failed"),
+                ("resume-repaired", 2, 2, "completed"),
+                ("resume-after-initial-repair", 2, 1, "completed")):
+            with self.subTest(case=case):
+                source = self.root / case / "old"
+                destination = self.root / case / "new"
+                old, new = source / "run-id", destination / "run-id"
+                manifests = []
+                for number in range(1, revision + 1):
+                    base = Path() if number == 1 else Path(f"revisions/{number:06}")
+                    repair = number == repair_revision
+                    status = terminal if number == revision else "completed"
+                    attempts = []
+                    for index in range(2 if repair else 1):
+                        directory = base / "repair" if index else base
+                        invalid = repair and (index == 0 or status == "failed")
+                        attempt = {"logs": str(old / directory),
+                                   "candidate": str(old / directory / "candidate.txt"),
+                                   "status": "invalid" if invalid else "validated"}
+                        self.put(old, directory / "candidate.txt", b'{"status":"completed","format":"json"}')
+                        if invalid:
+                            attempt["diagnostics"] = str(old / directory / "validation.json")
+                            self.put(old, directory / "validation.json", b'{"error":"content JSON"}')
+                        attempts.append(attempt)
+                    handoff = base / "artifacts/handoff.json"
+                    self.put(old, handoff, b"[" if status == "failed" else b"[]")
+                    raw = self.team_manifest(old, revision=number, repairs=int(repair), status=status,
+                        logs=str(old / base), attempts=attempts, review_checkpoint=None,
+                        artifact=None if status == "failed" else handoff.as_posix(),
+                        result=None if status == "failed" else str(old / handoff))
+                    manifests.append(raw)
+                    self.put(old, f"revisions/{number:06}/manifest.json", raw)
+                self.put(old, "manifest.json", manifests[-1])
+                before = migration.inventory(old)
+                for raw in manifests:
+                    original = json.loads(raw)
+                    transformed = json.loads(migration.transform_team_manifest(raw, old, new))
+                    self.assertEqual(transformed["logs"], str(new / Path(original["logs"]).relative_to(old)))
+                    for attempt, rebased in zip(original["attempts"], transformed["attempts"]):
+                        for field in ("logs", "candidate", "diagnostics"):
+                            if field in attempt:
+                                self.assertEqual(rebased[field], str(new / Path(attempt[field]).relative_to(old)))
+                    for field in ("revision", "repairs", "status", "artifact", "revisions", "thread_id"):
+                        self.assertEqual(transformed[field], original[field])
+                self.assertTrue(migration.team_history(old, new))
+                helper = MagicMock()
+                helper.capabilities.return_value = {"admitted": True}
+                with patch.object(migration, "team_backend", return_value=helper):
+                    plans = migration.preflight_team_relocation([source], destination, codex_binary="synthetic-only")
+                self.assertEqual(len(plans), 1)
+                helper.inspect_source.assert_called_once_with(old, "run-id", "native-fixture", codex_binary="synthetic-only")
+                self.assertEqual(migration.inventory(old), before)
+                self.assertFalse(destination.exists())
+
+    def test_team_root_repair_paths_are_exact_and_attempt_scoped(self):
+        old, new = self.source / "run-id", self.destination / "run-id"
+        for field, suffix in (
+                ("logs", "repair/candidate.txt"), ("logs", "repair/nested"),
+                ("candidate", "repair"), ("candidate", "repair/validation.json"),
+                ("candidate", "repair/nested/candidate.txt"), ("candidate", "repair/auth.json"),
+                ("candidate", "repair/../candidate.txt"), ("candidate", "repair/./candidate.txt"),
+                ("candidate", "repair//candidate.txt"), ("candidate", "repair/..\\candidate.txt"),
+                ("diagnostics", "repair/candidate.txt"), ("diagnostics", "repair/nested/validation.json")):
+            with self.subTest(field=field, suffix=suffix), self.assertRaises(RuntimeError):
+                migration.transform_team_manifest(self.team_manifest(old, revision=1, repairs=1,
+                    attempts=[{field: str(old) + "/" + suffix}]), old, new)
+        for field in ("logs", "result", "review_checkpoint"):
+            with self.subTest(top_level=field), self.assertRaises(RuntimeError):
+                migration.transform_team_manifest(self.team_manifest(old, revision=1, repairs=1,
+                    **{field: str(old / "repair")}), old, new)
+        for changes in ({"revision": 2}, {"revision": True}, {"revision": "1"},
+                        {"run_id": "wrong"}, {"status": "running"}, {"active_turn": "active"},
+                        {"schema_version": 99}):
+            with self.subTest(changes=changes), self.assertRaises(RuntimeError):
+                fields = dict(revision=1, repairs=1, attempts=[{"logs": str(old / "repair")}])
+                fields.update(changes)
+                migration.transform_team_manifest(self.team_manifest(old, **fields), old, new)
+        for path in ("repair/candidate.txt", str(old) + "-other/repair/candidate.txt", 3):
+            with self.subTest(path=path), self.assertRaises(RuntimeError):
+                migration.transform_team_manifest(self.team_manifest(old, revision=1, repairs=1,
+                    attempts=[{"candidate": path}]), old, new)
+
+    def test_team_root_repair_preserves_windows_prefix_case_semantics(self):
+        from pathlib import PureWindowsPath
+        old = PureWindowsPath(r"C:\Source\run-id")
+        new = PureWindowsPath(r"C:\Destination\run-id")
+        for suffix in ("candidate.txt", r"repair\candidate.txt"):
+            with self.subTest(suffix=suffix), patch.object(migration, "Path", PureWindowsPath):
+                raw = self.team_manifest(old, revision=1, repairs=1, attempts=[{
+                    "candidate": str(PureWindowsPath(r"c:\source\run-id") / suffix)}])
+                transformed = json.loads(migration.transform_team_manifest(raw, old, new))
+                self.assertEqual(transformed["attempts"][0]["candidate"], str(new / suffix))
+
+    def test_team_root_repair_history_keeps_snapshot_and_alias_guards(self):
+        old, new = self.source / "run-id", self.destination / "run-id"
+        raw = self.team_manifest(old, revision=1, repairs=1, logs=str(old), attempts=[
+            {"logs": str(old), "status": "invalid"},
+            {"logs": str(old / "repair"), "candidate": str(old / "repair/candidate.txt"),
+             "status": "validated"}])
+        self.put(old, "manifest.json", raw)
+        snapshot = self.put(old, "revisions/000001/manifest.json", raw)
+        candidate = self.put(old, "repair/candidate.txt", b"control response")
+        self.assertTrue(migration.team_history(old, new))
+        wrong_id = json.loads(raw)
+        wrong_id["run_id"] = "other-run"
+        for corrupt in (b"{", json.dumps(wrong_id).encode()):
+            with self.subTest(corrupt=corrupt):
+                snapshot.write_bytes(corrupt)
+                with self.assertRaises(RuntimeError):
+                    migration.team_history(old, new)
+                self.assertEqual(snapshot.read_bytes(), corrupt)
+                self.assertEqual((old / "manifest.json").read_bytes(), raw)
+        snapshot.write_bytes(raw)
+        if os.name != "nt":  # Do not require Windows symlink privileges for this fixture.
+            unrelated = self.put(self.root / "unrelated", "candidate.txt", b"unrelated fixture")
+            candidate.unlink()
+            candidate.symlink_to(unrelated)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                migration.team_history(old, new)
+            candidate.unlink()
+            candidate.parent.rmdir()
+            candidate.parent.symlink_to(unrelated.parent, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                migration.team_history(old, new)
+            self.assertEqual(unrelated.read_bytes(), b"unrelated fixture")
+        self.assertFalse(self.destination.exists())
+
     @patch('team_store_relocation._VALIDATED_PLATFORMS', frozenset())
     def test_team_same_id_compares_whole_transformed_history_and_omits_capabilities(self):
         old = self.source / "run-id"
@@ -577,6 +742,35 @@ class MigrationTests(unittest.TestCase):
         setup.apply_store_migrations(self.metadata_plan(), dry_run=True, verify=True)
         self.assertEqual(migration.inventory(self.destination, tool="pira_team"), used)
         self.assertEqual(migration.inventory(self.source, tool="pira_team"), original)
+
+    def test_team_scoped_bookmarks_merge_with_legacy_and_keep_session_collisions(self):
+        self.put(self.source, "bookmarks.json", b'[2, [["main-a", "same", "run-a"]], [["same", "legacy-run"]]]')
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.destination, "bookmarks.json", b'[2, [["main-b", "same", "run-b"]], [["other", "legacy-other"]]]')
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        target = self.destination / "bookmarks.json"
+        self.assertEqual(json.loads(target.read_bytes()), [2,
+            [["main-a", "same", "run-a"], ["main-b", "same", "run-b"]],
+            [["other", "legacy-other"], ["same", "legacy-run"]]])
+        target.write_bytes(b'[2, [["main-a", "same", "remapped"]], [["other", "legacy-other"]]]')
+        before = target.read_bytes()
+        setup.apply_store_migrations(self.metadata_plan(), dry_run=False)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_team_scoped_bookmark_corruption_and_same_session_conflicts_fail(self):
+        self.destination = self.root / ".local/share/pira/team"
+        self.put(self.source, "bookmarks.json", b'[2, [["main-a", "same", "run-a"]], []]')
+        for data in [b'[2, [["main-a", "same", "run-b"]], []]',
+                     b'[2, [["main-a", "same", "run-a"], ["main-a", "same", "run-a"]], []]',
+                     b'[2, [["bad/id", "same", "run-a"]], []]',
+                     b'[2, [["main-a", "same", "../run"]], []]']:
+            with self.subTest(data=data):
+                self.put(self.destination, "bookmarks.json", data)
+                source = (self.source / "bookmarks.json").read_bytes()
+                with self.assertRaises(RuntimeError):
+                    self.metadata_plan()
+                self.assertEqual((self.source / "bookmarks.json").read_bytes(), source)
+                self.assertEqual((self.destination / "bookmarks.json").read_bytes(), data)
 
     def test_team_metadata_conflicts_and_malformed_maps_preserve_stores(self):
         self.destination = self.root / ".local/share/pira/team"

@@ -698,7 +698,8 @@ def check_team_schema(schema: dict, expected: dict) -> None:
             fields(variant(schema["definitions"][name], "type", tag), names)
 
 
-def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: float = 10) -> None:
+def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: float = 10,
+                          project: str | None = None) -> None:
     """Wait with live stdin: 10s by default, then 1s EOF grace and 2s kill/reap limit."""
     initialize = {"id": 1, "method": "initialize", "params": {
         "clientInfo": {"name": "pira_team_setup", "version": "1"},
@@ -720,6 +721,7 @@ def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: f
                 pending = b""
                 received = 0
                 exited = False
+                expected_id = 1
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -735,11 +737,31 @@ def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: f
                         if not frame.strip():
                             continue
                         reply = json.loads(frame)
-                        if not isinstance(reply, dict) or type(reply.get("id")) is not int or reply["id"] != 1:
+                        if not isinstance(reply, dict) or type(reply.get("id")) is not int or reply["id"] != expected_id:
                             continue
-                        if ("error" in reply or not isinstance(reply.get("result"), dict)
-                                or not isinstance(reply["result"].get("userAgent"), str)):
-                            raise ValueError("invalid matching initialize response")
+                        result = reply.get("result")
+                        if "error" in reply or not isinstance(result, dict):
+                            raise ValueError("invalid matching startup response")
+                        if expected_id == 1:
+                            if not isinstance(result.get("userAgent"), str):
+                                raise ValueError("invalid matching initialize response")
+                            if project is None:
+                                matched = True
+                                return
+                            for request in ({"method": "initialized"}, {
+                                    "id": 2, "method": "config/read",
+                                    "params": {"includeLayers": True, "cwd": project}}):
+                                child.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+                            child.stdin.flush()
+                            expected_id = 2
+                            continue
+                        if result.get("config", {}).get("projects") != {project: {"trust_level": "untrusted"}}:
+                            raise ValueError("project trust override did not preserve the exact untrusted cwd key")
+                        project_folder = str(Path(project) / ".codex")
+                        if not any(layer.get("name", {}).get("dotCodexFolder") == project_folder
+                                   and layer.get("disabledReason")
+                                   for layer in result.get("layers", [])):
+                            raise ValueError("untrusted project configuration layer was not disabled")
                         matched = True
                         return
                     if data:
@@ -783,10 +805,20 @@ def check_team_protocol(executable: str) -> None:
         root = Path(temporary)
         home = root / "home"
         home.mkdir()
-        env = dict(os.environ, CODEX_HOME=str(home), TMPDIR=temporary, TMP=temporary, TEMP=temporary)
-        for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_THREAD_ID", "CODEX_SESSION_ID"):
-            env.pop(key, None)
-        command = [executable, "app-server", "--strict-config", "--stdio"]
+        # No caller credentials or backend selectors enter this no-model probe.
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"}}
+        env.update(HOME=str(home), USERPROFILE=str(home), CODEX_HOME=str(home),
+                   TMPDIR=temporary, TMP=temporary, TEMP=temporary)
+        project = (root / "project.path with spaces").resolve()
+        (project / ".git").mkdir(parents=True)
+        (project / ".codex").mkdir()
+        (project / ".codex/config.toml").write_text('model="project-layer-must-not-load"\n')
+        # JSON strings are TOML basic strings except for literal DEL.
+        project_key = json.dumps(str(project), ensure_ascii=False).replace("\x7f", "\\u007f")
+        (home / "config.toml").write_text(f'[projects.{project_key}]\ntrust_level="trusted"\n', encoding="utf-8")
+        command = [executable, "app-server", "--strict-config", "--stdio",
+                   "-c", f'projects={{{project_key}={{trust_level="untrusted"}}}}']
         for setting in contract["config"]:
             command.extend(["-c", setting])
         schema_dir = root / "schema"
@@ -806,7 +838,7 @@ def check_team_protocol(executable: str) -> None:
                 check_team_schema(schema, expected)
             except (KeyError, TypeError, AttributeError, ValueError) as error:
                 raise ValueError(f"{name}: {error}") from error
-        check_team_initialize(command, env)
+        check_team_initialize(command, env, project=str(project))
 
 
 def check_team_runtime(tools: list[str], executable: str | None = None) -> str | None:

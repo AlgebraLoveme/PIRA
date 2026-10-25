@@ -227,6 +227,7 @@ def digest(data: bytes) -> str:
 def selected(root: Path) -> list[Path]:
     # Runtime policy-mirror inputs used by Team Python tests (not user profiles).
     paths = [Path("AGENTS.md"), Path("modules/CODING_STYLE.md"),
+             Path("modules/PUBLIC_FIGURE_STYLE.md"),
              Path("tools/Cargo.toml"), Path("tools/Cargo.lock")]
     for tool in TOOLS:
         paths.append(Path(f"tools/crates/{tool}/Cargo.toml"))

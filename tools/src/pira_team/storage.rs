@@ -5,7 +5,9 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 pub fn default_root() -> Result<PathBuf, String> {
-    configured_root("PIRA_TEAM_DIR", "team")
+    crate::subteam::default_store()?
+        .map(Ok)
+        .unwrap_or_else(|| configured_root("PIRA_TEAM_DIR", "team"))
 }
 
 pub fn configured_root(key: &str, leaf: &str) -> Result<PathBuf, String> {
@@ -82,6 +84,14 @@ pub fn access(args: &[String]) -> Result<(), String> {
         if !path.is_file() {
             return Err("read requires a regular file".into());
         }
+        if path == run.join("manifest.json") {
+            let mut manifest = crate::lifecycle::read_json(&path)?;
+            if manifest["allow_subteam"] == true {
+                manifest["descendants"] = crate::subteam::summary(&run)?;
+                println!("{manifest}");
+                return Ok(());
+            }
+        }
         let mut file = File::open(&path).map_err(|e| format!("open managed file: {e}"))?;
         io::copy(&mut file, &mut io::stdout().lock())
             .map_err(|e| format!("read managed file: {e}"))?;
@@ -101,34 +111,94 @@ pub(crate) fn validate_run_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+const UNAVAILABLE: &str = "run unavailable to this main session";
+
 pub fn locate(root: &Path, reference: &str) -> Result<PathBuf, String> {
-    // Literal IDs keep their existing lookup path, even when bookmark metadata is bad.
+    let session = crate::profile::caller_session()?;
+    locate_for(root, reference, &session)
+}
+
+pub(crate) fn locate_for(root: &Path, reference: &str, session: &str) -> Result<PathBuf, String> {
     let resolved;
     let id = if let Some(label) = reference.strip_prefix('@') {
-        resolved = crate::bookmarks::resolve(root, label)?;
+        resolved = crate::bookmarks::resolve_for(root, label, session)?;
         resolved.as_str()
     } else {
         reference
     };
     validate_run_id(id)?;
-    let root = root
-        .canonicalize()
-        .map_err(|e| lookup_error("open Team store", e))?;
-    let run = root.join(id);
-    let meta =
-        fs::symlink_metadata(&run).map_err(|e| lookup_error(&format!("open run {id}"), e))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err("run must be a real directory".into());
+    let run = root.canonicalize().map_err(|_| UNAVAILABLE)?.join(id);
+    let creator = creator_session(&run).map_err(|_| UNAVAILABLE)?;
+    if creator != session {
+        return Err(UNAVAILABLE.into());
     }
     Ok(run)
 }
 
-fn lookup_error(context: &str, error: io::Error) -> String {
-    let mut message = format!("{context}: {error}");
-    if error.kind() == io::ErrorKind::NotFound {
-        message.push_str("; Team now defaults to the persistent PIRA/team store. For an older temporary-store run, pass --store OLD_STORE (or PIRA_TEAM_DIR). The former default was the platform temp directory's pira-team-UID on Unix, pira-team on Windows. Use the dedicated store migration tooling for relocation: retained runs contain absolute paths; do not simply move/merge directories");
+/// Only original evidence establishes ownership; latest execution caller and native
+/// worker thread identity are not creators. Errors are masked at the interface.
+pub(crate) fn creator_session(run: &Path) -> Result<String, String> {
+    use crate::lifecycle::{private_path, read_json};
+    private_path(run, true)?;
+    let manifest = read_json(&run.join("manifest.json"))?;
+    let id = run
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or(UNAVAILABLE)?;
+    if manifest.get("run_id").is_some_and(|stored| stored != id) {
+        return Err(UNAVAILABLE.into());
     }
-    message
+    if let Some(owner) = manifest.get("creator_main_session_id") {
+        let owner = owner.as_str().ok_or(UNAVAILABLE)?;
+        crate::profile::validate_session_id(owner)?;
+        return Ok(owner.to_owned());
+    }
+    let first = run.join("revisions/000001/manifest.json");
+    // A present but invalid original snapshot never falls back to mutable state.
+    let original = match fs::symlink_metadata(&first) {
+        Ok(_) => {
+            private_path(&run.join("revisions"), true)?;
+            private_path(&run.join("revisions/000001"), true)?;
+            read_json(&first)?
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Before the first snapshot, accept only an actively owned initial
+            // invocation, not an orphan/historical revision-1 manifest.
+            if manifest["revision"] != 1
+                || manifest["status"] != "running"
+                || !manifest["revisions"].as_array().is_some_and(Vec::is_empty)
+            {
+                return Err(UNAVAILABLE.into());
+            }
+            let lock = run.join("run.lock");
+            private_path(&lock, false)?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock)
+                .map_err(|_| UNAVAILABLE)?;
+            if !matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)) {
+                return Err(UNAVAILABLE.into());
+            }
+            manifest
+        }
+        Err(_) => return Err(UNAVAILABLE.into()),
+    };
+    if original["revision"] != 1 || original["run_id"] != id {
+        return Err(UNAVAILABLE.into());
+    }
+    let owner = if let Some(owner) = original.get("creator_main_session_id") {
+        owner.as_str().ok_or(UNAVAILABLE)?
+    } else {
+        if original["execution_permissions"]["source"] != "verified-caller-turn-context" {
+            return Err(UNAVAILABLE.into());
+        }
+        original["execution_permissions"]["caller_thread_id"]
+            .as_str()
+            .ok_or(UNAVAILABLE)?
+    };
+    crate::profile::validate_session_id(owner)?;
+    Ok(owner.to_owned())
 }
 
 fn artifact_path(run: &Path) -> Result<PathBuf, String> {

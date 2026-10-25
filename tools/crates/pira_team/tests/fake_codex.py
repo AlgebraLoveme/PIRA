@@ -9,11 +9,19 @@ import time
 
 def pause_at(stage):
     if os.environ.get("TEAM_PAUSE_AT") == stage and os.environ.get("TEAM_PAUSE_DIRECTORY", Path.cwd().name) == Path.cwd().name:
-        os.write(int(os.environ["TEAM_BOUNDARY_READY_FD"]), b"1")
-        assert os.read(int(os.environ["TEAM_BOUNDARY_RELEASE_FD"]), 1) == b"1"
+        if endpoint := os.environ.get("TEAM_BOUNDARY_ENDPOINT"):
+            import socket
+            with socket.create_connection(tuple(json.loads(endpoint)), timeout=20) as connection:
+                connection.sendall(b"1")
+                assert connection.recv(1) == b"1"
+        else:
+            os.write(int(os.environ["TEAM_BOUNDARY_READY_FD"]), b"1")
+            assert os.read(int(os.environ["TEAM_BOUNDARY_RELEASE_FD"]), 1) == b"1"
 
 
 args = sys.argv[1:]
+if args and args[0] == "native-fixture-app-server":
+    args[0] = "app-server"
 if args[:2] == ["app-server", "generate-json-schema"]:
     import runpy
     pause_at("schema")
@@ -87,13 +95,37 @@ if source := os.environ.get("TEAM_TEST_AUTH_SOURCE"):
     assert (home / "auth.json").samefile(source)
 if os.environ.get("CODEX_API_KEY"):
     assert not (home / "auth.json").exists()
-policy = Path(json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("model_instructions_file=")))).read_text()
+if os.environ.get("TEAM_FORBID_API_KEY"):
+    assert not os.environ.get("CODEX_API_KEY"), "unexpected API-key authentication selection"
+if expected_url := os.environ.get("TEAM_EXPECT_BACKEND_URL"):
+    assert os.environ.get("OPENAI_BASE_URL") == expected_url, "selected backend endpoint changed"
+if expected := os.environ.get("TEAM_EXPECT_AUTH_SHA256"):
+    import fnmatch
+    import hashlib
+    selected_key = os.environ.get("CODEX_API_KEY", "")
+    assert hashlib.sha256(selected_key.encode()).hexdigest() == expected, "backend authentication selection mismatch"
+    excluded = json.loads(next(a.split("=",1)[1] for a in args if a.startswith("shell_environment_policy.exclude=")))
+    shell = {key:value for key,value in os.environ.items()
+             if not any(fnmatch.fnmatchcase(key.upper(), pattern.upper()) for pattern in excluded)}
+    prefix = "shell_environment_policy.set."
+    for arg in args:
+        if arg.startswith(prefix):
+            key,value = arg[len(prefix):].split("=",1)
+            shell[key] = json.loads(value)
+    assert all(selected_key not in str(value) for value in shell.values()), "credential exposed to worker environment"
+    assert all(selected_key not in arg for arg in args), "credential exposed in backend arguments"
+    del selected_key
+policy = Path(json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("model_instructions_file=")))).read_text(encoding="utf-8")
 assert "Never read or expose secrets files" in policy and "pira_nav" in policy
 assert Path.cwd() != home
 state_path = home / "fixture-state.json"
 state = json.loads(state_path.read_text()) if state_path.exists() else {"thread": "fixture-thread", "turns": 0, "history": [], "usage": {}}
+if os.environ.get("TEAM_SUBTEAM_FIXTURE") and not state_path.exists():
+    state["thread"] = "worker-" + home.parent.name
 active = None
 due = None
+subteam_service = None
+service_read, service_write = os.pipe()
 handoff = Path(json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("shell_environment_policy.set.PIRA_TEAM_HANDOFF="))))
 
 def send(value):
@@ -101,6 +133,19 @@ def send(value):
 
 def notify(method, params):
     send({"method": method, "params": {"threadId": state["thread"], "turnId": active, **params}})
+
+def notification_burst():
+    for index in range(int(os.environ.get("TEAM_BURST_COUNT", "0"))):
+        state["usage"] = {"inputTokens": index + 1, "cachedInputTokens": 0, "outputTokens": index + 1}
+        notify("thread/tokenUsage/updated", {"tokenUsage": {"total": state["usage"]}})
+        notify("item/completed", {"item": {"type": "agentMessage", "phase": "final_answer",
+                                           "text": f"burst-{index}"}})
+        notify("item/completed", {"item": {"type": "agentMessage", "phase": "commentary", "text": "progress"}})
+        if delay := float(os.environ.get("TEAM_BURST_DELAY", "0")):
+            time.sleep(delay)
+    if os.environ.get("TEAM_BURST_MALFORMED"):
+        print("not-json", flush=True)
+        sys.exit(9)
 
 def partial_evidence(*, acknowledged):
     notify("thread/tokenUsage/updated", {"tokenUsage": {"total": {"inputTokens": 11, "cachedInputTokens": 3, "outputTokens": 2}}})
@@ -181,18 +226,50 @@ def finish(status="completed"):
     notify("turn/completed", {"turn": turn})
     active, due = None, None
 
+if os.name == "nt":
+    import queue
+    import threading
+    native_input = queue.Queue()
+    def read_input():
+        # Raw reads cannot hold Python's buffered-stdin lock during failure exit.
+        pending = b""
+        while chunk := os.read(sys.stdin.fileno(), 65536):
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                native_input.put(line)
+        native_input.put(b"")
+    threading.Thread(target=read_input, daemon=True).start()
+
 buffer = b""
 while True:
     wait = max(0, due - time.monotonic()) if due else None
-    if b"\n" not in buffer:
-        if not select.select([sys.stdin], [], [], wait)[0]:
+    if os.name == "nt":
+        try:
+            line = native_input.get(timeout=wait)
+        except queue.Empty:
+            finish("failed" if task == "failed" else "completed")
+            continue
+        if line is None:
+            finish()
+            continue
+        if not line:
+            break
+    elif b"\n" not in buffer:
+        ready = select.select([sys.stdin, service_read], [], [], wait)[0]
+        if service_read in ready:
+            os.read(service_read, 1)
+            finish()
+            continue
+        if not ready:
             finish("failed" if task == "failed" else "completed")
             continue
         chunk = os.read(sys.stdin.fileno(), 65536)
         if not chunk: break
         buffer += chunk
         if b"\n" not in buffer: continue
-    line, buffer = buffer.split(b"\n", 1)
+    if os.name != "nt":
+        line, buffer = buffer.split(b"\n", 1)
     request = json.loads(line)
     method, params = request["method"], request.get("params", {})
     if method == "initialized":
@@ -215,6 +292,18 @@ while True:
         if os.environ.get("TEAM_BAD_PERMISSION"):
             result["sandbox"]["type"] = "dangerFullAccess"
         state_path.write_text(json.dumps(state))
+        if os.environ.get("TEAM_SUBTEAM_FIXTURE"):
+            sessions = home / "sessions"
+            sessions.mkdir(exist_ok=True)
+            caller_policy = ({"type":"danger-full-access"} if sandbox == "danger-full-access" else {
+                "type":"workspace-write", "writable_roots":expected_sandbox["writableRoots"],
+                "network_access":expected_sandbox["networkAccess"],
+                "exclude_tmpdir_env_var":expected_sandbox["excludeTmpdirEnvVar"],
+                "exclude_slash_tmp":expected_sandbox["excludeSlashTmp"]})
+            (sessions / f"rollout-worker-{state['thread']}.jsonl").write_text(
+                json.dumps({"type":"session_meta", "payload":{"id":state["thread"]}}) + "\n" +
+                json.dumps({"type":"turn_context", "payload":{"model":params["model"], "effort":"high", "cwd":state["cwd"],
+                    "approval_policy":"never", "sandbox_policy":caller_policy}}) + "\n")
     elif method == "thread/inject_items":
         assert params["threadId"] == state["thread"]
         item, = params["items"]
@@ -229,21 +318,45 @@ while True:
         assert params["sandboxPolicy"] == expected_sandbox
         if sandbox == "workspace-write":
             roots = params["sandboxPolicy"]["writableRoots"]
-            assert any(Path(params["cwd"]).is_relative_to(Path(r)) for r in roots)
-            assert any(handoff.parent.is_relative_to(Path(r)) for r in roots)
+            def physical_path(path):
+                value = str(Path(path).resolve())
+                # ntpath.realpath deliberately preserves a supplied verbatim
+                # prefix, but removes it for ordinary paths to the same file.
+                if value.startswith("\\\\?\\UNC\\"):
+                    value = "\\\\" + value[8:]
+                elif value.startswith("\\\\?\\"):
+                    value = value[4:]
+                return Path(value)
+            physical_roots = [physical_path(root) for root in roots]
+            def within_roots(path):
+                path = physical_path(path)
+                return any(path.is_relative_to(root) for root in physical_roots)
+            assert within_roots(params["cwd"])
+            assert within_roots(handoff.parent)
             assert str(home) not in roots
-            assert any(scratch.is_relative_to(Path(r)) for r in roots)
+            assert within_roots(scratch)
             for expected in json.loads(os.environ.get("TEAM_EXPECT_BUILD_ROOTS", "[]")):
-                assert any(Path(expected).is_relative_to(Path(r)) for r in roots), (expected, roots)
+                assert within_roots(expected), (expected, roots)
             for forbidden in json.loads(os.environ.get("TEAM_FORBIDDEN_BUILD_ROOTS", "[]")):
                 assert forbidden not in roots
             for forbidden in json.loads(os.environ.get("TEAM_FORBIDDEN_TEMP_ROOTS", "[]")):
                 assert forbidden not in roots
             for key in ("PIRA_CTX_STORE_DIR", "PIRA_DEC_STORE_DIR"):
                 prefix = f"shell_environment_policy.set.{key}="
-                assert any(Path(json.loads(next(a[len(prefix):] for a in args if a.startswith(prefix)))).is_relative_to(Path(r)) for r in roots)
+                target = json.loads(next(a[len(prefix):] for a in args if a.startswith(prefix)))
+                assert within_roots(target), (key, target, roots)
 
         task = params["input"][0]["text"]
+        if task == "subteam-service" or (task == "Continue the existing assignment." and os.environ.get("TEAM_SUBTEAM_FIXTURE")):
+            import runpy
+            sys.path.insert(0, str(Path(os.environ["TEAM_SUBTEAM_FIXTURE"]).parent))
+            fixture = runpy.run_path(os.environ["TEAM_SUBTEAM_FIXTURE"])
+            def complete_subteam():
+                if os.name == "nt":
+                    native_input.put(None)
+                else:
+                    os.write(service_write, b"1")
+            subteam_service = fixture["start"](args, state, home, complete_subteam)
         repair = task.startswith("Repair only the output format")
         if repair and os.environ.get("TEAM_REPAIR_CRASH"): sys.exit(8)
         if task == "crash": sys.exit(7)
@@ -256,7 +369,7 @@ while True:
         state.setdefault("turn_details", []).append({"phase": state.get("phase"), "handoff": str(handoff), "policy": policy})
         state_path.write_text(json.dumps(state))
         due = time.monotonic() + float(os.environ.get("TEAM_DELAY", "0.001"))
-        if task in ("interrupt", "timeout", "steerable") or (repair and os.environ.get("TEAM_REPAIR_WAIT")): due = None
+        if task in ("interrupt", "timeout", "steerable", "subteam-service") or subteam_service is not None or (repair and os.environ.get("TEAM_REPAIR_WAIT")): due = None
         if os.environ.get("TEAM_IMPLEMENT_WAIT") and "IMPLEMENTATION STAGE." in state.get("phase", ""):
             due = None
         result = {"turn":{"id":active}}
@@ -279,6 +392,8 @@ while True:
     elif method != "initialize":
         raise AssertionError(method)
     failure = os.environ.get("TEAM_PARTIAL_FAILURE", "")
+    if method == "turn/start" and os.environ.get("TEAM_BURST_AT") == "before-ack":
+        notification_burst()
     if method == "turn/start" and failure.startswith("before-"):
         partial_evidence(acknowledged=False)
         if failure == "before-refusal":
@@ -291,6 +406,8 @@ while True:
             continue
     pause_at(method)
     send({"id":request["id"], "result":result})
+    if method == "turn/start" and os.environ.get("TEAM_BURST_AT") == "after-ack":
+        notification_burst()
     if method == "turn/start" and failure == "after-refusal":
         partial_evidence(acknowledged=True)
         refuse_request()

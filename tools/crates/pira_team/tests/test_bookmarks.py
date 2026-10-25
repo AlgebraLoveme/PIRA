@@ -24,10 +24,8 @@ class BookmarkTests(unittest.TestCase):
         self.env = self.fixture.env
         self.env["PIRA_TEAM_DIR"] = str(self.store)
         self.management_env = dict(self.env)
-        for key in ("CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_API_KEY", "OPENAI_API_KEY"):
+        for key in ("CODEX_API_KEY", "OPENAI_API_KEY"):
             self.management_env.pop(key, None)
-        self.management_env.update(CODEX_HOME=str(self.root / "no-session-or-auth"),
-                                   HOME=str(self.root / "no-personal-home"))
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(self.fixture.bin), *args], cwd=self.root,
@@ -44,12 +42,12 @@ class BookmarkTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         return result
 
-    def legacy(self, run_id: str, status: str = "completed") -> Path:
+    def owned_run(self, run_id: str, status: str = "completed") -> Path:
         run = self.store / run_id
         (run / "artifacts").mkdir(parents=True, mode=0o700)
         (run / "artifacts/handoff").write_text("legacy handoff " + run_id)
         (run / "manifest.json").write_text(json.dumps({"run_id": run_id, "status": status,
-            "artifact": "artifacts/handoff", "task": "not searchable task keywords"}))
+            "creator_main_session_id": "parent-session", "artifact": "artifacts/handoff", "task": "not searchable task keywords"}))
         return run
 
     def reference(self, run: Path) -> dict:
@@ -58,13 +56,13 @@ class BookmarkTests(unittest.TestCase):
     def assign(self, run: str, label: str) -> dict:
         return self.success("bookmark", run, "--label", label)
 
-    def test_no_caller_management_legacy_move_exact_equality_and_removal(self) -> None:
+    def test_verified_caller_management_move_exact_equality_and_removal(self) -> None:
         empty = {"matches": [], "has_more": False}
         self.assertEqual(self.success("bookmarks"), empty)
         self.assertEqual(self.success("search", "missing"), empty)
         self.assertFalse(self.success("unbookmark", "absent")["changed"])
         self.assertFalse(self.store.exists())
-        first, second = self.legacy("first"), self.legacy("second", "running")
+        first, second = self.owned_run("first"), self.owned_run("second", "running")
         originals = {p: p.read_bytes() for run in (first, second) for p in run.rglob("*") if p.is_file()}
         self.assertEqual(self.success("bookmarks"), empty)
         receipt = self.assign(first.name, "Reusable")
@@ -99,7 +97,7 @@ class BookmarkTests(unittest.TestCase):
         self.assertFalse(any((run / "codex-home").exists() for run in (first, second)))
 
     def test_literal_case_search_order_limits_and_metadata_only_fields(self) -> None:
-        run = self.legacy("run")
+        run = self.owned_run("run")
         for label in ("alpha ordinary", "ALPHA [X].* Λ", "Alpha [x].* λ"):
             self.assign(run.name, label)
         result = self.success("search", "[x].* λ", "--limit", "1")
@@ -118,12 +116,12 @@ class BookmarkTests(unittest.TestCase):
         self.assertTrue(result["has_more"])
         self.assertEqual(len(self.success("search", "default-", "--limit", "1000")["matches"]), 21)
         self.assertTrue(self.success("bookmarks", "--limit", "1")["has_more"])
-        # Listing/search are pointers, not stale classification or task/log scans.
+        # Listing/search must hide pointers whose ownership cannot be verified.
         (run / "manifest.json").write_text("invalid manifest")
-        self.assertEqual(len(self.success("search", "default-", "--limit", "1000")["matches"]), 21)
+        self.assertEqual(self.success("search", "default-", "--limit", "1000")["matches"], [])
 
     def test_invalid_cli_and_label_boundaries_leave_index_unchanged(self) -> None:
-        run = self.legacy("valid")
+        run = self.owned_run("valid")
         self.assign(run.name, "λ" * 64)
         before = self.index.read_bytes()
         for label in ("", " ", " edge", "edge ", ".", "..", "../escape", "a/b", "a\\b", "@alias", "\x01", "λ" * 65):
@@ -144,9 +142,9 @@ class BookmarkTests(unittest.TestCase):
                 self.assertEqual(self.index.read_bytes(), before)
 
     def test_corruption_fails_all_metadata_reads_edits_without_reset_or_partial_results(self) -> None:
-        run = self.legacy("valid")
+        run = self.owned_run("valid")
         self.assign(run.name, "needle")
-        invalid = [b"not JSON", b'[2,[]]', b'[1,{"needle":"valid"}]',
+        invalid = [b"not JSON", b'[3,[]]', b'[1,{"needle":"valid"}]',
                    b'[1,[["needle","valid"],["needle","other"]]]',
                    b'[1,[["needle","valid"],["bad","../outside"]]]',
                    b'[1,[["needle","valid"],["bad","@needle"]]]',
@@ -163,25 +161,25 @@ class BookmarkTests(unittest.TestCase):
                 self.assertEqual(self.cli("read", run.name).stdout, "legacy handoff valid")
 
     def test_index_capacity_rejects_growth_without_replacement(self) -> None:
-        run = self.legacy("valid")
+        run = self.owned_run("valid")
         self.assign(run.name, "initial")
         # Near-ceiling valid input, independently serialized without implementation helpers.
-        pair_bytes = len(json.dumps(["x" * 128, run.name], separators=(",", ":"))) + 1
+        pair_bytes = len(json.dumps(["parent-session", "x" * 128, run.name], separators=(",", ":"))) + 1
         count = (1024 * 1024 - 8) // pair_bytes
-        entries = [[f"{n:08}" + "x" * 120, run.name] for n in range(count)]
-        before = json.dumps([1, entries], separators=(",", ":")).encode()
+        entries = [["parent-session", f"{n:08}" + "x" * 120, run.name] for n in range(count)]
+        before = json.dumps([2, entries, []], separators=(",", ":")).encode()
         self.assertLessEqual(len(before), 1024 * 1024)
         self.index.write_bytes(before)
         result = self.failure("bookmark", run.name, "--label", "n" * 128)
         self.assertIn("would exceed 1 MiB", result.stderr)
         self.assertEqual(self.index.read_bytes(), before)
         self.assertEqual(list(self.store.glob(".bookmarks-*.tmp")), [])
-        self.assertTrue(self.success("unbookmark", entries[0][0])["changed"])
+        self.assertTrue(self.success("unbookmark", entries[0][1])["changed"])
         self.assign(run.name, "n" * 128)
 
     @unittest.skipUnless(os.name == "posix", "POSIX no-follow/privacy/lock guards")
     def test_path_privacy_and_dangling_pointer_boundaries(self) -> None:
-        run = self.legacy("valid")
+        run = self.owned_run("valid")
         self.assign(run.name, "prior")
         original = self.index.read_bytes()
         outside = self.root / "outside.json"
@@ -224,18 +222,18 @@ class BookmarkTests(unittest.TestCase):
         self.store.chmod(0o700)
         (self.store / "linked-run").symlink_to(run, target_is_directory=True)
         self.failure("bookmark", "linked-run", "--label", "new")
-        # A synthetically dangling mapping remains listed and may be explicitly removed.
-        self.index.write_text('[1,[["dangling","missing"],["linked","linked-run"]]]')
-        self.assertEqual(len(self.success("bookmarks")["matches"]), 2)
+        # Inaccessible pointers are hidden; own mappings may still be removed safely.
+        self.index.write_text('[2,[["parent-session","dangling","missing"],["parent-session","linked","linked-run"]],[]]')
+        self.assertEqual(len(self.success("bookmarks")["matches"]), 0)
         self.failure("path", "@dangling", ".")
         self.failure("path", "@linked", ".")
-        self.assertEqual(self.success("unbookmark", "dangling")["previous"]["run_id"], "missing")
+        self.assertEqual(self.success("unbookmark", "dangling")["previous"], None)
         (run / "manifest.json").unlink()
         (run / "manifest.json").symlink_to(outside)
         self.failure("bookmark", run.name, "--label", "new")
 
     def test_concurrent_edits_and_readers_observe_atomic_snapshots(self) -> None:
-        first, second, third = (self.legacy(name) for name in ("first", "second", "third"))
+        first, second, third = (self.owned_run(name) for name in ("first", "second", "third"))
         self.assign(first.name, "movable")
         barrier = threading.Barrier(5)
         def writer(n: int):
@@ -305,7 +303,7 @@ class BookmarkTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX stable-lock fixture")
     def test_parallel_labeled_launches_wait_for_brief_lock_without_new_runs_or_attempts(self) -> None:
         import fcntl
-        old = [self.legacy(name) for name in ("old-a", "old-b")]
+        old = [self.owned_run(name) for name in ("old-a", "old-b")]
         labels = ("launch-a", "launch-b")
         for run, label in zip(old, labels):
             self.assign(run.name, label)
@@ -334,7 +332,7 @@ class BookmarkTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX stable-lock fixture")
     def test_lock_budget_exhaustion_preserves_mapping_and_failed_run_without_inference(self) -> None:
         import fcntl
-        old = self.legacy("old")
+        old = self.owned_run("old")
         self.assign(old.name, "reusable")
         original, old_manifest = self.index.read_bytes(), (old / "manifest.json").read_bytes()
         with (self.store / "bookmarks.lock").open("r+") as lock:
@@ -359,7 +357,7 @@ class BookmarkTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX installed cancellation handler")
     def test_signal_cancels_bookmark_lock_wait_before_any_worker_or_mapping_update(self) -> None:
         import fcntl
-        old = self.legacy("old")
+        old = self.owned_run("old")
         self.assign(old.name, "reusable")
         original = self.index.read_bytes()
         with (self.store / "bookmarks.lock").open("r+") as lock:
@@ -420,7 +418,7 @@ class BookmarkTests(unittest.TestCase):
         self.failure("comment", run.name, "--text", "superseded")
 
     def test_startup_label_failure_contract_preserves_or_moves_at_defined_boundary(self) -> None:
-        old = self.legacy("old")
+        old = self.owned_run("old")
         self.assign(old.name, "reusable")
         before = self.index.read_bytes()
         runs = {p for p in self.store.iterdir() if p.is_dir()}

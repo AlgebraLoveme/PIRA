@@ -77,8 +77,8 @@ jobs:
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
           cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
           if [[ "${TOOL}" == "pira_team" ]]; then
-            cargo build --manifest-path tools/Cargo.toml --locked --package pira_team
-            PIRA_TEAM_BIN="$PWD/tools/target/debug/pira_team" python3 tools/crates/pira_team/tests/test_team.py
+            cargo build --manifest-path tools/Cargo.toml --locked --package pira_team --package pira_dec
+            PIRA_TEAM_BIN="$PWD/tools/target/debug/pira_team" PIRA_DEC_BIN="$PWD/tools/target/debug/pira_dec" TEAM_TEST_SLOW_PREFLIGHT=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tools/crates/pira_team/tests -p 'test_*.py' -v
           fi
 
       - name: Install Windows cross-linker

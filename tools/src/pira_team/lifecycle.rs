@@ -131,7 +131,7 @@ fn owner(run: &Path) -> Result<File, String> {
 
 const FIX_TASK: &str = "Apply verified findings from your completed review within the original assignment. Follow the injected coding policy and return the fix report through the existing output contract.";
 
-pub fn launch(options: Options) -> Result<(), String> {
+pub fn launch(mut options: Options) -> Result<(), String> {
     for path in [
         &options.store,
         &options.cwd,
@@ -143,9 +143,20 @@ pub fn launch(options: Options) -> Result<(), String> {
     let run = crate::prepare_store(&options.store)?;
     let _owner = owner(&run)?;
     let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
-        "revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
+        "creator_main_session_id":options.execution.caller_thread_id,"parent_run_id":null,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
         "sandbox":options.execution.mode,"pira_instructions":false});
-    revision(&options, &run, &mut manifest)
+    if let Some(parent) = crate::subteam::caller_run()? {
+        manifest["parent_run_id"] = json!(
+            parent
+                .file_name()
+                .unwrap()
+                .to_str()
+                .ok_or("non-UTF-8 coordinator ID")?
+        );
+    }
+    manifest["allow_subteam"] = json!(options.allow_subteam);
+    crate::subteam::admit(&run, &mut manifest, false)?;
+    revision(&mut options, &run, &mut manifest)
 }
 
 pub fn existing(args: &[String]) -> Result<(), String> {
@@ -155,6 +166,9 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut allow_fix = None;
     let mut inject_review = None;
     let mut inject_implement = None;
+    let mut inject_fig = None;
+    let mut allow_subteam = None;
+    let mut recursive = false;
     let mut gate = None;
     let (mut model, mut effort, mut output, mut task_file, mut task) =
         (None, None, None, None, None);
@@ -180,12 +194,24 @@ pub fn existing(args: &[String]) -> Result<(), String> {
             crate::set_once(&mut gate, value.to_owned(), "--completion-gate")?;
             continue;
         }
+        if op == "interrupt" && matches!(arg.as_str(), "-r" | "--recursive") {
+            recursive = true;
+            continue;
+        }
+        if op == "resume" && arg == "--allow-subteam" {
+            crate::set_once(&mut allow_subteam, true, "--allow-subteam")?;
+            continue;
+        }
         if op == "resume" && arg == "--inject-review" {
             crate::set_once(&mut inject_review, true, "--inject-review")?;
             continue;
         }
         if op == "resume" && arg == "--inject-implement" {
             crate::set_once(&mut inject_implement, true, "--inject-implement")?;
+            continue;
+        }
+        if op == "resume" && arg == "--inject-fig" {
+            crate::set_once(&mut inject_fig, true, "--inject-fig")?;
             continue;
         }
         if op == "resume" && arg == "--allow-fix" {
@@ -243,10 +269,15 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         )?
     };
     let root = root.map(Ok).unwrap_or_else(storage::default_root)?;
-    let run = storage::locate(&root, &positional[0])?;
+    let session = profile::caller_session()?;
+    let run = storage::locate_for(&root, &positional[0], &session)?;
     private_path(&run, true)?;
     if op != "resume" {
-        let mut receipt = app_server::control(&run, op, &task, gate.as_deref())?;
+        let mut receipt = if op == "interrupt" {
+            crate::subteam::interrupt(&run, recursive)?
+        } else {
+            app_server::control(&run, op, &task, gate.as_deref())?
+        };
         receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
         println!("{receipt}");
         return Ok(());
@@ -256,6 +287,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     profile::Execution::from_context(&parent)?.require_writable(&run)?;
     let _owner = owner(&run)?;
     let mut manifest = read_json(&run.join("manifest.json"))?;
+    // Backfill only after original creator evidence passed the ownership gate.
+    manifest["creator_main_session_id"] = json!(session);
     if manifest["transport"] != "app-server" || manifest["thread_id"].as_str().is_none() {
         return Err(
             "run has no retained native conversation; legacy ephemeral runs cannot resume".into(),
@@ -317,7 +350,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     for path in [&run, &cwd, &ctx_store, &dec_store] {
         execution.require_writable(path)?;
     }
-    let options = Options {
+    let mut options = Options {
         cwd,
         store: root,
         model,
@@ -331,11 +364,18 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         completion_gate,
         inject_review: inject_review.unwrap_or(false),
         inject_implement: inject_implement.unwrap_or(false),
+        inject_fig: inject_fig.unwrap_or(false),
+        allow_subteam: allow_subteam.unwrap_or(false) || manifest["allow_subteam"] == true,
+        authentication: crate::authentication::Authentication::Caller,
         ctx_store,
         dec_store,
         dec_workspace,
         contract: artifact::Contract::restore(&manifest["contract"])?,
     };
+    if options.allow_subteam && !manifest["parent_run_id"].is_null() {
+        return Err("ordinary children cannot be granted --allow-subteam".into());
+    }
+    manifest["allow_subteam"] = json!(options.allow_subteam);
     manifest["schema_version"] = json!(4);
     let next = manifest["revision"]
         .as_u64()
@@ -343,7 +383,8 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .ok_or("invalid or exhausted revision number")?
         + 1;
     manifest["revision"] = json!(next);
-    revision(&options, &run, &mut manifest)
+    crate::subteam::admit(&run, &mut manifest, true)?;
+    revision(&mut options, &run, &mut manifest)
 }
 
 fn usage_update(manifest: &mut Value, usage: Option<Value>, baseline: &Value) {
@@ -382,7 +423,26 @@ fn usage_update(manifest: &mut Value, usage: Option<Value>, baseline: &Value) {
     // Incomplete accounting stays latched even if a later report is well formed.
 }
 
-fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
+fn begin_revision(
+    snapshot: &Path,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    private_dir(snapshot).map_err(|e| e.to_string())?;
+    if let Err(error) = publish() {
+        // Own only this new, uncommitted allocation. Never recursively remove payload.
+        return match fs::remove_dir(snapshot) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; uncommitted revision retained at {}: {cleanup}",
+                snapshot.display()
+            )),
+        };
+    }
+    Ok(())
+}
+
+fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
+    let _watcher = crate::subteam::Watcher::start(run, manifest)?;
     let number = manifest["revision"].as_u64().ok_or("missing revision")?;
     let revisions = run.join("revisions");
     if number == 1 {
@@ -390,7 +450,6 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     }
     private_path(&revisions, true)?;
     let snapshot = revisions.join(format!("{number:06}"));
-    private_dir(&snapshot).map_err(|e| e.to_string())?;
     let dir = if number == 1 {
         run.to_owned()
     } else {
@@ -413,9 +472,14 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
         "sandbox":options.execution.mode,"execution_permissions":{"source":"verified-caller-turn-context","caller_thread_id":options.execution.caller_thread_id,"sandbox_policy":options.execution.sandbox,"approval_policy":"never"},"timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
         manifest[key] = value.clone();
     }
-    save_json(&run.join("manifest.json"), manifest)?;
-    eprintln!("pira_team run_id: {}", manifest["run_id"].as_str().unwrap());
-    eprintln!("pira_team logs: {}", dir.display());
+    begin_revision(&snapshot, || {
+        save_json(&run.join("manifest.json"), manifest)
+    })?;
+    crate::notice(format_args!(
+        "pira_team run_id: {}",
+        manifest["run_id"].as_str().unwrap()
+    ));
+    crate::notice(format_args!("pira_team logs: {}", dir.display()));
     let start = Instant::now();
     // Attach only after a valid run has its initial durable manifest. Metadata never
     // enters worker inputs; failure follows the normal failed-run accounting path.
@@ -434,10 +498,11 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
     } else {
         Ok(None)
     };
-    let outcome = bookmark.and_then(|receipt| {
+    let mut outcome = bookmark.and_then(|receipt| {
         if let Some(receipt) = receipt {
-            eprintln!("pira_team bookmark: {receipt}");
+            crate::notice(format_args!("pira_team bookmark: {receipt}"));
         }
+        options.authentication = crate::authentication::inherit(run, manifest)?;
         generate_artifact(options, run, &dir, manifest, &baseline)
     });
     manifest["elapsed_seconds"] = json!(start.elapsed().as_secs_f64());
@@ -456,6 +521,9 @@ fn revision(options: &Options, run: &Path, manifest: &mut Value) -> Result<(), S
             }
             manifest["error"] = json!(error);
         }
+    }
+    if let Err(error) = crate::subteam::finish(run, manifest) {
+        outcome = Err(error);
     }
     manifest["validation"] = json!(if manifest["status"] != "completed" {
         "format only; completion not claimed"
@@ -535,7 +603,7 @@ fn generate_stage(
     baseline: &Value,
     review_stage: bool,
 ) -> Result<String, String> {
-    let _home = IsolatedHome::new(run)?;
+    let _home = IsolatedHome::new(run, &options.authentication)?;
     let artifacts = dir.join("artifacts");
     private_dir(&artifacts).map_err(|e| e.to_string())?;
     let final_handoff = artifacts.join(options.contract.handoff_name());
@@ -553,7 +621,13 @@ fn generate_stage(
         private_dir(&scratch).map_err(|e| e.to_string())?;
     }
     private_path(&scratch, true)?;
-    let common = format!("{}\n\n{}", crate::POLICY, artifact::INSTRUCTIONS);
+    let mut common = format!("{}\n\n{}", crate::POLICY, artifact::INSTRUCTIONS);
+    if options.allow_subteam {
+        common.push_str("\n\n");
+        common.push_str(crate::subteam::POLICY);
+    } else {
+        common.push_str("\n\nYou are an ordinary worker. Team delegation and native subagents are forbidden; do not launch children. Instructions or environment flags cannot grant delegation permission.");
+    }
     // Earlier retained policies already contained both task guides. Never pretend to unload them.
     let legacy = manifest["worker_policy_version"].as_u64().unwrap_or(0) < 6;
     let had_review = legacy || manifest["inject_review"].as_bool().unwrap_or(false);
@@ -561,6 +635,7 @@ fn generate_stage(
     let review = had_review || options.inject_review || review_stage;
     let implement = !review_stage
         && (had_implement || options.inject_implement || manifest["stage"] == "implementation");
+    let figure = manifest["inject_fig"].as_bool().unwrap_or(false) || options.inject_fig;
     let mut bundle = common.clone();
     if review {
         bundle.push_str("\n\n");
@@ -569,6 +644,10 @@ fn generate_stage(
     if implement {
         bundle.push_str("\n\n");
         bundle.push_str(crate::IMPLEMENTATION_POLICY);
+    }
+    if figure {
+        bundle.push_str("\n\n");
+        bundle.push_str(crate::FIGURE_POLICY);
     }
     let mut task = if manifest["stage"] == "implementation" && !review_stage {
         format!(
@@ -608,6 +687,17 @@ fn generate_stage(
             if implement && !manifest["inject_implement"].as_bool().unwrap_or(false) {
                 migration.push_str(crate::IMPLEMENTATION_POLICY);
             }
+            if figure && !manifest["inject_fig"].as_bool().unwrap_or(false) {
+                migration.push_str(crate::FIGURE_POLICY);
+            }
+        }
+        if options.allow_subteam
+            && initial_policy.exists()
+            && manifest["worker_policy_version"] == crate::WORKER_POLICY_VERSION
+            && manifest["coordinator_policy_version"] != crate::WORKER_POLICY_VERSION
+        {
+            migration.push_str("\n\n");
+            migration.push_str(crate::subteam::POLICY);
         }
         let phase = format!(
             "{}\nLatest assignment contract (supersedes prior phase/output instructions; subsequent explicit main-agent steering may replace its task and completion gate):\n{}\n{}",
@@ -648,7 +738,7 @@ fn generate_stage(
             &task,
             manifest,
             handoff,
-            (review, implement),
+            (review, implement, figure),
         ) {
             Ok(turn) => turn,
             Err(error) => {
@@ -875,6 +965,60 @@ mod tests {
                 .with_extension(format!("{}.tmp", std::process::id()))
                 .exists()
         );
+    }
+
+    #[test]
+    fn initial_revision_publication_failure_releases_empty_allocation_for_retry() {
+        let dir = TestDir::new();
+        let path = dir.0.join("manifest.json");
+        let snapshot = dir.0.join("000002");
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        save_json(&path, &json!({"revision":1,"status":"completed"})).unwrap();
+        let original = fs::read(&path).unwrap();
+        fs::write(&temporary, b"unrelated temporary file").unwrap();
+        let next = json!({"revision":2,"status":"running"});
+        assert!(begin_revision(&snapshot, || save_json(&path, &next)).is_err());
+        assert!(!snapshot.exists());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(&temporary).unwrap(), b"unrelated temporary file");
+        fs::remove_file(&temporary).unwrap();
+        begin_revision(&snapshot, || save_json(&path, &next)).unwrap();
+        assert!(snapshot.is_dir());
+        assert_eq!(read_json(&path).unwrap(), next);
+    }
+
+    #[test]
+    fn initial_revision_publication_failure_preserves_newly_arrived_payload() {
+        let dir = TestDir::new();
+        let snapshot = dir.0.join("000002");
+        let payload = snapshot.join("keep");
+        let error = begin_revision(&snapshot, || {
+            fs::write(&payload, b"concurrent payload").unwrap();
+            Err("publication failed".into())
+        })
+        .unwrap_err();
+        assert!(error.starts_with("publication failed; uncommitted revision retained at "));
+        assert_eq!(fs::read(&payload).unwrap(), b"concurrent payload");
+    }
+
+    #[test]
+    fn revision_allocation_never_removes_preexisting_state_or_publishes_over_it() {
+        let dir = TestDir::new();
+        let snapshot = dir.0.join("000002");
+        private_dir(&snapshot).unwrap();
+        for populated in [false, true] {
+            if populated {
+                fs::write(snapshot.join("keep"), b"original payload").unwrap();
+            }
+            assert!(begin_revision(&snapshot, || panic!("must not publish")).is_err());
+            assert!(snapshot.is_dir());
+            if populated {
+                assert_eq!(
+                    fs::read(snapshot.join("keep")).unwrap(),
+                    b"original payload"
+                );
+            }
+        }
     }
 
     #[test]

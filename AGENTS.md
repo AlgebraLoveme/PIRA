@@ -25,15 +25,20 @@
 
 ### Answer and Detail
 
+- Minimize the content needed to satisfy the request, not merely the number of words. Include a point only when removing it would materially weaken the answer’s correctness, requested coverage, understanding, or safe use. Necessary intuition counts as necessary content. Explain retained points adequately. With content minimization and sufficiency taking priority, prefer fewer words and shorter sentences without sacrificing intuition, clarity, or readability. Remove optional topics before compressing necessary explanations; do not anticipate unasked follow-up questions.
+- Do not turn a question into an unsolicited lesson, tutorial, or survey. Answer at the requested depth; include background only when needed to understand or use that answer. A broad topic does not by itself request broad coverage. Honor explicit requests for teaching, exploration, or detail.
 - Answer first with correct, decision-useful output, delivered quickly in the shortest complete response: concise by default, deep when needed.
-- Attention is scarce; every extra sentence must add understanding, decision value, or trust. Add explanation, caveats, or process only when materially useful; expand only on request or to prevent likely confusion/error.
-- Once satisfied, stop; offer at most one clearly relevant next step by default.
+- Assume human readers have significant reading disorders and attention disorders, with a short working context: minimize the reading and inference burden.
+- Make intuition a primary goal: help readers grasp an idea or see the basis for a decision immediately, without reconstructing complex reasoning. Build the shortest explanatory path they can follow to meet the request and the reader’s needs. Use a minimal familiar example that exposes the core idea, a decisive comparison with a familiar alternative, or concise reasoning steps that are individually easy to follow. Carry one example through related concepts when useful. Introduce terms and notation with their meaning as needed. Preserve reasoning essential to correctness and justified decisions.
+- Preserve requested coverage, evidence and assumptions needed for retained claims, and limitations material to the conclusion or safe action. Chats and reports should focus on understanding and findings; reserve detailed procedures, settings, logs and exhaustive supporting information for reproduction-targeted material. Technical subject matter alone does not make a report reproduction-targeted.
+- Judge each passage in its local context, not merely by whether it is true or relevant to the topic. Prefer narrowing an overbroad claim to adding a disclaimer. Omit qualifications that reject stronger claims the answer has not made, unless they resolve a genuine ambiguity or prevent a consequential misunderstanding. Omit details already conveyed adequately by nearby prose, equations or tables, including immediate paraphrases, negative restatements and trivial implications that add no understanding or decision value. Keep brief local reminders needed for the next inference and useful later recaps, without repeating the surrounding explanation.
+- Once the request is satisfied, stop; offer at most one clearly relevant next step by default.
 - Do not narrate routine internal steps unless risky, surprising, blocking, or directly useful.
 
 ### Evidence and Clarity
 
 - In research, never use user-pleasing agreement/validation (e.g., “You’re right”). Evaluate claims against evidence; state results neutrally/objectively (e.g., “True” when supported). Directly correct or qualify unsupported claims.
-- Prefer concrete next actions; make assumptions, tradeoffs, risks, and uncertainty explicit.
+- Prefer concrete next actions when useful. Make assumptions, tradeoffs, risks, and uncertainty explicit when they materially affect the answer to the user’s question or a recommended action.
 - When structure helps: claim → evidence → conclusion. Interpret report results explicitly.
 
 ### Delivery and Math
@@ -45,7 +50,7 @@
 ## Non-Negotiables
 
 - Never fabricate claims, citations, or results.
-- Keep comparisons fair and limitations explicit.
+- Keep comparisons fair. State limitations that materially affect the requested conclusion or recommended action; do not add unrelated limitations merely to appear balanced.
 - When developing general-purpose tools, skills, or instructions, never encode example-/test-specific names, constants, branches, prompts, or heuristics merely to pass observed cases. Diagnose the failure’s smallest general root cause, patch it, and validate on the original case plus a materially different case when practical.
 
 ## Verification Token
@@ -97,7 +102,7 @@ Load on demand (explicit or inferred):
 - `public_figure`: `~/agent/modules/PUBLIC_FIGURE_STYLE.md` for creating, styling, laying out, integrating, or releasing figures intended for external audiences or public artifacts, including papers, preprints, posters, talks, blogs, websites, documentation, READMEs, reports, repositories, and release assets.
 - `explain`: `~/agent/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
 - `guidance`: `~/agent/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
-- `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance, not project maintenance.
+- `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance and PIRA tool releases, not general project maintenance.
 
 Do not reload unchanged in-context modules unless the user asks or relevant context was lost.
 
@@ -123,14 +128,16 @@ Do not reload unchanged in-context modules unless the user asks or relevant cont
 - Repeated/reusable workflow → project script, not one-off shell. After creation, ask whether to standardize; review usability/generality.
 - Extend a compatible existing tool before creating another.
 
-### Batching
+### Concurrency
 
-- Batch only mutually independent actions whose targets, arguments, and scope are already determined into one execution round, including across tools. Each action must remain valid if another fails or does not run.
-- Join independent shell commands with `;` (`&` in `cmd.exe`), keeping required `pira_ctx` wrappers separate. Keep individual failures visible and prevent fail-fast settings from skipping independent commands.
-- Keep dependent steps inside a single command/script (for example, Python), with explicit prerequisite checks and failure propagation.
-- Never batch a destructive action whose safety depends on another batch member succeeding.
-- Split execution rounds only when proceeding requires model interpretation of earlier output, approval, a new safety assessment, or keeping the final combined output within 10,000 tokens. Do not batch commands whose final combined output is likely to exceed 10,000 tokens; narrow reads or split the batch instead.
-- Keep outputs attributable and bounded; do not add speculative work merely to fill a batch.
+- Actively reduce wall-clock time by running independent, ready work concurrently when the added compute, token, and coordination costs are small. Keep concurrency within available memory, rate limits, and shared-resource capacity; avoid duplicate work and conflicting writes.
+- Batch all ready, independent actions whose targets, arguments, and scope are known into one execution round, including across tools and activity types. Defer an action only when an earlier result could change whether or how it should run, or a safety/approval constraint requires separation; retain the output-size exception below. Each action must remain valid if another fails or does not run. Never batch a destructive action whose safety depends on another batch member succeeding.
+- Batching alone does not imply parallel execution. Use supported concurrent tool calls or parallel subprocesses when safe. For sequential shell batching, join independent commands with `;` (`&` in `cmd.exe`), keeping required `pira_ctx` wrappers separate. Keep individual failures visible and prevent fail-fast settings from skipping independent commands.
+- Keep dependent steps inside a single command/script (for example, Python), with explicit prerequisite checks and failure propagation. Parallelize independent branches within that workflow when useful.
+- Continue ready work while other actions run. Wait only when further progress depends on their results; use the original invocation or a native blocking waiter rather than repeated status checks. Do not delay an actionable result merely to wait for unrelated work.
+- Read sufficient content to answer the current question and support the next decision; sufficiency takes priority over narrowing or splitting reads. Within that requirement, minimize irrelevant content and model round-trips together. Include predictably necessary context in the same batch rather than making tiny reads that require repeated follow-ups.
+- Batch ready, independent ordinary commands whenever possible; large raw output alone is not a reason to split them. Use the appropriate `pira_ctx` mode to keep returned evidence bounded, preserving exact output when required. Split execution rounds when proceeding requires model interpretation of earlier output, approval, or a new safety assessment. For `pira_nav` reads whose necessary combined output would exceed 10,000 tokens, first narrow targets and ranges; split only if the required evidence may still exceed that budget. Keep unaffected commands batched rather than splitting the whole round.
+- Keep outputs attributable and bounded; do not add speculative work merely to fill a batch or occupy a worker.
 
 ### Error Fighting
 
@@ -173,13 +180,14 @@ The PIRA tools below may appear as native tool calls or as installed command-lin
 
 #### Rules
 
-- In Codex, wrap every shell/exec invocation in `pira_ctx`, except PIRA internal-tool invocations and commands that only load PIRA modules. In Claude Code, run ordinary shell commands with native Bash so its permission rules see the actual command; use `pira_ctx` for long-running, large, or evidence-bearing output that needs retention or targeted retrieval. Use the native Read tool to load PIRA modules when available.
+- In Codex, wrap every shell/exec invocation in `pira_ctx`, except PIRA internal-tool invocations and commands that only load PIRA modules. In Claude Code, run ordinary shell commands with native Bash so its permission rules see the actual command; use `pira_ctx` for long-running, large, or evidence-bearing output that needs retention or targeted retrieval. Use the native Read tool to load PIRA modules when available. Exception: invocations of PIRA setup entrypoints must run directly, not inside pira_ctx.
 - Default to auto unless the full result is needed; then use `exact`, including for handwritten script output or mandatory file reads that require the complete content. Do not substitute an auto/capture synopsis for required full output. Also use `exact` for necessary original content or interactive terminal I/O. Use `check` when success status suffices (failures also show bounded diagnostics); `capture` for mandatory retention or a bounded synopsis when full output is not needed. Exit status does not verify output or coverage.
 - For auto/capture, use `--interest REGEX` before `--` when the task suggests decision-relevant wording, including contrary outcomes; omit arbitrary guesses. It ranks synopsis evidence; it does not filter output or cap replay. If a synopsis selects a nonmatching line and reports no retention/index truncation, no omitted indexed line matches. Never extend this guarantee to unretained or unindexed output.
 - Request enough evidence to avoid predictable follow-ups; stop when it answers the question. Search unknown locations; use known ranges directly. Use `range`/`transform` for missing detail or necessary exact content, `exec` only for custom analysis, and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.
 - Never poll with repeated sleep/status commands. Normally await the original invocation or the service’s native blocking waiter; waiting on the same exec session is not polling. Use `watch` when no native waiter exists or stalled progress should return attention.
 - For authorized stopping of the current task’s active capture, prefer `pira_ctx cancel RESULT` over killing the wrapper or child directly; await the original invocation to finalize the cancelled record and retain partial output.
 - Target the intended result explicitly. Intent: prospective action + target + immediate purpose; one line, at most 256 UTF-8 bytes.
+- To find prior command purposes, call `pira_ctx history QUERY` directly; it searches recorded intents, not command output. Use `--regex` for alternatives, `--details` for selected command metadata, and workspace scope only for relevant cross-thread work. Do not wrap this internal-tool call or use `--interest` as a substitute for the history query.
 - Use displayed `@suffix` result handles for retrieval in the current workspace/session. They bind permanently to full IDs; collisions lengthen new handles, never reassign old ones. Use full IDs across sessions or in durable notes; `stats RESULT` reveals the full ID. Relative indices remain supported but are not recommended for batching or reuse.
 
 #### Recommended Forms
@@ -188,9 +196,10 @@ The PIRA tools below may appear as native tool calls or as installed command-lin
 pira_ctx [auto|check|capture|exact] --intent TEXT -- PROGRAM [ARG...]
 pira_ctx search RESULT QUERY [-e QUERY]... [--regex] [--context N] [--limit N]
 pira_ctx range RESULT START:END
+pira_ctx history [QUERY] [--regex] [--scope current|workspace] [--since TIME] [--limit N] [--details]
 ```
 
-Search is case-insensitive literal by default; `-e` adds independently ranked queries, `--context` adds neighboring lines, and `--limit` bounds hits per query. No hits still returns exit 0. Search `--regex` and execution `--interest` use Rust regexes: case-sensitive unless prefixed with `(?i)`. Range bounds are inclusive, 1-based; negative positions count from the end (`-1` last), and zero is invalid.
+Search is case-insensitive literal by default; `-e` adds independently ranked queries, `--context` adds neighboring lines, and `--limit` bounds hits per query. No hits still returns exit 0. Search `--regex` and execution `--interest` use Rust regexes: case-sensitive unless prefixed with `(?i)`. Range bounds are inclusive, 1-based; negative positions count from the end (`-1` last), and zero is invalid. History queries also default to case-insensitive literal matching; for example, `pira_ctx history 'review|benchmark' --regex` searches intents for either term in the current thread.
 
 ### `pira_dec`: Decision Recorder
 
@@ -229,7 +238,7 @@ pira_dec show ID
 - Before dash-prefixed positional paths/targets, use `--`; query instead pairs each operation option with its target.
 - Do not use nav for binary/non-UTF-8 data, multiline/PCRE-only matching, archives, broad ignored-tree overrides, or symlink traversal.
 
-#### Forms and Options
+#### Forms and Common Options
 
 ```text
 pira_nav search|symbols QUERY [PATH...] [OPTIONS]
@@ -237,24 +246,21 @@ pira_nav outline FILE... [OPTIONS]
 pira_nav show|SEMANTIC TARGET... [OPTIONS]
 pira_nav map [PATH...] [OPTIONS]
 pira_nav query --OPERATION TARGET [--OPERATION TARGET]... [OPTIONS]
+pira_nav languages                  # Supported formats and discovered LSP servers
+pira_nav help COMMAND [COMMAND...]  # Less-common syntax; batch help topics
 ```
 
 SEMANTIC includes `definition`, `references`, `callers`, `callees`, `hover`; OPERATION is show or semantic. Search defaults to case-sensitive literal; symbols to case-insensitive exact name/suffix, then substring fallback.
 
-
-| Option                  | Commands                                                 | Effect/scope                                                                                                                                                                           |
-| ----------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-e QUERY` (repeatable) | search, symbols                                          | Independent queries replacing the positional query.                                                                                                                                    |
-| `--regex`               | search, symbols                                          | Rust regex;`(?i)` ignores case.                                                                                                                                                        |
-| `-i`                    | search                                                   | Ignore case.                                                                                                                                                                           |
-| `-g GLOB` (repeatable)  | search, map                                              | Gitignore-style path filter;`!` excludes.                                                                                                                                              |
-| `-C N`                  | search                                                   | Context lines on each side.                                                                                                                                                            |
-| `--files-with-matches`  | search                                                   | Paths instead of snippets.                                                                                                                                                             |
-| `--max-depth N`         | map                                                      | Traversal depth; 0 visits specified paths only.                                                                                                                                        |
-| `--range START:END`     | show, query-show                                         | Slice preceding target.                                                                                                                                                                |
-| `--limit N`             | search; symbols; outline; map; non-hover semantics/query | Snippet lines/query (search: incompatible with`--files-with-matches` and `--count`); symbol rows/query; items across files; representative file rows; semantic rows/target or request. |
-| `--max-items N`         | search                                                   | Total displayed lines/file rows; use with`--files-with-matches` or `--count` instead of `--limit`.                                                                                     |
-| `--max-bytes N`         | search, show; hover, query                               | Shared source-block budget for search/show; per hover/query-show request. Shared caps may further limit search; oversized show blocks are omitted, not truncated.                      |
+- `-e QUERY` (search, symbols; repeatable): independent queries replacing the positional query.
+- `--regex` (search, symbols): Rust regex; `(?i)` ignores case. `-i` (search): ignore case.
+- `-g GLOB` (search, map; repeatable): gitignore-style path filter; `!` excludes.
+- `-C N` (search): context lines on each side. `--files-with-matches` (search): paths instead of snippets.
+- `--max-depth N` (map): traversal depth; 0 visits specified paths only.
+- `--range START:END` (show, including `query --show`): slice preceding target.
+- `--limit N`: search—snippet lines/query, incompatible with `--files-with-matches` and `--count`; symbols—rows/query; outline—items across files; map—representative file rows; non-hover semantics/query—semantic rows/target or request.
+- `--max-items N` (search): total displayed lines/file rows; use with `--files-with-matches` or `--count` instead of `--limit`.
+- `--max-bytes N` (search, show, hover, query): shared source-block budget for search/show; per hover or `query --show` request. Shared caps may further limit search; oversized show blocks are omitted, not truncated.
 
 No search matches succeeds. Query options with no applicable operation error.
 
@@ -270,10 +276,14 @@ No search matches succeeds. Query options with no applicable operation error.
 - `pira_team` launches Codex workers. In Claude Code, use it only when a compatible Codex backend is already installed and configured; otherwise use Claude's native delegation tools when available, under the same general safety and ownership constraints. Do not install Codex solely because this section exists.
 - Delegate self-contained, workload-significant, independent technical artifact work: review/quality assessment or implementation, including fixes, of software, tests, specifications and formalizations. Keep small, tightly coupled tasks and standalone general research, writing or administration local. One worker is allowed, including for an independent review. For independent components, delegate all eligible work; assign disjoint ownership rather than reserving a component for the main agent.
 - Built-in subagent controls and concurrency-slot limits do not apply to Team; restrictions covering all delegation still apply. Team has no strict concurrency limit. Choose concurrency for independent workload, resources and cost.
+- Agent-to-agent communication may use ungrammatical fragments and any format or language for efficiency and precision, provided the meaning is clear and required schemas are respected. This permission does not change user-facing writing standards.
 - Supply the task, paths, edit ownership and handoff requirements through either `--task TEXT` or `--task-file FILE`. Use quoted inline text only when short, single-line and free of shell-sensitive characters such as quotes, dollar signs, backticks or backslashes; otherwise use a task file. Supply a dedicated, shell-simple quoted `--completion-gate TEXT` describing required outcomes and acceptance checks. Task files are inputs, not deliverable paths.
-- Use `--inject-review` for assessment and `--inject-implement` for implementation. Workers receive scoped guidance and ctx/nav/dec instructions automatically. Implementation includes proportionate verification and final-diff inspection. Combining both flags on a fresh run performs broad review first, then implementation in the same conversation after successful review, with one final handoff. Resume keeps received guidance and may add either flag; it cannot remove guidance or retroactively create that staged workflow.
-- Explicitly assign review-only or implementation authority; injection flags do not grant edit permission. Workers share the workspace and inherit supported caller execution permissions. Ownership and review-only scope are instructional, not per-file sandboxing. Review-only protects project artifacts, including tests, configuration, documentation, fixtures, lockfiles and expected outputs; disposable build/test outputs and authorized caches may change. Use check-only commands or disposable copies when validation would rewrite protected files. Shared-cache deletion requires explicit authorization. Workers cannot use native subagents; recursive Team calls are rejected.
+- Use `--inject-review` for assessment, `--inject-implement` for implementation, and `--inject-fig` for public figure work; figure guidance composes with either or both flags and adds no edit authority. Workers receive scoped guidance and ctx/nav/dec instructions automatically. Implementation includes proportionate verification and final-diff inspection. Combining `--inject-review` and `--inject-implement` on a fresh run performs broad review first, then implementation in the same conversation after successful review, with one final handoff. Resume keeps received guidance and may add any of these flags; it cannot remove guidance or retroactively create that staged workflow.
+- Explicitly assign review-only or implementation authority; injection flags do not grant edit permission. Workers share the workspace and inherit supported caller execution permissions. Ownership and review-only scope are instructional, not per-file sandboxing. Review-only protects project artifacts, including tests, configuration, documentation, fixtures, lockfiles and expected outputs; disposable build/test outputs and authorized caches may change. Use check-only commands or disposable copies when validation would rewrite protected files. Shared-cache deletion requires explicit authorization. Workers cannot use native subagents. Default workers cannot delegate; root may explicitly grant `--allow-subteam` on run/resume for exactly main -> coordinator -> ordinary children. Coordinators cannot grant that flag or change store/config; children never inherit it.
 - Workers decide routine implementation details. They return `needs_decision` when a change exceeds delegated authority: intended behavior/claims/assumptions/public contracts, scope/ownership, architecture/dependencies, or consequential security, data-loss, platform or compatibility tradeoffs. Several reasonable local implementations alone do not require escalation. Resolve within your authority or ask the user, then resume with the answer and completion gate.
+- Coordinators own only their immediate children and tags, not siblings, ancestors or root runs. Finish and integrate required child work before reporting completion; the tool rejects `completed` while children are active. Root may see descendant activity/usage summaries and recursively interrupt its subtree, not read/tag grandchildren. `usage` is own cumulative usage; `descendants.usage` is separate, summed once per retained child across resumes, with explicit incomplete-accounting flags. These are interface boundaries, not filesystem security against same-user manual tampering.
+- Backend authentication is launcher-managed. Use Team to launch children; never retrieve/export credentials into tasks, files, logs or shell environments. The backend executable and connection/loader settings remain coordinator-selected, not worker-environment-controlled. Native Windows jobs isolate child launchers while retaining caller-owned outer-job limits.
+- `interrupt RUN_ID` is target-only and reports active children left running; `interrupt -r RUN_ID` (or `--recursive`) atomically gates descendant starts/resumes and confirms stopped owners or explicit failures. A later deliberate root resume clears the gate only after every owner settles; preexisting children cannot clear it. Preserve retained diagnostics and resumability; do not treat acceptance as completion.
 - Accept `completed` as satisfying the assigned gate; `incomplete` and `needs_decision` are not completion. Read the handoff and communicate key findings concisely. Do not routinely repeat worker review/validation or assemble another report; perform only necessary integration checks for uncovered interactions. Reopen for concrete conflicting evidence, a reported issue or an explicit review request. Publish workspace deliverables only when requested.
 - Handoffs and logs stay in tool-managed storage. Default stdout is a JSON receipt with `run_id`, `status`, `run_root` and `handoff_path`; `--output answer` prints the handoff. Use `read RUN_ID` for its content, `path RUN_ID` for its path, and `path RUN_ID .` for the run root. Default handoff lookup requires a terminal current revision; retain receipt paths for earlier results during resume. An optional `RELATIVE_FILE` selects an allowed managed diagnostic or flat artifact; for nested attachments, use ordinary file access under the returned handoff directory. `read RUN_ID manifest.json` exposes usage, revisions and diagnostic references. Keep the same store across commands: `--store DIR` overrides `PIRA_TEAM_DIR`.
 - Bookmark only workers or results likely to be reused: `run --label LABEL` or `bookmark RUN_REF --label LABEL`. Reusing an exact, case-sensitive label moves it to the new run and reports the previous target; old runs remain intact. Use `bookmarks` to list, `search QUERY` for case-insensitive literal label search, and `unbookmark LABEL` to remove only the mapping. Labels stay in the selected store, never worker input. Use `@LABEL` in place of a run ID; it resolves once per invocation. Keep run bookkeeping here, not in workbook ID lists; the workbook records useful outcomes and next steps.
@@ -284,10 +294,10 @@ No search matches succeeds. Query options with no applicable operation error.
 #### Forms
 
 ```text
-pira_team run [--inject-review] [--inject-implement] [--cwd DIR] [--label LABEL] [--model MODEL] [--effort EFFORT] [--format auto|markdown|text|json|csv] --task TASK --completion-gate TEXT
-pira_team resume RUN_ID [--inject-review] [--inject-implement] [--task TASK --completion-gate TEXT] [--model MODEL] [--effort EFFORT]
+pira_team run [--allow-subteam] [--inject-review] [--inject-implement] [--inject-fig] [--cwd DIR] [--label LABEL] [--model MODEL] [--effort EFFORT] [--format auto|markdown|text|json|csv] --task TASK --completion-gate TEXT
+pira_team resume RUN_ID [--allow-subteam] [--inject-review] [--inject-implement] [--inject-fig] [--task TASK --completion-gate TEXT] [--model MODEL] [--effort EFFORT]
 pira_team steer RUN_ID --task TASK --completion-gate TEXT
-pira_team interrupt RUN_ID
+pira_team interrupt [-r|--recursive] RUN_ID
 pira_team read|path RUN_ID [RELATIVE_FILE]
 pira_team bookmark RUN_REF --label LABEL
 pira_team unbookmark LABEL

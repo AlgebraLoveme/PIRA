@@ -19,7 +19,7 @@ class TeamTests(unittest.TestCase):
         home = self.root / "original-home"
         home.mkdir()
         (home / "AGENTS.md").write_text("global instructions must not be inherited")
-        self.env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}", CODEX_HOME=str(home))
+        self.env = dict(os.environ, PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}", CODEX_HOME=str(home))
         self.env["PIRA_CTX_STORE_DIR"] = str(self.root / "ctx-store")
         self.env["PIRA_DEC_STORE_DIR"] = str(self.root / "dec-store")
         self.env["TEAM_TEST_BACKEND_CONTRACT"] = str(Path(__file__).resolve().parents[3] / "src/pira_team/backend_contract.json")
@@ -32,6 +32,11 @@ class TeamTests(unittest.TestCase):
         fake = self.root / "codex"
         fake.write_text(Path(__file__).with_name("fake_codex.py").read_text())
         fake.chmod(0o700)
+        if os.name == "nt":
+            import shutil
+            import sys
+            shutil.copyfile(os.environ["PIRA_TEAM_TEST_CODEX"], self.root / "codex.exe")
+            self.env.update(TEAM_FIXTURE_PYTHON=sys.executable, TEAM_FIXTURE_CODEX=str(fake))
         self.parent([{}])
 
     def launch(self, task: str, *extra: str) -> subprocess.CompletedProcess[str]:
@@ -452,7 +457,7 @@ class TeamTests(unittest.TestCase):
         return subprocess.run([str(self.bin), command, run, *extra, "--store", str(self.root / "logs")],
             env=self.env, capture_output=True, text=True, timeout=5)
 
-    def test_run_id_reads_exact_artifact_and_resolves_paths_without_parent(self) -> None:
+    def test_run_id_reads_exact_artifact_and_resolves_paths_with_verified_parent(self) -> None:
         self.env["TEAM_CANDIDATE"] = self.candidate('line\r\nλ\n', "notes.txt", "text")
         launched = self.launch("review")
         self.assertEqual(launched.returncode, 0, launched.stderr)
@@ -468,7 +473,7 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(self.access("path", run, ".").stdout.strip(), str(Path(receipt["run_root"])))
         self.assertEqual(json.loads(self.access("read", run, "manifest.json").stdout)["run_id"], run)
         self.assertIn("turn/completed", self.access("read", run, "events.jsonl").stdout)
-        # Older completed manifests remain readable without new artifact/run_id fields.
+        # Immutable creator evidence allows older layouts without artifact/run_id fields.
         path = Path(receipt["run_root"]) / "manifest.json"
         manifest = json.loads(path.read_text()); manifest.pop("artifact"); manifest.pop("run_id")
         path.write_text(json.dumps(manifest))
@@ -533,6 +538,8 @@ class TeamTests(unittest.TestCase):
         override = self.root / "environment-store"
         for root in (default, explicit, override):
             (root / "fixture-run").mkdir(parents=True)
+            (root / "fixture-run/manifest.json").write_text(json.dumps({"run_id":"fixture-run",
+                "creator_main_session_id":"parent-session"}))
         def lookup(*extra):
             return subprocess.run([str(self.bin), "path", "fixture-run", ".", *extra],
                                   env=self.env, capture_output=True, text=True, timeout=5)
@@ -555,7 +562,7 @@ class TeamTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("cannot resolve persistent PIRA store", failed.stderr)
 
-    def test_missing_run_explains_old_store_access_without_migration(self):
+    def test_missing_run_is_generic_without_migration_or_disclosure(self):
         store = self.root / "empty-persistent-store"
         self.env["PIRA_TEAM_DIR"] = str(store)
         for create in (False, True):
@@ -564,8 +571,8 @@ class TeamTests(unittest.TestCase):
             result = subprocess.run([str(self.bin), "path", "old-run"], env=self.env,
                                     capture_output=True, text=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("--store OLD_STORE", result.stderr)
-            self.assertIn("absolute paths", result.stderr)
+            self.assertEqual(result.stderr, "pira_team: run unavailable to this main session\n")
+            self.assertEqual(result.stdout, "")
             self.assertEqual(store.exists(), create)
             if create:
                 self.assertEqual(list(store.iterdir()), [])
@@ -643,15 +650,17 @@ class TeamTests(unittest.TestCase):
         manifest = json.loads(self.access("read", run.name, "manifest.json").stdout)
         self.assertFalse(manifest["usage_complete"])
 
-    def test_nav_rule_mirrors_main_policy(self):
+    def test_shared_rules_mirror_main_policy(self):
         root = Path(__file__).resolve().parents[4]
-        prefix = "- Let structural backends auto-select."
-        def rule(path):
-            with path.open() as source:
-                matches = [line.rstrip("\n") for line in source if line.startswith(prefix)]
-            self.assertEqual(len(matches), 1)
-            return matches[0]
-        self.assertEqual(rule(root / "AGENTS.md"), rule(root / "tools/src/pira_team/main.md"))
+        main = (root / "AGENTS.md").read_text()
+        worker = (root / "tools/src/pira_team/main.md").read_text()
+        for start, end in (("### Concurrency", "## Safety"),
+                           ("### `pira_nav`:", "### `pira_team`:")):
+            self.assertIn(main[main.index(start):main.index(end, main.index(start))].rstrip(), worker)
+        for prefix in ("- Minimize the content", "- Preserve requested coverage",
+                       "- Judge each passage", "- Do not narrate routine"):
+            rule = next(line for line in main.splitlines() if line.startswith(prefix))
+            self.assertIn(rule, worker)
 
     def test_injects_exact_technical_and_tool_guidance(self):
         result = self.launch("review", "--inject-review", "--inject-implement")
@@ -698,7 +707,8 @@ class TeamTests(unittest.TestCase):
             handoff.write_text("Final public handoff")
             (directory / "phase.md").write_text("stage instructions")
             (directory / "repair/validation.json").write_text('{"error":"fixture"}')
-            (run / "manifest.json").write_text(json.dumps({"status": "completed", "artifact": str(handoff.relative_to(run))}))
+            (run / "manifest.json").write_text(json.dumps({"status": "completed", "artifact": str(handoff.relative_to(run)),
+                "run_id":run.name, "creator_main_session_id":"parent-session"}))
             self.assertEqual(self.access("read", run.name).stdout, "Final public handoff")
             self.assertEqual(self.access("path", run.name).stdout.strip(), str(handoff))
             self.assertEqual(self.access("read", run.name, prefix + "/phase.md").stdout, "stage instructions")
@@ -970,7 +980,10 @@ class TeamTests(unittest.TestCase):
                 self.assertFalse((run / "implementation").exists())
 
     def test_guidance_selection_and_additive_resume(self):
-        for flags in ((), ("--inject-review",), ("--inject-implement",), ("--inject-review", "--inject-implement")):
+        for flags in ((), ("--inject-review",), ("--inject-implement",), ("--inject-review", "--inject-implement"),
+                      ("--inject-fig",), ("--inject-review", "--inject-fig"),
+                      ("--inject-implement", "--inject-fig"),
+                      ("--inject-review", "--inject-implement", "--inject-fig")):
             with self.subTest(flags=flags):
                 result = self.launch("Assess assigned artifact", *flags)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -978,21 +991,99 @@ class TeamTests(unittest.TestCase):
                 run = Path(receipt["run_root"])
                 prefix = (run / "policy.md").read_text()
                 self.assertEqual("# Review\n" in prefix, "--inject-review" in flags)
-                self.assertEqual("# Implementation\n" in prefix, flags == ("--inject-implement",))
-                resumed = self.access("resume", receipt["run_id"], "--inject-review", "--inject-implement")
+                self.assertEqual("# Implementation\n" in prefix, "--inject-implement" in flags and "--inject-review" not in flags)
+                figure = (Path(__file__).resolve().parents[4] / "modules/PUBLIC_FIGURE_STYLE.md").read_text()
+                self.assertEqual(figure in prefix, "--inject-fig" in flags)
+                initial = self.metadata(receipt)
+                self.assertEqual(initial["inject_fig"], "--inject-fig" in flags)
+                staged = "--inject-review" in flags and "--inject-implement" in flags
+                self.assertEqual(initial.get("stage"), "implementation" if staged else None)
+                state = json.loads((run / "codex-home/fixture-state.json").read_text())
+                self.assertEqual(len(state["turn_details"]), 2 if staged else 1)
+                for index, turn in enumerate(state["turn_details"]):
+                    self.assertEqual(figure in turn["policy"] + turn["phase"], "--inject-fig" in flags)
+                    self.assertIn("The assignment defines authority", turn["policy"])
+                    if staged and index == 0:
+                        self.assertIn("Do not edit project source, tests, configuration", turn["phase"])
+                    else:
+                        self.assertIn("Edit authority comes from the assigned task", turn["phase"])
+                resumed = self.access("resume", receipt["run_id"], "--inject-review", "--inject-implement", "--inject-fig")
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
                 latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
                 self.assertEqual((latest / "policy.md").read_text(), prefix)
                 phase = (latest / "phase.md").read_text()
                 self.assertEqual("# Review\n" in phase, "--inject-review" not in flags)
                 self.assertEqual("# Implementation\n" in phase, "--inject-implement" not in flags)
+                self.assertEqual(figure in phase, "--inject-fig" not in flags)
+                updated = self.metadata(json.loads(resumed.stdout))
+                self.assertTrue(updated["inject_fig"])
+                self.assertEqual(updated.get("stage"), initial.get("stage"))
                 again = self.access("resume", receipt["run_id"])
                 self.assertEqual(again.returncode, 0, again.stderr)
                 phase = (Path(json.loads(again.stdout)["handoff_path"]).parent.parent / "phase.md").read_text()
                 self.assertNotIn("# Review\n", phase)
                 self.assertNotIn("# Implementation\n", phase)
-        for flag in ("--inject-review", "--inject-implement"):
+                self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", phase)
+        for flag in ("--inject-review", "--inject-implement", "--inject-fig"):
             self.assertNotEqual(self.launch("review", flag, flag).returncode, 0)
+            before = (run / "manifest.json").read_bytes()
+            self.assertNotEqual(self.access("resume", receipt["run_id"], flag, flag).returncode, 0)
+            self.assertEqual((run / "manifest.json").read_bytes(), before)
+
+    def test_figure_guidance_missing_in_old_manifests_is_not_implied(self):
+        for version in (5, 16):
+            with self.subTest(version=version):
+                result = self.launch("Assess artifact")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                receipt = json.loads(result.stdout)
+                run = Path(receipt["run_root"])
+                path = run / "manifest.json"
+                manifest = json.loads(path.read_text())
+                manifest.pop("inject_fig")
+                manifest["worker_policy_version"] = version
+                path.write_text(json.dumps(manifest))
+                prefix = (run / "policy.md").read_bytes()
+                for flags, retained in (((), False), (("--inject-fig",), True), ((), True)):
+                    resumed = self.access("resume", receipt["run_id"], *flags)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+                    self.assertEqual((latest / "policy.md").read_bytes(), prefix)
+                    self.assertEqual("# PUBLIC_FIGURE_STYLE\n" in (latest / "phase.md").read_text(), bool(flags))
+                    self.assertEqual(json.loads(path.read_text())["inject_fig"], retained)
+
+    def test_figure_guidance_not_acknowledged_is_not_marked_received(self):
+        first = self.launch("Assess artifact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        self.env["TEAM_BAD_PERMISSION"] = "1"
+        failed = self.access("resume", receipt["run_id"], "--inject-fig")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Codex did not confirm", failed.stderr)
+        self.assertFalse(json.loads((run / "manifest.json").read_text())["inject_fig"])
+        self.env.pop("TEAM_BAD_PERMISSION")
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+        self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", (latest / "phase.md").read_text())
+
+    def test_figure_guidance_acknowledged_before_failed_turn_is_retained(self):
+        first = self.launch("Assess artifact")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        self.env["TEAM_PARTIAL_FAILURE"] = "before-rpc-error"
+        failed = self.access("resume", receipt["run_id"], "--inject-fig")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("fixture turn/start error", failed.stderr)
+        manifest = json.loads((run / "manifest.json").read_text())
+        self.assertTrue(manifest["inject_fig"])
+        self.assertIn("# PUBLIC_FIGURE_STYLE\n", manifest["phase_instructions"])
+        self.env.pop("TEAM_PARTIAL_FAILURE")
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
+        self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", (latest / "phase.md").read_text())
 
     def test_fix_needs_no_prior_review_marker(self):
         first = self.launch("Review assigned module only")
@@ -1090,7 +1181,7 @@ class TeamTests(unittest.TestCase):
         run = Path(first["run_root"])
         manifest = run / "manifest.json"
         state = json.loads(manifest.read_text())
-        state["worker_policy_version"] = 4
+        state["worker_policy_version"] = 16
         manifest.write_text(json.dumps(state))
         prefix = (run / "policy.md").read_bytes()
         for migrated in (True, False):
@@ -1099,7 +1190,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1147,7 +1238,7 @@ class TeamTests(unittest.TestCase):
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual(policy.read_bytes(), prefix)
             updated = json.loads(manifest.read_text())
-            self.assertEqual(updated["worker_policy_version"], 16)
+            self.assertEqual(updated["worker_policy_version"], 20)
             self.assertIsNone(updated.get("dec_workspace"))
 
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
@@ -1180,7 +1271,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 16)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
@@ -1440,7 +1531,7 @@ class TeamTests(unittest.TestCase):
         run = self.root / "logs" / "stopped-run"
         run.mkdir(parents=True, mode=0o700)
         manifest = run / "manifest.json"
-        state = {}
+        state = {"run_id":run.name, "creator_main_session_id":"parent-session"}
         for status, turn, expected in (
             ("completed", None, "read the handoff; use explicit resume"),
             ("running", None, "starting or between turns"),
@@ -1462,7 +1553,7 @@ class TeamTests(unittest.TestCase):
 
         manifest.write_text("invalid JSON")
         result = self.access("interrupt", run.name)
-        self.assertIn("persisted lifecycle/revision unavailable", result.stderr)
+        self.assertEqual(result.stderr, "pira_team: run unavailable to this main session\n")
 
     def test_environment_inheritance_exclusions_and_resume(self) -> None:
         for key in ("CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR", "TMPDIR"):

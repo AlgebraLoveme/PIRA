@@ -1,4 +1,4 @@
-//! Store-wide management pointers; never part of worker inputs or configuration.
+//! Main-session-scoped management pointers; never part of worker inputs or configuration.
 use crate::{lifecycle, profile::defaults, storage};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -12,7 +12,12 @@ const FILE_NAME: &str = "bookmarks.json";
 const MAX_BYTES: u64 = 1024 * 1024;
 const LOCK_WAIT_BUDGET: Duration = Duration::from_secs(5);
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
-type Index = BTreeMap<String, String>;
+#[derive(Default)]
+struct Index {
+    scoped: BTreeMap<(String, String), String>,
+    // Legacy global pointers have no assignment identity. Preserve, never expose.
+    legacy: BTreeMap<String, String>,
+}
 
 pub fn validate_label(label: &str) -> Result<(), String> {
     if label.is_empty()
@@ -81,7 +86,7 @@ fn load(root: &Path) -> Result<Index, String> {
 
 fn load_file(path: &Path) -> Result<Index, String> {
     if !inspect_if_present(path)? {
-        return Ok(Index::new());
+        return Ok(Index::default());
     }
     let mut bytes = Vec::new();
     open(path, false)?
@@ -92,15 +97,15 @@ fn load_file(path: &Path) -> Result<Index, String> {
         return Err("bookmark index exceeds 1 MiB".into());
     }
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid bookmark JSON")?;
-    // Arrays avoid JSON object duplicate-key overwrite. Versioned format is
-    // [1, [[label, literal_run_id], ...]]; duplicate labels fail, never silently drop.
-    let document = value
-        .as_array()
-        .filter(|v| v.len() == 2 && v[0] == 1)
-        .ok_or("invalid bookmark index schema")?;
-    let entries = document[1].as_array().ok_or("invalid bookmark entries")?;
-    let mut index = Index::new();
-    for entry in entries {
+    // Arrays reject duplicate keys rather than silently overwriting mappings.
+    let document = value.as_array().ok_or("invalid bookmark index schema")?;
+    let mut index = Index::default();
+    let (scoped, legacy) = match document.as_slice() {
+        [version, legacy] if *version == 1 => (None, legacy),
+        [version, scoped, legacy] if *version == 2 => (Some(scoped), legacy),
+        _ => return Err("invalid bookmark index schema".into()),
+    };
+    for entry in legacy.as_array().ok_or("invalid bookmark entries")? {
         let pair = entry
             .as_array()
             .filter(|v| v.len() == 2)
@@ -109,8 +114,34 @@ fn load_file(path: &Path) -> Result<Index, String> {
         let id = pair[1].as_str().ok_or("invalid bookmark run ID")?;
         validate_label(label).map_err(|_| "invalid stored bookmark label")?;
         storage::validate_run_id(id).map_err(|_| "invalid stored bookmark run ID")?;
-        if index.insert(label.to_owned(), id.to_owned()).is_some() {
+        if index
+            .legacy
+            .insert(label.to_owned(), id.to_owned())
+            .is_some()
+        {
             return Err("duplicate label in bookmark index".into());
+        }
+    }
+    if let Some(scoped) = scoped {
+        for entry in scoped.as_array().ok_or("invalid scoped bookmark entries")? {
+            let triple = entry
+                .as_array()
+                .filter(|v| v.len() == 3)
+                .ok_or("invalid scoped bookmark entry")?;
+            let session = triple[0].as_str().ok_or("invalid bookmark session")?;
+            let label = triple[1].as_str().ok_or("invalid bookmark label")?;
+            let id = triple[2].as_str().ok_or("invalid bookmark run ID")?;
+            crate::profile::validate_session_id(session)
+                .map_err(|_| "invalid stored bookmark session")?;
+            validate_label(label).map_err(|_| "invalid stored bookmark label")?;
+            storage::validate_run_id(id).map_err(|_| "invalid stored bookmark run ID")?;
+            if index
+                .scoped
+                .insert((session.to_owned(), label.to_owned()), id.to_owned())
+                .is_some()
+            {
+                return Err("duplicate scoped label in bookmark index".into());
+            }
         }
     }
     Ok(index)
@@ -151,8 +182,13 @@ fn lock(root: &Path) -> Result<File, String> {
 }
 
 fn persist(root: &Path, index: &Index) -> Result<(), String> {
-    let entries: Vec<_> = index.iter().map(|(label, id)| [label, id]).collect();
-    let mut bytes = serde_json::to_vec(&json!([1, entries])).map_err(|e| e.to_string())?;
+    let entries: Vec<_> = index
+        .scoped
+        .iter()
+        .map(|((session, label), id)| [session, label, id])
+        .collect();
+    let legacy: Vec<_> = index.legacy.iter().map(|(label, id)| [label, id]).collect();
+    let mut bytes = serde_json::to_vec(&json!([2, entries, legacy])).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_BYTES {
         return Err("bookmark index would exceed 1 MiB; prior file was not changed".into());
@@ -195,75 +231,102 @@ fn run_reference(root: &Path, id: &str) -> Value {
     json!({"run_id":id,"run_root":root.join(id)})
 }
 
-fn lookup(index: &Index, label: &str) -> Result<String, String> {
+fn visible_reference(root: &Path, id: &str, session: &str) -> Option<Value> {
+    storage::locate_for(root, id, session)
+        .ok()
+        .map(|_| run_reference(root, id))
+}
+
+fn lookup(index: &Index, label: &str, session: &str) -> Result<String, String> {
     validate_label(label)?;
     index
-        .get(label)
+        .scoped
+        .get(&(session.to_owned(), label.to_owned()))
         .cloned()
         .ok_or_else(|| format!("bookmark {label:?} not found"))
 }
 
 /// Resolve exactly one label from an atomic snapshot; mappings contain literal IDs only.
-pub fn resolve(root: &Path, label: &str) -> Result<String, String> {
+pub(crate) fn resolve_for(root: &Path, label: &str, session: &str) -> Result<String, String> {
     validate_label(label)?;
     let root = root_if_present(root)?.ok_or("Team store does not exist")?;
-    lookup(&load(&root)?, label)
+    lookup(&load(&root)?, label, session)
 }
 
 /// Add/move a unique label under one update lock; aliases use that same snapshot.
 pub fn assign(root: &Path, reference: &str, label: &str) -> Result<Value, String> {
+    let session = crate::profile::caller_session()?;
     validate_label(label)?;
+    // Reject inaccessible targets before creating any lock/metadata files.
+    storage::locate_for(root, reference, &session)?;
     let root = root_if_present(root)?.ok_or("Team store does not exist")?;
     let _lock = lock(&root)?;
     let mut index = load(&root)?;
     let id = if let Some(alias) = reference.strip_prefix('@') {
-        lookup(&index, alias)?
+        lookup(&index, alias, &session)?
     } else {
         storage::validate_run_id(reference)?;
         reference.to_owned()
     };
-    let run = storage::locate(&root, &id)?;
+    let run = storage::locate_for(&root, &id, &session)?;
     lifecycle::private_path(&run, true)?;
     lifecycle::private_path(&run.join("manifest.json"), false)?;
-    let previous = index.get(label).cloned();
+    let previous = index
+        .scoped
+        .get(&(session.clone(), label.to_owned()))
+        .cloned();
     let changed = previous.as_deref() != Some(&id);
     if changed {
-        index.insert(label.to_owned(), id.clone());
+        index
+            .scoped
+            .insert((session.clone(), label.to_owned()), id.clone());
         persist(&root, &index)?;
     }
     Ok(
-        json!({"label":label,"previous":previous.map(|id| run_reference(&root,&id)),
+        json!({"label":label,"previous":previous.as_deref().and_then(|id| visible_reference(&root,id,&session)),
         "current":run_reference(&root,&id),"changed":changed}),
     )
 }
 
 fn remove(root: &Path, label: &str) -> Result<Value, String> {
+    let session = crate::profile::caller_session()?;
     validate_label(label)?;
     let Some(root) = root_if_present(root)? else {
         return Ok(json!({"label":label,"previous":null,"current":null,"changed":false}));
     };
+    // An absent label can linearize at this snapshot without creating a lock file.
+    if !load(&root)?
+        .scoped
+        .contains_key(&(session.clone(), label.to_owned()))
+    {
+        return Ok(json!({"label":label,"previous":null,"current":null,"changed":false}));
+    }
     let _lock = lock(&root)?;
     let mut index = load(&root)?;
-    let previous = index.remove(label);
+    let previous = index.scoped.remove(&(session.clone(), label.to_owned()));
     if previous.is_some() {
         persist(&root, &index)?;
     }
     Ok(
-        json!({"label":label,"previous":previous.as_deref().map(|id|run_reference(&root,id)),
+        json!({"label":label,"previous":previous.as_deref().and_then(|id|visible_reference(&root,id,&session)),
         "current":null,"changed":previous.is_some()}),
     )
 }
 
 fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, String> {
+    let session = crate::profile::caller_session()?;
     let Some(root) = root_if_present(root)? else {
         return Ok(json!({"matches":[],"has_more":false}));
     };
-    // Validate the whole index before limiting. No manifests, logs or sessions are read.
+    // Validate the whole index before filtering; expose only accessible runs.
     let index = load(&root)?;
     let query = query.map(str::to_lowercase);
     let mut matches = Vec::new();
     let mut has_more = false;
-    for (label, id) in index {
+    for ((owner, label), id) in index.scoped {
+        if owner != session || visible_reference(&root, &id, &session).is_none() {
+            continue;
+        }
         if query
             .as_ref()
             .is_some_and(|q| !label.to_lowercase().contains(q))
@@ -279,7 +342,7 @@ fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, Strin
     Ok(json!({"matches":matches,"has_more":has_more}))
 }
 
-/// Session-free bookmark/search/list/remove management; no worker launch or auth lookup.
+/// Session-scoped bookmark management; no worker launch or authentication lookup.
 pub fn command(args: &[String]) -> Result<(), String> {
     let action = args[0].as_str();
     let (mut store, mut label, mut limit, mut target) = (None, None, None, None);
