@@ -170,7 +170,7 @@ class SubteamTests(unittest.TestCase):
         self.assertFalse(active["descendants"]["usage_complete"])
         self.finish(child["run_id"])
         process2, _ = self.start(resume=coordinator, allow=False)
-        self.assertEqual(self.manifest(coordinator)["coordinator_policy_version"], 19)
+        self.assertEqual(self.manifest(coordinator)["coordinator_policy_version"], 20)
         self.assertNotIn("# Coordinator Team usage", self.manifest(coordinator)["phase_instructions"])
         # Permission is retained; child resume stays owned by coordinator and nondelegating.
         result = self.command(coordinator, "resume", child["run_id"], "--task", "ordinary", "--completion-gate", "x")
