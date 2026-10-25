@@ -131,6 +131,27 @@ class ClaudeSetupTests(unittest.TestCase):
                 self.assertEqual(self.run_setup(), 0)
                 self.assertEqual(legacy.read_bytes(), original)
 
+    def test_legacy_custom_policy_directory(self) -> None:
+        snapshot = self.claude.parent / "custom-policy"
+        snapshot.mkdir()
+        policy = (setup.VERIFY_TOKEN + "\n").encode()
+        (snapshot / "AGENTS.md").write_bytes(policy)
+        manifest = {"schema_version": 1, "target": "claude-code",
+                    "files": [{"path": "AGENTS.md", "sha256": setup.sha256(policy)}]}
+        (snapshot / "install.json").write_text(json.dumps(manifest), encoding="utf-8")
+        bridge = self.claude / "CLAUDE.md"
+        home = self.claude.parent
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            for target in ("~/custom-policy/AGENTS.md", (snapshot / "AGENTS.md").as_posix()):
+                with self.subTest(target=target):
+                    bridge.write_text(f"Local rules\n{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n",
+                                      encoding="utf-8")
+                    self.assertEqual(self.run_setup(), 0)
+                    self.assertEqual(bridge.read_text(encoding="utf-8"), "Local rules\n")
+                    self.assertEqual((snapshot / "AGENTS.md").read_bytes(), policy)
+                    self.assertEqual(json.loads((snapshot / "install.json").read_text()), manifest)
+                    self.assertEqual(self.run_setup("--verify"), 0)
+
     def test_unmanaged_entry_and_modified_legacy_block_are_refused(self) -> None:
         entry = self.entry
         entry.parent.mkdir()
@@ -145,6 +166,38 @@ class ClaudeSetupTests(unittest.TestCase):
         )
         self.assertEqual(self.run_setup(), 1)
         self.assertFalse(entry.exists())
+
+    def test_custom_legacy_unowned_or_modified_is_preserved(self) -> None:
+        snapshot = self.claude.parent / "custom-policy"
+        snapshot.mkdir()
+        policy = snapshot / "AGENTS.md"
+        original = (setup.VERIFY_TOKEN + "\n").encode()
+        policy.write_bytes(original)
+        record = {"path": "AGENTS.md", "sha256": setup.sha256(original)}
+        manifest_path = snapshot / "install.json"
+        bridge = self.claude / "CLAUDE.md"
+        for defect in ("missing", "wrong-target", "wrong-schema", "duplicate", "unowned", "modified", "edited-import"):
+            with self.subTest(defect=defect):
+                manifest = {"schema_version": 1, "target": "claude-code", "files": [record]}
+                if defect == "wrong-target":
+                    manifest["target"] = "other"
+                elif defect == "wrong-schema":
+                    manifest["schema_version"] = 99
+                elif defect == "duplicate":
+                    manifest["files"] = [record, record]
+                elif defect == "unowned":
+                    manifest["files"] = []
+                if defect != "missing":
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                policy.write_bytes(original + (b"edited\n" if defect == "modified" else b""))
+                target = policy.as_posix() + (" extra text" if defect == "edited-import" else "")
+                bridge.write_text(f"{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n", encoding="utf-8")
+                before = {p: p.read_bytes() for p in (bridge, policy, manifest_path) if p.exists()}
+                self.assertEqual(self.run_setup(), 1)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
+
 
     def test_preexisting_identical_rule_requires_install_manifest(self) -> None:
         self.entry.parent.mkdir()

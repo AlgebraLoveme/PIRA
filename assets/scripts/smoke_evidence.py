@@ -102,37 +102,52 @@ def native_read_evidence(events: list[dict], expected: Mapping[Path, str], cwd: 
     return reads
 
 
-def _reader_patterns(command: str, depth: int = 0) -> list[str]:
+def _reader_patterns(command: str, depth: int = 0, *, posix_shell: bool = True) -> list[str]:
     # PIRA: conservative reader subset, not a shell interpreter. Unsupported
     # scripts, cwd changes, pipelines and substitutions fail closed; extend with
     # framing/command fixtures before adding a new reader or shell syntax.
     if depth > 2 or any(token in command for token in ("$", "`", "<", ">", "|", "\n")):
         return []
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        # Keep raw words beside decoded values: shell tilde expansion depends on
+        # quoting, which shlex's POSIX decoding alone discards.
+        word = r'''(?:[^\s'"\\;&]+|\\[^\n]|'[^']*'|"(?:[^"\\]|\\.)*")+|[;&]+'''
+        words = []
+        end = 0
+        for match in re.finditer(word, command):
+            if command[end:match.start()].strip():
+                return []
+            raw = match.group()
+            decoded = shlex.split(raw, comments=True)
+            if len(decoded) != 1:
+                return []
+            words.append((decoded[0], raw))
+            end = match.end()
+        if command[end:].strip():
+            return []
     except ValueError:
         return []
+    tokens = [value for value, _ in words]
     if not tokens:
         return []
     executable = tokens[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
     if executable in ("bash", "sh", "powershell", "powershell.exe", "pwsh", "pwsh.exe"):
         for flag in ("-c", "-lc", "-Command", "-command"):
             if flag in tokens and tokens.index(flag) == len(tokens) - 2:
-                return _reader_patterns(tokens[-1], depth + 1)
+                return _reader_patterns(tokens[-1], depth + 1,
+                                        posix_shell=executable in ("bash", "sh"))
         return []
     segments = [[]]
-    for token in tokens:
-        if token in (";", "&&"):
+    for token, raw in words:
+        if raw in (";", "&&"):
             segments.append([])
         else:
-            segments[-1].append(token)
+            segments[-1].append((token, raw))
     patterns = []
     for segment in segments:
         if not segment:
             return []
-        reader = segment[0].rsplit("/", 1)[-1].lower()
+        reader = segment[0][0].rsplit("/", 1)[-1].lower()
         allowed_flags = {
             "cat": {"-n", "-b", "-s", "--"},
             "nl": {"-ba", "-bt", "-bn", "--"},
@@ -142,15 +157,20 @@ def _reader_patterns(command: str, depth: int = 0) -> list[str]:
         if reader not in allowed_flags:
             return []
         args = segment[1:]
-        if any(token.startswith("-") and token.lower() not in allowed_flags[reader] for token in args):
+        if any(token.startswith("-") and token.lower() not in allowed_flags[reader] for token, _ in args):
             return []
-        operands = [token for token in args if not token.startswith("-")]
+        operands = [(token, raw) for token, raw in args if not token.startswith("-")]
         if reader == "sed":
             operands = operands[1:]  # First operand is the script, not a file.
-        if reader == "get-content" and any(token.lower() == "-literalpath" for token in args):
-            if any(character in operand for operand in operands for character in "*?["):
+        if reader == "get-content" and any(token.lower() == "-literalpath" for token, _ in args):
+            if any(character in operand for operand, _ in operands for character in "*?["):
                 return []
-        patterns.extend(operands)
+        for operand, raw in operands:
+            if reader != "get-content" and any(c in operand for c in "*?[") and any(c in raw for c in "'\"\\"):
+                return []  # PIRA: quoted/escaped glob syntax is outside this subset.
+            if posix_shell and reader != "get-content" and raw.startswith("~/"):
+                operand = str(Path.home()) + operand[1:]
+            patterns.append(operand)
     return patterns
 
 

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from assets.scripts.smoke_evidence import (
     claude_evidence, codex_evidence, complete_content, native_read_evidence,
@@ -67,6 +72,52 @@ class CompleteContentTests(unittest.TestCase):
 
 
 class ReadEvidenceTests(unittest.TestCase):
+    def test_home_expansion_preserves_quoting_and_shell_boundaries(self) -> None:
+        home = self.root / "home"
+        target = home / "agent" / "modules" / "a.md"
+        body = "# Policy\nComplete content.\n"
+        commands = {
+            "cat ~/agent/modules/a.md": True,
+            "cat ~/agent/modules/*.md": True,
+            "sh -c 'cat ~/agent/modules/*.md'": True,
+            'bash -lc "cat ~/agent/modules/a.md"': True,
+            "cat '~/agent/modules/a.md'": False,
+            'cat "~/agent/modules/a.md"': False,
+            r"cat \~/agent/modules/a.md": False,
+            "cat '~/agent/modules/'*.md": False,
+            'cat ~/agent/modules/"*.md"': False,
+            "cat ~/agent/modules/a.md | head": False,
+            "cat $HOME/agent/modules/a.md": False,
+            "pwsh -Command 'cat ~/agent/modules/a.md'": False,
+        }
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            for command, wanted in commands.items():
+                for parser, trace in ((claude_evidence, claude_trace("Bash", {"command": command}, body)),
+                                      (codex_evidence, codex_trace(command, body))):
+                    with self.subTest(command=command, parser=parser.__name__):
+                        self.assertEqual(parser(trace, {target: body}, self.root)["reads"][target], wanted)
+            literal = self.root / "~" / "agent" / "modules" / "a.md"
+            command = "cat '~/agent/modules/a.md'"
+            self.assertTrue(claude_evidence(claude_trace("Bash", {"command": command}, body),
+                                           {literal: body}, self.root)["reads"][literal])
+
+    @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "requires POSIX Bash")
+    def test_home_relative_shell_read(self) -> None:
+        home = self.root / "home"
+        module = home / "agent" / "modules" / "a.md"
+        module.parent.mkdir(parents=True)
+        body = "# Module\nComplete policy body.\n"
+        module.write_text(body, encoding="utf-8")
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            for command in ("cat ~/agent/modules/*.md", "cat " + shlex.quote(str(module))):
+                result = subprocess.run([shutil.which("bash"), "--noprofile", "--norc", "-c", command],
+                                        cwd=self.root, text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout, body)
+                for parser, trace in ((claude_evidence, claude_trace("Bash", {"command": command}, result.stdout)),
+                                      (codex_evidence, codex_trace(command, result.stdout))):
+                    with self.subTest(command=command, parser=parser.__name__):
+                        self.assertTrue(parser(trace, {module: body}, self.root)["reads"][module])
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix="pira-evidence-tests-")
         self.addCleanup(temporary.cleanup)

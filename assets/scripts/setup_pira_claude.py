@@ -332,6 +332,30 @@ def read_manifest(path: Path) -> dict[str, object] | None:
     return data
 
 
+def verify_custom_legacy_import(body: str) -> None:
+    """Accept only a canonical import backed by an unchanged owned snapshot."""
+    if not body.startswith("@") or any(character.isspace() for character in body):
+        raise RuntimeError("invalid custom legacy PIRA import")
+    target = Path(os.path.expanduser(body[1:]))
+    if not target.is_absolute() or target.name != "AGENTS.md":
+        raise RuntimeError("custom legacy PIRA import must name an absolute policy path")
+    require_resolved_directory(target.parent)
+    try:
+        canonical = "~/" + target.relative_to(Path.home().absolute()).as_posix()
+    except ValueError:
+        canonical = target.as_posix()
+    if body[1:] not in (canonical, target.as_posix()) or target.is_symlink() or not target.is_file():
+        raise RuntimeError("custom legacy PIRA import is edited or unsafe")
+    manifest = read_object(target.parent / "install.json", "legacy PIRA ownership manifest")
+    files = manifest.get("files")
+    if (manifest.get("schema_version") != 1 or manifest.get("target") != "claude-code"
+            or not isinstance(files, list) or not all(isinstance(entry, dict) for entry in files)):
+        raise RuntimeError("custom legacy PIRA import has no valid ownership manifest")
+    policies = [entry for entry in files if entry.get("path") == "AGENTS.md"]
+    if len(policies) != 1 or policies[0].get("sha256") != sha256(target.read_bytes()):
+        raise RuntimeError("custom legacy PIRA policy is unowned or modified")
+
+
 def legacy_without_pira(path: Path) -> bytes | None:
     if path.is_symlink():
         raise RuntimeError(f"refusing unsafe Claude instructions: {path}")
@@ -356,7 +380,7 @@ def legacy_without_pira(path: Path) -> bytes | None:
         end = len(text)
     body = text[start + len(LEGACY_START):end_marker].strip()
     if not re.fullmatch(r"@(?:~|[^ \t\r\n]+)/\.claude/pira/AGENTS\.md", body):
-        raise RuntimeError(f"PIRA-managed CLAUDE.md block was edited: {path}")
+        verify_custom_legacy_import(body)
     remaining = text[:start] + text[end:]
     return remaining.encode("utf-8") if remaining.strip() else b""
 
