@@ -27,7 +27,7 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Claude Code v2.1.283 smoke tests confirmed global user-rule loading and project `AGENTS.md` loading alongside `CLAUDE.md`. In an Opus code-review control, a required module read was denied without a permission rule; with the narrow rule below, Claude read both coding and research modules. A separate explanation task read its explanation module. These are smoke tests, not proof of broad behavioral parity. Other models or agent platforms may work without equivalent testing.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Claude Code v2.1.283 smoke tests covered global user-rule loading, both project instruction formats, and module access. Broad behavioral parity with Codex remains unverified. Other models or agent platforms may work without equivalent testing.
 
 ## Quick start with Codex
 
@@ -147,7 +147,7 @@ The adapter makes three Claude-side changes:
 2. Sets [Project instructions](https://code.claude.com/docs/en/memory#choose-which-instruction-files-load) to `claude-md-and-agents-md`, so each project's `AGENTS.md` and `CLAUDE.md` load together. Resolve any contradictory project rules.
 3. Adds narrow `Read(~/agent/modules/*.md)`, `Read(~/.claude/pira/USER.md)`, and `Read(~/agent/USER.md)` [allow rules](https://code.claude.com/docs/en/permissions#read-and-edit), so it can load PIRA modules, its private profile, or the shared fallback profile from other projects without gaining edit access. Existing rules are preserved; deny rules still take precedence.
 
-Claude shares PIRA policy, modules, and the four common tool binaries with Codex. The new `pira_team` launches Codex workers and is installed by Codex setup, not by the Claude-only adapter; in Claude, use it only when that Codex backend is already configured, or use Claude's native delegation. Its `~/.claude/pira/USER.md` stays private and independent. These allow rules grant tool access, not authority to disclose profile data; project instructions remain untrusted. The adapter preserves unrelated Claude settings and instructions, and removes only the old PIRA-managed `CLAUDE.md` import after the new rule is prepared.
+`pira_team` launches Codex workers; use it only with an already configured Codex backend, or use Claude's native delegation. Claude's `~/.claude/pira/USER.md` stays private and independent. These allow rules grant tool access, not authority to disclose profile data; project instructions remain untrusted. The adapter preserves unrelated Claude settings and instructions, and removes only the old PIRA-managed `CLAUDE.md` import after the new rule is prepared.
 
 The adapter conservatively rejects potentially overlapping or unrecognized `Read` deny/ask rules in the settings file it manages. It does not evaluate managed, project, or session permission layers; installer verification is not a live permission test.
 
