@@ -39,7 +39,6 @@ class Migration:
     applied: bool = False
     completed_only: bool = False
     excluded_records: frozenset[str] = frozenset()
-    copy_required: bool = True
 
 
 def checked_path(path: Path) -> None:
@@ -1273,19 +1272,10 @@ def plan_migration(tool: str, sources: list[Path], destination: Path, *, complet
         if source in destination.parents or destination in source.parents:
             raise RuntimeError("Overlapping migration roots are unsafe")
     snapshots = {root: inventory(root, tool=tool) for root in (*roots, destination)}
-    copy_required = any(copied(tool, name, completed_only, excluded_records)
-                        and (name not in snapshots[destination]
-                             or not same_data(entry, snapshots[destination][name]))
-                        for root in roots for name, entry in snapshots[root].items())
-    if copy_required:
-        from setup_ctx_wrapper import require_unwrapped_migration
-        require_unwrapped_migration()
     files: dict[str, tuple[Path, Entry]] = {}
     identities: dict[str, tuple[Path, Entry]] = {}
     with ExitStack() as locks:
         for root, entries in snapshots.items():
-            if root == destination and not copy_required:
-                continue  # No destination writes: an ordinary wrapped update is safe.
             check_idle(tool, root, entries, completed_only)
             for name in sorted(entries):
                 if is_lease(tool, name):
@@ -1308,7 +1298,7 @@ def plan_migration(tool: str, sources: list[Path], destination: Path, *, complet
     for name in identities:
         if any(parent.as_posix() in identities for parent in Path(name).parents if parent != Path(".")):
             raise RuntimeError(f"File/directory collision: {name}")
-    return Migration(tool, roots, destination, snapshots, files, completed_only=completed_only, excluded_records=frozenset(excluded_records), copy_required=copy_required)
+    return Migration(tool, roots, destination, snapshots, files, completed_only=completed_only, excluded_records=frozenset(excluded_records))
 
 
 def private_parents(path: Path, template: Path | None = None) -> None:
@@ -1329,12 +1319,6 @@ def verify_sources(plan: Migration) -> None:
 
 
 def verify_destination(plan: Migration) -> None:
-    if not plan.copy_required:
-        for name, (_, entry) in plan.files.items():
-            target = plan.destination / name
-            if not target.exists() or not same_data(entry, file_entry(target)):
-                raise RuntimeError(f"Migration destination verification failed: {name}")
-        return
     current = inventory(plan.destination, tool=plan.tool)
     unexpected = current.keys() - plan.inventories[plan.destination].keys() - plan.files.keys()
     if unexpected:
@@ -1361,25 +1345,15 @@ def apply_migrations(plans: list[Migration], *, dry_run: bool = False, verify: b
             if any(destination == source or destination in source.parents or source in destination.parents
                    for source in plan.sources):
                 raise RuntimeError("Migration destination overlaps a source")
-    if any(plan.copy_required for plan in plans):
-        from setup_ctx_wrapper import require_unwrapped_migration
-        require_unwrapped_migration()
     with ExitStack() as locks:
         for plan in plans:
             for root, entries in plan.inventories.items():
-                if root == plan.destination and not plan.copy_required:
-                    continue
                 if not (plan.applied and root == plan.destination) and inventory(root, tool=plan.tool) != entries:
                     raise RuntimeError(f"Store changed after migration preflight: {root}")
                 check_idle(plan.tool, root, entries, plan.completed_only)
                 for name in sorted(entries):
                     if is_lease(plan.tool, name):
                         locks.enter_context(lease(root / name))
-        for plan in plans:
-            if not plan.copy_required:
-                verify_sources(plan)
-                verify_destination(plan)
-        plans = [plan for plan in plans if plan.copy_required]
         if dry_run or verify:
             if verify:
                 for plan in plans:

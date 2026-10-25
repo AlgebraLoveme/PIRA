@@ -492,7 +492,8 @@ class AutoRecapTests(unittest.TestCase):
             prepare.assert_not_called()
 
     @unittest.skipUnless(NATIVE_CTX_BINARY, "isolated native Ctx fixture requires explicit binary")
-    def test_fresh_ctx_capture_blocks_full_setup_retained_migration(self):
+    def test_active_ctx_writer_blocks_direct_setup_until_idle(self):
+        import socket
         import subprocess
         root = Path(setup.os.environ["HOME"])
         binary = NATIVE_CTX_BINARY
@@ -524,20 +525,41 @@ class AutoRecapTests(unittest.TestCase):
                 + "s.audio_retirement.default_profiles.assert_called_once(); "
                 + "registry.SetValueEx.assert_not_called(); s.stores.notify_windows_environment.assert_not_called(); raise SystemExit(result)")
         env.update(PIRA_CTX_STORE_DIR=str(destination), PIRA_DEC_STORE_DIR=str(root / "dec"), PIRA_TEAM_DIR=str(root / "team"))
-        captured = subprocess.run([binary, "capture", "--interest", "(?i)active|error", "--intent", "probe fresh captured setup", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)
-        self.assertIn("rerun the same setup command directly without pira_ctx", captured.stdout + captured.stderr, f"wrapper exit={captured.returncode}: {captured.stdout} {captured.stderr}")
-        self.assertEqual(config.read_text(), 'model = "custom"\n')
-        self.assertFalse((agent / "AGENTS.override.md").exists())
-        exact = subprocess.run([binary, "exact", "--intent", "inspect complete setup output", "--", sys.executable, "-c", code], env=env, capture_output=True, text=True)
-        self.assertNotEqual(exact.returncode, 0)
-        self.assertIn("rerun the same setup command directly without pira_ctx", exact.stdout + exact.stderr)
-        self.assertEqual(config.read_text(), 'model = "custom"\n')
-        direct = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        # The writer is independent; setup itself is always invoked directly.
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0)); server.listen(); server.settimeout(15)
+            wait = ("import socket,sys; "
+                    "connection=socket.create_connection(('127.0.0.1',int(sys.argv[1])),timeout=15); "
+                    "connection.sendall(b'R'); assert connection.recv(1)==b'G'")
+            writer = subprocess.Popen([binary, "capture", "--intent", "independent active writer", "--",
+                                       sys.executable, "-c", wait, str(server.getsockname()[1])],
+                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                connection, _ = server.accept()
+                with connection:
+                    connection.settimeout(15)
+                    self.assertEqual(connection.recv(1), b"R")
+                    try:
+                        refused = subprocess.run([sys.executable, "-c", code], env=env,
+                                                 capture_output=True, text=True, timeout=30)
+                        self.assertNotEqual(refused.returncode, 0)
+                        self.assertIn("Unfinished capture requires recovery", refused.stdout + refused.stderr)
+                        self.assertEqual(config.read_text(), 'model = "custom"\n')
+                        self.assertFalse((agent / "AGENTS.override.md").exists())
+                    finally:
+                        connection.sendall(b"G")
+            finally:
+                output, errors = writer.communicate(timeout=30)
+            self.assertEqual(writer.returncode, 0, output + errors)
+        retained = {path: path.read_bytes() for path in destination.rglob("*.piractx")}
+        self.assertTrue(retained)
+        direct = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
         self.assertIn("Verification passed", direct.stdout)
         self.assertIn("PIRA_TEAM_DIR", config.read_text())
-        update = subprocess.run([binary, "capture", "--intent", "no-migration setup update", "--", sys.executable, "-c", code],
-                                env=env, capture_output=True, text=True)
+        for path, data in retained.items():
+            self.assertEqual(path.read_bytes(), data)
+        update = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(update.returncode, 0, update.stdout + update.stderr)
         self.assertFalse(agent.is_symlink())
 

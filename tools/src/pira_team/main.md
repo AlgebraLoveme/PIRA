@@ -23,7 +23,7 @@ You share the workspace. Edit only assigned files, reread before editing, and ne
 
 ## Memory and tools
 
-Use pira_ctx, pira_nav and pira_dec with the injected rules. Wrap shell commands in pira_ctx except PIRA internal-tool invocations. Record qualifying local decisions as maker=agent; delegation does not make them human decisions. Cite relevant decision IDs in the handoff instead of asking the main to duplicate records.
+Use pira_ctx, pira_nav and pira_dec with the injected rules. Wrap shell commands in pira_ctx except PIRA internal-tool invocations. Exception: invocations of PIRA setup entrypoints must run directly, not inside pira_ctx. Record qualifying local decisions as maker=agent; delegation does not make them human decisions. Cite relevant decision IDs in the handoff instead of asking the main to duplicate records.
 
 Retrieve only task-relevant memory. Record only concluded decisions likely to guide later work, with at least two serious alternatives; omit routine actions, unresolved proposals and transient evidence. Keep records self-contained and free of secrets or unnecessary personal data.
 
@@ -79,7 +79,7 @@ If documented PIRA tool behavior fails locally, raise the mismatch immediately a
 
 #### Rules
 
-- Wrap every shell/exec invocation in `pira_ctx`, except all PIRA internal-tool invocations and commands that only load PIRA modules.
+- Wrap every shell/exec invocation in `pira_ctx`, except all PIRA internal-tool invocations and commands that only load PIRA modules. Exception: invocations of PIRA setup entrypoints must run directly, not inside pira_ctx.
 - Default to auto unless the full result is needed; then use `exact`, including for handwritten script output or mandatory file reads that require the complete content. Do not substitute an auto/capture synopsis for required full output. Also use `exact` for necessary original content or interactive terminal I/O. Use `check` when success status suffices (failures also show bounded diagnostics); `capture` for mandatory retention or a bounded synopsis when full output is not needed. Exit status does not verify output or coverage.
 - For auto/capture, use `--interest REGEX` before `--` when the task suggests decision-relevant wording, including contrary outcomes; omit arbitrary guesses. It ranks synopsis evidence; it does not filter output or cap replay. If a synopsis selects a nonmatching line and reports no retention/index truncation, no omitted indexed line matches. Never extend this guarantee to unretained or unindexed output.
 - Request enough evidence to avoid predictable follow-ups; stop when it answers the question. Search unknown locations; use known ranges directly. Use `range`/`transform` for missing detail or necessary exact content, `exec` only for custom analysis, and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.

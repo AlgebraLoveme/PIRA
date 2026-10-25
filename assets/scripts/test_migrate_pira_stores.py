@@ -66,6 +66,39 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual((self.destination / "workspace/records/two.piradec").read_bytes(), b"two")
         self.assertEqual(len(migration.inventory(self.destination)), 3)
 
+    def test_identical_destination_still_requires_idle_writer_lease(self):
+        self.put(self.source, "record.piractx")
+        self.put(self.destination, "record.piractx")
+        lock = self.put(self.destination, "indexes/.index.owner-lock", b"lease")
+        before = migration.inventory(self.destination, tool="pira_ctx")
+        with migration.lease(lock), self.assertRaisesRegex(RuntimeError, "lease"):
+            self.plan("pira_ctx")
+        self.assertEqual(migration.inventory(self.destination, tool="pira_ctx"), before)
+
+    def test_identical_destination_addition_after_preflight_is_rejected(self):
+        self.put(self.source, "record")
+        self.put(self.destination, "record")
+        plan = self.plan()
+        late = self.put(self.destination, "late", b"late writer")
+        with self.assertRaisesRegex(RuntimeError, "changed after migration preflight"):
+            migration.apply_migrations([plan])
+        self.assertEqual(late.read_bytes(), b"late writer")
+
+    def test_destination_addition_during_copy_is_not_silently_accepted(self):
+        source = self.put(self.source, "record")
+        plan = self.plan()
+        copy = migration.shutil.copyfileobj
+        def concurrent_write(original, output, length):
+            copy(original, output, length)
+            self.put(self.destination, "late", b"late writer")
+        with patch.object(migration.shutil, "copyfileobj", side_effect=concurrent_write):
+            with self.assertRaisesRegex(RuntimeError, "Unexpected destination writes"):
+                migration.apply_migrations([plan])
+        self.assertEqual(source.read_bytes(), b"record\x00\xff")
+        self.assertEqual((self.destination / "late").read_bytes(), b"late writer")
+        migration.apply_migrations([self.plan()])
+        self.assertEqual((self.destination / "late").read_bytes(), b"late writer")
+
     def test_conflicting_content_or_modes_and_tree_collision_fail_before_writes(self):
         self.put(self.source, "record", b"source")
         for content, mode in ((b"different", 0o600), (b"source", 0o400)):

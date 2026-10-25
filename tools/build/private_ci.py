@@ -255,7 +255,6 @@ def selected(root: Path) -> list[Path]:
         "assets/scripts/setup_pira_tools.py", "assets/scripts/test_setup_pira_tools.py",
         "assets/scripts/setup_pira_stores.py", "assets/scripts/test_setup_pira_stores.py",
         "assets/scripts/setup_migration_choices.py", "assets/scripts/test_setup_migration_choices.py",
-        "assets/scripts/setup_ctx_wrapper.py", "assets/scripts/test_setup_ctx_wrapper.py",
         "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
         "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
     paths.append(Path("tools/build/private_ci.py"))

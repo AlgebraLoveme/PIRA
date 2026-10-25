@@ -1190,7 +1190,7 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 19)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1238,7 +1238,7 @@ class TeamTests(unittest.TestCase):
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual(policy.read_bytes(), prefix)
             updated = json.loads(manifest.read_text())
-            self.assertEqual(updated["worker_policy_version"], 19)
+            self.assertEqual(updated["worker_policy_version"], 20)
             self.assertIsNone(updated.get("dec_workspace"))
 
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
@@ -1271,7 +1271,7 @@ class TeamTests(unittest.TestCase):
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 19)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")
