@@ -598,8 +598,12 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
         format!("model_reasoning_effort={}", json!(options.effort)),
         format!("model_instructions_file={}", json!(dir.join("policy.md"))),
         format!(
-            "projects.{}.trust_level=\"untrusted\"",
+            "projects={{{}={{trust_level=\"untrusted\"}}}}",
+            // CLI keys split on every dot; only the value supports TOML quoted keys.
+            // JSON strings are TOML basic strings except for literal DEL.
             json!(options.cwd.to_string_lossy())
+                .to_string()
+                .replace('\u{7f}', "\\u007f")
         ),
     ] {
         cmd.arg("-c").arg(setting);
@@ -885,4 +889,5 @@ mod tests {
                 .any(|a| a.contains("danger-full-access") || a == "resume")
         );
     }
+    include!("project_trust_tests.rs");
 }
