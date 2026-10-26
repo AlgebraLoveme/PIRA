@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPT = Path(__file__).with_name("setup_pira_claude.py")
@@ -164,7 +164,14 @@ class ClaudeSetupTests(unittest.TestCase):
         (codex_root / "USER.md").write_bytes(b"Private Codex profile\n")
         (self.agent / "USER.md").write_bytes(b"Private Claude fallback\n")
         codex_args = ["--skip-tools", "--yes", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]
+        profile = home / "fixture-profile.ps1"
+        profile.write_bytes(b"# Unrelated shell preferences\n")
+        # HOME does not redirect Windows known-folder discovery or HKCU.
+        registry = MagicMock()
+        registry.OpenKey.side_effect = FileNotFoundError
         with patch.dict(os.environ, {**native_ctx_environment(home), "SHELL": "/bin/sh"}, clear=True), \
+                patch.dict(sys.modules, {"winreg": registry}), \
+                patch.object(codex.audio_retirement, "default_profiles", return_value=[profile]), \
                 patch.object(codex, "__file__", str(codex_root / "assets/scripts/setup_pira.py")), \
                 patch.object(codex, "migration_codex_binary", return_value=None):
             self.assertEqual(codex.main(codex_args), 0)
@@ -194,6 +201,8 @@ class ClaudeSetupTests(unittest.TestCase):
             self.assertEqual(self.run_setup(), 0)
             for path, content in codex_updated.items():
                 self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(profile.read_bytes(), b"# Unrelated shell preferences\n")
+            registry.SetValueEx.assert_not_called()
 
     def test_fresh_install_verify_rerun_and_uninstall(self) -> None:
         codex_config = self.claude.parent / ".codex" / "config.toml"
