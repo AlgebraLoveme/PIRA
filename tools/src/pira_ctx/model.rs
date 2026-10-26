@@ -148,7 +148,7 @@ impl CapturedStream {
                 Ok(RawReader::Memory(Cursor::new(Arc::clone(bytes))))
             }
             CapturedStreamData::File(path) => Ok(RawReader::File(BufReader::new(
-                File::open(path).map_err(|error| error.to_string())?,
+                util::open_regular_file(path, "capture spool")?,
             ))),
         }
     }
@@ -168,6 +168,7 @@ impl Drop for CapturedStream {
 
 #[derive(Debug)]
 pub struct CaptureResult {
+    pub redirected_stream: Option<StreamKind>,
     pub stdout: CapturedStream,
     pub stderr: CapturedStream,
     pub timeline: Vec<LineMeta>,
@@ -176,12 +177,14 @@ pub struct CaptureResult {
     pub stderr_lines: usize,
     pub timeline_truncated: bool,
     pub retention_truncated: bool,
+    pub drain_truncated: bool,
     pub cancelled: bool,
     pub exit_code: i32,
     pub start_ms: u128,
     pub end_ms: u128,
     pub duration_ms: u128,
     pub cwd: String,
+    pub cwd_native: crate::native_path::NativePath,
     pub live_id: Option<String>,
     pub live_store_dir: Option<PathBuf>,
     pub(crate) _live_owner: Option<crate::storage::LiveOwnerLease>,
@@ -213,6 +216,8 @@ impl CaptureResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirected_stream: Option<StreamKind>,
     #[serde(default = "default_compat_version")]
     pub compat_version: u32,
     #[serde(default)]
@@ -223,6 +228,8 @@ pub struct Metadata {
     pub original_command_argv: Vec<String>,
     #[serde(default)]
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_native: Option<crate::native_path::NativePath>,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
@@ -247,6 +254,8 @@ pub struct Metadata {
     pub observed_total_bytes: u64,
     #[serde(default)]
     pub retention_truncated: bool,
+    #[serde(default)]
+    pub drain_truncated: bool,
     #[serde(default)]
     pub cancelled: bool,
     #[serde(default)]
@@ -441,16 +450,18 @@ impl StreamReaders {
     ) -> Result<Self, String> {
         Ok(Self {
             stdout: SectionReader::Raw {
-                reader: RawReader::File(BufReader::new(
-                    File::open(stdout_path).map_err(|error| error.to_string())?,
-                )),
+                reader: RawReader::File(BufReader::new(util::open_regular_file(
+                    stdout_path,
+                    "capture stdout",
+                )?)),
                 base: stdout_base,
                 length: stdout_length,
             },
             stderr: SectionReader::Raw {
-                reader: RawReader::File(BufReader::new(
-                    File::open(stderr_path).map_err(|error| error.to_string())?,
-                )),
+                reader: RawReader::File(BufReader::new(util::open_regular_file(
+                    stderr_path,
+                    "capture stderr",
+                )?)),
                 base: stderr_base,
                 length: stderr_length,
             },
@@ -468,14 +479,14 @@ impl StreamReaders {
     ) -> Result<Self, String> {
         Ok(Self {
             stdout: SectionReader::Blocks {
-                file: File::open(path).map_err(|e| e.to_string())?,
+                file: util::open_regular_file(path, "capture result")?,
                 base: stdout_base,
                 length: stdout_length,
                 blocks: stdout_blocks,
                 cache: None,
             },
             stderr: SectionReader::Blocks {
-                file: File::open(path).map_err(|e| e.to_string())?,
+                file: util::open_regular_file(path, "capture result")?,
                 base: stderr_base,
                 length: stderr_length,
                 blocks: stderr_blocks,
@@ -489,14 +500,30 @@ impl StreamReaders {
         Ok(util::sanitize_terminal(&String::from_utf8_lossy(&bytes)))
     }
 
+    pub fn read_full_display_line(&mut self, line: &LineMeta) -> Result<String, String> {
+        // Interest matching covers every retained indexed byte, not display excerpts.
+        let bytes = self.read_bounded(line, u64::MAX)?;
+        Ok(util::sanitize_terminal(&String::from_utf8_lossy(&bytes)))
+    }
+
     pub fn read_security_line(&mut self, line: &LineMeta) -> Result<String, String> {
         let bytes = self.read_bounded(line, util::MAX_DISPLAY_READ_BYTES)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    pub fn read_search_line(&mut self, line: &LineMeta) -> Result<String, String> {
+    pub fn read_search_line(
+        &mut self,
+        line: &LineMeta,
+    ) -> Result<(String, crate::security::ContentRisk), String> {
+        if line.length > util::MAX_SEARCH_LINE_BYTES {
+            return Err(
+                "search line exceeds coverage limit; use exec for full-capture analysis".into(),
+            );
+        }
         let bytes = self.read_bounded(line, util::MAX_SEARCH_LINE_BYTES)?;
-        Ok(util::sanitize_terminal(&String::from_utf8_lossy(&bytes)))
+        let raw = String::from_utf8_lossy(&bytes);
+        let risk = crate::security::inspect(&raw);
+        Ok((util::sanitize_terminal(&raw), risk))
     }
 
     fn read_bounded(&mut self, line: &LineMeta, maximum: u64) -> Result<Vec<u8>, String> {
@@ -587,7 +614,12 @@ impl SectionReader {
                     .seek(SeekFrom::Start(*base + offset))
                     .map_err(|e| e.to_string())?;
                 let mut limited = reader.take(length);
-                std::io::copy(&mut limited, out).map_err(util::io_error)?;
+                let copied = std::io::copy(&mut limited, out).map_err(util::io_error)?;
+                if copied != length {
+                    return Err(format!(
+                        "short stream read: expected {length} bytes, read {copied}"
+                    ));
+                }
                 Ok(())
             }
             Self::Blocks {
@@ -598,11 +630,13 @@ impl SectionReader {
                 ..
             } => {
                 let end = offset + length;
-                for (index, b) in blocks.iter().enumerate() {
-                    let bend = b.logical_offset + b.uncompressed_length;
-                    if bend <= offset || b.logical_offset >= end {
-                        continue;
+                let first =
+                    blocks.partition_point(|b| b.logical_offset + b.uncompressed_length <= offset);
+                for (index, b) in blocks.iter().enumerate().skip(first) {
+                    if b.logical_offset >= end {
+                        break;
                     }
+                    let bend = b.logical_offset + b.uncompressed_length;
                     if cache.as_ref().is_none_or(|(i, _)| *i != index) {
                         file.seek(SeekFrom::Start(*base + b.payload_offset))
                             .map_err(|e| e.to_string())?;
@@ -622,6 +656,9 @@ impl SectionReader {
                             .map_err(|e| format!("lz4 decode: {e}"))?,
                             _ => return Err("unsupported block codec".into()),
                         };
+                        if decoded.len() as u64 != b.uncompressed_length {
+                            return Err("decoded block length mismatch".into());
+                        }
                         if b.content_sha256.is_some_and(|expected| {
                             <[u8; 32]>::from(sha2::Sha256::digest(&decoded)) != expected
                         }) {
@@ -633,7 +670,7 @@ impl SectionReader {
                     let from = offset.max(b.logical_offset) - b.logical_offset;
                     let to = end.min(bend) - b.logical_offset;
                     out.write_all(&data[from as usize..to as usize])
-                        .map_err(|e| e.to_string())?;
+                        .map_err(util::io_error)?;
                 }
                 Ok(())
             }
@@ -650,4 +687,154 @@ fn validate_line(line: &LineMeta, section_length: u64) -> Result<(), String> {
         return Err(format!("invalid timeline offset at L{}", line.line));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod block_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn block_output_errors_preserve_broken_pipe_classification() {
+        struct FailedWriter(std::io::ErrorKind);
+        impl Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "fixture output failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let path = std::env::temp_dir().join(format!("ctx-output-error-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let mut reader = SectionReader::Blocks {
+            file: File::open(&path).unwrap(),
+            base: 0,
+            length: 3,
+            blocks: vec![BlockDescriptor {
+                codec: 0,
+                logical_offset: 0,
+                uncompressed_length: 3,
+                stored_length: 3,
+                payload_offset: 0,
+                content_sha256: None,
+            }],
+            cache: None,
+        };
+        let broken = reader.copy_range(0, 3, &mut FailedWriter(std::io::ErrorKind::BrokenPipe));
+        let other = reader.copy_range(
+            0,
+            3,
+            &mut FailedWriter(std::io::ErrorKind::PermissionDenied),
+        );
+        drop(reader);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(broken.unwrap_err(), util::BROKEN_PIPE);
+        assert_eq!(other.unwrap_err(), "fixture output failure");
+    }
+
+    #[test]
+    fn compressed_length_mismatch_returns_error_instead_of_panicking() {
+        let path = std::env::temp_dir().join(format!("ctx-lz4-length-{}", std::process::id()));
+        let payload = lz4_flex::block::compress(b"abc");
+        std::fs::write(&path, &payload).unwrap();
+        for length in [2, 3, 5] {
+            let mut reader = SectionReader::Blocks {
+                file: File::open(&path).unwrap(),
+                base: 0,
+                length,
+                blocks: vec![BlockDescriptor {
+                    codec: 1,
+                    logical_offset: 0,
+                    uncompressed_length: length,
+                    stored_length: payload.len() as u64,
+                    payload_offset: 0,
+                    content_sha256: None,
+                }],
+                cache: None,
+            };
+            let result = reader.read_range(0, length);
+            if length == 3 {
+                assert_eq!(result.unwrap(), b"abc");
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn raw_copy_rejects_premature_eof_but_preserves_exact_and_empty_reads() {
+        let mut reader = SectionReader::Raw {
+            reader: RawReader::Memory(Cursor::new(Arc::from(&b"abc"[..]))),
+            base: 0,
+            length: 4,
+        };
+        let mut output = Vec::new();
+        let error = reader.copy_range(0, 4, &mut output).unwrap_err();
+        assert_eq!(error, "short stream read: expected 4 bytes, read 3");
+        assert_eq!(output, b"abc");
+        assert_eq!(reader.read_range(0, 3).unwrap(), b"abc");
+        assert!(reader.read_range(3, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_reads_preserve_variable_blocks_crossings_and_checksums() {
+        let path = std::env::temp_dir().join(format!(
+            "pira-block-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let parts = [vec![b'a'; 113], vec![b'b'; 257], vec![b'c'; 61]];
+        let mut payload = Vec::new();
+        let mut blocks = Vec::new();
+        let mut logical = 0;
+        for (i, part) in parts.iter().enumerate() {
+            let stored = if i == 1 {
+                lz4_flex::block::compress(part)
+            } else {
+                part.clone()
+            };
+            blocks.push(BlockDescriptor {
+                codec: u8::from(i == 1),
+                logical_offset: logical,
+                uncompressed_length: part.len() as u64,
+                stored_length: stored.len() as u64,
+                payload_offset: payload.len() as u64,
+                content_sha256: Some(sha2::Sha256::digest(part).into()),
+            });
+            logical += part.len() as u64;
+            payload.extend(stored);
+        }
+        std::fs::write(&path, payload).unwrap();
+        let expected = parts.concat();
+        let mut reader = SectionReader::Blocks {
+            file: File::open(&path).unwrap(),
+            base: 0,
+            length: logical,
+            blocks: blocks.clone(),
+            cache: None,
+        };
+        for (offset, len) in [(0, 431), (112, 4), (120, 8), (3, 1), (431, 0), (0, 0)] {
+            assert_eq!(
+                reader.read_range(offset, len).unwrap(),
+                expected[offset as usize..(offset + len) as usize]
+            );
+        }
+        assert!(reader.read_range(431, 1).is_err());
+        blocks[1].content_sha256 = Some([0; 32]);
+        let mut corrupt = SectionReader::Blocks {
+            file: File::open(&path).unwrap(),
+            base: 0,
+            length: logical,
+            blocks,
+            cache: None,
+        };
+        assert!(corrupt.read_range(113, 1).unwrap_err().contains("checksum"));
+        drop(reader);
+        drop(corrupt);
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -73,6 +73,17 @@ impl StoredResult {
         self.live.is_some()
     }
 
+    /// Persisted lifecycle state, shared by stats and Python bindings.
+    pub fn state(&self) -> &'static str {
+        if self.is_running() {
+            "running"
+        } else if self.metadata.cancelled {
+            "cancelled"
+        } else {
+            "complete"
+        }
+    }
+
     pub fn live_generation(&self) -> Option<u64> {
         self.live.as_ref().map(|state| state.generation)
     }
@@ -170,6 +181,29 @@ impl StoredResult {
         })
     }
 
+    pub(crate) fn sample_growth(
+        self,
+        stdout_from: u64,
+        stderr_from: u64,
+        maximum_each: u64,
+    ) -> Result<(Self, StreamGrowth), String> {
+        match self.read_stream_growth(stdout_from, stderr_from, maximum_each) {
+            Ok(growth) => Ok((self, growth)),
+            Err(error) if self.is_running() => {
+                // Publication retires the manifest and spools. Retry only this capture,
+                // from the unchanged cursors, never an unrelated/latest result.
+                let finalized = final_result_for_live_path(&self.path)?.ok_or(error)?;
+                if finalized.metadata.result_id != self.metadata.result_id {
+                    return Err("final capture identity differs from live checkpoint".into());
+                }
+                let growth =
+                    finalized.read_stream_growth(stdout_from, stderr_from, maximum_each)?;
+                Ok((finalized, growth))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn verify(&self) -> Result<(), String> {
         if self.is_running() {
             return Err("cannot verify a running capture; retry after PROGRAM exits".into());
@@ -218,14 +252,88 @@ struct LiveManifest {
     checkpoint_unix_ms: u128,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_path_native: Option<crate::native_path::NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_path_native: Option<crate::native_path::NativePath>,
     #[serde(default)]
     owner_lock: bool,
     metadata: Metadata,
 }
 
+impl LiveManifest {
+    fn stream_paths(&self) -> Result<(PathBuf, PathBuf), String> {
+        let expected_schema =
+            if self.stdout_path_native.is_some() || self.stderr_path_native.is_some() {
+                4
+            } else if self
+                .metadata
+                .cwd_native
+                .as_ref()
+                .is_some_and(|path| path.requires_native())
+            {
+                3
+            } else if self.metadata.redirected_stream.is_some() {
+                2
+            } else {
+                1
+            };
+        if self.schema != expected_schema {
+            return Err("unsupported live checkpoint schema".into());
+        }
+        // Legacy strings stay exact, including actual Unicode replacement characters.
+        // Native fields are authoritative; display strings must never retarget a spool.
+        let resolve = |native: Option<&crate::native_path::NativePath>, legacy: &Path| {
+            native.map_or_else(|| Ok(legacy.to_path_buf()), |path| path.to_path())
+        };
+        Ok((
+            resolve(self.stdout_path_native.as_ref(), &self.stdout_path)?,
+            resolve(self.stderr_path_native.as_ref(), &self.stderr_path)?,
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub struct LiveOwnerLease {
     _file: File,
+}
+
+fn encode_live_manifest(manifest: &mut LiveManifest) -> Result<Vec<u8>, String> {
+    struct LimitedJson {
+        bytes: Vec<u8>,
+        overflow: bool,
+    }
+    impl Write for LimitedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_METADATA_BYTES as usize).saturating_sub(self.bytes.len()) {
+                self.overflow = true;
+                return Err(std::io::Error::other("live metadata byte limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    loop {
+        let mut output = LimitedJson {
+            bytes: Vec::new(),
+            overflow: false,
+        };
+        match serde_json::to_writer(&mut output, &manifest) {
+            Ok(()) => return Ok(output.bytes),
+            Err(error) if !output.overflow || manifest.metadata.line_timeline.is_empty() => {
+                return Err(error.to_string());
+            }
+            Err(_) => {
+                // Limit only this snapshot: final indexing and exact retained streams are unchanged.
+                let shorter = manifest.metadata.line_timeline.len() / 2;
+                manifest.metadata.line_timeline.truncate(shorter);
+                manifest.metadata.timeline_truncated = true;
+            }
+        }
+    }
 }
 
 fn live_owner_path(store_dir: &Path, result_id: &str) -> PathBuf {
@@ -267,14 +375,18 @@ fn live_owner_is_active(store_dir: &Path, result_id: &str) -> bool {
 
 #[derive(Debug)]
 pub struct LiveCheckpoint<'a> {
+    pub redirected_stream: Option<StreamKind>,
     pub command: &'a [String],
     pub cwd: &'a str,
+    pub cwd_native: &'a crate::native_path::NativePath,
     pub start_ms: u128,
     pub duration_ms: u128,
     pub stdout_path: &'a Path,
     pub stderr_path: &'a Path,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
+    pub observed_stdout_bytes: u64,
+    pub observed_stderr_bytes: u64,
     pub stdout_lines: usize,
     pub stderr_lines: usize,
     pub total_lines: usize,
@@ -303,18 +415,28 @@ pub fn write_live_checkpoint(
         return Err("invalid live result id".into());
     }
     let workspace_id = workspace_id()?;
-    let workspace_hash = short_hash(workspace_id.as_bytes(), 16);
+    let workspace_hash = checked_workspace_hash(store_dir)?;
     let scope_hash = crate::events::current_scope(&workspace_hash).hash;
     let total_bytes = snapshot.stdout_bytes.saturating_add(snapshot.stderr_bytes);
+    let retention_truncated = snapshot.observed_stdout_bytes > snapshot.stdout_bytes
+        || snapshot.observed_stderr_bytes > snapshot.stderr_bytes;
     let checkpoint_unix_ms = util::millis(SystemTime::now());
     let filename = format!("{result_id}.live.json");
     let path = live_dir.join(&filename);
     let metadata = Metadata {
-        compat_version: FORMAT_VERSION,
+        redirected_stream: snapshot.redirected_stream,
+        compat_version: if snapshot.cwd_native.requires_native() {
+            7
+        } else if snapshot.redirected_stream.is_some() {
+            5
+        } else {
+            FORMAT_VERSION
+        },
         tool_version: format!("pira_ctx-{}", env!("CARGO_PKG_VERSION")),
         command_argv: crate::util::redacted_argv(snapshot.command),
         original_command_argv: snapshot.command.to_vec(),
         cwd: snapshot.cwd.to_string(),
+        cwd_native: Some(snapshot.cwd_native.clone()),
         created_at: format_utc_timestamp(snapshot.start_ms / 1000),
         start_unix_ms: snapshot.start_ms,
         end_unix_ms: checkpoint_unix_ms,
@@ -323,10 +445,13 @@ pub fn write_live_checkpoint(
         stdout_bytes: snapshot.stdout_bytes,
         stderr_bytes: snapshot.stderr_bytes,
         total_bytes,
-        observed_stdout_bytes: snapshot.stdout_bytes,
-        observed_stderr_bytes: snapshot.stderr_bytes,
-        observed_total_bytes: total_bytes,
-        retention_truncated: false,
+        observed_stdout_bytes: snapshot.observed_stdout_bytes,
+        observed_stderr_bytes: snapshot.observed_stderr_bytes,
+        observed_total_bytes: snapshot
+            .observed_stdout_bytes
+            .saturating_add(snapshot.observed_stderr_bytes),
+        retention_truncated,
+        drain_truncated: false,
         cancelled: false,
         stdout_lines: snapshot.stdout_lines,
         stderr_lines: snapshot.stderr_lines,
@@ -347,21 +472,33 @@ pub fn write_live_checkpoint(
         scope_hash,
         stdout_sha256: String::new(),
         stderr_sha256: String::new(),
-        timeline_truncated: snapshot.timeline_truncated,
+        timeline_truncated: snapshot.timeline_truncated || retention_truncated,
     };
-    let manifest = LiveManifest {
-        schema: 1,
+    let stdout_native = crate::native_path::NativePath::from_path(snapshot.stdout_path);
+    let stderr_native = crate::native_path::NativePath::from_path(snapshot.stderr_path);
+    let stdout_path_native = stdout_native.requires_native().then_some(stdout_native);
+    let stderr_path_native = stderr_native.requires_native().then_some(stderr_native);
+    let mut manifest = LiveManifest {
+        schema: if stdout_path_native.is_some() || stderr_path_native.is_some() {
+            4
+        } else if snapshot.cwd_native.requires_native() {
+            3
+        } else if snapshot.redirected_stream.is_some() {
+            2
+        } else {
+            1
+        },
         generation,
         checkpoint_unix_ms,
-        stdout_path: snapshot.stdout_path.to_path_buf(),
-        stderr_path: snapshot.stderr_path.to_path_buf(),
+        // These legacy fields are display-only when the native counterpart is present.
+        stdout_path: PathBuf::from(snapshot.stdout_path.to_string_lossy().as_ref()),
+        stderr_path: PathBuf::from(snapshot.stderr_path.to_string_lossy().as_ref()),
+        stdout_path_native,
+        stderr_path_native,
         owner_lock,
         metadata,
     };
-    let bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_METADATA_BYTES {
-        return Err("live checkpoint metadata is too large".into());
-    }
+    let bytes = encode_live_manifest(&mut manifest)?;
     let temporary = live_dir.join(format!(".{result_id}.{}.tmp", std::process::id()));
     write_private_file_relaxed(&temporary, &bytes)?;
     atomic_replace(&temporary, &path)
@@ -398,31 +535,89 @@ pub(crate) fn atomic_replace(temporary: &Path, destination: &Path) -> io::Result
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        use std::os::windows::fs::OpenOptionsExt;
+        // POSIX replacement permits retained handles. Still respect an owner's
+        // explicit denial of delete sharing, and its original file permissions.
+        let destination_guard = match OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .open(destination)
+        {
+            Ok(file) => Some(file),
+            Err(error) if error.raw_os_error() == Some(2) => None,
+            Err(error) => return Err(error),
         };
+        windows_rename_snapshot(temporary, destination, destination_guard.is_some())
+    }
+}
 
-        let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        // SAFETY: both pointers refer to live, NUL-terminated UTF-16 buffers for this call.
-        let ok = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+#[cfg(windows)]
+fn windows_rename_snapshot(temporary: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
+    };
+    // FILE_RENAME_INFO.Flags values from the Windows SDK (not exported by our
+    // windows-sys feature set): REPLACE_IF_EXISTS=1, POSIX_SEMANTICS=2.
+    // See FILE_RENAME_INFO / SetFileInformationByHandle documentation. One
+    // namespace operation avoids ReplaceFileW's backup-name gap and exclusive
+    // replacement-file handle. Source handle explicitly shares read/write/delete.
+    let source = OpenOptions::new()
+        .access_mode(0x0001_0000) // DELETE, required for rename
+        .share_mode(7)
+        .open(temporary)?;
+    let destination = std::path::absolute(destination)?;
+    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL in snapshot destination",
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot destination is too long",
             )
-        };
-        if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+        })?;
+    let offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = offset
+        .checked_add(name_bytes as usize)
+        .and_then(|size| size.checked_add(2))
+        .and_then(|size| u32::try_from(size).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot rename buffer is too large",
+            )
+        })?;
+    // The flexible filename tail needs HANDLE alignment, not Vec<u8> alignment.
+    let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: buffer is aligned for FILE_RENAME_INFO and sized for its header,
+    // the complete UTF-16 name and a zero terminator. All fields/tail are written
+    // before the call; source, name and buffer remain alive throughout it.
+    unsafe {
+        (&raw mut (*info).Anonymous.Flags).write(if replace { 1 | 2 } else { 0 });
+        (&raw mut (*info).RootDirectory).write(std::ptr::null_mut());
+        (&raw mut (*info).FileNameLength).write(name_bytes);
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            (&raw mut (*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        if SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfoEx, info.cast(), size)
+            == 0
+        {
+            // Unsupported OS/filesystem and all sharing/access failures are errors.
+            // Never retry with a weaker publication API or delete the destination.
+            return Err(io::Error::last_os_error());
         }
     }
+    Ok(())
 }
 
 fn live_manifest_path(store_dir: &Path, result_id: &str) -> PathBuf {
@@ -479,37 +674,9 @@ pub struct PruneResult {
 }
 
 pub fn effective_store_dir(option: Option<&PathBuf>) -> Result<PathBuf, String> {
-    if let Some(path) = option {
-        return Ok(path.clone());
-    }
-    if let Some(path) = std::env::var_os("PIRA_CTX_STORE_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
-        return Ok(PathBuf::from(path).join("PIRA").join("ctx"));
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(home)
-            .join("Library")
-            .join("Caches")
-            .join("PIRA")
-            .join("ctx"));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
-            return Ok(PathBuf::from(path).join("pira").join("ctx"));
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return Ok(PathBuf::from(home).join(".cache").join("pira").join("ctx"));
-        }
-    }
-    Err(
-        "cannot determine a per-user pira_ctx store; set PIRA_CTX_STORE_DIR or --store-dir"
-            .to_string(),
-    )
+    let path = crate::store_location::configured(option)?.path;
+    checked_workspace_hash(&path)?;
+    Ok(path)
 }
 
 pub fn store_capture(
@@ -521,7 +688,7 @@ pub fn store_capture(
     ensure_private_dir(store_dir)?;
     ensure_private_dir(&store_dir.join("indexes"))?;
     let workspace_id = workspace_id()?;
-    let workspace_hash = short_hash(workspace_id.as_bytes(), 16);
+    let workspace_hash = checked_workspace_hash(store_dir)?;
     let scope_hash = crate::events::current_scope(&workspace_hash).hash;
     let timestamp = format_utc_timestamp(capture.start_ms / 1000);
     let mut seed = Vec::new();
@@ -549,11 +716,21 @@ pub fn store_capture(
     let detected_paths = summarize::detected_paths(capture)?;
     let suggested_keywords = summarize::suggested_keywords(capture, command, keywords)?;
     let metadata = Metadata {
-        compat_version: FORMAT_VERSION,
+        redirected_stream: capture.redirected_stream,
+        compat_version: if capture.cwd_native.requires_native() {
+            7
+        } else if capture.drain_truncated {
+            6
+        } else if capture.redirected_stream.is_some() {
+            5
+        } else {
+            FORMAT_VERSION
+        },
         tool_version: format!("pira_ctx-{}", env!("CARGO_PKG_VERSION")),
         command_argv: crate::util::redacted_argv(command),
         original_command_argv: command.to_vec(),
         cwd: capture.cwd.clone(),
+        cwd_native: Some(capture.cwd_native.clone()),
         created_at: timestamp,
         start_unix_ms: capture.start_ms,
         end_unix_ms: capture.end_ms,
@@ -566,6 +743,7 @@ pub fn store_capture(
         observed_stderr_bytes: capture.stderr.observed_length,
         observed_total_bytes: capture.observed_bytes(),
         retention_truncated: capture.retention_truncated,
+        drain_truncated: capture.drain_truncated,
         cancelled: capture.cancelled,
         stdout_lines: capture.stdout_lines,
         stderr_lines: capture.stderr_lines,
@@ -596,7 +774,9 @@ pub fn store_capture(
     let entry = ListedEntry::from_metadata(&metadata, path.clone());
     if let Err(error) = update_index(store_dir, &entry, &dirty) {
         let _ = fs::remove_file(store_dir.join("indexes").join(INDEX_COMPLETE));
-        eprintln!("pira_ctx: warning: stored result but could not update index: {error}");
+        crate::util::diagnostic_line(&format!(
+            "pira_ctx: warning: stored result but could not update index: {error}"
+        ));
     }
     if capture.live_id.is_some() {
         remove_live_checkpoint(store_dir, &result_id);
@@ -640,14 +820,14 @@ fn write_container(
     let stdout_table_length = block_table_length(capture.stdout.length)?;
     let stderr_table_length = block_table_length(capture.stderr.length)?;
     let temporary = path.with_extension(format!("piractx.tmp-{}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut output = options
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
     let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut output = options
-            .open(&temporary)
-            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
         write_zeros(&mut output, HEADER_V4_BYTES)?;
         output
             .write_all(&metadata_bytes)
@@ -708,24 +888,70 @@ fn write_container(
             output.write_all(&hash).map_err(|e| e.to_string())?;
         }
         output.sync_all().map_err(|error| error.to_string())?;
-        match fs::hard_link(&temporary, path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&temporary);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(format!("result path already exists: {}", path.display()));
-            }
-            Err(_) if !path.exists() => {
-                fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-            }
-            Err(error) => return Err(format!("publish {}: {error}", path.display())),
-        }
+        drop(output);
+        publish_immutable(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Publish a synchronized immutable file without ever replacing an existing record.
+pub(crate) fn publish_immutable(temporary: &Path, path: &Path) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(temporary, path).map_err(|error| format!(
+            "cannot publish {} without clobbering: {error}; a hard-link-capable filesystem is required; no rename fallback is used", path.display()))?;
+        if let Err(error) = fs::remove_file(temporary) {
+            crate::util::diagnostic_line(&format!(
+                "pira_ctx: published result; temporary link cleanup failed: {error}"
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            sync_directory(parent).map_err(|error| {
+                format!(
+                    "published {} but directory synchronization failed: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: valid NUL-terminated paths; omission of REPLACE_EXISTING preserves records.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "publish {} without replacement: {}",
+                path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    // PIRA: Windows uses write-through publication, not a Unix directory-fsync guarantee.
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn write_zeros(output: &mut File, length: u64) -> Result<(), String> {
@@ -747,9 +973,13 @@ pub fn read_result_path(path: &Path) -> Result<StoredResult, String> {
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.ends_with(".live.json"))
     {
-        return read_live_result(path);
+        if let Some(finalized) = final_result_for_live_path(path)? {
+            return Ok(finalized);
+        }
+        return read_live_result(path)
+            .or_else(|error| final_result_for_live_path(path)?.ok_or(error));
     }
-    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut file = util::open_regular_file(path, "capture result")?;
     let file_length = file.metadata().map_err(|error| error.to_string())?.len();
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)
@@ -763,14 +993,54 @@ pub fn read_result_path(path: &Path) -> Result<StoredResult, String> {
     }
 }
 
+fn final_result_for_live_path(path: &Path) -> Result<Option<StoredResult>, String> {
+    let Some(live_dir) = path
+        .parent()
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "live"))
+    else {
+        return Ok(None);
+    };
+    let Some(id) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".live.json"))
+    else {
+        return Ok(None);
+    };
+    let Some(store) = live_dir.parent() else {
+        return Ok(None);
+    };
+    read_exact_final(store, id)
+}
+
+fn read_exact_final(store: &Path, id: &str) -> Result<Option<StoredResult>, String> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Ok(None);
+    }
+    let path = store.join(format!("{id}.piractx"));
+    if !path
+        .try_exists()
+        .map_err(|error| format!("inspect final capture: {error}"))?
+    {
+        return Ok(None);
+    }
+    let stored = read_result_path(&path)?;
+    if stored.metadata.result_id != id {
+        return Err("final capture identity differs from requested result".into());
+    }
+    Ok(Some(stored))
+}
+
 fn read_live_result(path: &Path) -> Result<StoredResult, String> {
     let bytes = crate::util::read_file_limited(path, MAX_METADATA_BYTES, "live checkpoint")?;
     let manifest: LiveManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid live checkpoint: {error}"))?;
-    if manifest.schema != 1 {
-        return Err("unsupported live checkpoint schema".into());
-    }
-    for stream_path in [&manifest.stdout_path, &manifest.stderr_path] {
+    let (stdout_path, stderr_path) = manifest.stream_paths()?;
+    for stream_path in [&stdout_path, &stderr_path] {
         let valid_name = stream_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -779,10 +1049,10 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
             return Err("invalid live checkpoint stream path".into());
         }
     }
-    let stdout_length = fs::metadata(&manifest.stdout_path)
+    let stdout_length = fs::metadata(&stdout_path)
         .map_err(|error| format!("open live stdout: {error}"))?
         .len();
-    let stderr_length = fs::metadata(&manifest.stderr_path)
+    let stderr_length = fs::metadata(&stderr_path)
         .map_err(|error| format!("open live stderr: {error}"))?
         .len();
     if manifest.metadata.stdout_bytes > stdout_length
@@ -809,8 +1079,8 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
             generation: manifest.generation,
             checkpoint_unix_ms: manifest.checkpoint_unix_ms,
             owner_lock: manifest.owner_lock,
-            stdout_path: manifest.stdout_path,
-            stderr_path: manifest.stderr_path,
+            stdout_path,
+            stderr_path,
         }),
     })
 }
@@ -966,6 +1236,9 @@ fn get_varint(bytes: &[u8], position: &mut usize) -> Result<u64, String> {
     for shift in (0..=63).step_by(7) {
         let byte = *bytes.get(*position).ok_or("truncated varint")?;
         *position += 1;
+        if shift == 63 && byte > 1 {
+            return Err("oversized varint".into());
+        }
         value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
@@ -1308,7 +1581,21 @@ fn read_v4(path: &Path, mut file: File, file_length: u64) -> Result<StoredResult
     }
     let mut metadata: Metadata = serde_json::from_slice(&metadata_bytes)
         .map_err(|e| format!("invalid result metadata: {e}"))?;
-    if metadata.compat_version != 4 {
+    if metadata.compat_version
+        != if metadata
+            .cwd_native
+            .as_ref()
+            .is_some_and(|path| path.requires_native())
+        {
+            7
+        } else if metadata.drain_truncated {
+            6
+        } else if metadata.redirected_stream.is_some() {
+            5
+        } else {
+            4
+        }
+    {
         return Err("unsupported metadata compatibility version".into());
     }
     let stdout_blocks = decode_block_table_v4(&stdout_table, metadata.stdout_bytes, stdout_length)?;
@@ -1412,13 +1699,15 @@ fn read_v1(path: &Path, mut file: File, file_length: u64) -> Result<StoredResult
     let stderr_length_offset = stdout_offset
         .checked_add(stdout_length)
         .ok_or_else(|| "corrupt result: length overflow".to_string())?;
-    if stderr_length_offset + 8 > file_length {
+    let stderr_offset = stderr_length_offset
+        .checked_add(8)
+        .ok_or_else(|| "corrupt result: length overflow".to_string())?;
+    if stderr_offset > file_length {
         return Err("corrupt result: stdout length exceeds file".to_string());
     }
     file.seek(SeekFrom::Start(stderr_length_offset))
         .map_err(|error| error.to_string())?;
     let stderr_length = read_u64(&mut file)?;
-    let stderr_offset = stderr_length_offset + 8;
     let expected = stderr_offset
         .checked_add(stderr_length)
         .ok_or_else(|| "corrupt result: length overflow".to_string())?;
@@ -1462,6 +1751,9 @@ fn validate_layout(
 }
 
 fn validate_metadata(metadata: &Metadata, stdout: u64, stderr: u64) -> Result<(), String> {
+    if metadata.drain_truncated && !metadata.timeline_truncated {
+        return Err("corrupt result: incomplete pipe drain requires an incomplete index".into());
+    }
     if metadata.stdout_bytes != stdout || metadata.stderr_bytes != stderr {
         return Err("corrupt result: metadata stream lengths disagree with container".to_string());
     }
@@ -1531,7 +1823,7 @@ fn verify_section(
     expected: &[u8; 32],
     name: &str,
 ) -> Result<(), String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut file = util::open_regular_file(path, "capture result")?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|error| error.to_string())?;
     let mut limited = file.take(length);
@@ -1641,7 +1933,7 @@ pub(crate) fn resolve_current_live_capture(store_dir: &Path) -> Result<String, S
     }
 }
 
-fn live_result_is_active(store_dir: &Path, stored: &StoredResult) -> bool {
+pub(crate) fn live_result_is_active(store_dir: &Path, stored: &StoredResult) -> bool {
     let Some(live) = stored.live.as_ref() else {
         return false;
     };
@@ -1697,7 +1989,7 @@ fn read_indexes(
         if !path.is_file() {
             continue;
         }
-        let reader = BufReader::new(File::open(&path).map_err(|error| error.to_string())?);
+        let reader = BufReader::new(util::open_regular_file(&path, "capture index")?);
         for line in reader.lines() {
             let line = line.map_err(|error| error.to_string())?;
             if line.len() > 64 * 1024 {
@@ -1736,11 +2028,10 @@ fn update_index(store_dir: &Path, entry: &ListedEntry, current_dirty: &Path) -> 
     let _lock = StoreLock::acquire(&indexes.join(".index.lock"))?;
     if !indexes.join(INDEX_COMPLETE).is_file() || indexes_dirty_except(&indexes, current_dirty) {
         rebuild_indexes_locked(store_dir, &indexes)?;
-        clear_dirty_markers(&indexes);
-        return Ok(());
+    } else {
+        append_index(&indexes, entry)?;
     }
-    let path = indexes.join(format!("{}.jsonl", entry.workspace_hash));
-    append_index(&path, entry)?;
+    // Other publishers may not yet have published their captures. Keep their markers.
     match fs::remove_file(current_dirty) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1771,20 +2062,6 @@ fn indexes_dirty_except(indexes: &Path, current: &Path) -> bool {
     })
 }
 
-fn clear_dirty_markers(indexes: &Path) {
-    if let Ok(entries) = fs::read_dir(indexes) {
-        for entry in entries.filter_map(Result::ok) {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".dirty-"))
-            {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
 fn rebuild_indexes_locked(store_dir: &Path, indexes: &Path) -> Result<(), String> {
     for item in fs::read_dir(indexes).map_err(|error| error.to_string())? {
         let path = item.map_err(|error| error.to_string())?.path();
@@ -1800,17 +2077,31 @@ fn rebuild_indexes_locked(store_dir: &Path, indexes: &Path) -> Result<(), String
             .or_default()
             .push(entry);
     }
-    for (workspace, entries) in grouped {
-        let path = indexes.join(format!("{workspace}.jsonl"));
+    for entries in grouped.into_values() {
         for entry in entries {
-            append_index(&path, &entry)?;
+            append_index(indexes, &entry)?;
         }
     }
     write_private_file(&indexes.join(INDEX_COMPLETE), b"2\n")?;
     Ok(())
 }
 
-fn append_index(path: &Path, entry: &ListedEntry) -> Result<(), String> {
+fn append_index(indexes: &Path, entry: &ListedEntry) -> Result<(), String> {
+    // Accept generated identities and empty legacy ownership, not filesystem names
+    // supplied by capture metadata (including Windows device/alternate-stream names).
+    let hash = &entry.workspace_hash;
+    let hex = |value: &str, length: usize| {
+        value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if !hash.is_empty()
+        && !hex(hash, 16)
+        && !hash
+            .strip_prefix("native-v1-")
+            .is_some_and(|value| hex(value, 64))
+    {
+        return Err("invalid workspace identity for capture index".into());
+    }
+    let path = indexes.join(format!("{hash}.jsonl"));
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -1822,7 +2113,147 @@ fn append_index(path: &Path, entry: &ListedEntry) -> Result<(), String> {
     file.write_all(b"\n").map_err(|error| error.to_string())
 }
 
+/// Reservations are never recycled by capture pruning: stale handles must not retarget.
+fn short_id_dir(store_dir: &Path) -> Result<PathBuf, String> {
+    let workspace = current_workspace_hash()?;
+    let scope = crate::events::current_scope(&workspace);
+    if !scope.detected {
+        return Err("short result IDs require a detected agent session; use the full ID".into());
+    }
+    Ok(store_dir.join("short-ids").join(workspace).join(scope.hash))
+}
+
+fn read_short_binding(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 128 {
+        return Err("invalid short result ID reservation".into());
+    }
+    let id = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("incomplete or invalid short result ID reservation; use the full ID".into());
+    }
+    Ok(id)
+}
+
+fn reserve_short_id(directory: &Path, id: &str) -> Result<String, String> {
+    if id.len() < 6 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("invalid full result ID".into());
+    }
+    for length in 6..id.len() {
+        let suffix = &id[id.len() - length..];
+        let path = directory.join(suffix);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(id.as_bytes())
+                    .map_err(|error| error.to_string())?;
+                file.sync_all().map_err(|error| error.to_string())?;
+                return Ok(format!("@{suffix}"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_short_binding(&path).is_ok_and(|existing| existing == id) {
+                    return Ok(format!("@{suffix}"));
+                }
+                // Occupied or incomplete reservations remain occupied.
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(id.to_string())
+}
+
+/// Best-effort display shortening; storage/events always retain the full ID.
+pub fn display_result_id(store_dir: &Path, id: &str) -> String {
+    let reserve = || {
+        let directory = short_id_dir(store_dir)?;
+        ensure_private_dir(store_dir)?;
+        ensure_private_dir(&store_dir.join("short-ids"))?;
+        ensure_private_dir(directory.parent().expect("workspace directory"))?;
+        ensure_private_dir(&directory)?;
+        reserve_short_id(&directory, id)
+    };
+    reserve().unwrap_or_else(|_: String| id.to_string())
+}
+
 pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String> {
+    if let Some(suffix) = target.strip_prefix('@') {
+        if suffix.len() < 6
+            || suffix.len() > 127
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("invalid short result ID; use the displayed @suffix or full ID".into());
+        }
+        let directory = short_id_dir(store_dir)?;
+        // Read-only resolution must not create stores or follow reservation-directory links.
+        for directory in [
+            store_dir.join("short-ids"),
+            directory.parent().unwrap().to_path_buf(),
+            directory.clone(),
+        ] {
+            let meta = fs::symlink_metadata(&directory).map_err(|_| {
+                "short result ID not found in this workspace/session; use the full ID".to_string()
+            })?;
+            if !meta.is_dir() || meta.file_type().is_symlink() {
+                return Err("invalid short result ID directory".into());
+            }
+        }
+        let id = read_short_binding(&directory.join(suffix))?;
+        if !id.ends_with(suffix) {
+            return Err("short result ID reservation does not match its suffix".into());
+        }
+        let path = resolve_result(store_dir, &id)?;
+        let stored = read_result_path(&path)?;
+        let workspace = current_workspace_hash()?;
+        let scope = crate::events::current_scope(&workspace);
+        if stored.metadata.result_id != id
+            || stored.metadata.workspace_hash != workspace
+            || stored.metadata.scope_hash != scope.hash
+        {
+            return Err(
+                "short result ID no longer resolves to its original capture; use the full ID"
+                    .into(),
+            );
+        }
+        return Ok(path);
+    }
+    if let Some(offset) = target
+        .strip_prefix('-')
+        .and_then(|digits| digits.parse::<usize>().ok())
+    {
+        if offset == 0 {
+            return Err("relative result index must be negative and nonzero".into());
+        }
+        let workspace = current_workspace_hash()?;
+        let scope = crate::events::current_scope(&workspace);
+        if !scope.detected {
+            return Err(
+                "relative result IDs require a detected agent session; use an explicit result ID"
+                    .into(),
+            );
+        }
+        let mut remaining = offset;
+        for entry in scan_store(store_dir, Some(&workspace))? {
+            if entry.running {
+                continue;
+            }
+            let stored = read_result_path(&entry.path)?;
+            if stored.is_running() || stored.metadata.scope_hash != scope.hash {
+                continue;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return Ok(entry.path);
+            }
+        }
+        return Err(format!(
+            "no retained result at relative index -{offset} in the current workspace/session; use an explicit result ID"
+        ));
+    }
     if target == "--last" {
         let workspace = current_workspace_hash()?;
         return scan_store(store_dir, Some(&workspace))?
@@ -1873,7 +2304,10 @@ pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String>
         })
         .collect();
     match matches.as_slice() {
-        [] => Err(format!("no result matches {target}")),
+        // A final capture can be published between the completed and live scans.
+        [] => read_exact_final(store_dir, target)?
+            .map(|stored| stored.path)
+            .ok_or_else(|| format!("no result matches {target}")),
         [entry] => Ok(entry.path.clone()),
         _ => Err(format!("ambiguous result id/name {target}")),
     }
@@ -1885,8 +2319,14 @@ pub fn prune_store(
     max_store_bytes: Option<u64>,
 ) -> Result<PruneResult, String> {
     ensure_private_dir(store_dir)?;
-    let mut entries = scan_store(store_dir, None)?;
-    entries.retain(|entry| !entry.running);
+    // Destructive decisions must use authoritative headers, never derived cache ages.
+    let mut entries = scan_result_headers(store_dir, None)?;
+    let completed_ids: HashSet<_> = entries.iter().map(|entry| entry.id.clone()).collect();
+    entries.extend(
+        scan_live_headers(store_dir, None)
+            .into_iter()
+            .filter(|entry| !entry.running && !completed_ids.contains(&entry.id)),
+    );
     entries.sort_by_key(|entry| entry.start_ms);
     let now = util::millis(SystemTime::now());
     let cutoff = max_age_days.map(|days| now.saturating_sub(days as u128 * 86_400_000));
@@ -1943,13 +2383,113 @@ fn entry_disk_size(entry: &ListedEntry) -> u64 {
 }
 
 pub fn current_workspace_hash() -> Result<String, String> {
-    Ok(short_hash(workspace_id()?.as_bytes(), 16))
+    Ok(workspace_identity(&workspace_root()?).0)
+}
+
+fn workspace_identity(root: &Path) -> (String, Option<String>) {
+    let legacy = short_hash(root.to_string_lossy().as_bytes(), 16);
+    if root.to_str().is_some_and(|text| !text.contains('\u{fffd}')) {
+        return (legacy, None);
+    }
+    #[cfg(unix)]
+    let native = {
+        use std::os::unix::ffi::OsStrExt;
+        root.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let native: Vec<u8> = {
+        use std::os::windows::ffi::OsStrExt;
+        root.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let native = root.as_os_str().as_encoded_bytes().to_vec();
+    (
+        format!("native-v1-{}", util::hex(&Sha256::digest(&native))),
+        Some(legacy),
+    )
+}
+
+fn checked_workspace_hash(store: &Path) -> Result<String, String> {
+    let (hash, legacy) = workspace_identity(&workspace_root()?);
+    if let Some(legacy) = legacy {
+        reject_legacy_workspace(store, &legacy)?;
+    }
+    Ok(hash)
+}
+
+fn reject_legacy_workspace(store: &Path, legacy: &str) -> Result<(), String> {
+    let ambiguous = || {
+        format!(
+            "ambiguous legacy workspace identity {legacy} in {}; records are unchanged; use a separate store until ownership can be explicitly resolved",
+            store.display()
+        )
+    };
+    for path in [
+        store.join("indexes").join(format!("{legacy}.jsonl")),
+        store.join(".events").join(legacy),
+        store.join("short-ids").join(legacy),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err(ambiguous()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let states = store.join("watch/state");
+    match fs::read_dir(&states) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    let bytes = util::read_file_limited(&path, 1024 * 1024, "legacy watch state")?;
+                    let state: serde_json::Value =
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    if state.get("workspace_hash").and_then(|value| value.as_str()) == Some(legacy)
+                    {
+                        return Err(ambiguous());
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    // Indexes may be absent. Authoritative capture headers still carry legacy ownership.
+    for directory in [store.to_path_buf(), store.join("live")] {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        for entry in entries {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().is_some_and(|ext| ext == "piractx")
+                || path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".live.json"))
+            {
+                let capture = read_result_path(&path)?;
+                if capture.metadata.workspace_hash == legacy {
+                    return Err(ambiguous());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let root = nearest_git_root(&cwd).unwrap_or(cwd);
+    root.canonicalize()
+        .map_err(|error| format!("canonical workspace: {error}"))
 }
 
 fn workspace_id() -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let root = nearest_git_root(&cwd).unwrap_or(cwd);
-    Ok(root.canonicalize().unwrap_or(root).display().to_string())
+    Ok(workspace_root()?.display().to_string())
 }
 
 fn nearest_git_root(start: &Path) -> Option<PathBuf> {
@@ -1965,6 +2505,46 @@ fn nearest_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let mut prefix = PathBuf::new();
+    let mut missing_prefix = false;
+    let mut missing = Vec::new();
+    for component in absolute.components() {
+        // Creating a missing prefix could expose an unchecked alias after `..`.
+        if missing_prefix && component == std::path::Component::ParentDir {
+            return Err(format!(
+                "refusing parent traversal after missing store path component: {}",
+                prefix.display()
+            ));
+        }
+        prefix.push(component);
+        match fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked store directory {}",
+                    prefix.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "store path is not a directory: {}",
+                    prefix.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_prefix = true;
+                missing.push(prefix.clone());
+            }
+            Err(error) => return Err(format!("inspect {}: {error}", prefix.display())),
+        }
+    }
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -1976,7 +2556,31 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
             return Err(format!("store path is not a directory: {}", path.display()));
         }
     } else {
-        fs::create_dir_all(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        for directory in missing {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&directory) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(format!(
+                            "unsafe directory created concurrently: {}",
+                            directory.display()
+                        ));
+                    }
+                }
+                Err(e) => return Err(format!("create {}: {e}", directory.display())),
+            }
+            sync_directory(&directory)?;
+            if let Some(parent) = directory.parent() {
+                sync_directory(parent)?;
+            }
+        }
     }
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -2008,48 +2612,47 @@ fn write_private_file_relaxed(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 struct StoreLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl StoreLock {
-    fn acquire(path: &Path) -> Result<Self, String> {
+    fn acquire(legacy_path: &Path) -> Result<Self, String> {
+        let reject_legacy = || -> Result<(), String> {
+            match fs::symlink_metadata(legacy_path) {
+                Ok(_) => Err(format!(
+                    "legacy index lock exists at {}; stop old writers and resolve that lock explicitly; it will not be age-deleted",
+                    legacy_path.display()
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        reject_legacy()?;
+        let path = legacy_path.with_extension("owner-lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(&path)
+            .map_err(|error| format!("open index owner lock: {error}"))?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("index owner lock is not a regular file".into());
+        }
         for attempt in 0..100 {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options.mode(0o600);
-            match options.open(path) {
-                Ok(mut file) => {
-                    writeln!(file, "{}", std::process::id()).map_err(|error| error.to_string())?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    reject_legacy()?;
+                    return Ok(Self { _file: file });
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(path) {
-                        let _ = fs::remove_file(path);
-                    } else {
-                        thread::sleep(Duration::from_millis(20 + attempt));
-                    }
+                Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                    thread::sleep(Duration::from_millis(20 + attempt))
                 }
-                Err(error) => return Err(format!("create index lock: {error}")),
+                Err(e) => return Err(format!("lock capture index: {e}")),
             }
         }
-        Err("timed out waiting for pira_ctx index lock".to_string())
+        Err("timed out waiting for pira_ctx index owner lock".into())
     }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    path.metadata()
-        .and_then(|metadata| metadata.modified())
-        .and_then(|modified| modified.elapsed().map_err(io::Error::other))
-        .is_ok_and(|age| age > Duration::from_secs(300))
 }
 
 fn read_u32(reader: &mut File) -> Result<u32, String> {
@@ -2126,6 +2729,599 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_checkpoint_paths_preserve_ordinary_schemas_and_native_units() {
+        use crate::native_path::NativePath;
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-native-checkpoint-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let stdout = std::env::temp_dir().join(".pira_ctx-spool-unicode-�-é-stdout");
+        let stderr = std::env::temp_dir().join(".pira_ctx-spool-unicode-�-é-stderr");
+        let cwd = NativePath::Utf8("ordinary".into());
+        let mut snapshot = LiveCheckpoint {
+            redirected_stream: None,
+            command: &[],
+            cwd: "ordinary",
+            cwd_native: &cwd,
+            start_ms: 0,
+            duration_ms: 0,
+            stdout_path: &stdout,
+            stderr_path: &stderr,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            observed_stdout_bytes: 0,
+            observed_stderr_bytes: 0,
+            stdout_lines: 0,
+            stderr_lines: 0,
+            total_lines: 0,
+            timeline: &[],
+            timeline_truncated: false,
+        };
+        for redirected in [None, Some(StreamKind::Stderr)] {
+            snapshot.redirected_stream = redirected;
+            let id = write_live_checkpoint(&dir, None, 1, true, &snapshot).unwrap();
+            let bytes = fs::read(live_manifest_path(&dir, &id)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["schema"], if redirected.is_some() { 2 } else { 1 });
+            assert!(json.get("stdout_path_native").is_none());
+            assert!(json.get("stderr_path_native").is_none());
+            let manifest: LiveManifest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (stdout.clone(), stderr.clone())
+            );
+        }
+        #[cfg(unix)]
+        let native = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(
+                b"/native-\xff/.pira_ctx-spool-test".to_vec(),
+            ))
+        };
+        #[cfg(windows)]
+        let native = {
+            use std::os::windows::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_wide(&[
+                67, 58, 92, 0xd800, 92, 46, 112,
+            ]))
+        };
+        #[cfg(any(unix, windows))]
+        {
+            let native_cwd = NativePath::from_path(&native);
+            snapshot.redirected_stream = None;
+            snapshot.cwd_native = &native_cwd;
+            let id = write_live_checkpoint(&dir, None, 2, true, &snapshot).unwrap();
+            let mut manifest: LiveManifest =
+                serde_json::from_slice(&fs::read(live_manifest_path(&dir, &id)).unwrap()).unwrap();
+            assert_eq!(manifest.schema, 3);
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (stdout.clone(), stderr.clone())
+            );
+            // Invalid native units need no filesystem creation for the codec/publication test.
+            snapshot.cwd_native = &cwd;
+            snapshot.stdout_path = &native;
+            let id = write_live_checkpoint(&dir, None, 3, true, &snapshot).unwrap();
+            let bytes = fs::read(live_manifest_path(&dir, &id)).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["schema"], 4);
+            assert!(json.get("stdout_path_native").is_some());
+            assert!(json.get("stderr_path_native").is_none());
+            manifest = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                manifest.stream_paths().unwrap(),
+                (native.clone(), stderr.clone())
+            );
+            assert_ne!(manifest.stdout_path, native);
+            manifest.stdout_path = PathBuf::from("untrusted-display-alias");
+            assert_eq!(manifest.stream_paths().unwrap().0, native);
+            manifest.schema = 1;
+            assert!(manifest.stream_paths().is_err());
+            manifest.schema = 4;
+            #[cfg(unix)]
+            {
+                manifest.stdout_path_native = Some(NativePath::WindowsWide(vec![0xd800]));
+            }
+            #[cfg(windows)]
+            {
+                manifest.stdout_path_native = Some(NativePath::UnixBytes(vec![255]));
+            }
+            assert!(manifest.stream_paths().is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn index_destinations_accept_generated_and_legacy_identities_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-index-identity-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let mut entry = ListedEntry {
+            id: "fixture".into(),
+            filename: "fixture.piractx".into(),
+            timestamp: String::new(),
+            start_ms: 0,
+            exit: 0,
+            bytes: 0,
+            lines: 0,
+            command: String::new(),
+            path: dir.join("fixture.piractx"),
+            workspace_hash: String::new(),
+            kind: "capture".into(),
+            state: "complete".into(),
+            running: false,
+        };
+        for hash in [
+            String::new(),
+            "0123456789abcdef".into(),
+            format!("native-v1-{}", "a".repeat(64)),
+        ] {
+            entry.workspace_hash = hash.clone();
+            append_index(&dir, &entry).unwrap();
+            assert!(dir.join(format!("{hash}.jsonl")).is_file());
+        }
+        for hash in [
+            "../../sentinel",
+            "CON",
+            "foo:bar",
+            "a/b",
+            "a\\b",
+            "native-v1-bad",
+        ] {
+            entry.workspace_hash = hash.into();
+            assert!(append_index(&dir, &entry).is_err());
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_snapshot_publication_never_hides_or_locks_current_path() {
+        use std::sync::{Arc, Barrier};
+        let root = std::env::temp_dir().join(format!(
+            "ctx-concurrent-snapshot-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("snapshot.json");
+        let temporary = root.join("next.json");
+        let payload = |generation: usize| format!("{generation:04}:{}", "x".repeat(256));
+        fs::write(&temporary, payload(0)).unwrap();
+        atomic_replace(&temporary, &path).expect("initial publication");
+        // No capture child or finalization exists here: the published name must
+        // remain readable throughout every phase, not merely before/after replace.
+        let barrier = Arc::new(Barrier::new(2));
+        let (write_errors, read_errors) = std::thread::scope(|scope| {
+            let reader_barrier = barrier.clone();
+            let reader_path = &path;
+            let reader = scope.spawn(move || {
+                let mut errors = Vec::new();
+                for generation in 1..=128 {
+                    reader_barrier.wait();
+                    for attempt in 0..16 {
+                        match crate::util::read_file_limited(reader_path, 1024, "concurrent snapshot") {
+                            Ok(bytes) => {
+                                if bytes != payload(generation).as_bytes() && bytes != payload(generation - 1).as_bytes() {
+                                    errors.push(format!("phase {generation} read {attempt}: incomplete/unexpected generation {bytes:?}"));
+                                }
+                            }
+                            Err(error) => errors.push(format!("phase {generation} read {attempt}: {error}")),
+                        }
+                    }
+                    reader_barrier.wait();
+                }
+                errors
+            });
+            let mut writes = Vec::new();
+            for generation in 1..=128 {
+                // Record failures but always release the reader's phase barriers.
+                let prepared = fs::write(&temporary, payload(generation));
+                barrier.wait();
+                if let Err(error) = prepared.and_then(|()| atomic_replace(&temporary, &path)) {
+                    writes.push(format!("phase {generation}: {error:?}"));
+                }
+                barrier.wait();
+            }
+            (writes, reader.join().unwrap())
+        });
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            write_errors.is_empty() && read_errors.is_empty(),
+            "publication failures={} first={:?}; current-path read failures={} first={:?}",
+            write_errors.len(),
+            write_errors.first(),
+            read_errors.len(),
+            read_errors.first()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn snapshot_readers_share_delete_and_keep_complete_old_generation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "ctx-snapshot-sharing-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("snapshot.json");
+        let next = root.join("next.json");
+        fs::write(&next, b"old generation").unwrap();
+        atomic_replace(&next, &path).expect("first publication into absent destination");
+        // Model a destination appearing after the caller observed its absence.
+        fs::write(&next, b"must not overwrite first publication").unwrap();
+        assert!(windows_rename_snapshot(&next, &path, false).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old generation");
+        assert_eq!(
+            fs::read(&next).unwrap(),
+            b"must not overwrite first publication"
+        );
+        fs::remove_file(&next).unwrap();
+        // Model the DELETE-access handle required by Windows atomic replacement.
+        let deleting = OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            crate::util::read_file_limited(&path, 100, "snapshot").unwrap(),
+            b"old generation"
+        );
+        drop(deleting);
+        let mut reader = crate::util::open_regular_file(&path, "snapshot").unwrap();
+        fs::write(&next, b"new generation").unwrap();
+        atomic_replace(&next, &path).expect("replace destination held by shared-delete reader");
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old generation");
+        assert_eq!(
+            crate::util::read_file_limited(&path, 100, "snapshot").unwrap(),
+            b"new generation"
+        );
+        drop(reader);
+        // Access denial is not absence: preserve the snapshot and return the error.
+        let exclusive = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        fs::write(&next, b"must not publish").unwrap();
+        let error =
+            atomic_replace(&next, &path).expect_err("exclusive reader must prevent replacement");
+        eprintln!("exclusive-reader replacement rejected: {error:?}");
+        drop(exclusive);
+        assert_eq!(fs::read(&path).unwrap(), b"new generation");
+        assert_eq!(fs::read(&next).unwrap(), b"must not publish");
+        fs::remove_file(&next).unwrap();
+        assert!(
+            atomic_replace(&next, &path).is_err(),
+            "missing source must fail"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new generation");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_identity_preserves_plain_paths_and_separates_lossy_collisions() {
+        use std::os::unix::ffi::OsStringExt;
+        let ordinary = Path::new("/workspace/plain");
+        assert_eq!(
+            workspace_identity(ordinary),
+            (short_hash(b"/workspace/plain", 16), None)
+        );
+        let first = PathBuf::from(std::ffi::OsString::from_vec(b"/workspace/\xff".to_vec()));
+        let second = PathBuf::from(std::ffi::OsString::from_vec(b"/workspace/\xfe".to_vec()));
+        let replacement = Path::new("/workspace/�");
+        let a = workspace_identity(&first);
+        let b = workspace_identity(&second);
+        let c = workspace_identity(replacement);
+        assert_eq!(a.1, b.1);
+        assert_eq!(b.1, c.1);
+        assert_ne!(a.0, b.0);
+        assert_ne!(b.0, c.0);
+        let root = std::env::temp_dir().join(format!("ctx-native-{}", std::process::id()));
+        ensure_private_dir(&root).unwrap();
+        reject_legacy_workspace(&root, a.1.as_ref().unwrap()).unwrap();
+        let record = root.join(".events").join(a.1.unwrap()).join("record");
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(&record, b"unchanged").unwrap();
+        assert!(
+            reject_legacy_workspace(&root, b.1.as_ref().unwrap())
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert_eq!(fs::read(record).unwrap(), b"unchanged");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_does_not_delete_an_existing_temporary_file() {
+        let root = std::env::temp_dir().join(format!("ctx-temp-collision-{}", std::process::id()));
+        let command = vec!["sh".into(), "-c".into(), "printf retained".into()];
+        let capture = crate::capture::capture_command(&command, None, false, None)
+            .unwrap()
+            .unwrap();
+        let stored = store_capture(&root, &command, &[], &capture).unwrap();
+        let temporary = stored
+            .path
+            .with_extension(format!("piractx.tmp-{}", std::process::id()));
+        fs::write(&temporary, b"another writer").unwrap();
+        assert!(write_container(&stored.path, &stored.metadata, &capture).is_err());
+        assert_eq!(fs::read(&temporary).unwrap(), b"another writer");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn immutable_publication_rejects_collision_without_modifying_records() {
+        let root = std::env::temp_dir().join(format!("ctx-publish-{}", std::process::id()));
+        ensure_private_dir(&root).unwrap();
+        let source = root.join("new.tmp");
+        let target = root.join("record");
+        // FlushFileBuffers on Windows requires write access, as production writers have.
+        let mut output = File::create(&source).unwrap();
+        output.write_all(b"new").unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        publish_immutable(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        fs::write(&source, b"different").unwrap();
+        assert!(publish_immutable(&source, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read(&source).unwrap(), b"different");
+        assert!(publish_immutable(&root.join("missing"), &root.join("absent")).is_err());
+        assert!(!root.join("absent").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_lock_survives_paused_owner_and_releases_on_death() {
+        const ENV: &str = "PIRA_CTX_TEST_INDEX_OWNER";
+        if let Some(root) = std::env::var_os(ENV) {
+            let root = PathBuf::from(root);
+            let _lock = StoreLock::acquire(&root.join(".index.lock")).unwrap();
+            fs::write(root.join("ready"), b"ready").unwrap();
+            thread::sleep(Duration::from_secs(10));
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ctx-owner-death-{}", std::process::id()));
+        ensure_private_dir(&root).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::index_lock_survives_paused_owner_and_releases_on_death",
+            ])
+            .env(ENV, &root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !root.join("ready").exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !root.join("ready").exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lock owner did not become ready");
+        }
+        // SAFETY: this is our live child process, stopped only until it is killed/reaped below.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGSTOP);
+        }
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(".index.owner-lock"))
+            .unwrap();
+        let held = contender.try_lock_exclusive();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            held.unwrap_err().raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        contender.try_lock_exclusive().unwrap();
+        drop(contender);
+        StoreLock::acquire(&root.join(".index.lock")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_lock_waits_for_owner_release() {
+        let root = std::env::temp_dir().join(format!("ctx-index-wait-{}", std::process::id()));
+        ensure_private_dir(&root).unwrap();
+        let legacy = root.join(".index.lock");
+        let owner = StoreLock::acquire(&legacy).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let contender = thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            done_tx.send(StoreLock::acquire(&legacy)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let while_owned = done_rx.recv_timeout(Duration::from_millis(100));
+        drop(owner);
+        // A native lock violation must retry, not escape as an unrelated OS error.
+        assert!(matches!(
+            while_owned,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let acquired = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        drop(acquired);
+        contender.join().unwrap();
+        assert!(root.join(".index.owner-lock").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_lock_lives_with_owner_and_is_not_unlinked() {
+        let root = std::env::temp_dir().join(format!("ctx-index-lock-{}", std::process::id()));
+        ensure_private_dir(&root).unwrap();
+        let legacy = root.join(".index.lock");
+        let lock = StoreLock::acquire(&legacy).unwrap();
+        let path = legacy.with_extension("owner-lock");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            contender.try_lock_exclusive().unwrap_err().raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(lock);
+        assert!(path.exists());
+        contender.try_lock_exclusive().unwrap();
+        drop(contender);
+        fs::write(&legacy, b"legacy-owner").unwrap();
+        assert!(StoreLock::acquire(&legacy).is_err());
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy-owner");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_guard_checks_ancestors_even_before_parent_components() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ctx-ancestors-{}", std::process::id()));
+        fs::create_dir_all(dir.join("real")).unwrap();
+        symlink(dir.join("real"), dir.join("alias")).unwrap();
+        for path in [
+            dir.join("alias/store"),
+            dir.join("alias/../other"),
+            dir.join("alias"),
+        ] {
+            assert!(ensure_private_dir(&path).unwrap_err().contains("symlinked"));
+        }
+        assert!(!dir.join("real/store").exists());
+        assert!(!dir.join("other").exists());
+        ensure_private_dir(&dir.join("normal/nested")).unwrap();
+        assert!(dir.join("normal/nested").is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_rebuild_preserves_another_unpublished_captures_marker() {
+        let dir = std::env::temp_dir().join(format!("ctx-dirty-marker-{}", std::process::id()));
+        ensure_private_dir(&dir.join("indexes")).unwrap();
+        let foreign = dir.join("indexes/.dirty-pending");
+        fs::write(&foreign, b"pending").unwrap();
+        let command = vec!["sh".into(), "-c".into(), "printf hello".into()];
+        let capture = crate::capture::capture_command(&command, None, false, None)
+            .unwrap()
+            .unwrap();
+        let stored = store_capture(&dir, &command, &[], &capture).unwrap();
+        assert!(foreign.exists());
+        assert!(
+            !dir.join(format!("indexes/.dirty-{}", stored.metadata.result_id))
+                .exists()
+        );
+        // Publication after the rebuild must still be visible through the dirty-index scan.
+        let mut metadata = stored.metadata.clone();
+        metadata.result_id = "pending".into();
+        metadata.filename = "pending.piractx".into();
+        write_container(&dir.join("pending.piractx"), &metadata, &capture).unwrap();
+        assert!(
+            scan_store(&dir, None)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "pending")
+        );
+        fs::remove_file(&foreign).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_live_path_survives_final_publication() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-handoff-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf hello; printf error >&2".into(),
+        ];
+        let capture = crate::capture::capture_command(&command, Some(&dir), true, None)
+            .unwrap()
+            .unwrap();
+        let live_path = live_manifest_path(&dir, capture.live_id.as_ref().unwrap());
+        let live = read_result_path(&live_path).unwrap();
+        let failed_live = read_result_path(&live_path).unwrap();
+        let finalized = store_capture(&dir, &command, &[], &capture).unwrap();
+        drop(capture);
+        let stored = read_result_path(&live_path).unwrap();
+        assert_eq!(stored.metadata.result_id, finalized.metadata.result_id);
+        assert!(!stored.is_running());
+        let (stored, growth) = live.sample_growth(2, 1, 100).unwrap();
+        assert!(!stored.is_running());
+        assert_eq!(growth.stdout, b"llo");
+        assert_eq!(growth.stderr, b"rror");
+        assert_eq!((growth.stdout_total, growth.stderr_total), (5, 5));
+        assert!(stored.sample_growth(6, 0, 100).is_err());
+
+        // Missing, unrelated, and corrupt final files must not conceal failures.
+        let unrelated = dir.join("unrelated.piractx");
+        fs::rename(&finalized.path, &unrelated).unwrap();
+        assert!(read_result_path(&live_path).is_err());
+        assert!(failed_live.sample_growth(0, 0, 100).is_err());
+        assert!(read_exact_final(&dir, "unrelated").is_err());
+        fs::write(&finalized.path, b"bad").unwrap();
+        assert!(read_result_path(&live_path).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn short_id_reservations_extend_collisions_and_never_reassign() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-short-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let first = "20260101-120000-aaaaaa123456";
+        let second = "20260101-120001-bbbbbb123456";
+        assert_eq!(reserve_short_id(&dir, first).unwrap(), "@123456");
+        assert_eq!(reserve_short_id(&dir, second).unwrap(), "@b123456");
+        assert_eq!(reserve_short_id(&dir, first).unwrap(), "@123456");
+        assert_eq!(read_short_binding(&dir.join("123456")).unwrap(), first);
+        // Incomplete reservations (e.g. a crash before write) stay occupied.
+        fs::write(dir.join("abcdef"), "").unwrap();
+        assert_eq!(
+            reserve_short_id(&dir, "20260101-120002-999999abcdef").unwrap(),
+            "@9abcdef"
+        );
+        let handles: Vec<_> = (0..16)
+            .map(|n| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let id = format!("20260101-120003-{n:06x}654321");
+                    let handle = reserve_short_id(&dir, &id).unwrap();
+                    assert_eq!(read_short_binding(&dir.join(&handle[1..])).unwrap(), id);
+                    handle
+                })
+            })
+            .collect();
+        let handles: std::collections::BTreeSet<_> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(handles.len(), 16);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn line_index_rejects_impossible_count_and_oversized_varint() {
         let mut impossible = 2_u64.to_le_bytes().to_vec();
         impossible.extend_from_slice(&[0, 0, 1]);
@@ -2136,6 +3332,53 @@ mod tests {
         oversized.extend_from_slice(&[0x80; 10]);
         oversized.push(0);
         assert!(decode_line_index_v4(&oversized, 1, 0).is_err());
+    }
+
+    #[test]
+    fn varint_checks_terminal_bits_without_rejecting_in_range_encodings() {
+        for terminal in [0, 1, 2, 0x7f, 0x80] {
+            let mut bytes = vec![0x80; 9];
+            bytes.push(terminal);
+            let decoded = get_varint(&bytes, &mut 0);
+            if terminal <= 1 {
+                assert_eq!(decoded.unwrap(), u64::from(terminal) << 63);
+            } else {
+                assert_eq!(decoded.unwrap_err(), "oversized varint");
+            }
+        }
+        let mut bytes = Vec::new();
+        put_varint(&mut bytes, u64::MAX);
+        assert_eq!(get_varint(&bytes, &mut 0).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn legacy_stderr_boundary_rejects_overflow() {
+        let path = std::env::temp_dir().join(format!(
+            "ctx-legacy-boundary-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let metadata = b"{}";
+        let stdout_offset = 24 + metadata.len() as u64;
+        for end in [u64::MAX, u64::MAX - 7] {
+            let mut bytes = MAGIC_V1.to_vec();
+            bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(metadata);
+            bytes.extend_from_slice(&(end - stdout_offset).to_le_bytes());
+            fs::write(&path, bytes).unwrap();
+            assert!(
+                read_result_path(&path)
+                    .unwrap_err()
+                    .contains("length overflow")
+            );
+        }
+        let mut empty = MAGIC_V1.to_vec();
+        empty.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        empty.extend_from_slice(metadata);
+        empty.extend_from_slice(&[0; 16]);
+        fs::write(&path, empty).unwrap();
+        assert_eq!(read_result_path(&path).unwrap().metadata.total_bytes, 0);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

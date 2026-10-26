@@ -3,6 +3,8 @@ mod export;
 mod model;
 mod storage;
 mod util;
+#[cfg(windows)]
+mod windows;
 
 use cli::{Command, SearchField};
 use model::{DecisionRecord, DecisionView};
@@ -15,14 +17,21 @@ pub fn run() -> i32 {
         Ok(code) => code,
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
-            eprintln!("pira_dec: {error}");
+            eprintln!("pira_dec: {}", util::escape_diagnostic(&error));
             2
         }
     }
 }
 
 fn real_main() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument
+                .into_string()
+                .map_err(|_| "command-line arguments must be valid UTF-8".to_string())
+        })
+        .collect::<Result<_, _>>()?;
     let config = cli::parse_args(&args)?;
     let store = config.store_dir.as_deref();
     match config.command {
@@ -115,7 +124,9 @@ fn run_show(store: Option<&Path>, id: &str, json: bool) -> Result<i32, String> {
             return Ok(1);
         }
         storage::Resolution::Ambiguous => {
-            eprintln!("pira_dec: decision prefix is ambiguous: {id:?}");
+            eprintln!(
+                "pira_dec: decision prefix is ambiguous: {id:?}; use a complete ID from pira_dec list --limit 20"
+            );
             return Ok(1);
         }
         storage::Resolution::Found(path) => path,
@@ -145,6 +156,7 @@ struct SkippedRecord {
 #[derive(Serialize)]
 struct SearchOutput {
     matches: Vec<DecisionView>,
+    has_more: bool,
     skipped_count: usize,
     skipped: Vec<SkippedRecord>,
 }
@@ -159,6 +171,7 @@ struct ListDecision {
 #[derive(Serialize)]
 struct ListOutput {
     decisions: Vec<ListDecision>,
+    has_more: bool,
     skipped_count: usize,
     skipped: Vec<SkippedRecord>,
 }
@@ -171,19 +184,26 @@ fn run_list(
     json: bool,
 ) -> Result<i32, String> {
     let (since_ms, until_ms) = parse_time_window("list", since, until)?;
-    let (records, skipped) = load_records(store)?;
+    let (records, skipped, has_more) = load_bounded_records(store, limit, |record| {
+        Ok(time_matches(record, since_ms, until_ms))
+    })?;
     let decisions = collect_list_decisions(records, since_ms, until_ms, limit)?;
     if json {
         let output = ListOutput {
             decisions,
+            has_more,
             skipped_count: skipped.len(),
             skipped,
         };
         print_json(&output)?;
     } else {
+        if decisions.is_empty() {
+            util::stdout_line("decisions=0")?;
+        }
         for decision in decisions {
             util::stdout_line(&format_list_row(&decision))?;
         }
+        print_limit_notice(limit, has_more)?;
     }
     Ok(0)
 }
@@ -232,34 +252,40 @@ fn run_search(
 ) -> Result<i32, String> {
     let expression = match (field, pattern) {
         (Some(field), Some(pattern)) => Some((
-            field,
+            Some(field),
             Regex::new(pattern).map_err(|error| format!("invalid regex: {error}"))?,
+        )),
+        (None, Some(query)) => Some((
+            None,
+            regex::RegexBuilder::new(&regex::escape(query))
+                .case_insensitive(true)
+                .build()
+                .map_err(|error| format!("invalid query: {error}"))?,
         )),
         (None, None) => None,
         _ => return Err("search requires --field and --regex together".into()),
     };
     let (since_ms, until_ms) = parse_time_window("search", since, until)?;
-    let (records, skipped) = load_records(store)?;
-    let mut matches = Vec::new();
-    for record in records {
-        if !time_matches(&record, since_ms, until_ms) {
-            continue;
+    let (records, skipped, has_more) = load_bounded_records(store, limit, |record| {
+        if !time_matches(record, since_ms, until_ms) {
+            return Ok(false);
         }
-        let text_matches = match expression.as_ref() {
-            Some((field, expression)) => record_matches(&record, *field, expression)?,
-            None => true,
-        };
-        if text_matches {
-            matches.push(record.view()?);
-            if matches.len() == limit {
-                break;
-            }
+        match expression.as_ref() {
+            Some((Some(field), regex)) => record_matches(record, *field, regex),
+            Some((None, regex)) => Ok(regex.is_match(&record.context)
+                || record.choices.iter().any(|choice| regex.is_match(choice))),
+            None => Ok(true),
         }
-    }
+    })?;
+    let matches = records
+        .iter()
+        .map(DecisionRecord::view)
+        .collect::<Result<Vec<_>, _>>()?;
     let found = !matches.is_empty();
     if json {
         let output = SearchOutput {
             matches,
+            has_more,
             skipped_count: skipped.len(),
             skipped,
         };
@@ -277,14 +303,32 @@ fn run_search(
             ))?;
         }
         for record in matches {
-            util::stdout_line(&format!(
-                "{} | {} | {} | {}",
+            let evidence = expression.as_ref().and_then(|(field, regex)| match field {
+                None => match_excerpt(&record.context, regex).or_else(|| {
+                    record
+                        .choices
+                        .iter()
+                        .find_map(|choice| match_excerpt(choice, regex))
+                }),
+                Some(SearchField::Context) => match_excerpt(&record.context, regex),
+                Some(SearchField::Choice) => record
+                    .choices
+                    .iter()
+                    .find_map(|choice| match_excerpt(choice, regex)),
+                _ => None,
+            });
+            let mut row = format!(
+                "{} | {} | {}",
                 record.id,
-                record.timestamp,
                 record.maker,
                 util::single_line_clip(&record.decision_text, 200)
-            ))?;
+            );
+            if let Some(evidence) = evidence {
+                row.push_str(&format!(" | match={evidence}"));
+            }
+            util::stdout_line(&row)?;
         }
+        print_limit_notice(limit, has_more)?;
     }
     Ok(if found { 0 } else { 1 })
 }
@@ -294,7 +338,7 @@ fn parse_time_window(
     since: Option<&str>,
     until: Option<&str>,
 ) -> Result<(Option<u64>, Option<u64>), String> {
-    let (since_ms, until_ms) = if since.is_some() || until.is_some() {
+    let (since_time, until_time) = if since.is_some() || until.is_some() {
         let now_ms = util::now_ms()?;
         (
             since
@@ -307,30 +351,114 @@ fn parse_time_window(
     } else {
         (None, None)
     };
-    if since_ms
-        .zip(until_ms)
+    if since_time
+        .zip(until_time)
         .is_some_and(|(since, until)| since >= until)
     {
         return Err(format!("{command} --since must be earlier than --until"));
     }
-    Ok((since_ms, until_ms))
+    // Records have millisecond precision. Ceiling both bounds preserves >= and <
+    // membership, but window validity must be checked before rounding.
+    let ceil_ms = |time: jiff::Timestamp| ((time.as_nanosecond() + 999_999) / 1_000_000) as u64;
+    Ok((since_time.map(ceil_ms), until_time.map(ceil_ms)))
+}
+
+fn match_excerpt(text: &str, regex: &Regex) -> Option<String> {
+    let matched = regex.find(text)?;
+    let mut start = matched.start().saturating_sub(60);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (matched.start() + 140).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        util::single_line_clip(&text[start..end], 200),
+        if end < text.len() { "…" } else { "" }
+    ))
+}
+
+fn print_limit_notice(limit: usize, has_more: bool) -> Result<(), String> {
+    if has_more {
+        util::stdout_line(&format!(
+            "shown={limit} has_more=1 limit={limit}; narrow filters or raise --limit (max 1000)"
+        ))?;
+    }
+    Ok(())
+}
+
+struct RankedRecord(DecisionRecord);
+impl PartialEq for RankedRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for RankedRecord {}
+impl PartialOrd for RankedRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for RankedRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.timestamp_ms, &self.0.id).cmp(&(other.0.timestamp_ms, &other.0.id))
+    }
+}
+
+fn load_bounded_records(
+    store: Option<&Path>,
+    limit: usize,
+    mut matches: impl FnMut(&DecisionRecord) -> Result<bool, String>,
+) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>, bool), String> {
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut total = 0usize;
+    let skipped = visit_records(store, |record| {
+        if matches(&record)? {
+            total += 1;
+            heap.push(std::cmp::Reverse(RankedRecord(record)));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        Ok(())
+    })?;
+    let mut records = heap.into_iter().map(|r| r.0.0).collect::<Vec<_>>();
+    sort_records_newest_first(&mut records);
+    Ok((records, skipped, total > limit))
 }
 
 fn load_records(store: Option<&Path>) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>), String> {
-    let layout = storage::Layout::current(store)?;
     let mut records = Vec::new();
+    let skipped = visit_records(store, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    sort_records_newest_first(&mut records);
+    Ok((records, skipped))
+}
+
+fn visit_records(
+    store: Option<&Path>,
+    mut visit: impl FnMut(DecisionRecord) -> Result<(), String>,
+) -> Result<Vec<SkippedRecord>, String> {
+    let layout = storage::Layout::current(store)?;
     let mut skipped = Vec::new();
     for path in storage::record_paths(&layout)? {
         match storage::read_record(&path) {
-            Ok(record) => records.push(record),
+            Ok(record) => visit(record)?,
             Err(storage::ReadFailure::Vanished) => {}
             Err(storage::ReadFailure::Invalid(error)) => {
                 let filename = filename_only(&path);
-                eprintln!(
-                    "pira_dec: skipped {}: {}",
-                    filename,
-                    util::single_line_clip(&error, 300)
-                );
+                if skipped.len() < 8 {
+                    eprintln!(
+                        "pira_dec: skipped {}: {}",
+                        filename,
+                        util::single_line_clip(&error, 300)
+                    );
+                }
                 skipped.push(SkippedRecord {
                     filename,
                     error: util::single_line_clip(&error, 300),
@@ -338,8 +466,14 @@ fn load_records(store: Option<&Path>) -> Result<(Vec<DecisionRecord>, Vec<Skippe
             }
         }
     }
-    sort_records_newest_first(&mut records);
-    Ok((records, skipped))
+    if skipped.len() > 8 {
+        eprintln!(
+            "pira_dec: skipped={} warnings_omitted={}; use search --json for record details",
+            skipped.len(),
+            skipped.len() - 8
+        );
+    }
+    Ok(skipped)
 }
 
 fn sort_records_newest_first(records: &mut [DecisionRecord]) {
@@ -426,12 +560,18 @@ fn print_human_record(record: &DecisionRecord) -> Result<(), String> {
         };
         output.push_str(&format!("  {}. {}{}\n", index + 1, choice, selected));
     }
-    output.push_str(&format!(
-        "Decision: {}. {}\n",
-        record.decision,
-        record.selected_text()?
-    ));
-    util::stdout_text(&output)
+    output.push_str(&format!("Decision: {}\n", record.decision));
+    let mut safe = String::with_capacity(output.len());
+    for character in output.chars() {
+        if (character.is_control() && !matches!(character, '\n' | '\t'))
+            || util::is_bidi_control(character)
+        {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    util::stdout_text(&safe)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
@@ -470,6 +610,22 @@ mod tests {
         assert!(time_matches(&record, Some(2_000), Some(2_001)));
         assert!(!time_matches(&record, Some(2_001), None));
         assert!(!time_matches(&record, None, Some(2_000)));
+    }
+
+    #[test]
+    fn fractional_bounds_preserve_membership_and_window_order() {
+        let lower = "1970-01-01T00:00:02.000000001Z";
+        let upper = "1970-01-01T00:00:02.000999999Z";
+        let (since, _) = parse_time_window("list", Some(lower), None).unwrap();
+        let (_, until) = parse_time_window("list", None, Some(lower)).unwrap();
+        assert!(!time_matches(&record(2_000), since, None));
+        assert!(time_matches(&record(2_000), None, until));
+        assert!(!time_matches(&record(2_001), None, until));
+        let (since, until) = parse_time_window("list", Some(lower), Some(upper)).unwrap();
+        assert_eq!((since, until), (Some(2_001), Some(2_001)));
+        assert!(!time_matches(&record(2_001), since, until));
+        assert!(parse_time_window("list", Some(upper), Some(lower)).is_err());
+        assert!(parse_time_window("list", Some(lower), Some(lower)).is_err());
     }
 
     #[test]

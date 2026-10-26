@@ -242,7 +242,7 @@ pub fn record(
     storage::ensure_private_dir(&records_dir)?;
     let _workspace_lock = lock_workspace(&workspace_dir)?;
     let state_path = retention_state_path(&workspace_dir);
-    let loaded = load_or_rebuild_retention_state(&workspace_dir, &workspace_hash);
+    let loaded = load_or_rebuild_retention_state(&workspace_dir, &workspace_hash)?;
     let mut retention = loaded.state;
     event.timestamp_ms = next_retention_timestamp(&retention, event.timestamp_ms);
     let name = format!(
@@ -278,7 +278,13 @@ pub fn record(
         let _ = fs::remove_file(&state_path);
         return Err(error);
     }
-    if let Err(error) = atomic_write(&records_dir.join(&name), &encode_event(&event)?) {
+    if let Err(error) = publish_event(&records_dir.join(&name), &encode_event(&event)?) {
+        if records_dir.join(&name).exists() {
+            // Publication may have succeeded before directory sync failed. Rebuild from records,
+            // rather than hiding an authoritative record behind a rolled-back journal entry.
+            let _ = fs::remove_file(&state_path);
+            return Err(error);
+        }
         remove_retention_entry(&mut retention, scope.directory_name(), &name);
         let rollback = RetentionRemoval {
             scope_name: scope.directory_name().to_string(),
@@ -343,7 +349,7 @@ where
     let state = match read_retention_state(&state_path, &workspace_hash) {
         Ok(state) => state,
         Err(_) => {
-            let state = rebuild_retention_state(&workspace_dir, &workspace_hash);
+            let state = rebuild_retention_state(&workspace_dir, &workspace_hash)?;
             write_retention_snapshot(&state_path, &workspace_hash, &state)?;
             state
         }
@@ -713,13 +719,20 @@ fn record_paths(records_dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !real_directory(records_dir, "event records")? {
         return Ok(Vec::new());
     }
-    Ok(fs::read_dir(records_dir)
-        .map_err(|error| error.to_string())?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("piraevt"))
-        .collect())
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(records_dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("piraevt")
+            && entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_file()
+        {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 fn recursive_record_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -821,32 +834,33 @@ fn valid_record_name(value: &str) -> bool {
         && timestamp_from_path(path).is_some()
 }
 
-fn load_or_rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> RetentionLoad {
+fn load_or_rebuild_retention_state(
+    workspace_dir: &Path,
+    workspace_hash: &str,
+) -> Result<RetentionLoad, String> {
     let path = retention_state_path(workspace_dir);
-    match read_retention_state(&path, workspace_hash) {
+    Ok(match read_retention_state(&path, workspace_hash) {
         Ok(state) => RetentionLoad {
             state,
             appendable: true,
             bytes: fs::metadata(path).map_or(RETENTION_COMPACT_BYTES, |value| value.len()),
         },
         Err(_) => RetentionLoad {
-            state: rebuild_retention_state(workspace_dir, workspace_hash),
+            state: rebuild_retention_state(workspace_dir, workspace_hash)?,
             appendable: false,
             bytes: 0,
         },
-    }
+    })
 }
 
-fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> RetentionState {
+fn rebuild_retention_state(
+    workspace_dir: &Path,
+    workspace_hash: &str,
+) -> Result<RetentionState, String> {
     let mut state = RetentionState::default();
-    let Ok(entries) = fs::read_dir(workspace_dir) else {
-        return state;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let scope_dir = entry.path();
+    let entries = fs::read_dir(workspace_dir).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let scope_dir = entry.map_err(|error| error.to_string())?.path();
         let Some(scope_name) = scope_dir
             .file_name()
             .and_then(|value| value.to_str())
@@ -854,9 +868,10 @@ fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> Retent
         else {
             continue;
         };
-        let Ok(paths) = record_paths(&scope_dir.join("records")) else {
+        if !real_directory(&scope_dir, "event scope")? {
             continue;
-        };
+        }
+        let paths = record_paths(&scope_dir.join("records"))?;
         let records = state.scopes.entry(scope_name.to_string()).or_default();
         for path in paths {
             let Some(record_name) = path
@@ -889,7 +904,7 @@ fn rebuild_retention_state(workspace_dir: &Path, workspace_hash: &str) -> Retent
         records.sort_by(retention_record_key);
     }
     state.scopes.retain(|_, records| !records.is_empty());
-    state
+    Ok(state)
 }
 
 fn retention_record_key(left: &RetentionRecord, right: &RetentionRecord) -> std::cmp::Ordering {
@@ -975,6 +990,11 @@ fn remove_retention_record(workspace_dir: &Path, removal: &RetentionRemoval) -> 
         return Err("invalid event retention entry".into());
     }
     let scope_dir = workspace_dir.join(&removal.scope_name);
+    if !real_directory(&scope_dir, "event scope")?
+        || !real_directory(&scope_dir.join("records"), "event records")?
+    {
+        return Ok(());
+    }
     let path = scope_dir.join("records").join(&removal.record.record_name);
     match fs::remove_file(&path) {
         Ok(()) => {}
@@ -1621,6 +1641,28 @@ fn take_array<const N: usize>(bytes: &[u8], position: &mut usize) -> Result<[u8;
     Ok(value)
 }
 
+fn publish_event(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temporary =
+        path.with_extension(format!("tmp-{}-{:016x}", std::process::id(), short_nonce()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| e.to_string())?;
+        drop(file);
+        storage::publish_immutable(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(test)]
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomic_write_with_durability(path, bytes, true)
 }
@@ -1756,6 +1798,45 @@ fn short_nonce() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_deletion_rejects_foreign_scope_and_records_links() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("ctx-retention-links-{}", std::process::id()));
+        let workspace = dir.join("workspace");
+        let foreign = dir.join("foreign");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(foreign.join("records")).unwrap();
+        let record = foreign.join("records/1-test.piraevt");
+        fs::write(&record, b"keep").unwrap();
+        let removal = RetentionRemoval {
+            scope_name: ".unscoped".into(),
+            record: RetentionRecord {
+                timestamp_ms: 1,
+                record_name: "1-test.piraevt".into(),
+                summary: None,
+            },
+        };
+        let scope = workspace.join(".unscoped");
+        symlink(&foreign, &scope).unwrap();
+        assert!(remove_retention_record(&workspace, &removal).is_err());
+        assert_eq!(fs::read(&record).unwrap(), b"keep");
+        fs::remove_file(&scope).unwrap();
+        fs::create_dir(&scope).unwrap();
+        symlink(foreign.join("records"), scope.join("records")).unwrap();
+        assert!(remove_retention_record(&workspace, &removal).is_err());
+        assert!(record.exists());
+        fs::remove_file(scope.join("records")).unwrap();
+        fs::create_dir(scope.join("records")).unwrap();
+        let local = scope.join("records/1-test.piraevt");
+        fs::write(&local, b"remove").unwrap();
+        remove_retention_record(&workspace, &removal).unwrap();
+        remove_retention_record(&workspace, &removal).unwrap();
+        assert!(!local.exists());
+        assert!(record.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn sample_event() -> Event {
         Event {

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const MAX_SYMBOL_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SymbolPath {
     segments: Vec<SymbolPathSegment>,
@@ -12,6 +14,16 @@ pub enum SymbolPathSegment {
 }
 
 impl SymbolPath {
+    pub fn text_bytes(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                SymbolPathSegment::Name(name) => name.len(),
+                SymbolPathSegment::Index(_) => 0,
+            })
+            .sum()
+    }
+
     pub fn from_names(names: impl IntoIterator<Item = String>) -> Self {
         Self {
             segments: names.into_iter().map(SymbolPathSegment::Name).collect(),
@@ -35,6 +47,18 @@ impl SymbolPath {
         path.segments
             .extend(names.into_iter().map(SymbolPathSegment::Name));
         path
+    }
+
+    /// Literal heading ancestry for diagnostics only, never for target resolution.
+    pub fn unquoted_names(&self) -> Option<String> {
+        self.segments
+            .iter()
+            .map(|segment| match segment {
+                SymbolPathSegment::Name(name) => Some(name.as_str()),
+                SymbolPathSegment::Index(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|names| names.join("::"))
     }
 
     pub fn last_name(&self) -> Option<&str> {
@@ -128,11 +152,15 @@ impl SymbolPath {
         let mut segments = Vec::new();
         let mut expect_name = true;
         while index < bytes.len() {
-            if !expect_name && bytes[index] == b'[' {
+            if (!expect_name || segments.is_empty())
+                && bytes[index] == b'['
+                && bytes.get(index + 1) != Some(&b'"')
+            {
                 let end = value[index + 1..].find(']')? + index + 1;
                 let raw = &value[index + 1..end];
                 if raw.bytes().all(|byte| byte.is_ascii_digit()) && !raw.is_empty() {
                     segments.push(SymbolPathSegment::Index(raw.parse().ok()?));
+                    expect_name = false;
                     index = end + 1;
                     if index == bytes.len() {
                         break;
@@ -236,6 +264,8 @@ pub struct Symbol {
     pub qualified_name: String,
     pub legacy_qualified_name: String,
     pub signature: String,
+    /// Declaration-name position: zero-based row and UTF-8 byte column, not the show range.
+    pub name_position: Option<(usize, usize)>,
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_row: usize,
@@ -246,18 +276,31 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    pub fn text_bytes(&self) -> usize {
+        self.path
+            .text_bytes()
+            .saturating_add(self.qualified_name.len())
+            .saturating_add(self.legacy_qualified_name.len())
+            .saturating_add(self.signature.len())
+    }
+
     pub fn name_matches(&self, query: &str) -> bool {
-        self.qualified_name == query || self.legacy_qualified_name == query
+        match SymbolPath::parse_canonical(query) {
+            Some(path) => self.path == path,
+            None => self.legacy_qualified_name == query,
+        }
     }
 
     pub fn name_suffix_matches(&self, query: &str) -> bool {
-        SymbolPath::parse_canonical(query).is_some_and(|path| self.path.ends_with(&path))
-            || legacy_suffix_matches(&self.legacy_qualified_name, query)
+        match SymbolPath::parse_canonical(query) {
+            Some(path) => self.path.ends_with(&path),
+            None => legacy_suffix_matches(&self.legacy_qualified_name, query),
+        }
     }
 
     pub fn contains_line(&self, one_based_line: usize) -> bool {
         let start = self.start_row + 1;
-        let end = self.end_row + 1;
+        let end = self.end_row + usize::from(self.end_column > 0);
         one_based_line >= start && one_based_line <= end
     }
 
@@ -272,6 +315,23 @@ impl Symbol {
     pub fn byte_len(&self) -> usize {
         self.end_byte.saturating_sub(self.start_byte)
     }
+}
+
+/// Exact paths take precedence over abbreviations. Callers reject multiple matches.
+pub fn target_matches<'a>(symbols: &'a [Symbol], query: &str) -> Vec<(usize, &'a Symbol)> {
+    let exact: Vec<_> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name_matches(query))
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, symbol)| symbol.name_suffix_matches(query))
+        .collect()
 }
 
 fn legacy_suffix_matches(candidate: &str, query: &str) -> bool {
@@ -302,8 +362,29 @@ mod tests {
 
     #[test]
     fn canonical_parser_rejects_incomplete_or_malformed_paths() {
-        for value in ["::name", "name::", "name:::child", "[\"unterminated\"]x"] {
+        for value in [
+            "::name",
+            "name::",
+            "name:::child",
+            "[\"unterminated\"]x",
+            "[]",
+            "[0]::",
+            "name::[0]",
+            "[0]x",
+        ] {
             assert!(SymbolPath::parse_canonical(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn root_array_paths_round_trip() {
+        let root = SymbolPath::default().child_index(0);
+        for path in [
+            root.clone(),
+            root.child_index(1).child_name("x"),
+            root.child_name("a.b"),
+        ] {
+            assert_eq!(SymbolPath::parse_canonical(&path.canonical()), Some(path));
         }
     }
 

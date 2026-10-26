@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::language::Language;
-use crate::util::absolute_lexical;
+use crate::util::{absolute_lexical, reject_symlink_components};
 
 pub struct FileDiscovery {
     pub files: Vec<(PathBuf, Language)>,
@@ -23,7 +23,7 @@ pub enum DiscoverySelection {
     Dependencies(Language),
 }
 
-enum DiscoveredLanguage {
+pub(crate) enum DiscoveredLanguage {
     Eligible(Language),
     Unsupported,
     Ambiguous,
@@ -43,7 +43,7 @@ fn dependency_languages_are_compatible(target: Language, candidate: Language) ->
         )
 }
 
-fn classify(path: &Path, selection: DiscoverySelection) -> DiscoveredLanguage {
+pub(crate) fn classify(path: &Path, selection: DiscoverySelection) -> DiscoveredLanguage {
     match selection {
         DiscoverySelection::Any => {
             if Language::is_ambiguous_path(path) {
@@ -89,6 +89,33 @@ pub fn discover_files_with_max_depth(
     selection: DiscoverySelection,
     max_depth: Option<usize>,
 ) -> FileDiscovery {
+    discover_filtered_files(root, selection, max_depth, &[]).unwrap_or_else(|error| FileDiscovery {
+        files: Vec::new(),
+        all_files: Vec::new(),
+        discovered: 0,
+        unsupported: 0,
+        ambiguous: 0,
+        walk_errors: vec![error],
+        walk_errors_total: 1,
+    })
+}
+
+pub fn discover_filtered_files(
+    root: &Path,
+    selection: DiscoverySelection,
+    max_depth: Option<usize>,
+    globs: &[String],
+) -> Result<FileDiscovery, String> {
+    reject_symlink_components(root)?;
+    let mut filters = ignore::overrides::OverrideBuilder::new(root);
+    for glob in globs {
+        filters
+            .add(glob)
+            .map_err(|e| format!("invalid map glob: {e}"))?;
+    }
+    let filters = filters
+        .build()
+        .map_err(|e| format!("invalid map globs: {e}"))?;
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -120,6 +147,10 @@ pub fn discover_files_with_max_depth(
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
+        // Filtering after the normal walker cannot re-include ignored files.
+        if filters.matched(entry.path(), false).is_ignore() {
+            continue;
+        }
         discovered += 1;
         let path = absolute_lexical(entry.path(), root);
         all_files.push(path.clone());
@@ -131,7 +162,7 @@ pub fn discover_files_with_max_depth(
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     all_files.sort();
-    FileDiscovery {
+    Ok(FileDiscovery {
         files,
         all_files,
         discovered,
@@ -139,7 +170,7 @@ pub fn discover_files_with_max_depth(
         ambiguous,
         walk_errors,
         walk_errors_total,
-    }
+    })
 }
 
 /// Discover and deduplicate supported files across overlapping roots.
@@ -153,6 +184,13 @@ where
     let mut walk_errors_total = 0usize;
     for root in roots {
         let root = root.as_ref();
+        if let Err(error) = reject_symlink_components(root) {
+            walk_errors_total += 1;
+            if walk_errors.len() < 20 {
+                walk_errors.push(error);
+            }
+            continue;
+        }
         let mut builder = WalkBuilder::new(root);
         builder
             .hidden(true)

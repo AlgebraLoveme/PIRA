@@ -1,380 +1,844 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
 import io
 import json
-import shutil
+import os
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-SCRIPT = Path(__file__).with_name("setup_pira.py")
-REPO_ROOT = SCRIPT.parents[2]
-SPEC = importlib.util.spec_from_file_location("pira_setup_claude_test", SCRIPT)
+
+SCRIPT = Path(__file__).with_name("setup_pira_claude.py")
+SPEC = importlib.util.spec_from_file_location("pira_claude_setup_test", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 setup = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
-
-AGENTS_MD = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-README_MD = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+CLAUDE_VERSION = setup.claude_version
 
 
-class SetupPiraClaudeTests(unittest.TestCase):
-    def state(self, policy_dir: Path, *, dry_run: bool = False) -> Any:
-        return setup.SetupState(
-            repo_root=REPO_ROOT,
-            policy_dir=policy_dir,
-            dry_run=dry_run,
-            yes=True,
-            source_commit="a" * 40,
-            source_branch="claude",
-            source_dirty=False,
+class ClaudeSetupTests(unittest.TestCase):
+    def test_tool_setup_selects_shared_tools_without_codex_team(self) -> None:
+        with patch.object(setup.subprocess, "run") as run:
+            setup.tools_setup(Path("/pira"), verify=False, dry_run=True)
+        command = run.call_args.args[0]
+        selected = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--tool"]
+        self.assertEqual(
+            selected,
+            ["pira_ctx", "pira_dec", "pira_nav", "pira_svg_check"],
+        )
+        self.assertNotIn("pira_team", command)
+        self.assertIn("--dry-run", command)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        root = Path(self.temporary.name).resolve()
+        home = patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root)})
+        home.start()
+        self.addCleanup(home.stop)
+        self.agent = root / "agent-claude"
+        self.claude = root / ".claude"
+        (self.agent / "modules").mkdir(parents=True)
+        (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\n", encoding="utf-8")
+        (self.agent / "modules" / "CODING_STYLE.md").write_text("coding\n", encoding="utf-8")
+        self.claude.mkdir()
+        self.entry = self.claude / "rules" / setup.RULE_FILE
+        self.arguments = [
+            "--agent-dir", str(self.agent), "--claude-dir", str(self.claude), "--skip-tools"
+        ]
+        version = patch.object(setup, "claude_version", return_value=(2, 1, 283))
+        version.start()
+        self.addCleanup(version.stop)
+
+    def run_setup(self, *extra: str) -> int:
+        return setup.main([*self.arguments, *extra])
+
+    def settings(self) -> dict[str, object]:
+        return json.loads((self.claude / "settings.json").read_text(encoding="utf-8"))
+
+    def test_shared_source_file_aliases_are_refused_before_mutation(self) -> None:
+        for name in ("AGENTS.md", "modules/CODING_STYLE.md"):
+            source = self.agent / name
+            content = source.read_bytes()
+            shared = self.claude.parent / "shared-policy.md"
+            shared.write_bytes(content)
+            for alias in ("hardlink", "symlink"):
+                with self.subTest(name=name, alias=alias):
+                    source.unlink()
+                    try:
+                        if alias == "hardlink":
+                            os.link(shared, source)
+                        else:
+                            source.symlink_to(shared)
+                    except OSError as error:
+                        source.write_bytes(content)
+                        if getattr(error, "winerror", None) == 1314:
+                            continue  # Non-elevated Windows can lack symlink permission.
+                        raise
+                    try:
+                        with contextlib.redirect_stderr(io.StringIO()) as errors:
+                            self.assertEqual(self.run_setup(), 1)
+                        self.assertIn("independent regular file", errors.getvalue())
+                        self.assertEqual(shared.read_bytes(), content)
+                        self.assertFalse(self.entry.exists())
+                        self.assertFalse((self.claude / "settings.json").exists())
+                    finally:
+                        source.unlink()
+                        source.write_bytes(content)
+
+    def test_custom_production_paths_are_rejected_before_mutation(self) -> None:
+        for argument, path in (("--agent-dir", self.agent.with_name("custom-checkout")),
+                               ("--claude-dir", self.claude.with_name("custom-config"))):
+            original = {}
+            if argument == "--agent-dir":
+                (path / "modules").mkdir(parents=True)
+                for relative in ("AGENTS.md", "modules/CODING_STYLE.md"):
+                    target = path / relative
+                    target.write_bytes((setup.VERIFY_TOKEN + "\n").encode())
+                    original[target] = target.read_bytes()
+            with self.subTest(argument=argument), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(self.run_setup(argument, str(path)), 1)
+                self.assertIn("unsupported", errors.getvalue())
+                for target, content in original.items():
+                    self.assertEqual(target.read_bytes(), content)
+                if not original:
+                    self.assertFalse(path.exists())
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_explicit_shared_source_migration_preserves_profiles_and_unrelated_files(self) -> None:
+        settings = {"theme": "dark", "permissions": {"allow": ["Bash(echo safe)"]}}
+        (self.claude / "settings.json").write_bytes(setup.json_bytes(settings))
+        self.assertEqual(self.run_setup(), 0)
+        profile = self.claude / "pira" / "USER.md"
+        profile.write_bytes(b"Private Claude preferences\n")
+        legacy = self.agent.with_name("agent")
+        (legacy / "modules").mkdir(parents=True)
+        (legacy / "AGENTS.md").write_bytes((setup.VERIFY_TOKEN + "\nCodex policy\n").encode())
+        (legacy / "USER.md").write_bytes(b"Private original preferences\n")
+        (legacy / "modules" / "CODING_STYLE.md").write_bytes(b"Codex coding\n")
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_bytes())
+        configured = self.settings()
+        for key, rule in (("module_read_rule", setup.module_read_rule(legacy)),
+                          ("shared_profile_read_rule", setup.shared_profile_read_rule(legacy))):
+            configured["permissions"]["allow"].remove(manifest[key])
+            configured["permissions"]["allow"].append(rule)
+            manifest[key] = rule
+        manifest["policy_path"] = str(legacy / "AGENTS.md")
+        manifest["policy_sha256"] = setup.sha256((legacy / "AGENTS.md").read_bytes())
+        manifest_path.write_bytes(setup.json_bytes(manifest))
+        (self.claude / "settings.json").write_bytes(setup.json_bytes(configured))
+        self.entry.unlink()
+        setup.install_entry(self.entry, legacy / "AGENTS.md", None, dry_run=False, copy_policy=os.name == "nt")
+        unrelated = self.claude / "CLAUDE.md"
+        unrelated.write_bytes(b"Unrelated instructions\n")
+        before = {path: path.read_bytes() for path in (manifest_path, profile, unrelated,
+                  self.claude / "settings.json", legacy / "AGENTS.md", legacy / "USER.md")}
+        self.assertEqual(self.run_setup(), 1)  # Never silently retarget an owned rule.
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup("--uninstall"), 0)  # Uses the old manifest, not new defaults.
+        self.assertEqual(self.settings(), settings)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup(), 0)
+        for path in (profile, unrelated, legacy / "AGENTS.md", legacy / "USER.md"):
+            self.assertEqual(path.read_bytes(), before[path])
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings(), settings)
+
+    def test_dual_install_and_updates_keep_policies_and_profiles_isolated(self) -> None:
+        from assets.scripts.test_setup_pira import setup as codex
+        from assets.scripts.test_migrate_pira_stores import native_ctx_environment
+        home = self.claude.parent
+        codex_root = home / "agent"
+        (codex_root / "modules").mkdir(parents=True)
+        (codex_root / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nCodex policy\n", encoding="utf-8")
+        (codex_root / "modules" / "CODING_STYLE.md").write_bytes(b"Codex module\n")
+        (codex_root / "USER.md").write_bytes(b"Private Codex profile\n")
+        (self.agent / "USER.md").write_bytes(b"Private Claude fallback\n")
+        codex_args = ["--skip-tools", "--yes", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]
+        profile = home / "fixture-profile.ps1"
+        profile.write_bytes(b"# Unrelated shell preferences\n")
+        # HOME does not redirect Windows known-folder discovery or HKCU.
+        registry = MagicMock()
+        registry.OpenKey.side_effect = FileNotFoundError
+        with patch.dict(os.environ, {**native_ctx_environment(home), "SHELL": "/bin/sh"}, clear=True), \
+                patch.dict(sys.modules, {"winreg": registry}), \
+                patch.object(codex.audio_retirement, "default_profiles", return_value=[profile]), \
+                patch.object(codex, "__file__", str(codex_root / "assets/scripts/setup_pira.py")), \
+                patch.object(codex, "migration_codex_binary", return_value=None):
+            self.assertEqual(codex.main(codex_args), 0)
+            config = home / ".codex" / "config.toml"
+            codex_files = (config, codex_root / "AGENTS.md", codex_root / "AGENTS.override.md",
+                           codex_root / "modules" / "CODING_STYLE.md", codex_root / "USER.md")
+            codex_before = {path: path.read_bytes() for path in codex_files}
+            self.assertEqual(self.run_setup(), 0)
+            self.assertEqual(self.run_setup("--verify"), 0)
+            (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nClaude update\n", encoding="utf-8")
+            (self.agent / "modules" / "CODING_STYLE.md").write_bytes(b"Claude module update\n")
+            self.assertEqual(self.run_setup(), 0)
+            self.assertEqual(self.entry.read_bytes(), (self.agent / "AGENTS.md").read_bytes())
+            for path, content in codex_before.items():
+                self.assertEqual(path.read_bytes(), content)
+            claude_files = (self.entry, self.claude / "settings.json", self.claude / "pira" / setup.MANIFEST,
+                            self.claude / "pira" / "USER.md", self.agent / "AGENTS.md",
+                            self.agent / "modules" / "CODING_STYLE.md", self.agent / "USER.md")
+            claude_before = {path: path.read_bytes() for path in claude_files}
+            (codex_root / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nCodex update\n", encoding="utf-8")
+            self.assertEqual(codex.main(codex_args), 0)
+            self.assertEqual(codex.main([*codex_args, "--verify"]), 0)
+            for path, content in claude_before.items():
+                self.assertEqual(path.read_bytes(), content)
+            codex_updated = {path: path.read_bytes() for path in codex_files}
+            self.assertEqual(self.run_setup("--uninstall"), 0)
+            self.assertEqual(self.run_setup(), 0)
+            for path, content in codex_updated.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(profile.read_bytes(), b"# Unrelated shell preferences\n")
+            registry.SetValueEx.assert_not_called()
+
+    def test_fresh_install_verify_rerun_and_uninstall(self) -> None:
+        codex_config = self.claude.parent / ".codex" / "config.toml"
+        codex_config.parent.mkdir()
+        codex_config.write_bytes(b"model = 'existing-codex-setting'\n")
+        policy_before = (self.agent / "AGENTS.md").read_bytes()
+        self.assertEqual(self.run_setup("--dry-run"), 0)
+        self.assertFalse(self.entry.exists())
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup(), 0)
+        if os.name == "nt":
+            self.assertTrue(self.entry.is_file())
+            self.assertFalse(self.entry.is_symlink())
+        else:
+            self.assertTrue(self.entry.is_symlink())
+        self.assertEqual(
+            self.settings()["pluginConfigs"][setup.PLUGIN]["options"]["instructionFiles"],
+            setup.MODE,
+        )
+        self.assertEqual(
+            self.settings()["permissions"]["allow"],
+            [setup.module_read_rule(self.agent), setup.profile_read_rule(self.claude),
+             setup.shared_profile_read_rule(self.agent)],
+        )
+        self.assertTrue((self.claude / "pira" / "USER.md").is_file())
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertFalse(self.entry.exists())
+        self.assertFalse((self.claude / "settings.json").exists())
+        self.assertTrue((self.claude / "pira" / "USER.md").exists())
+        self.assertEqual(codex_config.read_bytes(), b"model = 'existing-codex-setting'\n")
+        self.assertEqual((self.agent / "AGENTS.md").read_bytes(), policy_before)
+
+    def test_preserves_unrelated_settings_and_legacy_instructions(self) -> None:
+        settings = {
+            "permissions": {"allow": ["Read(~/notes.md)"]},
+            "pluginConfigs": {setup.PLUGIN: {"options": {"instructionFiles": "claude-md"}}},
+        }
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        legacy = (
+            "# Local rules\n\nKeep this.\n"
+            f"{setup.LEGACY_START}\n@~/.claude/pira/AGENTS.md\n{setup.LEGACY_END}\n"
+            "After the block.\n"
+        )
+        (self.claude / "CLAUDE.md").write_text(legacy, encoding="utf-8")
+        self.assertEqual(self.run_setup("--user-mode", "keep"), 0)
+        self.assertEqual(
+            self.settings()["permissions"]["allow"],
+            ["Read(~/notes.md)", setup.module_read_rule(self.agent),
+             setup.profile_read_rule(self.claude), setup.shared_profile_read_rule(self.agent)],
+        )
+        self.assertEqual(
+            (self.claude / "CLAUDE.md").read_text(encoding="utf-8"),
+            "# Local rules\n\nKeep this.\n\nAfter the block.\n",
+        )
+        self.assertFalse((self.claude / "pira" / "USER.md").exists())
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"], settings["permissions"])
+        self.assertEqual(
+            self.settings()["pluginConfigs"][setup.PLUGIN]["options"]["instructionFiles"],
+            "claude-md",
         )
 
-    def install_bundle(self, state: Any) -> None:
-        setup.install_policy_bundle(state)
-
-    def test_managed_block_is_only_the_runtime_import(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            state = self.state(root / "pira")
-
-            setup.update_claude_md(state, claude_md)
-            installed = claude_md.read_text(encoding="utf-8")
-
-            self.assertEqual(installed, setup.claude_managed_block(state.policy_dir))
-            self.assertEqual(installed.splitlines()[1], "@" + setup.claude_import_path(state.policy_dir / "AGENTS.md"))
-            self.assertEqual(len(installed.splitlines()), 3)
-
-    def test_canonical_policy_is_claude_native_and_runtime_local(self) -> None:
-        self.assertIn("Run every other shell command with native Bash", AGENTS_MD)
-        self.assertIn("Load PIRA modules with Read, never with a shell command", AGENTS_MD)
-        self.assertIn("~/.claude/pira/modules/CODING_STYLE.md", AGENTS_MD)
-        self.assertNotIn("~/agent", AGENTS_MD)
-        self.assertNotIn("Every shell/exec invocation", AGENTS_MD)
-        self.assertNotIn("AGENTS.override.md", AGENTS_MD)
-
-    def test_readme_defines_agent_managed_installation_and_all_layouts(self) -> None:
-        self.assertIn("agent-managed operation", README_MD)
-        self.assertIn("Install PIRA for Claude", README_MD)
-        self.assertIn("PIRA + Codex only", README_MD)
-        self.assertIn("PIRA + Claude only", README_MD)
-        self.assertIn("Both clients", README_MD)
-        self.assertIn("Separate `USER.md` files by default", README_MD)
-        self.assertIn("one-time copy from Codex", README_MD)
-        self.assertIn("compares the two SHA-256 hashes", README_MD)
-        self.assertIn("must stop and ask rather than overwrite it", README_MD)
-
-    def test_install_uninstall_preserves_user_bytes_exactly(self) -> None:
-        contents = ["# Mine", "# Mine\n", "# Mine\n\n\n", "before\nafter\n"]
-        for original in contents:
-            with self.subTest(original=repr(original)), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                claude_md = root / "CLAUDE.md"
-                claude_md.write_text(original, encoding="utf-8")
-                state = self.state(root / "pira")
-
-                setup.update_claude_md(state, claude_md)
-                setup.remove_claude_md_block(state, claude_md)
-
-                self.assertEqual(claude_md.read_text(encoding="utf-8"), original)
-
-    def test_uninstall_absorbs_only_the_old_managed_final_newline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            state = self.state(root / "pira")
-            original = "# Mine\n\n\n"
-            claude_md.write_text(original + setup.claude_managed_block(state.policy_dir) + "\n", encoding="utf-8")
-
-            setup.remove_claude_md_block(state, claude_md)
-
-            self.assertEqual(claude_md.read_text(encoding="utf-8"), original)
-
-    def test_install_and_bundle_are_idempotent(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            claude_md.write_text("# My instructions\n", encoding="utf-8")
-            state = self.state(root / "pira")
-
-            self.install_bundle(state)
-            setup.update_claude_md(state, claude_md)
-            first_claude = claude_md.read_bytes()
-            first_manifest = (state.policy_dir / setup.MANIFEST_NAME).read_bytes()
-            state.changed.clear()
-            self.install_bundle(state)
-            setup.update_claude_md(state, claude_md)
-
-            self.assertEqual(claude_md.read_bytes(), first_claude)
-            self.assertEqual((state.policy_dir / setup.MANIFEST_NAME).read_bytes(), first_manifest)
-            self.assertEqual(state.changed, [])
-
-    def test_replaces_stale_managed_block_in_place(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            stale = setup.CLAUDE_BLOCK_START + "\n@/old/AGENTS.md\nold override\n" + setup.CLAUDE_BLOCK_END
-            claude_md.write_text("before\n" + stale + "\nafter\n", encoding="utf-8")
-            state = self.state(root / "pira")
-
-            setup.update_claude_md(state, claude_md)
-
-            self.assertEqual(
-                claude_md.read_text(encoding="utf-8"),
-                "before\n" + setup.claude_managed_block(state.policy_dir) + "\nafter\n",
-            )
-
-    def test_rejects_bad_markers_and_non_utf8_without_changes(self) -> None:
-        cases = [
-            setup.CLAUDE_BLOCK_START,
-            setup.CLAUDE_BLOCK_START + setup.CLAUDE_BLOCK_END + setup.CLAUDE_BLOCK_START,
-            setup.CLAUDE_BLOCK_END + setup.CLAUDE_BLOCK_START,
-        ]
-        for content in cases:
-            with self.subTest(content=content), tempfile.TemporaryDirectory() as temporary:
-                path = Path(temporary) / "CLAUDE.md"
-                path.write_text(content, encoding="utf-8")
-                state = self.state(Path(temporary) / "pira")
-                with self.assertRaisesRegex(RuntimeError, "PIRA markers"):
-                    setup.planned_claude_md(path, state.policy_dir)
-                self.assertEqual(path.read_text(encoding="utf-8"), content)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "CLAUDE.md"
-            path.write_bytes(b"\xff\xfe")
-            with self.assertRaisesRegex(RuntimeError, "not valid UTF-8"):
-                setup.planned_claude_md(path, Path(temporary) / "pira")
-            self.assertEqual(path.read_bytes(), b"\xff\xfe")
-
-    def test_bundle_contains_manifested_snapshot_and_renders_custom_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            policy_dir = Path(temporary) / "runtime"
-            state = self.state(policy_dir)
-            self.install_bundle(state)
-
-            manifest = json.loads((policy_dir / setup.MANIFEST_NAME).read_text(encoding="utf-8"))
-            paths = {entry["path"] for entry in manifest["files"]}
-            installed_agents = (policy_dir / "AGENTS.md").read_text(encoding="utf-8")
-            installed_maintenance = (policy_dir / "modules" / "MAINTENANCE.md").read_text(encoding="utf-8")
-
-            self.assertEqual(manifest["source_commit"], "a" * 40)
-            self.assertFalse(manifest["source_dirty"])
-            self.assertIn("AGENTS.md", paths)
-            self.assertIn("modules/CODING_STYLE.md", paths)
-            self.assertIn(setup.claude_import_path(policy_dir), installed_agents)
-            self.assertNotIn(setup.DEFAULT_POLICY_DIR, installed_agents)
-            self.assertNotIn(setup.DEFAULT_POLICY_DIR, installed_maintenance)
-            self.assertFalse((policy_dir / ".git").exists())
-
-    def test_refuses_unowned_or_modified_policy_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            policy_dir = Path(temporary) / "pira"
-            policy_dir.mkdir()
-            (policy_dir / "AGENTS.md").write_text("mine", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "not owned"):
-                setup.prepare_policy_bundle(self.state(policy_dir))
-
-        with tempfile.TemporaryDirectory() as temporary:
-            policy_dir = Path(temporary) / "pira"
-            state = self.state(policy_dir)
-            self.install_bundle(state)
-            (policy_dir / "AGENTS.md").write_text("changed", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "modified managed"):
-                setup.prepare_policy_bundle(state)
-
-    def test_manifest_rejects_path_traversal(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            policy_dir = Path(temporary)
-            payload = {
-                "schema_version": setup.MANIFEST_SCHEMA,
-                "target": "claude-code",
-                "source_commit": "a" * 40,
-                "source_branch": "claude",
-                "source_dirty": False,
-                "files": [{"path": "../outside", "sha256": "0" * 64}],
-            }
-            (policy_dir / setup.MANIFEST_NAME).write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "unsafe managed path"):
-                setup.read_manifest(policy_dir)
-
-    def test_uninstall_removes_only_owned_bundle_and_preserves_user_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            policy_dir = root / "pira"
-            state = self.state(policy_dir)
-            self.install_bundle(state)
-            (policy_dir / "USER.md").write_text("private\n", encoding="utf-8")
-            (policy_dir / "notes.txt").write_text("mine\n", encoding="utf-8")
-            (policy_dir / "modules" / "PRIVATE.md").write_text("mine too\n", encoding="utf-8")
-            manifest = setup.prepare_bundle_uninstall(state)
-
-            setup.uninstall_policy_bundle(state, manifest)
-
-            self.assertEqual((policy_dir / "USER.md").read_text(encoding="utf-8"), "private\n")
-            self.assertEqual((policy_dir / "notes.txt").read_text(encoding="utf-8"), "mine\n")
-            self.assertEqual((policy_dir / "modules" / "PRIVATE.md").read_text(encoding="utf-8"), "mine too\n")
-            self.assertFalse((policy_dir / "AGENTS.md").exists())
-            self.assertFalse((policy_dir / setup.MANIFEST_NAME).exists())
-
-    def test_created_claude_file_is_deleted_on_uninstall(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            state = self.state(root / "pira")
-            setup.update_claude_md(state, claude_md)
-            setup.remove_claude_md_block(state, claude_md)
-            self.assertFalse(claude_md.exists())
-            self.assertEqual(len(list(root.glob("CLAUDE.md.bak.*"))), 1)
-
-    def test_cli_installs_verifies_and_uninstalls_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / ".claude" / "CLAUDE.md"
-            policy_dir = root / ".claude" / "pira"
-            common = ["--policy-dir", str(policy_dir), "--claude-md", str(claude_md), "--skip-tools"]
-            with redirect_stdout(io.StringIO()):
-                installed = setup.main([*common, "--yes", "--user-mode", "placeholder"])
-                verified = setup.main([*common, "--verify"])
-                removed = setup.main([*common, "--uninstall"])
-
-            self.assertEqual((installed, verified, removed), (0, 0, 0))
-            self.assertFalse(claude_md.exists())
-            self.assertTrue((policy_dir / "USER.md").exists())
-            self.assertFalse((policy_dir / setup.MANIFEST_NAME).exists())
-
-    def test_wrong_branch_and_whitespace_fail_before_first_write(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            claude_md = root / "CLAUDE.md"
-            policy_dir = root / "policy dir"
-            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                wrong_branch = setup.main(
-                    ["--policy-dir", str(root / "pira"), "--claude-md", str(claude_md), "--skip-tools", "--expected-source-branch", "not-this-branch"]
+    def test_legacy_removal_preserves_original_bytes(self) -> None:
+        for original in (b"Local rules", b"Local rules\r\n", b"Local rules\n"):
+            with self.subTest(original=original):
+                legacy = self.claude / "CLAUDE.md"
+                legacy.write_bytes(
+                    original + setup.LEGACY_START.encode() +
+                    b"\n@~/.claude/pira/AGENTS.md\n" + setup.LEGACY_END.encode() + b"\n"
                 )
-                whitespace = setup.main(
-                    ["--policy-dir", str(policy_dir), "--claude-md", str(claude_md), "--skip-tools", "--yes"]
-                )
-            self.assertEqual((wrong_branch, whitespace), (1, 1))
-            self.assertFalse(claude_md.exists())
-            self.assertFalse((root / "pira").exists())
-            self.assertFalse(policy_dir.exists())
+                self.assertEqual(self.run_setup(), 0)
+                self.assertEqual(legacy.read_bytes(), original)
 
-    def test_audited_branch_install_rejects_dirty_source(self) -> None:
-        with patch.object(
-            setup,
-            "command_output",
-            side_effect=["a" * 40, "claude", " M AGENTS.md"],
-        ):
-            with self.assertRaisesRegex(RuntimeError, "uncommitted"):
-                setup.source_metadata(REPO_ROOT, "claude")
+    def test_legacy_custom_policy_directory(self) -> None:
+        snapshot = self.claude.parent / "custom-policy"
+        snapshot.mkdir()
+        policy = (setup.VERIFY_TOKEN + "\n").encode()
+        (snapshot / "AGENTS.md").write_bytes(policy)
+        manifest = {"schema_version": 1, "target": "claude-code",
+                    "files": [{"path": "AGENTS.md", "sha256": setup.sha256(policy)}]}
+        (snapshot / "install.json").write_text(json.dumps(manifest), encoding="utf-8")
+        bridge = self.claude / "CLAUDE.md"
+        home = self.claude.parent
+        with patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            for target in ("~/custom-policy/AGENTS.md", (snapshot / "AGENTS.md").as_posix()):
+                with self.subTest(target=target):
+                    bridge.write_text(f"Local rules\n{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n",
+                                      encoding="utf-8")
+                    if any(character.isspace() for character in target):
+                        before = bridge.read_bytes()
+                        self.assertEqual(self.run_setup(), 1)
+                        self.assertEqual(bridge.read_bytes(), before)
+                        continue  # Unquoted whitespace is not a supported legacy import.
+                    self.assertEqual(self.run_setup(), 0)
+                    self.assertEqual(bridge.read_text(encoding="utf-8"), "Local rules\n")
+                    self.assertEqual((snapshot / "AGENTS.md").read_bytes(), policy)
+                    self.assertEqual(json.loads((snapshot / "install.json").read_text()), manifest)
+                    self.assertEqual(self.run_setup("--verify"), 0)
 
-    def test_codex_checkout_is_untouched_by_claude_install(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            codex = root / "agent"
-            codex.mkdir()
-            codex_policy = codex / "AGENTS.md"
-            codex_policy.write_text("codex master\n", encoding="utf-8")
-            state = self.state(root / ".claude" / "pira")
+    def test_unmanaged_entry_and_modified_legacy_block_are_refused(self) -> None:
+        entry = self.entry
+        entry.parent.mkdir()
+        entry.write_text("My own Claude instructions\n", encoding="utf-8")
+        self.assertEqual(self.run_setup(), 1)
+        self.assertEqual(entry.read_text(encoding="utf-8"), "My own Claude instructions\n")
+        entry.unlink()
+        legacy = self.claude / "CLAUDE.md"
+        legacy.write_text(
+            f"{setup.LEGACY_START}\nuser changes\n{setup.LEGACY_END}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(entry.exists())
 
-            self.install_bundle(state)
+    def test_custom_legacy_unowned_or_modified_is_preserved(self) -> None:
+        snapshot = self.claude.parent / "custom-policy"
+        snapshot.mkdir()
+        policy = snapshot / "AGENTS.md"
+        original = (setup.VERIFY_TOKEN + "\n").encode()
+        policy.write_bytes(original)
+        record = {"path": "AGENTS.md", "sha256": setup.sha256(original)}
+        manifest_path = snapshot / "install.json"
+        bridge = self.claude / "CLAUDE.md"
+        for defect in ("missing", "wrong-target", "wrong-schema", "duplicate", "unowned", "modified", "edited-import"):
+            with self.subTest(defect=defect):
+                manifest = {"schema_version": 1, "target": "claude-code", "files": [record]}
+                if defect == "wrong-target":
+                    manifest["target"] = "other"
+                elif defect == "wrong-schema":
+                    manifest["schema_version"] = 99
+                elif defect == "duplicate":
+                    manifest["files"] = [record, record]
+                elif defect == "unowned":
+                    manifest["files"] = []
+                if defect != "missing":
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                policy.write_bytes(original + (b"edited\n" if defect == "modified" else b""))
+                target = "~/custom-policy/AGENTS.md" + (" extra text" if defect == "edited-import" else "")
+                bridge.write_text(f"{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n", encoding="utf-8")
+                before = {p: p.read_bytes() for p in (bridge, policy, manifest_path) if p.exists()}
+                self.assertEqual(self.run_setup(), 1)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
 
-            self.assertEqual(codex_policy.read_text(encoding="utf-8"), "codex master\n")
-            self.assertNotEqual((state.policy_dir / "AGENTS.md").read_text(encoding="utf-8"), "codex master\n")
 
-    def test_installed_snapshot_survives_source_checkout_removal(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            policy_dir = root / "runtime"
-            (source / "modules").mkdir(parents=True)
-            (source / "AGENTS.md").write_text(
-                f"token {setup.VERIFY_TOKEN}\nread {setup.DEFAULT_POLICY_DIR}/modules/ONE.md\n",
-                encoding="utf-8",
+    def test_preexisting_identical_rule_requires_install_manifest(self) -> None:
+        self.entry.parent.mkdir()
+        if os.name != "nt":
+            self.entry.symlink_to(self.agent / "AGENTS.md")
+            self.assertEqual(self.run_setup(), 1)
+            self.assertTrue(self.entry.is_symlink())
+            self.entry.unlink()
+        self.entry.write_bytes((self.agent / "AGENTS.md").read_bytes())
+        with self.assertRaisesRegex(RuntimeError, "no install manifest"):
+            setup.install_entry(
+                self.entry, self.agent / "AGENTS.md", None, dry_run=True, copy_policy=True
             )
-            (source / "modules" / "ONE.md").write_text("module\n", encoding="utf-8")
-            state = setup.SetupState(source, policy_dir, False, True, "b" * 40, "claude", False)
 
-            with patch.object(setup, "tracked_policy_paths", return_value=["AGENTS.md", "modules/ONE.md"]):
-                self.install_bundle(state)
-            installed = (policy_dir / "AGENTS.md").read_bytes()
-            shutil.rmtree(source)
+    def test_malformed_or_symlinked_settings_are_refused_before_link(self) -> None:
+        settings = self.claude / "settings.json"
+        settings.write_text("{broken", encoding="utf-8")
+        self.assertEqual(self.run_setup(), 1)
+        settings.unlink()
+        if os.name == "nt":
+            self.assertFalse(self.entry.exists())
+            return
+        settings.symlink_to(self.agent / "AGENTS.md")
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists())
+        settings.unlink()
+        settings.symlink_to(self.agent / "missing")
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists())
 
-            self.assertEqual((policy_dir / "AGENTS.md").read_bytes(), installed)
-            self.assertEqual((policy_dir / "modules" / "ONE.md").read_text(encoding="utf-8"), "module\n")
+    def test_windows_copy_refresh_and_uninstall_after_source_update(self) -> None:
+        entry = self.entry
+        entry.parent.mkdir()
+        manifest = {"policy_sha256": setup.sha256((self.agent / "AGENTS.md").read_bytes())}
+        setup.install_entry(entry, self.agent / "AGENTS.md", manifest, dry_run=False, copy_policy=True)
+        (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nupdated\n", encoding="utf-8")
+        self.assertTrue(setup.verify_owned_entry(entry, self.agent / "AGENTS.md", manifest, copy_policy=True))
+        self.assertFalse(setup.verify_entry(entry, self.agent / "AGENTS.md", copy_policy=True))
+        setup.install_entry(entry, self.agent / "AGENTS.md", manifest, dry_run=False, copy_policy=True)
+        self.assertTrue(setup.verify_entry(entry, self.agent / "AGENTS.md", copy_policy=True))
+        self.assertTrue(setup.verify_owned_entry(
+            entry, self.agent / "AGENTS.md",
+            {"policy_sha256": setup.sha256(entry.read_bytes())}, copy_policy=True,
+        ))
+        entry.write_text("unmanaged\n", encoding="utf-8")
+        self.assertFalse(setup.verify_owned_entry(
+            entry, self.agent / "AGENTS.md", manifest, copy_policy=True,
+        ))
+        with self.assertRaisesRegex(RuntimeError, "not managed"):
+            setup.install_entry(entry, self.agent / "AGENTS.md", manifest, dry_run=False, copy_policy=True)
 
-    def test_snapshot_excludes_untracked_module_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            policy_dir = root / "runtime"
-            (source / "modules").mkdir(parents=True)
-            (source / "AGENTS.md").write_text(
-                f"token {setup.VERIFY_TOKEN}\nread {setup.DEFAULT_POLICY_DIR}/modules/TRACKED.md\n",
-                encoding="utf-8",
-            )
-            (source / "modules" / "TRACKED.md").write_text("tracked\n", encoding="utf-8")
-            (source / "modules" / "LOCAL.md").write_text("private local file\n", encoding="utf-8")
-            state = setup.SetupState(source, policy_dir, False, True, "b" * 40, "claude", False)
+    @unittest.skipIf(os.name == "nt", "creating symlinks may require Windows privileges")
+    def test_broken_manifest_and_profile_links_fail_before_install(self) -> None:
+        manifest = self.claude / "pira" / setup.MANIFEST
+        manifest.parent.mkdir()
+        manifest.symlink_to(self.agent / "missing")
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists())
+        manifest.unlink()
+        (self.claude / "pira" / "USER.md").symlink_to(self.agent / "missing")
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists())
 
-            with patch.object(setup, "tracked_policy_paths", return_value=["AGENTS.md", "modules/TRACKED.md"]):
-                self.install_bundle(state)
+    def test_legacy_snapshot_and_unrelated_global_agents_are_untouched(self) -> None:
+        old = self.claude / "pira" / "AGENTS.md"
+        old.parent.mkdir()
+        old.write_text("old snapshot\n", encoding="utf-8")
+        unrelated = self.claude / "AGENTS.md"
+        unrelated.write_text("unrelated\n", encoding="utf-8")
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(old.read_text(encoding="utf-8"), "old snapshot\n")
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "unrelated\n")
 
-            self.assertTrue((policy_dir / "modules" / "TRACKED.md").is_file())
-            self.assertFalse((policy_dir / "modules" / "LOCAL.md").exists())
+    @unittest.skipIf(os.name == "nt", "creating symlinks may require Windows privileges")
+    def test_symlinked_rules_directory_is_refused(self) -> None:
+        (self.claude / "rules").symlink_to(self.agent)
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse((self.claude / "settings.json").exists())
 
-    def test_failed_replacement_restores_previous_bundle(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            policy_dir = Path(temporary) / "pira"
-            old_state = self.state(policy_dir)
-            self.install_bundle(old_state)
-            old_agents = (policy_dir / "AGENTS.md").read_bytes()
-            old_manifest = (policy_dir / setup.MANIFEST_NAME).read_bytes()
-            new_state = setup.SetupState(REPO_ROOT, policy_dir, False, True, "c" * 40, "claude", False)
-            real_replace = setup.os.replace
-            calls = 0
+    def test_preexisting_module_rule_survives_uninstall(self) -> None:
+        rule = setup.module_read_rule(self.agent)
+        profile_rule = setup.profile_read_rule(self.claude)
+        shared_rule = setup.shared_profile_read_rule(self.agent)
+        settings = {"permissions": {"allow": [rule, profile_rule, shared_rule]}}
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"], settings["permissions"])
 
-            def fail_during_replace(source: object, target: object) -> None:
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise OSError("injected replacement failure")
-                real_replace(source, target)
+    def test_verify_detects_removed_module_read_rule(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.settings()
+        settings["permissions"]["allow"].clear()
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup("--verify"), 1)
 
-            with patch.object(setup.os, "replace", side_effect=fail_during_replace):
-                with self.assertRaisesRegex(RuntimeError, "previous files were restored"):
-                    setup.install_policy_bundle(new_state)
+    def test_verify_detects_removed_private_profile_read_rule(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.profile_read_rule(self.claude))
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup("--verify"), 1)
 
-            self.assertEqual((policy_dir / "AGENTS.md").read_bytes(), old_agents)
-            self.assertEqual((policy_dir / setup.MANIFEST_NAME).read_bytes(), old_manifest)
+    def test_verify_detects_removed_shared_profile_read_rule(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.shared_profile_read_rule(self.agent))
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup("--verify"), 1)
 
-    def test_prompt_uses_default_when_stdin_closes(self) -> None:
-        with patch("builtins.input", side_effect=EOFError), redirect_stdout(io.StringIO()):
-            self.assertTrue(setup.prompt_yes_no("Continue?", default=True))
-            self.assertFalse(setup.prompt_yes_no("Continue?", default=False))
+    def test_rerun_upgrades_previous_manifest_without_losing_user_rules(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("profile_read_rule")
+        manifest.pop("profile_read_rule_added")
+        manifest.pop("shared_profile_read_rule")
+        manifest.pop("shared_profile_read_rule_added")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        settings = self.settings()
+        settings["permissions"]["allow"].remove(setup.profile_read_rule(self.claude))
+        settings["permissions"]["allow"].remove(setup.shared_profile_read_rule(self.agent))
+        settings["permissions"]["allow"].append("Read(~/notes.md)")
+        (self.claude / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"]["allow"], ["Read(~/notes.md)"])
 
-    def test_cli_rejects_removed_or_codex_only_options(self) -> None:
-        options = [
-            ["--agent-dir", "x"],
-            ["--force-agent-link"],
-            ["--legacy", "keep"],
-            ["--execution-mode", "safe"],
-            ["--audio", "yes"],
-            ["--codex-config", "x"],
-            ["--claude-code"],
-        ]
-        for extra_args in options:
-            with self.subTest(extra_args=extra_args), redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as raised:
-                    setup.main(["--skip-tools", *extra_args])
-                self.assertEqual(raised.exception.code, 2)
+    def test_partial_private_profile_manifest_is_refused(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.pop("profile_read_rule_added")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        settings_before = (self.claude / "settings.json").read_bytes()
+        self.assertEqual(self.run_setup(), 1)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), settings_before)
+
+    def test_malformed_permission_list_is_refused_before_install(self) -> None:
+        (self.claude / "settings.json").write_text(
+            json.dumps({"permissions": {"allow": "Read"}}), encoding="utf-8"
+        )
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists())
+
+    def test_default_module_read_rule_is_home_scoped(self) -> None:
+        self.assertEqual(
+            setup.module_read_rule(Path.home() / "agent"),
+            "Read(~/agent/modules/*.md)",
+        )
+        self.assertEqual(
+            setup.profile_read_rule(Path.home() / ".claude"),
+            "Read(~/.claude/pira/USER.md)",
+        )
+        self.assertEqual(
+            setup.shared_profile_read_rule(Path.home() / "agent"),
+            "Read(~/agent/USER.md)",
+        )
+
+    def test_uninstall_preserves_empty_permissions_shape(self) -> None:
+        for settings in ({"permissions": {}}, {"permissions": {"allow": []}}):
+            with self.subTest(settings=settings):
+                path = self.claude / "settings.json"
+                path.write_text(json.dumps(settings), encoding="utf-8")
+                self.assertEqual(self.run_setup(), 0)
+                self.assertEqual(self.run_setup("--uninstall"), 0)
+                self.assertEqual(self.settings(), settings)
+
+    def test_uninstall_succeeds_after_policy_source_is_removed(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        (self.agent / "AGENTS.md").unlink()
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertFalse(self.entry.is_symlink())
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_install_manifest_failure_rolls_back_and_retries(self) -> None:
+        settings = self.claude / "settings.json"
+        settings.write_bytes(b'{"permissions":{"allow":["Bash(echo safe)"]},"theme":"dark"}\n')
+        legacy = self.claude / "CLAUDE.md"
+        legacy.write_bytes(
+            b"Local rules\r\n" + setup.LEGACY_START.encode() +
+            b"\n@~/.claude/pira/AGENTS.md\n" + setup.LEGACY_END.encode() + b"\n"
+        )
+        profile = self.claude / "pira" / "USER.md"
+        profile.parent.mkdir()
+        profile.write_bytes(b"My private profile\n")
+        before = {path: path.read_bytes() for path in (settings, legacy, profile)}
+        manifest = profile.parent / setup.MANIFEST
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(self.entry.exists() or self.entry.is_symlink())
+        self.assertFalse(manifest.exists())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"]["allow"], ["Bash(echo safe)"])
+        self.assertEqual(profile.read_bytes(), before[profile])
+
+    def test_fresh_install_failure_removes_new_profile_and_settings(self) -> None:
+        manifest = self.claude / "pira" / setup.MANIFEST
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest):
+            self.assertEqual(self.run_setup(), 1)
+        for path in (self.entry, manifest, self.claude / "settings.json",
+                     self.claude / "pira" / "USER.md"):
+            self.assertFalse(path.exists() or path.is_symlink())
+        self.assertEqual(self.run_setup(), 0)
+
+    def test_uninstall_unlink_failure_rolls_back_and_retries(self) -> None:
+        for failed_name in (setup.RULE_FILE, setup.MANIFEST):
+            with self.subTest(failed_name=failed_name):
+                settings = self.claude / "settings.json"
+                settings.write_bytes(b'{"permissions":{"ask":["Bash(rm *)"]},"theme":"dark"}\n')
+                self.assertEqual(self.run_setup(), 0)
+                legacy = self.claude / "CLAUDE.md"
+                legacy.write_bytes(b"Unrelated local instructions\n")
+                profile = self.claude / "pira" / "USER.md"
+                profile.write_bytes(b"Private user changes\n")
+                manifest = profile.parent / setup.MANIFEST
+                before = {path: path.read_bytes() for path in (settings, manifest, profile, legacy)}
+                unlink = Path.unlink
+
+                def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+                    if path.name == failed_name:
+                        raise OSError("injected unlink failure")
+                    unlink(path, *args, **kwargs)
+
+                with patch.object(Path, "unlink", new=fail_unlink):
+                    self.assertEqual(self.run_setup("--uninstall"), 1)
+                self.assertEqual(self.run_setup("--verify"), 0)
+                for path, content in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+                self.assertEqual(self.run_setup("--uninstall"), 0)
+                self.assertEqual(self.settings(), {"permissions": {"ask": ["Bash(rm *)"]}, "theme": "dark"})
+                self.assertEqual(profile.read_bytes(), before[profile])
+                self.assertEqual(legacy.read_bytes(), before[legacy])
+
+    def test_verify_rejects_deny_and_ask_read_conflicts(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings_path = self.claude / "settings.json"
+        installed = self.settings()
+        rules = [setup.module_read_rule(self.agent), setup.profile_read_rule(self.claude),
+                 setup.shared_profile_read_rule(self.agent)]
+        broader = [f"Read({setup.permission_anchor(self.agent)}/**)",
+                   f"Read({setup.permission_anchor(self.claude)}/**)", "Read", "Read(//**)"]
+        for kind in ("deny", "ask"):
+            for rule in [*rules, *broader, "Read(**/*.md)", "Read(path:unknown)"]:
+                with self.subTest(kind=kind, rule=rule):
+                    configured = json.loads(json.dumps(installed))
+                    configured["permissions"][kind] = [rule]
+                    content = setup.json_bytes(configured)
+                    settings_path.write_bytes(content)
+                    self.assertEqual(self.run_setup("--verify"), 1)
+                    self.assertEqual(settings_path.read_bytes(), content)
+
+    def test_install_read_conflicts_are_refused_before_mutation(self) -> None:
+        settings = self.claude / "settings.json"
+        for kind in ("deny", "ask"):
+            with self.subTest(kind=kind):
+                content = setup.json_bytes({"permissions": {kind: ["Read"]}})
+                settings.write_bytes(content)
+                self.assertEqual(self.run_setup(), 1)
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "pira").exists())
+                self.assertEqual(settings.read_bytes(), content)
+
+    def test_unrelated_restrictions_survive_install_verify_and_uninstall(self) -> None:
+        permissions = {"deny": ["Bash(rm *)", "Read(~/unrelated-private/**)"],
+                       "ask": ["Bash(git push *)", "Read(//unrelated-root/**)"],
+                       "allow": ["Bash(echo safe)"]}
+        (self.claude / "settings.json").write_bytes(setup.json_bytes({"permissions": permissions}))
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.settings()["permissions"]["deny"], permissions["deny"])
+        self.assertEqual(self.settings()["permissions"]["ask"], permissions["ask"])
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings()["permissions"], permissions)
+
+    def test_malformed_deny_and_ask_lists_are_refused(self) -> None:
+        for kind in ("deny", "ask"):
+            for value in ("Read", [123], None):
+                with self.subTest(kind=kind, value=value):
+                    path = self.claude / "settings.json"
+                    content = setup.json_bytes({"permissions": {kind: value}})
+                    path.write_bytes(content)
+                    self.assertEqual(self.run_setup(), 1)
+                    self.assertFalse(self.entry.exists())
+                    self.assertEqual(path.read_bytes(), content)
+
+    def test_reversed_legacy_markers_are_refused_before_mutation(self) -> None:
+        legacy = self.claude / "CLAUDE.md"
+        content = f"{setup.LEGACY_END}\nLocal\n{setup.LEGACY_START}\n".encode()
+        legacy.write_bytes(content)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("ambiguous PIRA-managed CLAUDE.md block", errors.getvalue())
+        self.assertEqual(legacy.read_bytes(), content)
+        self.assertFalse(self.entry.exists())
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_alias_checkout_is_refused_with_resolved_path_before_mutation(self) -> None:
+        resolve = Path.resolve
+        canonical = self.agent.parent / "canonical-agent"
+
+        def aliased(path: Path, *args: object, **kwargs: object) -> Path:
+            if path == self.agent:
+                return canonical
+            return resolve(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with patch.object(Path, "resolve", new=aliased), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("resolved path", errors.getvalue())
+        self.assertIn(str(canonical), errors.getvalue())
+        self.assertFalse(self.entry.exists())
+        self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_native_directory_aliases_are_refused(self) -> None:
+        cases = [("--agent-dir", self.agent, self.agent.with_name("agent-alias")),
+                 ("--claude-dir", self.claude, self.claude.with_name("claude-alias")),
+                 (None, self.agent, self.claude / "rules"),
+                 (None, self.agent, self.claude / "pira")]
+        for argument, target, alias in cases:
+            with self.subTest(alias=alias):
+                if os.name == "nt":
+                    setup.subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+                        capture_output=True, check=True,
+                    )
+                else:
+                    alias.symlink_to(target, target_is_directory=True)
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.assertEqual(self.run_setup(*([argument, str(alias)] if argument else [])), 1)
+                self.assertIn("resolved path", errors.getvalue())
+                self.assertIn(str(target.resolve()), errors.getvalue())
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
+                if os.name == "nt":
+                    alias.rmdir()
+                else:
+                    alias.unlink()
+
+    def test_symlink_rule_snapshot_restoration(self) -> None:
+        self.entry.parent.mkdir()
+        policy = self.agent / "AGENTS.md"
+        try:
+            setup.install_entry(self.entry, policy, None, dry_run=False, copy_policy=False)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest(f"native symlink creation unavailable: {error}")
+            raise
+        self.assertTrue(self.entry.is_symlink())
+        states = setup.file_states((self.entry,))
+        self.entry.unlink()
+        setup.rollback_files(states, OSError("injected removal failure"))
+        self.assertTrue(self.entry.is_symlink())
+        self.assertTrue(setup.verify_entry(self.entry, policy, copy_policy=False))
+        self.assertEqual(os.readlink(self.entry), states[self.entry])
+
+    def test_copy_refresh_manifest_failure_restores_old_owned_rule(self) -> None:
+        if os.name != "nt":
+            self.skipTest("Windows copy refresh; POSIX uses a live symlink")
+        self.assertEqual(self.run_setup(), 0)
+        manifest = self.claude / "pira" / setup.MANIFEST
+        before = {path: path.read_bytes() for path in (self.entry, manifest, self.claude / "settings.json")}
+        (self.agent / "AGENTS.md").write_bytes((setup.VERIFY_TOKEN + "\nUpdated\n").encode())
+        write = setup.write_bytes
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest write failure")
+            write(path, content, dry_run=dry_run)
+
+        errors = io.StringIO()
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("safe to retry", errors.getvalue())
+        self.assertNotIn("rollback incomplete", errors.getvalue())
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+
+    def test_rollback_failure_reports_failed_path_and_original_error(self) -> None:
+        manifest = self.claude / "pira" / setup.MANIFEST
+        write, unlink = setup.write_bytes, Path.unlink
+
+        def fail_manifest(path: Path, content: bytes, *, dry_run: bool) -> None:
+            if path == manifest:
+                raise OSError("injected manifest failure")
+            write(path, content, dry_run=dry_run)
+
+        def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == self.entry:
+                raise OSError("injected rollback unlink failure")
+            unlink(path, *args, **kwargs)
+
+        errors = io.StringIO()
+        with patch.object(setup, "write_bytes", side_effect=fail_manifest), \
+                patch.object(Path, "unlink", new=fail_unlink), contextlib.redirect_stderr(errors):
+            self.assertEqual(self.run_setup(), 1)
+        self.assertIn("injected manifest failure", errors.getvalue())
+        self.assertIn("rollback incomplete", errors.getvalue())
+        self.assertIn(str(self.entry), errors.getvalue())
+        self.assertNotIn("safe to retry", errors.getvalue())
+        self.assertFalse((self.claude / "settings.json").exists())
+        self.assertFalse((self.claude / "pira" / "USER.md").exists())
+        # A leftover rule without a manifest is still unowned, never silently adopted.
+        self.assertEqual(self.run_setup(), 1)
+        self.assertFalse(manifest.exists())
+
+    def test_deleted_settings_are_restored_after_uninstall_failure(self) -> None:
+        self.assertEqual(self.run_setup(), 0)
+        settings = self.claude / "settings.json"
+        before = settings.read_bytes()
+        unlink = Path.unlink
+
+        def fail_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            if path == self.entry:
+                raise OSError("injected rule unlink failure")
+            unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=fail_unlink):
+            self.assertEqual(self.run_setup("--uninstall"), 1)
+        self.assertEqual(settings.read_bytes(), before)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertFalse(settings.exists())
+
+    def test_permission_prefix_normalization_and_unknown_syntax(self) -> None:
+        rules = (setup.module_read_rule(Path.home() / "agent"),
+                 setup.profile_read_rule(self.claude), setup.shared_profile_read_rule(self.agent))
+        conflicting = ["Read(/pira/**)", "Read(/pira/USER.md)", "Read(/pira/[A-Z]*.md)",
+                       f"Read(/{setup.absolute_permission_path(Path.home())}/agent/**)",
+                       "Read(~/agent/../agent/**)", "Read(~/agent//**)",
+                       "Read(~/agent/modules/[A-Z]*.md)", "Read(./USER.md)", "Read(broken"]
+        for rule in conflicting:
+            with self.subTest(rule=rule):
+                with self.assertRaisesRegex(RuntimeError, "may conflict"):
+                    setup.check_read_conflicts({"permissions": {"deny": [rule]}}, rules, self.claude)
+
+    def test_dry_run_and_verify_leave_all_files_unchanged(self) -> None:
+        settings = self.claude / "settings.json"
+        settings.write_bytes(b'{"theme":"dark"}\n')
+        legacy = self.claude / "CLAUDE.md"
+        legacy.write_bytes((setup.LEGACY_START + "\n@~/.claude/pira/AGENTS.md\n" + setup.LEGACY_END).encode())
+
+        def files() -> dict[str, bytes | str]:
+            return {str(path.relative_to(self.claude)): os.readlink(path) if path.is_symlink() else path.read_bytes()
+                    for path in self.claude.rglob("*") if path.is_file() or path.is_symlink()}
+
+        before = files()
+        self.assertEqual(self.run_setup("--dry-run"), 0)
+        self.assertEqual(files(), before)
+        self.assertEqual(self.run_setup(), 0)
+        installed = files()
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup("--uninstall", "--dry-run"), 0)
+        self.assertEqual(files(), installed)
+
+    def test_old_client_is_rejected_before_writes_without_live_client(self) -> None:
+        with patch.object(setup, "claude_version", CLAUDE_VERSION), \
+                patch.object(setup.subprocess, "run") as command:
+            for version in ("2.1.217", "2.1.280"):
+                with self.subTest(version=version):
+                    command.return_value.stdout = version + " (Claude Code)"
+                    self.assertEqual(self.run_setup(), 1)
+                    self.assertFalse(self.entry.exists())
+                    self.assertFalse((self.claude / "settings.json").exists())
+            command.return_value.stdout = "2.1.281 (Claude Code)"
+            self.assertEqual(self.run_setup(), 0)
 
 
 if __name__ == "__main__":

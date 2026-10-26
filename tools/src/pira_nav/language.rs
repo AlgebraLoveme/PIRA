@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -235,8 +234,9 @@ impl Language {
             };
         }
         let mut prefix = Vec::with_capacity(256);
-        File::open(path)
-            .and_then(|file| file.take(256).read_to_end(&mut prefix))
+        crate::util::open_regular_file(path)?
+            .take(256)
+            .read_to_end(&mut prefix)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let first_line = String::from_utf8_lossy(&prefix)
             .lines()

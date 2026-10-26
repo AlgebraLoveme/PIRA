@@ -21,7 +21,7 @@ use state::{
     SourceKind, WatchConfiguration, WatchState,
 };
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const CONTROL_POLL_MS: u64 = 100;
 const MAX_REPORT_BYTES: usize = 12 * 1024;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -92,8 +92,13 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         analyzer.is_some(),
         config.watch_sample_every_ms,
     )?;
+    let cwd_native = crate::native_path::NativePath::from_path(&cwd);
     let watch = WatchState {
-        schema: SCHEMA,
+        schema: if cwd_native.requires_native() {
+            3
+        } else {
+            SCHEMA
+        },
         id: id.clone(),
         workspace_hash: storage::current_workspace_hash()?,
         created_ms: now,
@@ -106,6 +111,7 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         source_kind,
         source,
         source_cwd: cwd.display().to_string(),
+        source_cwd_native: Some(cwd_native),
         capture_path,
         intent: config.intent.clone(),
         sample_every_ms: config.watch_sample_every_ms,
@@ -193,8 +199,15 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
     if terminal(&watch) {
         return report(&watch, exit_code(&watch));
     }
+    // Validate before resume writes or any process can use the persisted cwd.
+    if watch.source_kind == SourceKind::Probe || watch.analyzer.is_some() {
+        crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?;
+    }
     if watch.monitor == MonitorStatus::Stopped {
-        state::update_control(store, id, |control| control.stop_requested = false)?;
+        state::update_control(store, id, |control| {
+            control.stop_requested = false;
+            Ok(())
+        })?;
         watch.monitor = MonitorStatus::Active;
         watch.detail = "watch resumed".into();
     } else if watch.monitor == MonitorStatus::Paused {
@@ -235,6 +248,14 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
             sleep_controlled(store, &mut watch, wake_at)?;
             continue;
         }
+        validate_sampling_cost(
+            watch.source_kind,
+            watch.analyzer.is_some(),
+            watch.sample_every_ms,
+        )?;
+        if watch.no_progress_after_ms.is_some() && watch.analyzer.is_none() {
+            return Err("--no-progress-after requires an effective analyzer".into());
+        }
         watch.attempt = AttemptStatus::Probing;
         watch.updated_ms = now;
         state::write(&path, &watch)?;
@@ -260,6 +281,8 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
                 return report(&watch, 23);
             }
             Err(error) => {
+                watch.job = JobStatus::Unknown;
+                watch.rendered_reliable = false;
                 if state::now_ms() >= watch.deadline_ms {
                     watch.monitor = MonitorStatus::Deadline;
                     watch.detail = "overall deadline reached".into();
@@ -278,6 +301,7 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
                 return report(&watch, 22);
             }
         };
+        let observation_complete = sample.reliable;
         let run_analyzer = matches!(sample.job, JobStatus::Unknown | JobStatus::Pending);
         let analyzer_limit_ms = remaining_ms(
             state::now_ms(),
@@ -324,7 +348,7 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
             persist(&path, &mut watch)?;
             return report(&watch, 20);
         }
-        let attention = evaluate_attention(&mut watch, analyzer_attention);
+        let attention = evaluate_attention(&mut watch, analyzer_attention, observation_complete);
         watch.next_sample_ms = state::now_ms().saturating_add(u128::from(watch.sample_every_ms));
         persist(&path, &mut watch)?;
         if attention && watch.attention_policy == AttentionPolicy::Return {
@@ -361,12 +385,16 @@ fn incorporate_sample(
         watch.stdout_view = TerminalView::default();
         watch.stderr_view = TerminalView::default();
     }
+    if !sample.reliable {
+        watch.stdout_view.reliable = false;
+        watch.stderr_view.reliable = false;
+    }
     watch.stdout_view.feed(&sample.stdout);
     watch.stderr_view.feed(&sample.stderr);
     let stdout = watch.stdout_view.text();
     let stderr = watch.stderr_view.text();
     let visible_hash = sample::hash(&[stdout.as_bytes(), stderr.as_bytes()]);
-    if visible_hash != watch.visible_hash {
+    if stdout != watch.visible_stdout || stderr != watch.visible_stderr {
         watch.last_visible_change_ms = Some(now)
     }
     watch.visible_hash = visible_hash;
@@ -397,7 +425,7 @@ fn incorporate_sample(
             &input,
             attempt_limit_ms,
             store,
-            Path::new(&watch.source_cwd),
+            &crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?,
             || {
                 state::read::<ControlState>(&control_path, "watch control")
                     .is_ok_and(|control| control.stop_requested)
@@ -445,10 +473,23 @@ fn remaining_ms(now: u128, deadline: u128, review: Option<u128>, configured: u64
     configured.min(remaining.max(1))
 }
 
-fn evaluate_attention(watch: &mut WatchState, analyzer_reason: Option<String>) -> bool {
+fn evaluate_attention(
+    watch: &mut WatchState,
+    analyzer_reason: Option<String>,
+    observation_complete: bool,
+) -> bool {
     let now = state::now_ms();
     let reason = analyzer_reason.or_else(|| {
-        if watch.inactive_after_ms.is_some_and(|limit| {
+        // Retained cursors and analyzer tails cannot prove inactivity after output loss.
+        if !observation_complete
+            && (watch.inactive_after_ms.is_some() || watch.no_progress_after_ms.is_some())
+        {
+            Some("sample output is incomplete; inactivity or unchanged analyzer progress cannot be established".to_string())
+        } else if !watch.rendered_reliable {
+            Some("rendered state is unreliable; unchanged output cannot be established".to_string())
+        } else if !observation_complete {
+            Some("sample output is incomplete".to_string())
+        } else if watch.inactive_after_ms.is_some_and(|limit| {
             now.saturating_sub(watch.last_activity_ms.unwrap_or(watch.created_ms))
                 >= u128::from(limit)
         }) {
@@ -591,7 +632,10 @@ fn stop(store: &Path, id: &str) -> Result<i32, String> {
         ))?;
         return Ok(0);
     }
-    state::update_control(store, id, |control| control.stop_requested = true)?;
+    state::update_control(store, id, |control| {
+        control.stop_requested = true;
+        Ok(())
+    })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         let watch: WatchState = state::read(&state::state_path(store, id), "watch state")?;
@@ -637,50 +681,49 @@ fn update_controls(
         .map(|value| analyzer::store_code(store, value))
         .transpose()?;
     let state: WatchState = state::read(&state::state_path(store, id), "watch state")?;
-    let existing_control: ControlState =
-        state::read(&state::control_path(store, id), "watch control")?;
-    let effective_analyzer = if analyzer_update {
-        !config.watch_clear_analyzer
-    } else if existing_control.clear_analyzer {
-        existing_control.analyzer.is_some()
-    } else {
-        existing_control.analyzer.is_some() || state.analyzer.is_some()
-    };
-    let requested_no_progress = if config.watch_clear_analyzer {
-        if config.watch_no_progress_after_set {
-            config.watch_no_progress_after_ms
-        } else {
-            None
-        }
-    } else if config.watch_no_progress_after_set {
-        config.watch_no_progress_after_ms
-    } else {
-        existing_control
-            .configuration
-            .as_ref()
-            .map_or(state.no_progress_after_ms, |value| {
-                value.no_progress_after_ms
-            })
-    };
-    if requested_no_progress.is_some() && !effective_analyzer {
-        return Err("--no-progress-after requires an effective analyzer".into());
-    }
-    let requested_sample_every = if config.watch_sample_every_set {
-        config.watch_sample_every_ms
-    } else {
-        existing_control
-            .configuration
-            .as_ref()
-            .map_or(state.sample_every_ms, |value| value.sample_every_ms)
-    };
-    validate_sampling_cost(
-        state.source_kind,
-        effective_analyzer,
-        requested_sample_every,
-    )?;
     let mut analyzer_revision = None;
     let mut configuration_revision = None;
     state::update_control(store, id, |control| {
+        let effective_analyzer = if analyzer_update {
+            !config.watch_clear_analyzer
+        } else if control.clear_analyzer {
+            control.analyzer.is_some()
+        } else {
+            control.analyzer.is_some() || state.analyzer.is_some()
+        };
+        let requested_no_progress = if config.watch_clear_analyzer {
+            if config.watch_no_progress_after_set {
+                config.watch_no_progress_after_ms
+            } else {
+                None
+            }
+        } else if config.watch_no_progress_after_set {
+            config.watch_no_progress_after_ms
+        } else {
+            control
+                .configuration
+                .as_ref()
+                .map_or(state.no_progress_after_ms, |value| {
+                    value.no_progress_after_ms
+                })
+        };
+        if requested_no_progress.is_some() && !effective_analyzer {
+            return Err("--no-progress-after requires an effective analyzer".into());
+        }
+        let requested_sample_every = if config.watch_sample_every_set {
+            config.watch_sample_every_ms
+        } else {
+            control
+                .configuration
+                .as_ref()
+                .map_or(state.sample_every_ms, |value| value.sample_every_ms)
+        };
+        validate_sampling_cost(
+            state.source_kind,
+            effective_analyzer,
+            requested_sample_every,
+        )?;
+
         if analyzer_update {
             let revision = control
                 .analyzer_revision
@@ -699,7 +742,7 @@ fn update_controls(
             }
         }
         if !configuration_update {
-            return;
+            return Ok(());
         }
         let current = control.configuration.as_ref();
         let revision = control
@@ -743,6 +786,7 @@ fn update_controls(
                 current.map_or(state.attention_policy, |value| value.attention_policy)
             },
         });
+        Ok(())
     })?;
     let analyzer =
         analyzer_revision.map_or_else(String::new, |revision| format!(" analyzer={revision}"));
@@ -764,6 +808,16 @@ fn configuration_update_requested(config: &Config) -> bool {
 
 fn report(w: &WatchState, code: i32) -> Result<i32, String> {
     let mut out = util::BoundedStdout::new(MAX_REPORT_BYTES);
+    let risk = crate::security::inspect_combined([
+        w.visible_stdout.as_str(),
+        w.visible_stderr.as_str(),
+        w.progress.as_str(),
+        w.analyzer_summary.as_str(),
+        w.analyzer_error.as_deref().unwrap_or(""),
+        w.detail.as_str(),
+        w.attention_reason.as_deref().unwrap_or(""),
+    ]);
+    crate::print_content_warnings(&mut out, [(None, risk)])?;
     out.line("PIRA watch")?;
     out.line(&format!("Result: {}", w.id))?;
     let final_probe = terminal(w) && w.source_kind == SourceKind::Probe;
@@ -792,6 +846,11 @@ fn report(w: &WatchState, code: i32) -> Result<i32, String> {
         age(w.last_visible_change_ms),
         w.rendered_reliable
     ))?;
+    for (stream, view) in [("stdout", &w.stdout_view), ("stderr", &w.stderr_view)] {
+        if let Some(reason) = view.reason() {
+            out.line(&format!("Render {stream}: {reason}"))?;
+        }
+    }
     if let Some(analyzer) = w.analyzer.as_ref() {
         out.line(&format!(
             "Last semantic progress: {} | analyzer revision: {}",
@@ -837,8 +896,20 @@ fn age(value: Option<u128>) -> String {
 }
 
 fn validate(w: &WatchState, id: &str) -> Result<(), String> {
-    if w.schema != SCHEMA || w.id != id {
+    let expected_schema = if w
+        .source_cwd_native
+        .as_ref()
+        .is_some_and(|path| path.requires_native())
+    {
+        3
+    } else {
+        SCHEMA
+    };
+    if w.schema != expected_schema || w.id != id {
         return Err("watch state identity/schema mismatch".into());
+    }
+    if w.source.is_empty() {
+        return Err("watch source is empty".into());
     }
     state::validate_id(id)
 }

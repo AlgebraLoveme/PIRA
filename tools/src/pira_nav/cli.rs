@@ -11,11 +11,10 @@ use crate::command::{
     positive_usize,
 };
 use crate::deps;
-use crate::discovery::{
-    DiscoverySelection, discover_files, discover_files_many, discover_files_with_max_depth,
-};
+use crate::discovery::{DiscoverySelection, discover_files, discover_files_many};
 use crate::document::MAX_DOCUMENT_SYMBOLS;
 use crate::language::Language;
+use crate::lsp::LspService;
 use crate::lsp_options::{self, LspOptions};
 use crate::model::{ImportEdge, ParseBackend, Symbol};
 use crate::parse::{ParsedFile, parse_file};
@@ -122,22 +121,6 @@ impl FailureCollector {
     fn first_code(&self) -> i32 {
         self.first_code
             .expect("a non-empty failure collector has a first code")
-    }
-
-    fn merge_sorted(mut self, other: Self) -> Self {
-        self.total += other.total;
-        if self.first_code.is_none() {
-            self.first_code = other.first_code;
-        }
-        self.shown.extend(other.shown);
-        self.shown.sort_by(|left, right| {
-            left.subject
-                .cmp(&right.subject)
-                .then_with(|| left.code.cmp(&right.code))
-                .then_with(|| left.message.cmp(&right.message))
-        });
-        self.shown.truncate(MAX_REPORTED_FAILURES);
-        self
     }
 }
 
@@ -259,9 +242,9 @@ where
         "callees" => semantic::callees(&values, explicit_language, &cwd, &lsp, &mut output),
         "supertypes" => semantic::supertypes(&values, explicit_language, &cwd, &lsp, &mut output),
         "subtypes" => semantic::subtypes(&values, explicit_language, &cwd, &lsp, &mut output),
-        "imports" => command_imports(&values, explicit_language, &cwd, &mut output),
-        "dependents" => command_dependents(&values, explicit_language, &cwd, &mut output),
-        "deps" => command_deps(&values, explicit_language, &cwd, &mut output),
+        "imports" => command_imports(&values, explicit_language, &cwd, &lsp, &mut output),
+        "dependents" => command_dependents(&values, explicit_language, &cwd, &lsp, &mut output),
+        "deps" => command_deps(&values, explicit_language, &cwd, &lsp, &mut output),
         other => Err((2, unknown_command(other))),
     };
     finish_output(result, &mut output)
@@ -285,10 +268,68 @@ pub(crate) fn unknown_command(value: &str) -> String {
     )
 }
 
+// Arity shared by global preprocessors; operands must never become global flags.
+pub(crate) fn option_takes_value(value: &str) -> bool {
+    matches!(
+        value,
+        "--language"
+            | "--lsp"
+            | "--lsp-arg"
+            | "--lsp-root"
+            | "--lsp-init"
+            | "--lsp-settings"
+            | "--depth"
+            | "--direction"
+            | "--glob"
+            | "--head"
+            | "--kind"
+            | "--limit"
+            | "--match"
+            | "--max-bytes"
+            | "--max-depth"
+            | "--max-files"
+            | "--max-items"
+            | "--query"
+            | "--range"
+            | "--root"
+            | "--tail"
+            | "--window"
+            | "-e"
+            | "-g"
+            | "--after-context"
+            | "--before-context"
+            | "--context"
+            | "--max-per-query"
+            | "--max-results"
+            | "--pattern"
+            | "-A"
+            | "-B"
+            | "-C"
+            | "--show"
+            | "--definition"
+            | "--implementation"
+            | "--type-definition"
+            | "--references"
+            | "--hover"
+            | "--callers"
+            | "--callees"
+            | "--supertypes"
+            | "--subtypes"
+    )
+}
+
 fn help_requested(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|value| value.as_str() != "--")
-        .any(|value| matches!(value.as_str(), "--help" | "-h"))
+    let mut index = 0;
+    while let Some(value) = args.get(index) {
+        if value == "--" {
+            break;
+        }
+        if matches!(value.as_str(), "--help" | "-h") {
+            return true;
+        }
+        index += if option_takes_value(value) { 2 } else { 1 };
+    }
+    false
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -343,10 +384,28 @@ fn extract_language_option(
             })?);
         } else {
             remaining.push(value.clone());
+            if option_takes_value(value)
+                && let Some(operand) = args.get(index + 1)
+            {
+                remaining.push(operand.clone());
+                index += 1;
+            }
         }
         index += 1;
     }
     Ok((remaining, language))
+}
+
+fn parse_structural_input(
+    path: &Path,
+    language: Language,
+    options: &LspOptions,
+) -> Result<ParsedFile, String> {
+    if options.forces_language(language) {
+        StructuralResolver::load_for_lsp(path, language)
+    } else {
+        parse_file(path, language)
+    }
 }
 
 fn structural_resolver(
@@ -385,12 +444,13 @@ fn command_outline(
         .collect::<Vec<_>>();
     let mut resolver = structural_resolver(lsp, cwd)?;
     let mut remaining_items = options.max_items;
-    for (path, absolute) in resolved_paths {
+    for (file_index, (path, absolute)) in resolved_paths.into_iter().enumerate() {
         let result = (|| {
             validate_regular_file(&absolute, cwd, "outline")?;
             let language = language_for(&absolute, explicit)?;
             let parsed = resolver.resolve_path(&absolute, language)?;
-            let shown = render_outline(&parsed, cwd, &options, remaining_items, output)?;
+            let share = remaining_items.div_ceil(total - file_index);
+            let shown = render_outline(&parsed, cwd, &options, share, output)?;
             remaining_items = remaining_items.saturating_sub(shown);
             Ok(())
         })();
@@ -447,6 +507,7 @@ struct OutlineOptions {
 
 fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String)> {
     let mut paths = Vec::new();
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_OUTLINE_MAX_ITEMS;
     let mut max_depth = None;
     let mut selectors = false;
@@ -458,13 +519,23 @@ fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String
         if option == "--" {
             paths.extend(args[index + 1..].iter().cloned());
             break;
-        } else if matches!(option, "--max-items" | "--depth" | "--match") {
+        } else if matches!(
+            option,
+            "--max-items" | "--limit" | "--depth" | "--max-depth" | "--match"
+        ) {
             let value = args
                 .get(index + 1)
                 .ok_or_else(|| (2, format!("{option} requires a value")))?;
-            if option == "--max-items" {
+            if matches!(option, "--max-items" | "--limit") {
+                if max_items_set {
+                    return Err((2, "--limit/--max-items may be specified only once".into()));
+                }
+                max_items_set = true;
                 max_items = positive_usize(value, option)?;
-            } else if option == "--depth" {
+            } else if matches!(option, "--depth" | "--max-depth") {
+                if max_depth.is_some() {
+                    return Err((2, "--depth/--max-depth may be specified only once".into()));
+                }
                 let depth = value
                     .parse::<usize>()
                     .map_err(|_| (2, "--depth must be a non-negative integer".into()))?;
@@ -504,7 +575,11 @@ fn parse_outline_options(args: &[String]) -> Result<OutlineOptions, (i32, String
     })
 }
 
-fn command_show(
+pub(crate) fn validate_query_show(args: &[String]) -> CommandResult {
+    parse_show_options(args).map(|_| ())
+}
+
+pub(crate) fn command_show(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
@@ -512,31 +587,25 @@ fn command_show(
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_show_options(args)?;
+    let mut parsed_files = ParsedFileCache::new();
+    let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1 && options.targets[0].file_slice.is_some() {
         if options.max_items.is_some() {
-            return usage("show --max-items does not apply to a single --head/--tail target");
+            return usage("show --max-items does not apply to a single sliced target");
         }
         let target = &options.targets[0];
-        let file_slice = target.file_slice.expect("file slice was present");
-        let path = plain_show_path(&target.value, cwd).ok_or_else(|| {
-            let (option, lines) = file_slice.option_and_lines();
-            (
-                2,
-                show_file_slice_target_error(&target.value, option, lines),
-            )
-        })?;
-        validate_show_file_target(&target.value, &path, cwd)?;
         let mut item = Vec::new();
-        match file_slice {
-            ShowFileSlice::Head(lines) => {
-                render_file_head(&path, lines, cwd, options.glance, &mut item)?
-            }
-            ShowFileSlice::Tail(lines) => {
-                render_file_tail(&path, lines, cwd, options.glance, &mut item)?
-            }
-        }
+        let source_bytes = render_show_slice(
+            target,
+            explicit,
+            cwd,
+            options.glance,
+            &mut parsed_files,
+            &mut resolver,
+            &mut item,
+        )?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -570,9 +639,9 @@ fn command_show(
         let start = line.saturating_sub(window).max(1);
         let end = line.saturating_add(window);
         let mut item = Vec::new();
-        render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
+        let source_bytes = render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -593,9 +662,9 @@ fn command_show(
         }
         validate_show_file_target(&options.targets[0].value, &path, cwd)?;
         let mut item = Vec::new();
-        render_entire_file(&path, cwd, options.glance, &mut item)?;
+        let source_bytes = render_entire_file(&path, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -608,16 +677,15 @@ fn command_show(
         output.write_all(&item).map_err(output_error)?;
         return Ok(());
     }
-    let mut parsed_files = ParsedFileCache::new();
-    let mut resolver = structural_resolver(lsp, cwd)?;
     if options.targets.len() == 1
         && let Some((path_text, start, end)) = parse_line_range(&options.targets[0].value)
     {
         let path = absolute_lexical(Path::new(path_text), cwd);
         let mut item = Vec::new();
-        render_line_range(&path, start, end, cwd, options.glance, &mut item)?;
+        let source_bytes =
+            render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)?;
         if let Some(max_bytes) = options.max_bytes
-            && item.len() > max_bytes
+            && source_bytes > max_bytes
         {
             writeln!(
                 output,
@@ -642,6 +710,7 @@ fn command_show(
             .get(&key)
             .and_then(|result| result.as_ref().ok())
             .expect("resolved show target has a cached parse");
+        render_selection_notice(&options.targets[0].value, parsed, output)?;
         render_source(
             parsed,
             &parsed.symbols[symbol_index],
@@ -665,9 +734,10 @@ fn command_show(
     #[derive(Clone, Hash, Eq, PartialEq)]
     enum ShowIdentity {
         Entire(PathBuf),
-        Lines(PathBuf, usize, usize),
+        Lines(PathBuf, i64, i64),
         Head(PathBuf, usize),
         Tail(PathBuf, usize),
+        Slice(String, ShowFileSlice),
         Symbol(PathBuf, usize, usize),
     }
 
@@ -676,47 +746,46 @@ fn command_show(
             break;
         }
         if let Some(file_slice) = target.file_slice {
-            let (option, lines) = file_slice.option_and_lines();
-            let Some(path) = plain_show_path(&target.value, cwd) else {
-                failures.record(
-                    target.value.clone(),
-                    2,
-                    show_file_slice_target_error(&target.value, option, lines),
-                );
-                continue;
-            };
-            let identity = match file_slice {
-                ShowFileSlice::Head(lines) => ShowIdentity::Head(path.clone(), lines),
-                ShowFileSlice::Tail(lines) => ShowIdentity::Tail(path.clone(), lines),
+            let identity = if let Some(path) = plain_show_path(&target.value, cwd) {
+                match file_slice {
+                    ShowFileSlice::Head(n) => ShowIdentity::Head(path, n),
+                    ShowFileSlice::Tail(n) => ShowIdentity::Tail(path, n),
+                    ShowFileSlice::Range(..) => {
+                        ShowIdentity::Slice(target.value.clone(), file_slice)
+                    }
+                }
+            } else {
+                ShowIdentity::Slice(target.value.clone(), file_slice)
             };
             if !identities.insert(identity.clone()) {
                 duplicates += 1;
                 continue;
             }
             let mut item = Vec::new();
-            let result =
-                validate_show_file_target(&target.value, &path, cwd).and_then(
-                    |()| match file_slice {
-                        ShowFileSlice::Head(lines) => {
-                            render_file_head(&path, lines, cwd, options.glance, &mut item)
-                        }
-                        ShowFileSlice::Tail(lines) => {
-                            render_file_tail(&path, lines, cwd, options.glance, &mut item)
-                        }
-                    },
-                );
-            if let Err((code, message)) = result {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let result = render_show_slice(
+                target,
+                explicit,
+                cwd,
+                options.glance,
+                &mut parsed_files,
+                &mut resolver,
+                &mut item,
+            );
+            let source_bytes = match result {
+                Ok(bytes) => bytes,
+                Err((code, message)) => {
+                    identities.remove(&identity);
+                    failures.record(target.value.clone(), code, message);
+                    continue;
+                }
+            };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -729,18 +798,21 @@ fn command_show(
             let mut item = Vec::new();
             let result = validate_show_file_target(&target.value, &path, cwd)
                 .and_then(|()| render_entire_file(&path, cwd, options.glance, &mut item));
-            if let Err((code, message)) = result {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let source_bytes = match result {
+                Ok(bytes) => bytes,
+                Err((code, message)) => {
+                    identities.remove(&identity);
+                    failures.record(target.value.clone(), code, message);
+                    continue;
+                }
+            };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -752,20 +824,23 @@ fn command_show(
                 continue;
             }
             let mut item = Vec::new();
-            if let Err((code, message)) =
-                render_line_range(&path, start, end, cwd, options.glance, &mut item)
-            {
-                identities.remove(&identity);
-                failures.record(target.value.clone(), code, message);
-                continue;
-            }
+            let source_bytes =
+                match render_relative_line_range(&path, start, end, cwd, options.glance, &mut item)
+                {
+                    Ok(bytes) => bytes,
+                    Err((code, message)) => {
+                        identities.remove(&identity);
+                        failures.record(target.value.clone(), code, message);
+                        continue;
+                    }
+                };
             resolved += 1;
             considered += 1;
-            if item.len() > max_bytes.saturating_sub(payload_bytes) {
+            if source_bytes > max_bytes.saturating_sub(payload_bytes) {
                 byte_limited += 1;
                 continue;
             }
-            payload_bytes += item.len();
+            payload_bytes += source_bytes;
             rendered.push(item);
             continue;
         }
@@ -796,12 +871,13 @@ fn command_show(
         }
         considered += 1;
         let mut item = Vec::new();
-        render_source(parsed, symbol, cwd, options.glance, &mut item)?;
-        if item.len() > max_bytes.saturating_sub(payload_bytes) {
+        render_selection_notice(&target.value, parsed, &mut item)?;
+        let source_bytes = render_source(parsed, symbol, cwd, options.glance, &mut item)?;
+        if source_bytes > max_bytes.saturating_sub(payload_bytes) {
             byte_limited += 1;
             continue;
         }
-        payload_bytes += item.len();
+        payload_bytes += source_bytes;
         rendered.push(item);
     }
     let omitted = options
@@ -867,19 +943,11 @@ struct ShowTarget {
     file_slice: Option<ShowFileSlice>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum ShowFileSlice {
     Head(usize),
     Tail(usize),
-}
-
-impl ShowFileSlice {
-    fn option_and_lines(self) -> (&'static str, usize) {
-        match self {
-            Self::Head(lines) => ("--head", lines),
-            Self::Tail(lines) => ("--tail", lines),
-        }
-    }
+    Range(i64, i64),
 }
 
 fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
@@ -905,7 +973,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
             index += 1;
         } else if matches!(
             option,
-            "--max-items" | "--max-bytes" | "--window" | "--head" | "--tail"
+            "--max-items" | "--max-bytes" | "--window" | "--head" | "--tail" | "--range"
         ) {
             let value = args
                 .get(index + 1)
@@ -919,6 +987,23 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                         .parse::<usize>()
                         .map_err(|_| (2, "--window requires a non-negative integer".into()))?,
                 );
+            } else if option == "--range" {
+                let (start, end) = value
+                    .split_once(':')
+                    .and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)))
+                    .ok_or_else(|| input_error("--range requires signed START:END"))?;
+                if start == 0 || end == 0 {
+                    return Err(input_error("range indices are 1-based; zero is invalid"));
+                }
+                let target = targets
+                    .last_mut()
+                    .ok_or_else(|| input_error("--range must follow its TARGET"))?;
+                if target.file_slice.is_some() {
+                    return Err(input_error(
+                        "only one of --range, --head, or --tail may follow each TARGET",
+                    ));
+                }
+                target.file_slice = Some(ShowFileSlice::Range(start, end));
             } else if matches!(option, "--head" | "--tail") {
                 let parsed = value
                     .parse::<usize>()
@@ -932,7 +1017,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 if target.file_slice.is_some() {
                     return Err((
                         2,
-                        "--head and --tail may be specified at most once per bare FILE".into(),
+                        "only one of --range, --head, or --tail may follow each TARGET".into(),
                     ));
                 }
                 target.file_slice = Some(if option == "--head" {
@@ -942,10 +1027,13 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
                 });
             } else {
                 let parsed = positive_usize(value, option)?;
-                if option == "--max-items" {
-                    max_items = Some(parsed);
+                let slot = if option == "--max-items" {
+                    &mut max_items
                 } else {
-                    max_bytes = Some(parsed);
+                    &mut max_bytes
+                };
+                if slot.replace(parsed).is_some() {
+                    return Err((2, format!("{option} may be specified only once")));
                 }
             }
             index += 2;
@@ -973,7 +1061,7 @@ fn parse_show_options(args: &[String]) -> Result<ShowOptions, (i32, String)> {
     if window.is_some() && targets.iter().any(|target| target.file_slice.is_some()) {
         return Err((
             2,
-            "--window cannot be combined with --head or --tail".into(),
+            "--window cannot be combined with --range, --head or --tail".into(),
         ));
     }
     Ok(ShowOptions {
@@ -1065,32 +1153,39 @@ fn resolve_show_target(
                 )
             })?
     } else if let Some((_, qualified)) = split_existing_symbol_target(target, cwd) {
-        let exact = parsed
-            .symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, symbol)| symbol.name_matches(&qualified))
-            .collect::<Vec<_>>();
-        let matches = if exact.is_empty() {
-            parsed
-                .symbols
-                .iter()
-                .enumerate()
-                .filter(|(_, symbol)| symbol.name_suffix_matches(&qualified))
-                .collect::<Vec<_>>()
-        } else {
-            exact
-        };
+        if parsed.symbols_truncated {
+            return Err((
+                3,
+                format!(
+                    "cannot establish uniqueness of {qualified}: symbol inventory is truncated; use an exact line range or a freshness-checked selector"
+                ),
+            ));
+        }
+        let matches = crate::model::target_matches(&parsed.symbols, &qualified);
         match matches.as_slice() {
-            [] if parsed.symbols_truncated => {
-                return Err((
-                    3,
-                    format!(
-                        "item not found within the {MAX_DOCUMENT_SYMBOLS}-item structured-document limit: {qualified}; narrow the file with search or an exact line range"
-                    ),
-                ));
-            }
             [] => {
+                if parsed.language == Language::Markdown {
+                    let mut candidates = parsed.symbols.iter().filter(|symbol| {
+                        symbol.path.unquoted_names().as_deref() == Some(qualified.as_str())
+                            || symbol.path.last_name() == Some(qualified.as_str())
+                    });
+                    if let Some(candidate) = candidates.next()
+                        && candidates.next().is_none()
+                    {
+                        let canonical = format!(
+                            "{}::{}",
+                            display_path(&parsed.path, cwd),
+                            candidate.qualified_name
+                        );
+                        return Err((
+                            3,
+                            format!(
+                                "symbol not found: {qualified}; heading segments need bracket quoting; canonical target={} (shell-quote the target)",
+                                quote_metadata(&canonical)
+                            ),
+                        ));
+                    }
+                }
                 return Err((
                     3,
                     format!(
@@ -1161,20 +1256,6 @@ fn plain_show_path(target: &str, cwd: &Path) -> Option<PathBuf> {
         && parse_location(target).is_none()
         && parse_line_range(target).is_none())
     .then(|| absolute_lexical(Path::new(target), cwd))
-}
-
-fn show_file_slice_target_error(target: &str, option: &str, lines: usize) -> String {
-    let base = parse_line_range(target)
-        .map(|(path, _, _)| path)
-        .or_else(|| parse_location(target).map(|(path, _, _)| path))
-        .or_else(|| target.split_once("::").map(|(path, _)| path));
-    if let Some(path) = base {
-        format!(
-            "{option} applies to a bare file, not a range or item; try `pira_nav show {path} {option} {lines}`, or omit {option} to show the requested target"
-        )
-    } else {
-        format!("show {option} requires one bare FILE target")
-    }
 }
 
 fn validate_show_file_target(target: &str, path: &Path, cwd: &Path) -> CommandResult {
@@ -1254,19 +1335,62 @@ fn command_map(
         mut paths,
         max_items,
         max_depth,
+        globs,
     } = parse_map_options(args)?;
     if paths.is_empty() {
         paths.push(".".into());
-    } else if paths.len() != 1 {
-        return usage("map requires exactly one directory");
     }
-    let root = absolute_lexical(Path::new(&paths[0]), cwd);
-    validate_directory(&root, cwd, "map", "target")?;
-    let discovery = discover_files_with_max_depth(
-        &root,
-        explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
-        max_depth,
-    );
+    let roots = paths
+        .iter()
+        .map(|p| absolute_lexical(Path::new(p), cwd))
+        .collect::<BTreeSet<_>>();
+    let root = if roots.len() == 1 {
+        roots.first().unwrap().clone()
+    } else {
+        cwd.to_path_buf()
+    };
+    let mut discovery = crate::discovery::FileDiscovery {
+        files: Vec::new(),
+        all_files: Vec::new(),
+        discovered: 0,
+        unsupported: 0,
+        ambiguous: 0,
+        walk_errors: Vec::new(),
+        walk_errors_total: 0,
+    };
+    for requested in &roots {
+        validate_directory(requested, cwd, "map", "target")?;
+        let found = crate::discovery::discover_filtered_files(
+            requested,
+            explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+            max_depth,
+            &globs,
+        )
+        .map_err(input_error)?;
+        discovery.files.extend(found.files);
+        discovery.all_files.extend(found.all_files);
+        discovery.walk_errors_total += found.walk_errors_total;
+        for error in found.walk_errors {
+            if discovery.walk_errors.len() < 20 {
+                discovery.walk_errors.push(error);
+            }
+        }
+    }
+    discovery.files.sort_by(|a, b| a.0.cmp(&b.0));
+    discovery.files.dedup_by(|a, b| a.0 == b.0);
+    discovery.all_files.sort();
+    discovery.all_files.dedup();
+    discovery.discovered = discovery.all_files.len();
+    for path in &discovery.all_files {
+        match crate::discovery::classify(
+            path,
+            explicit.map_or(DiscoverySelection::Any, DiscoverySelection::Exact),
+        ) {
+            crate::discovery::DiscoveredLanguage::Eligible(_) => {}
+            crate::discovery::DiscoveredLanguage::Unsupported => discovery.unsupported += 1,
+            crate::discovery::DiscoveredLanguage::Ambiguous => discovery.ambiguous += 1,
+        }
+    }
     let shape = collect_map_shape(&root, &discovery.all_files);
     let mut failures = FailureCollector::default();
     for error in &discovery.walk_errors {
@@ -1285,7 +1409,7 @@ fn command_map(
             .par_iter()
             .map(|(path, language)| {
                 (!is_broad_map_fixture(path, &root, language.is_document()))
-                    .then(|| parse_file(path, *language))
+                    .then(|| parse_structural_input(path, *language, lsp))
             })
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(parsed) {
@@ -1341,6 +1465,12 @@ fn command_map(
         source_files
     )
     .map_err(output_error)?;
+    if roots.len() > 1 {
+        write!(output, " roots={}", roots.len()).map_err(output_error)?;
+    }
+    if !globs.is_empty() {
+        write!(output, " globs={}", globs.len()).map_err(output_error)?;
+    }
     if let Some(max_depth) = max_depth {
         write!(output, " max_depth={max_depth}").map_err(output_error)?;
     }
@@ -1528,6 +1658,14 @@ struct SymbolRow {
     backend: ParseBackend,
     symbol: Symbol,
     selector: Option<String>,
+    source_hash: String,
+}
+
+fn unchanged_symbol_source<'a>(row: &SymbolRow, source: &'a str) -> Option<&'a str> {
+    if hash16(source.as_bytes()) != row.source_hash {
+        return None;
+    }
+    source.get(row.symbol.start_byte..row.symbol.end_byte)
 }
 
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
@@ -1770,7 +1908,7 @@ fn command_symbols(
     for batch in parse_batches(&discovery.files) {
         let parsed = batch
             .par_iter()
-            .map(|(path, language)| parse_file(path, *language))
+            .map(|(path, language)| parse_structural_input(path, *language, lsp))
             .collect::<Vec<_>>();
         for ((path, _), result) in batch.iter().zip(parsed) {
             let parsed = match result {
@@ -1793,7 +1931,7 @@ fn command_symbols(
             if parsed.symbols_truncated {
                 truncated_files += 1;
             }
-            let shown_path = display_path(&parsed.path, cwd);
+            let source_hash = hash16(parsed.source.as_bytes());
             for symbol in &parsed.symbols {
                 if options
                     .kind
@@ -1811,9 +1949,10 @@ fn command_symbols(
                         language: parsed.language,
                         backend: parsed.backend,
                         symbol: symbol.clone(),
-                        selector: options
-                            .selectors
-                            .then(|| parsed.selector(symbol, &shown_path)),
+                        source_hash: source_hash.clone(),
+                        selector: options.selectors.then(|| {
+                            parsed.selector(symbol, &crate::util::identity_path(&parsed.path, cwd))
+                        }),
                     };
                     let rank = symbol_rank(query, &row);
                     buckets[query_index].record(class, row, rank, options.max_items);
@@ -2010,30 +2149,41 @@ fn command_symbols(
                     .map_err(output_error)?;
                     continue;
                 }
+                let snapshot = read_source(&row.path).map_err(input_error)?;
+                let Some(selected) = unchanged_symbol_source(&row, &snapshot) else {
+                    writeln!(
+                        output,
+                        "source_omitted query={} reason=changed-source complete=0",
+                        query_index + 1
+                    )
+                    .map_err(output_error)?;
+                    continue;
+                };
                 let mut source = Vec::new();
-                render_line_range(
+                let source_bytes = render_text_range(
                     &row.path,
+                    selected,
                     row.symbol.start_row + 1,
-                    row.symbol.end_row + 1,
+                    row.symbol.end_row + usize::from(row.symbol.end_column > 0),
                     cwd,
                     false,
                     &mut source,
                 )?;
-                if source.len() > SYMBOL_UNIQUE_MAX_BYTES
-                    || source.len() > SYMBOL_UNIQUE_TOTAL_BYTES.saturating_sub(unique_source_bytes)
+                if source_bytes > SYMBOL_UNIQUE_MAX_BYTES
+                    || source_bytes > SYMBOL_UNIQUE_TOTAL_BYTES.saturating_sub(unique_source_bytes)
                 {
                     writeln!(
                         output,
                         "source_omitted query={} reason=byte-limit bytes={} per_item_max={} total_max={} hint=use-show-with-max-bytes",
                         query_index + 1,
-                        source.len(),
+                        source_bytes,
                         SYMBOL_UNIQUE_MAX_BYTES,
                         SYMBOL_UNIQUE_TOTAL_BYTES
                     )
                     .map_err(output_error)?;
                     continue;
                 }
-                unique_source_bytes += source.len();
+                unique_source_bytes += source_bytes;
                 output.write_all(&source).map_err(output_error)?;
             }
         }
@@ -2054,6 +2204,7 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
     let mut contains = false;
     let mut regex = false;
     let mut kind = None;
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_SYMBOL_MAX_ITEMS;
     let mut selectors = false;
     let mut signatures = false;
@@ -2061,7 +2212,7 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--query" => {
+            "--query" | "-e" => {
                 explicit_queries.push(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--query requires a value".into()))?
@@ -2104,7 +2255,11 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
                 kind = Some(value.to_lowercase());
                 index += 2;
             }
-            "--max-items" => {
+            "--max-items" | "--limit" => {
+                if max_items_set {
+                    return Err((2, "--limit/--max-items may be specified only once".into()));
+                }
+                max_items_set = true;
                 max_items = positive_usize(
                     args.get(index + 1)
                         .ok_or_else(|| (2, "--max-items requires a value".into()))?,
@@ -2164,26 +2319,19 @@ fn parse_symbol_options(args: &[String]) -> Result<SymbolOptions, (i32, String)>
             }
         }
     }
-    let paths;
-    let queries;
-    if explicit_queries.is_empty() {
+    let queries = if explicit_queries.is_empty() {
         if positional.is_empty() {
             return Err((2, "symbols requires QUERY [PATH...]".into()));
         }
-        queries = vec![positional.remove(0)];
-        paths = if positional.is_empty() {
-            vec![".".into()]
-        } else {
-            positional
-        };
+        vec![positional.remove(0)]
     } else {
-        queries = explicit_queries;
-        paths = if positional.is_empty() {
-            vec![".".into()]
-        } else {
-            positional
-        };
-    }
+        explicit_queries
+    };
+    let paths = if positional.is_empty() {
+        vec![".".into()]
+    } else {
+        positional
+    };
     if paths.len() > MAX_SYMBOL_PATHS {
         return Err((
             2,
@@ -2518,6 +2666,7 @@ fn command_imports(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_import_options(args)?;
@@ -2525,13 +2674,14 @@ fn command_imports(
         return usage("imports requires at least one file");
     }
     let total = options.paths.len();
+    let mut service = LspService::new(lsp.config(cwd)?);
     let mut failures = FailureCollector::default();
     for value in &options.paths {
         let path = absolute_lexical(Path::new(value), cwd);
         let result = (|| {
             validate_regular_file(&path, cwd, "imports")?;
             let language = language_for(&path, explicit)?;
-            let edges = deps::imports_from_path(&path, language, cwd).map_err(input_error)?;
+            let edges = deps::imports_from_path(&path, language, cwd, lsp.root(cwd), &mut service)?;
             let shown = edges.len().min(options.max_items);
             let local = edges.iter().filter(|edge| edge.target.is_some()).count();
             let external = edges
@@ -2541,7 +2691,7 @@ fn command_imports(
             let unresolved = edges.len().saturating_sub(local + external);
             write!(
                 output,
-                "# pira_nav imports file={} imports={} local={} external={} unresolved={}",
+                "# pira_nav imports coverage=syntax-references file={} imports={} local={} external={} unresolved={}",
                 quote_metadata(&display_path(&path, cwd)),
                 edges.len(),
                 local,
@@ -2667,20 +2817,28 @@ fn command_dependents(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_rooted_target(args, cwd, "dependents")?;
     validate_directory(&options.root, cwd, "dependents", "root")?;
     let target = resolve_dependency_target(&options.target, &options.root, cwd, "dependents")?;
     let target_language = language_for(&target, explicit)?;
+    if !target.starts_with(lsp.root(&options.root)) {
+        return Err(input_error("dependency target must be inside --lsp-root"));
+    }
     let discovery = discover_files(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let mut extracted =
-        extract_dependencies(&discovery.files, &options.root, Some(&target), |edge| {
-            (edge.target.as_deref() == Some(target.as_path())).then_some(edge)
-        });
+    let mut extracted = extract_dependencies(
+        &discovery.files,
+        &options.root,
+        Some(&target),
+        target_language,
+        lsp,
+        |edge| (edge.target.as_deref() == Some(target.as_path())).then_some(edge),
+    )?;
     for error in &discovery.walk_errors {
         extracted
             .failures
@@ -2698,7 +2856,7 @@ fn command_dependents(
     let shown = edges.len().min(options.max_items);
     write!(
         output,
-        "# pira_nav dependents target={} root={} scanned={} parsed_imports={} local={} external={} unresolved={} count={}",
+        "# pira_nav dependents coverage=syntax-references target={} root={} scanned={} parsed_imports={} local={} external={} unresolved={} count={}",
         quote_metadata(&display_path(&target, &options.root)),
         quote_metadata(&display_path(&options.root, cwd)),
         extracted.scanned,
@@ -2825,6 +2983,7 @@ fn resolve_dependency_target(
     cwd: &Path,
     command: &str,
 ) -> Result<PathBuf, (i32, String)> {
+    crate::util::reject_symlink_components(root).map_err(input_error)?;
     let cwd_candidate = absolute_lexical(Path::new(value), cwd);
     let target = if cwd_candidate.is_file() {
         cwd_candidate
@@ -2849,6 +3008,7 @@ fn resolve_dependency_target(
             return Err(input_error(message));
         }
     };
+    crate::util::reject_symlink_components(&target).map_err(input_error)?;
     if !target.starts_with(root) {
         return Err(input_error(format!(
             "{command} target must be inside --root: {}; selected root is `{}`",
@@ -2913,69 +3073,53 @@ fn extract_dependencies<T, F>(
     files: &[(PathBuf, Language)],
     root: &Path,
     skip: Option<&Path>,
+    language: Language,
+    lsp: &LspOptions,
     map_edge: F,
-) -> DependencyExtraction<T>
+) -> Result<DependencyExtraction<T>, CommandError>
 where
-    T: Send,
-    F: Fn(ImportEdge) -> Option<T> + Sync,
+    F: Fn(ImportEdge) -> Option<T>,
 {
-    files
-        .par_iter()
+    if language.is_document() {
+        return Err(input_error("documents do not support dependency semantics"));
+    }
+    let mut service = LspService::new(lsp.config(root)?);
+    service
+        .require_definitions(language)
+        .map_err(crate::command::lsp_error)?;
+    let mut output = DependencyExtraction {
+        scanned: 0,
+        parsed_imports: 0,
+        resolved: 0,
+        external: 0,
+        unresolved: 0,
+        failures: FailureCollector::default(),
+        edges: Vec::new(),
+    };
+    // One client per configured language, reused across the scan. Do not start a server per worker.
+    for (path, language) in files
+        .iter()
         .filter(|(path, _)| skip != Some(path.as_path()))
-        .fold(
-            || DependencyExtraction {
-                scanned: 0,
-                parsed_imports: 0,
-                resolved: 0,
-                external: 0,
-                unresolved: 0,
-                failures: FailureCollector::default(),
-                edges: Vec::new(),
-            },
-            |mut output, (path, language)| {
-                output.scanned += 1;
-                match deps::imports_from_path(path, *language, root) {
-                    Ok(imports) => {
-                        output.parsed_imports += imports.len();
-                        for edge in imports {
-                            if edge.target.is_some() {
-                                output.resolved += 1;
-                            } else if edge.resolution == "external" {
-                                output.external += 1;
-                            } else {
-                                output.unresolved += 1;
-                            }
-                            output.edges.extend(map_edge(edge));
-                        }
+    {
+        output.scanned += 1;
+        match deps::imports_from_path(path, *language, root, lsp.root(root), &mut service) {
+            Ok(imports) => {
+                output.parsed_imports += imports.len();
+                for edge in imports {
+                    if edge.target.is_some() {
+                        output.resolved += 1;
+                    } else {
+                        output.unresolved += 1;
                     }
-                    Err(message) => {
-                        output.failures.record(display_path(path, root), 2, message);
-                    }
+                    output.edges.extend(map_edge(edge));
                 }
-                output
-            },
-        )
-        .reduce(
-            || DependencyExtraction {
-                scanned: 0,
-                parsed_imports: 0,
-                resolved: 0,
-                external: 0,
-                unresolved: 0,
-                failures: FailureCollector::default(),
-                edges: Vec::new(),
-            },
-            |mut left, mut right| {
-                left.scanned += right.scanned;
-                left.parsed_imports += right.parsed_imports;
-                left.resolved += right.resolved;
-                left.external += right.external;
-                left.unresolved += right.unresolved;
-                left.failures = left.failures.merge_sorted(right.failures);
-                left.edges.append(&mut right.edges);
-                left
-            },
-        )
+            }
+            Err((code, message)) => output
+                .failures
+                .record(display_path(path, root), code, message),
+        }
+    }
+    Ok(output)
 }
 
 struct DependencyGraph<'a> {
@@ -3016,6 +3160,7 @@ fn command_deps(
     args: &[String],
     explicit: Option<Language>,
     cwd: &Path,
+    lsp: &LspOptions,
     output: &mut dyn Write,
 ) -> CommandResult {
     let options = parse_dependency_options(args, cwd)?;
@@ -3035,17 +3180,31 @@ fn command_deps(
         }
     };
     let target_language = language_for(&target, explicit)?;
-    let discovery = discover_files(
+    if !target.starts_with(lsp.root(&options.root)) {
+        return Err(input_error("dependency target must be inside --lsp-root"));
+    }
+    let mut discovery = discover_files(
         &options.root,
         DiscoverySelection::Dependencies(target_language),
     );
-    let mut extracted = extract_dependencies(&discovery.files, &options.root, None, |edge| {
-        edge.target.map(|target| LocalDependencyEdge {
-            source: edge.source,
-            target,
-            line: edge.line,
-        })
-    });
+    // An explicit start node is not subject to broad ignore/suffix discovery.
+    discovery.files.retain(|(path, _)| path != &target);
+    discovery.files.push((target.clone(), target_language));
+    discovery.files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut extracted = extract_dependencies(
+        &discovery.files,
+        &options.root,
+        None,
+        target_language,
+        lsp,
+        |edge| {
+            edge.target.map(|target| LocalDependencyEdge {
+                source: edge.source,
+                target,
+                line: edge.line,
+            })
+        },
+    )?;
     for error in &discovery.walk_errors {
         extracted
             .failures
@@ -3103,7 +3262,7 @@ fn command_deps(
     let shown = traversed.len();
     write!(
         output,
-        "# pira_nav deps target={} root={} direction={} depth={} files={} parsed_imports={} local={} external={} unresolved={} edges={}",
+        "# pira_nav deps coverage=syntax-references target={} root={} direction={} depth={} files={} parsed_imports={} local={} external={} unresolved={} edges={}",
         quote_metadata(&display_path(&target, &options.root)),
         quote_metadata(&display_path(&options.root, cwd)),
         options.direction.as_str(),
@@ -3357,7 +3516,7 @@ fn render_outline(
     let metadata_warning = possible_prompt_injection(&shown_path)
         || selected.iter().take(shown).any(|symbol| {
             let display_name = outline_display_name(parsed.language, symbol);
-            possible_prompt_injection(display_name)
+            possible_prompt_injection(&display_name)
                 || (*signatures
                     && symbol.signature != display_name
                     && possible_prompt_injection(&symbol.signature))
@@ -3413,7 +3572,7 @@ fn render_outline(
             output,
             "{indent}{} {} L{}:{}-{}:{}",
             symbol.kind,
-            sanitize_metadata(display_name),
+            sanitize_metadata(&display_name),
             symbol.start_row + 1,
             symbol.start_column + 1,
             symbol.end_row + 1,
@@ -3425,21 +3584,25 @@ fn render_outline(
                 .map_err(output_error)?;
         }
         if *selectors {
-            write!(output, " selector={}", parsed.selector(symbol, &shown_path))
-                .map_err(output_error)?;
+            write!(
+                output,
+                " selector={}",
+                parsed.selector(symbol, &crate::util::identity_path(&parsed.path, cwd))
+            )
+            .map_err(output_error)?;
         }
         writeln!(output).map_err(output_error)?;
     }
     Ok(shown)
 }
 
-fn outline_display_name(language: Language, symbol: &Symbol) -> &str {
+fn outline_display_name(language: Language, symbol: &Symbol) -> String {
     if language == Language::Markdown && !symbol.signature.is_empty() {
         // Indentation already expresses Markdown ancestry. Repeating every ancestor
         // on every row makes long research-note outlines needlessly hard to scan.
-        &symbol.signature
+        crate::model::SymbolPath::from_names([symbol.signature.clone()]).canonical()
     } else {
-        &symbol.qualified_name
+        symbol.qualified_name.clone()
     }
 }
 
@@ -3462,13 +3625,25 @@ fn outline_symbol_matches(symbol: &Symbol, matches: &[String], exact_matches: &[
     })
 }
 
+fn render_selection_notice(
+    target: &str,
+    parsed: &ParsedFile,
+    output: &mut dyn Write,
+) -> CommandResult {
+    if parsed.symbols_truncated && parse_location(target).is_some() {
+        writeln!(output, "# pira_nav show selection=smallest-recorded-item inventory_truncated=1 complete=0 smallest_item=not-guaranteed; use an exact line range or --window for parser-free access")
+            .map_err(output_error)?;
+    }
+    Ok(())
+}
+
 fn render_source(
     parsed: &ParsedFile,
     symbol: &Symbol,
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let source = parsed
         .source
         .get(symbol.start_byte..symbol.end_byte)
@@ -3521,7 +3696,83 @@ fn render_source(
         writeln!(output).map_err(output_error)?;
     }
     writeln!(output, "--- end ---").map_err(output_error)?;
-    Ok(())
+    Ok(rendered.len())
+}
+
+fn render_show_slice(
+    target: &ShowTarget,
+    explicit: Option<Language>,
+    cwd: &Path,
+    glance: bool,
+    cache: &mut ParsedFileCache,
+    resolver: &mut StructuralResolver,
+    output: &mut dyn Write,
+) -> Result<usize, crate::command::CommandError> {
+    let slice = target.file_slice.expect("slice target");
+    if let Some(path) = plain_show_path(&target.value, cwd) {
+        validate_show_file_target(&target.value, &path, cwd)?;
+        let source = read_source(&path).map_err(input_error)?;
+        return render_slice(&path, &source, 1, slice, cwd, glance, output);
+    }
+    if let Some((path, start, end)) = parse_line_range(&target.value) {
+        let path = absolute_lexical(Path::new(path), cwd);
+        let source = read_source(&path).map_err(input_error)?;
+        let (start, end) = resolve_relative_range(start, end, source_line_count(&source))?;
+        let (_, selected) = select_line_range(&source, &path, start, end)?;
+        return render_slice(&path, selected, start, slice, cwd, glance, output);
+    }
+    let (key, index) = resolve_show_target(&target.value, explicit, cwd, cache, resolver)?;
+    let parsed = cache
+        .get(&key)
+        .and_then(|r| r.as_ref().ok())
+        .expect("resolved parse");
+    render_selection_notice(&target.value, parsed, output)?;
+    let symbol = &parsed.symbols[index];
+    let source = parsed
+        .source
+        .get(symbol.start_byte..symbol.end_byte)
+        .ok_or_else(|| input_error("invalid symbol source bounds"))?;
+    render_slice(
+        &parsed.path,
+        source,
+        symbol.start_row + 1,
+        slice,
+        cwd,
+        glance,
+        output,
+    )
+}
+
+fn render_slice(
+    path: &Path,
+    source: &str,
+    base: usize,
+    slice: ShowFileSlice,
+    cwd: &Path,
+    glance: bool,
+    output: &mut dyn Write,
+) -> Result<usize, crate::command::CommandError> {
+    let count = source_line_count(source);
+    if matches!(slice, ShowFileSlice::Head(0) | ShowFileSlice::Tail(0))
+        || (count == 0 && !matches!(slice, ShowFileSlice::Range(..)))
+    {
+        return render_text_range(path, "", 0, 0, cwd, glance, output);
+    }
+    let (start, end) = match slice {
+        ShowFileSlice::Head(n) => (1, n.min(count)),
+        ShowFileSlice::Tail(n) => (count.saturating_sub(n) + 1, count),
+        ShowFileSlice::Range(start, end) => resolve_relative_range(start, end, count)?,
+    };
+    let (_, selected) = select_line_range(source, path, start, end)?;
+    render_text_range(
+        path,
+        selected,
+        base + start - 1,
+        base + end - 1,
+        cwd,
+        glance,
+        output,
+    )
 }
 
 fn render_line_range(
@@ -3531,7 +3782,7 @@ fn render_line_range(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     if start == 0 || requested_end < start {
         return Err((2, "line range must satisfy 1 <= START <= END".into()));
     }
@@ -3545,7 +3796,7 @@ fn render_entire_file(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let source = read_source(path).map_err(input_error)?;
     let line_count = source_line_count(&source);
     render_text_range(
@@ -3557,44 +3808,6 @@ fn render_entire_file(
         glance,
         output,
     )
-}
-
-fn render_file_head(
-    path: &Path,
-    lines: usize,
-    cwd: &Path,
-    glance: bool,
-    output: &mut dyn Write,
-) -> CommandResult {
-    let source = read_source(path).map_err(input_error)?;
-    if lines == 0 {
-        return render_text_range(path, "", 0, 0, cwd, glance, output);
-    }
-    if source.is_empty() {
-        return render_text_range(path, &source, 0, 0, cwd, glance, output);
-    }
-    let (end, selected) = select_line_range(&source, path, 1, lines)?;
-    render_text_range(path, selected, 1, end, cwd, glance, output)
-}
-
-fn render_file_tail(
-    path: &Path,
-    lines: usize,
-    cwd: &Path,
-    glance: bool,
-    output: &mut dyn Write,
-) -> CommandResult {
-    let source = read_source(path).map_err(input_error)?;
-    if lines == 0 {
-        return render_text_range(path, "", 0, 0, cwd, glance, output);
-    }
-    let line_count = source_line_count(&source);
-    if line_count == 0 {
-        return render_text_range(path, &source, 0, 0, cwd, glance, output);
-    }
-    let start = line_count.saturating_sub(lines) + 1;
-    let (end, selected) = select_line_range(&source, path, start, line_count)?;
-    render_text_range(path, selected, start, end, cwd, glance, output)
 }
 
 fn source_line_count(source: &str) -> usize {
@@ -3655,7 +3868,7 @@ fn render_text_range(
     cwd: &Path,
     glance: bool,
     output: &mut dyn Write,
-) -> CommandResult {
+) -> Result<usize, crate::command::CommandError> {
     let glance_rendered = glance.then(|| render_glance(selected, start, GLANCE_LINE_PREFIX_BYTES));
     write!(
         output,
@@ -3691,7 +3904,7 @@ fn render_text_range(
         writeln!(output).map_err(output_error)?;
     }
     writeln!(output, "--- end ---").map_err(output_error)?;
-    Ok(())
+    Ok(rendered.len())
 }
 
 fn render_glance(source: &str, start_line: usize, prefix_bytes: usize) -> (String, usize) {
@@ -3738,10 +3951,13 @@ struct MapOptions {
     paths: Vec<String>,
     max_items: usize,
     max_depth: Option<usize>,
+    globs: Vec<String>,
 }
 
 fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
     let mut paths = Vec::new();
+    let mut globs = Vec::new();
+    let mut max_items_set = false;
     let mut max_items = DEFAULT_MAP_MAX_ITEMS;
     let mut max_depth = None;
     let mut index = 0;
@@ -3749,10 +3965,25 @@ fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
         if args[index] == "--" {
             paths.extend(args[index + 1..].iter().cloned());
             break;
-        } else if args[index] == "--max-items" {
+        } else if matches!(args[index].as_str(), "--glob" | "-g") {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| input_error("map -g requires GLOB"))?;
+            if globs.len() >= 64 || value.len() > 4096 {
+                return Err(input_error(
+                    "map accepts at most 64 globs of at most 4096 bytes",
+                ));
+            }
+            globs.push(value.clone());
+            index += 2;
+        } else if matches!(args[index].as_str(), "--max-items" | "--limit") {
             let Some(value) = args.get(index + 1) else {
                 return Err((2, "--max-items requires a positive integer".into()));
             };
+            if max_items_set {
+                return Err((2, "--limit/--max-items may be specified only once".into()));
+            }
+            max_items_set = true;
             max_items = value
                 .parse::<usize>()
                 .ok()
@@ -3795,8 +4026,12 @@ fn parse_map_options(args: &[String]) -> Result<MapOptions, (i32, String)> {
             index += 1;
         }
     }
+    if paths.len() > 64 {
+        return Err(input_error("map accepts at most 64 roots"));
+    }
     Ok(MapOptions {
         paths,
+        globs,
         max_items,
         max_depth,
     })
@@ -3848,10 +4083,58 @@ fn target_path(target: &str, cwd: &Path) -> Option<PathBuf> {
     split_existing_symbol_target(target, cwd).map(|(path, _)| path)
 }
 
-fn parse_line_range(value: &str) -> Option<(&str, usize, usize)> {
+fn parse_line_range(value: &str) -> Option<(&str, i64, i64)> {
     let (path, range) = value.rsplit_once(':')?;
-    let (start, end) = range.split_once('-')?;
-    Some((path, start.parse().ok()?, end.parse().ok()?))
+    if path.ends_with(':') {
+        return None;
+    }
+    let separator = range
+        .char_indices()
+        .find(|(index, ch)| *index > 0 && *ch == '-')?
+        .0;
+    Some((
+        path,
+        range[..separator].parse().ok()?,
+        range[separator + 1..].parse().ok()?,
+    ))
+}
+
+fn resolve_relative_range(
+    start: i64,
+    end: i64,
+    count: usize,
+) -> Result<(usize, usize), (i32, String)> {
+    if start == 0 || end == 0 {
+        return Err(input_error("range indices are 1-based; zero is invalid"));
+    }
+    let resolve = |index: i64| {
+        if index < 0 {
+            count as i128 + index as i128 + 1
+        } else {
+            index as i128
+        }
+    };
+    let (start, end) = (resolve(start), resolve(end));
+    if start < 1 || start > count as i128 || end < start {
+        return Err(input_error(
+            "range is reversed or starts outside the specified content boundary",
+        ));
+    }
+    Ok((start as usize, end.min(count as i128) as usize))
+}
+
+fn render_relative_line_range(
+    path: &Path,
+    start: i64,
+    end: i64,
+    cwd: &Path,
+    glance: bool,
+    output: &mut dyn Write,
+) -> Result<usize, crate::command::CommandError> {
+    let source = read_source(path).map_err(input_error)?;
+    let (start, end) = resolve_relative_range(start, end, source_line_count(&source))?;
+    let (_, selected) = select_line_range(&source, path, start, end)?;
+    render_text_range(path, selected, start, end, cwd, glance, output)
 }
 
 fn split_existing_symbol_target(target: &str, cwd: &Path) -> Option<(PathBuf, String)> {
@@ -3930,7 +4213,7 @@ mod tests {
         command_show, help_requested, outline_display_name, parse_dependency_options,
         parse_import_options, parse_location, parse_map_options, parse_selector,
         parse_show_options, parse_symbol_options, render_glance, select_line_range,
-        show_file_slice_target_error, source_line_count,
+        source_line_count,
     };
     use crate::language::Language;
     use crate::lsp_options::LspOptions;
@@ -4016,7 +4299,7 @@ mod tests {
         .err()
         .expect("head and tail must conflict");
         assert_eq!(error.0, 2);
-        assert!(error.1.contains("at most once per bare FILE"));
+        assert!(error.1.contains("only one of --range, --head, or --tail"));
 
         let batch = parse_show_options(&[
             "setup.py".into(),
@@ -4042,9 +4325,6 @@ mod tests {
         .expect("different files may each have a slice");
         assert_eq!(multiple.targets[0].file_slice, Some(ShowFileSlice::Head(2)));
         assert_eq!(multiple.targets[1].file_slice, Some(ShowFileSlice::Tail(3)));
-
-        let suggestion = show_file_slice_target_error("README.md:10-20", "--head", 5);
-        assert!(suggestion.contains("pira_nav show README.md --head 5"));
     }
 
     #[test]
@@ -4155,6 +4435,7 @@ mod tests {
             qualified_name: "Workbook::[\"Research state\"]".into(),
             legacy_qualified_name: "Workbook > Research state".into(),
             signature: "Research state".into(),
+            name_position: None,
             start_byte: 0,
             end_byte: 1,
             start_row: 0,
@@ -4165,7 +4446,7 @@ mod tests {
         };
         assert_eq!(
             outline_display_name(Language::Markdown, &symbol),
-            "Research state"
+            "[\"Research state\"]"
         );
         assert_eq!(
             outline_display_name(Language::Rust, &symbol),

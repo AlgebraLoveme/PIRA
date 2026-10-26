@@ -3,9 +3,11 @@ mod cli;
 mod events;
 mod help;
 mod model;
+mod native_path;
 mod python_exec;
 mod security;
 mod storage;
+mod store_location;
 mod summarize;
 mod transform;
 mod util;
@@ -23,27 +25,42 @@ use storage::{StoredResult, effective_store_dir};
 const AUTO_SUMMARY_THRESHOLD: u64 = 4 * 1024;
 const AUTO_DENSE_EXACT_MAX_BYTES: u64 = 16 * 1024;
 const AUTO_DENSE_EXACT_MAX_LINES: usize = 64;
-const EXACT_GUARD_MIN_LINES: usize = 40;
-const EXACT_GUARD_MAX_LINES: usize = 20_000;
+const REPETITION_MIN_LINES: usize = 40;
+const REPETITION_MAX_LINES: usize = 20_000;
 const MAX_IMPORTANT_LINES: usize = 10;
 const MAX_JSON_IMPORTANT_LINES: usize = 4;
 const MAX_JSON_SYNOPSIS_LINES: usize = 16;
-const MAX_SEARCH_RESULTS: usize = 5;
 
 pub fn run() -> i32 {
     match real_main() {
         Ok(code) => code,
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
-            eprintln!("pira_ctx: {error}");
+            util::diagnostic_line(&format!("pira_ctx: {error}"));
             125
         }
     }
 }
 
 fn real_main() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string()
+                .map_err(|_| format!("argument {} is not valid UTF-8", index + 1))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let config = cli::parse_args(&args)?;
+    if !matches!(config.mode, Mode::Help | Mode::Version) {
+        store_location::warn_legacy_default(config.store_dir.as_ref());
+    }
+    if matches!(config.mode, Mode::Auto | Mode::Exact)
+        && util::stdout_is_data_destination()
+        && util::stderr_is_data_destination()
+    {
+        return run_streaming_exact(&config);
+    }
     match config.mode {
         Mode::Help => {
             let text = config
@@ -152,7 +169,7 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             return Ok(code);
         }
     };
-    if should_guard_exact(&capture)? {
+    if capture.cancelled || capture.retention_truncated || capture.timeline_truncated {
         score_capture(config, &mut capture, &ranking)?;
         let store_dir = effective_store_dir(config.store_dir.as_ref())?;
         let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
@@ -162,22 +179,21 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             capture.duration_ms,
             Some(&stored.metadata),
         );
-        if capture.retention_truncated {
-            util::stdout_line(&format!(
-                "Auto-switched exact -> retained report: kept {} of {} observed bytes after the output-space ceiling was reached.",
+        let mut notice = util::BoundedStdout::report(1024, capture.redirected_stream);
+        if capture.cancelled {
+            notice.line("Cancelled command: partial captured output retained.")?;
+        } else if capture.drain_truncated {
+            notice.line("Exact output incomplete: post-exit pipe drain expired; only observed bytes were retained.")?;
+        } else if capture.retention_truncated {
+            notice.line(&format!(
+                "Exact output incomplete: kept {} of {} observed bytes after the output-space ceiling was reached; retained output is available through raw.",
                 capture.total_bytes(),
                 capture.observed_bytes()
             ))?;
-        } else if capture.timeline_truncated {
-            util::stdout_line(&format!(
-                "Auto-switched exact -> retained report: output exceeded the {}-line index ceiling; complete retained streams remain available through raw --stdout/--stderr.",
-                capture.timeline.len()
-            ))?;
         } else {
-            util::stdout_line(&format!(
-                "Auto-switched exact -> summary: non-interactive output was {} B/{} lines and highly repetitive; full capture retained.",
-                capture.total_bytes(),
-                capture.total_lines
+            notice.line(&format!(
+                "Exact replay unavailable: output exceeded the {}-line index ceiling; complete retained streams remain available through raw --stdout/--stderr.",
+                capture.timeline.len()
             ))?;
         }
         print_summary(&stored.metadata, &capture)?;
@@ -204,28 +220,25 @@ fn run_streaming_exact(config: &Config) -> Result<i32, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let duration = start.elapsed().as_millis();
             record_event(config, 127, duration, None);
-            eprintln!("pira_ctx: command not found: {}", cmd[0]);
+            util::diagnostic_line(&format!("pira_ctx: command not found: {}", cmd[0]));
             Ok(127)
         }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             let duration = start.elapsed().as_millis();
             record_event(config, 126, duration, None);
-            eprintln!(
+            util::diagnostic_line(&format!(
                 "pira_ctx: command not executable/permission denied: {}",
                 cmd[0]
-            );
+            ));
             Ok(126)
         }
         Err(error) => Err(format!("failed to spawn {}: {error}", cmd[0])),
     }
 }
 
-fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
-    if capture.timeline_truncated {
-        return Ok(true);
-    }
+fn capture_is_repetitive(capture: &CaptureResult) -> Result<bool, String> {
     if capture.total_bytes() <= AUTO_SUMMARY_THRESHOLD
-        || capture.total_lines < EXACT_GUARD_MIN_LINES
+        || capture.total_lines < REPETITION_MIN_LINES
         || capture.stdout.binary
         || capture.stderr.binary
         || capture.stdout.non_utf8
@@ -236,24 +249,24 @@ fn should_guard_exact(capture: &CaptureResult) -> Result<bool, String> {
     let mut readers = capture.readers()?;
     let mut counts = HashMap::<String, usize>::new();
     let mut eligible = 0_usize;
-    for line in capture.timeline.iter().take(EXACT_GUARD_MAX_LINES) {
+    for line in capture.timeline.iter().take(REPETITION_MAX_LINES) {
         if !(12..=4096).contains(&line.length) {
             continue;
         }
         let text = readers.read_display_line(line)?;
-        let Some(key) = exact_repetition_key(&text) else {
+        let Some(key) = repetition_key(&text) else {
             continue;
         };
         eligible += 1;
         *counts.entry(key).or_default() += 1;
     }
-    if eligible < EXACT_GUARD_MIN_LINES {
+    if eligible < REPETITION_MIN_LINES {
         return Ok(false);
     }
     Ok(is_highly_repetitive(&counts, eligible))
 }
 
-fn exact_repetition_key(text: &str) -> Option<String> {
+fn repetition_key(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.chars().count() < 12 {
         return None;
@@ -358,7 +371,9 @@ fn run_check(config: &Config) -> Result<i32, String> {
     score_capture(config, &mut capture, &ranking)?;
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
     let stored = storage::store_capture(&store_dir, &config.cmd, &ranking, &capture)?;
-    let retention = if capture.retention_truncated {
+    let mut retention = if capture.drain_truncated {
+        " | drain_truncated=1 observed_bytes_are_lower_bounds=1".to_string()
+    } else if capture.retention_truncated {
         format!(
             " | retained={}/{}B",
             capture.total_bytes(),
@@ -367,12 +382,16 @@ fn run_check(config: &Config) -> Result<i32, String> {
     } else {
         String::new()
     };
+    if capture.timeline_truncated {
+        retention.push_str(" | index_truncated=1");
+    }
     record_event(
         config,
         capture.exit_code,
         capture.duration_ms,
         Some(&stored.metadata),
     );
+    let display_id = storage::display_result_id(&store_dir, &stored.metadata.result_id);
     util::stdout_line(&format!(
         "{} | exit={} | duration={}ms | result={}{}",
         if capture.cancelled {
@@ -382,9 +401,14 @@ fn run_check(config: &Config) -> Result<i32, String> {
         },
         capture.exit_code,
         capture.duration_ms,
-        stored.metadata.result_id,
+        display_id,
         retention
     ))?;
+    if capture.exit_code != 0 && !capture.cancelled {
+        let mut display = stored.metadata.clone();
+        display.result_id = display_id;
+        print_summary(&display, &capture)?;
+    }
     Ok(capture.exit_code)
 }
 
@@ -406,7 +430,7 @@ fn should_retain_output(capture: &CaptureResult) -> Result<bool, String> {
     let repetitive = capture.total_bytes() > AUTO_SUMMARY_THRESHOLD
         && capture.total_bytes() <= AUTO_DENSE_EXACT_MAX_BYTES
         && capture.total_lines <= AUTO_DENSE_EXACT_MAX_LINES
-        && should_guard_exact(capture)?;
+        && capture_is_repetitive(capture)?;
     Ok(retain_text_shape(
         capture.total_bytes(),
         capture.total_lines,
@@ -474,10 +498,12 @@ fn store_and_summarize(
         capture.duration_ms,
         Some(&stored.metadata),
     );
+    let mut display = stored.metadata.clone();
+    display.result_id = storage::display_result_id(&store_dir, &display.result_id);
     if compact {
-        print_compact_summary(&stored.metadata, capture)?;
+        print_compact_summary(&display, capture)?;
     } else {
-        print_summary(&stored.metadata, capture)?;
+        print_summary(&display, capture)?;
     }
     Ok(capture.exit_code)
 }
@@ -513,7 +539,18 @@ fn capture_program(
     announce_live: bool,
 ) -> Result<Result<CaptureResult, i32>, String> {
     let store_dir = effective_store_dir(config.store_dir.as_ref())?;
-    capture::capture_command(command, Some(&store_dir), announce_live)
+    let redirected = if matches!(config.mode, Mode::Auto | Mode::Exact) {
+        if util::stdout_is_data_destination() {
+            Some(StreamKind::Stdout)
+        } else if util::stderr_is_data_destination() {
+            Some(StreamKind::Stderr)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    capture::capture_command(command, Some(&store_dir), announce_live, redirected)
 }
 
 fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Metadata>) {
@@ -523,12 +560,14 @@ fn record_event(config: &Config, exit: i32, duration: u128, metadata: Option<&Me
     let result = effective_store_dir(config.store_dir.as_ref())
         .and_then(|store| events::record(&store, intent, &config.cmd, exit, duration, metadata));
     if let Err(error) = result {
-        eprintln!("pira_ctx: warning: command completed but event recording failed: {error}");
+        util::diagnostic_line(&format!(
+            "pira_ctx: warning: command completed but event recording failed: {error}"
+        ));
     }
 }
 
 fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), String> {
-    let mut output = util::BoundedStdout::new(16 * 1024);
+    let mut output = util::BoundedStdout::report(16 * 1024, capture.redirected_stream);
     let json_synopsis = summarize::json_synopsis(capture, MAX_JSON_SYNOPSIS_LINES)?;
     let shown = summarize::select_important(
         &capture.timeline,
@@ -545,12 +584,18 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
     let omitted_lines = capture.total_lines.saturating_sub(shown.len());
     let omitted_bytes = capture.total_bytes().saturating_sub(shown_bytes);
     let mut rendered = Vec::with_capacity(shown.len());
+    let mut clipped_lines = 0usize;
+    let mut first_clipped_line = None;
     if !shown.is_empty() {
         let mut readers = capture.readers()?;
         for &index in &shown {
             let line = &capture.timeline[index];
             let raw = readers.read_security_line(line)?;
             let (text, risk) = prepare_program_display(&raw);
+            if line.length > util::MAX_DISPLAY_READ_BYTES || text != util::sanitize_terminal(&raw) {
+                clipped_lines += 1;
+                first_clipped_line.get_or_insert(line.line);
+            }
             rendered.push((line, text, risk));
         }
     }
@@ -589,7 +634,7 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             .chain(rendered_json.iter().map(|(text, _)| text.as_str())),
     );
     output.line(&format!(
-        "Result: {} | {}exit={} | {} B/{} lines | omitted={} B/{} lines",
+        "Result: {} | {}exit={} | {} B/{} lines | unselected={} B/{} lines",
         metadata.result_id,
         if capture.cancelled {
             "state=cancelled | "
@@ -660,16 +705,32 @@ fn print_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), Str
             output.line(&format!("  {count}x {example}"))?;
         }
     }
-    let recovery_needed = omitted_lines > 0
+    if clipped_lines > 0 {
+        output.line(&format!(
+            "display_clipped_lines={clipped_lines}; exact bytes remain retained"
+        ))?;
+    }
+    let recovery_needed = clipped_lines > 0
+        || omitted_lines > 0
         || omitted_bytes > 0
         || capture.timeline_truncated
         || capture.retention_truncated;
     if recovery_needed && !metadata.suggested_keywords.is_empty() {
         output.line(&format!("Search terms: {displayed_keywords}"))?;
     }
-    if recovery_needed {
+    if let Some(line) = first_clipped_line {
         output.line(&format!(
-            "Retrieve: pira_ctx search {} <query>",
+            "If needed (clipped line): pira_ctx range {} {line}:{line}",
+            metadata.result_id
+        ))?;
+    }
+    if omitted_lines > 0
+        || omitted_bytes > 0
+        || capture.timeline_truncated
+        || capture.retention_truncated
+    {
+        output.line(&format!(
+            "If needed (other output): pira_ctx search {} <query>",
             metadata.result_id
         ))?;
     }
@@ -721,6 +782,17 @@ fn print_retention_notice(
     output: &mut util::BoundedStdout,
     capture: &CaptureResult,
 ) -> Result<(), String> {
+    if let Some(stream) = capture.redirected_stream {
+        output.line(&format!("Scope: {stream} was redirected, not retained; counts and evidence cover the captured stream only"))?;
+    }
+    if capture.drain_truncated {
+        output.line("Pipe drain incomplete: retained bytes are exact; observed byte counts are lower bounds, not complete output lengths")?;
+    }
+    if capture.timeline_truncated {
+        output.line(
+            "Index: truncated; search covers only the indexed retained prefix; range unavailable",
+        )?;
+    }
     if capture.retention_truncated {
         output.line(&format!(
             "Retention limit reached: kept {} of {} observed bytes; excess PROGRAM output was discarded while the command continued.",
@@ -754,7 +826,7 @@ fn stream_description(
 }
 
 fn print_compact_summary(metadata: &Metadata, capture: &CaptureResult) -> Result<(), String> {
-    let mut output = util::BoundedStdout::new(4 * 1024);
+    let mut output = util::BoundedStdout::report(4 * 1024, capture.redirected_stream);
     let mut rendered = Vec::with_capacity(capture.timeline.len());
     if capture.total_lines > 0 {
         let mut readers = capture.readers()?;
@@ -807,134 +879,247 @@ fn prepare_program_display(raw: &str) -> (String, security::ContentRisk) {
     (displayed, risk)
 }
 
+struct CaptureQuery {
+    matcher: regex::Regex,
+    terms: Vec<String>,
+    hits: Vec<(usize, i64)>,
+    count: usize,
+    lexical_hits: Vec<(usize, i64)>,
+    lexical_count: usize,
+}
+
 fn run_search(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
+    let lines = &store.metadata.line_timeline;
     let mut reader = store.reader()?;
-    let mut output = util::BoundedStdout::new(64 * 1024);
-    if store.metadata.timeline_truncated {
-        output.line("Index: truncated; search covered only the indexed retained prefix")?;
-    }
-    for (query_index, query) in config.search_queries.iter().enumerate() {
-        let matcher = if config.regex {
-            regex::Regex::new(query).map_err(|error| format!("invalid regex: {error}"))?
+    let mut queries = config
+        .search_queries
+        .iter()
+        .map(|query| {
+            let matcher = if config.regex {
+                regex::Regex::new(query)
+            } else {
+                regex::RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(true)
+                    .build()
+            }
+            .map_err(|error| format!("invalid search query: {error}"))?;
+            Ok(CaptureQuery {
+                matcher,
+                terms: lexical_terms(query),
+                hits: Vec::new(),
+                count: 0,
+                lexical_hits: Vec::new(),
+                lexical_count: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut oversized = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if line.length > util::MAX_SEARCH_LINE_BYTES {
+            oversized += 1;
+            continue;
+        }
+        let (text, _) = reader.read_search_line(line)?;
+        let terms = if !config.approximate {
+            Vec::new()
         } else {
-            regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(true)
-                .build()
-                .map_err(|error| format!("invalid literal query: {error}"))?
+            lexical_terms(&text)
         };
-        let query_terms = lexical_terms(query);
-        let mut hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-        let mut hit_count = 0_usize;
-        let mut lexical_hits = Vec::with_capacity(MAX_SEARCH_RESULTS + 1);
-        let mut lexical_count = 0_usize;
-        for (index, line) in store.metadata.line_timeline.iter().enumerate() {
-            let text = reader.read_search_line(line)?;
-            let length_penalty = (line.length / 4096).min(200) as i64;
-            if matcher.is_match(&text) {
-                hit_count += 1;
+        let penalty = (line.length / 4096).min(200) as i64;
+        for query in &mut queries {
+            if query.matcher.is_match(&text) {
+                query.count += 1;
                 offer_search_hit(
-                    &mut hits,
+                    &mut query.hits,
                     (
                         index,
-                        line.score + if config.regex { 70 } else { 80 } - length_penalty,
+                        line.score
+                            .saturating_add(if config.regex { 70 } else { 80 })
+                            .saturating_sub(penalty),
                     ),
-                    &store.metadata.line_timeline,
+                    lines,
+                    config.search_limit,
                 );
-            } else if !config.regex {
-                let score = lexical_score(&text, &query_terms);
+            } else if config.approximate && query.count == 0 {
+                let score = lexical_score_terms(&terms, &query.terms);
                 if score > 0 {
-                    lexical_count += 1;
+                    query.lexical_count += 1;
                     offer_search_hit(
-                        &mut lexical_hits,
-                        (index, line.score + score - length_penalty),
-                        &store.metadata.line_timeline,
+                        &mut query.lexical_hits,
+                        (
+                            index,
+                            line.score.saturating_add(score).saturating_sub(penalty),
+                        ),
+                        lines,
+                        config.search_limit,
                     );
                 }
             }
         }
-        let lexical = hit_count == 0 && lexical_count > 0;
-        if lexical {
-            hits = lexical_hits;
-            hit_count = lexical_count;
+    }
+    let lexical = queries
+        .iter()
+        .map(|q| q.count == 0 && q.lexical_count > 0)
+        .collect::<Vec<_>>();
+    let mut queues = Vec::new();
+    for (q, use_lexical) in queries.iter_mut().zip(&lexical) {
+        if *use_lexical {
+            q.hits = std::mem::take(&mut q.lexical_hits);
+            q.count = q.lexical_count;
         }
-        if config.search_queries.len() == 1 {
-            output.line(&format!(
-                "{}{} hits",
-                hit_count,
-                if lexical { " lexical" } else { "" }
-            ))?;
-        } else {
-            output.line(&format!(
-                "Query {} {:?}: {}{} hits",
-                query_index + 1,
-                query,
-                hit_count,
-                if lexical { " lexical" } else { "" }
-            ))?;
-        }
-        let mut selected = std::collections::BTreeMap::new();
-        for (index, score) in hits.into_iter().take(MAX_SEARCH_RESULTS) {
-            let start = index.saturating_sub(config.context);
-            let end = index
-                .saturating_add(config.context)
-                .min(store.metadata.line_timeline.len().saturating_sub(1));
-            for nearby in start..=end {
-                let is_hit = nearby == index;
-                let nearby_score = if is_hit {
-                    score
-                } else {
-                    store.metadata.line_timeline[nearby].score
-                };
-                selected
-                    .entry(nearby)
-                    .and_modify(|entry: &mut (i64, bool)| {
-                        if is_hit {
-                            *entry = (nearby_score, true);
-                        }
-                    })
-                    .or_insert((nearby_score, is_hit));
+        let mut queue = q.hits.iter().map(|(i, _)| (*i, true)).collect::<Vec<_>>();
+        let mut seen = q
+            .hits
+            .iter()
+            .map(|(i, _)| *i)
+            .collect::<std::collections::BTreeSet<_>>();
+        for (i, _) in &q.hits {
+            for nearby in i.saturating_sub(config.context)
+                ..=i.saturating_add(config.context)
+                    .min(lines.len().saturating_sub(1))
+            {
+                if seen.insert(nearby) {
+                    queue.push((nearby, false));
+                }
             }
         }
-        let mut rendered = Vec::with_capacity(selected.len());
-        for (index, (score, is_hit)) in selected {
-            let line = &store.metadata.line_timeline[index];
-            let raw = if is_hit {
-                reader.read_search_line(line)?
-            } else {
-                reader.read_security_line(line)?
-            };
-            let risk = security::inspect(&raw);
-            let text = if is_hit && !lexical {
-                matcher.find(&raw).map_or_else(
-                    || prepare_program_display(&raw).0,
-                    |matched| util::clip_match_display(&raw, matched.start(), matched.end()),
-                )
-            } else {
-                prepare_program_display(&raw).0
-            };
-            rendered.push((line, score, text, risk));
+        queues.push(std::collections::VecDeque::from(queue));
+    }
+    let context_totals = queues
+        .iter()
+        .map(|q| q.iter().filter(|(_, hit)| !hit).count())
+        .collect::<Vec<_>>();
+    let mut context_shown = vec![0; queries.len()];
+    let mut shown = vec![0; queries.len()];
+    let mut byte_limited = vec![false; queries.len()];
+    let mut rendered = Vec::new();
+    let mut remaining = 56 * 1024usize; // Status and warnings share the remaining 8 KiB.
+    // Exhaust every query's selected hits before admitting any context.
+    for phase in [true, false] {
+        while queues
+            .iter()
+            .any(|q| q.front().is_some_and(|(_, hit)| *hit == phase))
+        {
+            for (qi, queue) in queues.iter_mut().enumerate() {
+                if !queue.front().is_some_and(|(_, hit)| *hit == phase) {
+                    continue;
+                }
+                let Some((index, hit)) = queue.pop_front() else {
+                    continue;
+                };
+                let line = &lines[index];
+                let (raw, risk) = if hit {
+                    reader.read_search_line(line)?
+                } else {
+                    let raw = reader.read_security_line(line)?;
+                    let risk = security::inspect(&raw);
+                    (raw, risk)
+                };
+                let text = if hit && !lexical[qi] {
+                    queries[qi].matcher.find(&raw).map_or_else(
+                        || prepare_program_display(&raw).0,
+                        |m| util::clip_match_display(&raw, m.start(), m.end()),
+                    )
+                } else {
+                    prepare_program_display(&raw).0
+                };
+                let prefix = if queries.len() > 1 {
+                    format!("q{} ", qi + 1)
+                } else {
+                    String::new()
+                };
+                let row = format!("{prefix}L{} {}: {}", line.line, line.stream, text);
+                let bytes = row.len() + 1;
+                if bytes > remaining {
+                    byte_limited[qi] = true;
+                    continue;
+                }
+                remaining -= bytes;
+                if hit {
+                    shown[qi] += 1;
+                } else {
+                    context_shown[qi] += 1;
+                }
+                rendered.push((line.line, row, risk));
+            }
+            if remaining < 64 {
+                for (qi, queue) in queues.iter_mut().enumerate() {
+                    byte_limited[qi] |= !queue.is_empty();
+                    queue.clear();
+                }
+            }
         }
-        print_content_warnings(
-            &mut output,
-            rendered
-                .iter()
-                .map(|(line, _, _, risk)| (Some(line.line), *risk))
-                .chain(std::iter::once((
-                    None,
-                    security::inspect_combined(
-                        rendered.iter().map(|(_, _, text, _)| text.as_str()),
-                    ),
-                ))),
-        )?;
-        for (line, score, text, _) in rendered {
-            output.line(&format_scored_line(line, score, &text))?;
+    }
+    let mut output = util::BoundedStdout::new(64 * 1024);
+    if store.metadata.timeline_truncated {
+        output.line("Index: truncated; search covered only the indexed retained prefix")?;
+    }
+    if store.metadata.drain_truncated {
+        output.line("complete=0 drain_truncated=1; unobserved bytes are not recoverable")?;
+    }
+    if store.metadata.retention_truncated {
+        output.line("complete=0 retention_truncated=1; discarded bytes are not recoverable")?;
+    }
+    if oversized > 0 {
+        output.line(&format!("complete=0 skipped_lines={oversized} max_search_line_bytes={}; use pira_ctx exec {} --code CODE for full-capture analysis", util::MAX_SEARCH_LINE_BYTES, store.metadata.result_id))?;
+    }
+    for (qi, query) in queries.iter().enumerate() {
+        let label = if queries.len() > 1 {
+            format!(
+                "Query {} {:?}: ",
+                qi + 1,
+                util::single_line_clip(&config.search_queries[qi], 120)
+            )
+        } else {
+            String::new()
+        };
+        let mut status = format!(
+            "{label}{}{} hits",
+            query.count,
+            if lexical[qi] { " lexical" } else { "" }
+        );
+        let omitted = query.count.saturating_sub(shown[qi]);
+        let context_omitted = context_totals[qi] - context_shown[qi];
+        if omitted > 0 || context_omitted > 0 {
+            status.push_str(&format!(" shown={} omitted={omitted}", shown[qi]));
+            if query.count > config.search_limit {
+                status.push_str(&format!(
+                    " per_query_limit={}; raise --limit (max 100) or narrow query",
+                    config.search_limit
+                ));
+            }
+            if byte_limited[qi] {
+                status.push_str(" byte_limited=1; reduce --context or narrow query");
+            }
+            if context_omitted > 0 {
+                status.push_str(&format!(" context_omitted={context_omitted}"));
+            }
         }
+        output.line(&status)?;
+    }
+    print_content_warnings(
+        &mut output,
+        rendered
+            .iter()
+            .map(|(line, _, risk)| (Some(*line), *risk))
+            .chain(std::iter::once((
+                None,
+                security::inspect_combined(rendered.iter().map(|(_, row, _)| row.as_str())),
+            ))),
+    )?;
+    for (_, row, _) in rendered {
+        output.line(&row)?;
     }
     Ok(0)
 }
 
-fn offer_search_hit(hits: &mut Vec<(usize, i64)>, hit: (usize, i64), lines: &[model::LineMeta]) {
+fn offer_search_hit(
+    hits: &mut Vec<(usize, i64)>,
+    hit: (usize, i64),
+    lines: &[model::LineMeta],
+    limit: usize,
+) {
     hits.push(hit);
     hits.sort_by(|a, b| {
         lines[b.0]
@@ -943,7 +1128,7 @@ fn offer_search_hit(hits: &mut Vec<(usize, i64)>, hit: (usize, i64), lines: &[mo
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| lines[a.0].line.cmp(&lines[b.0].line))
     });
-    hits.truncate(MAX_SEARCH_RESULTS);
+    hits.truncate(limit);
 }
 
 fn lexical_terms(value: &str) -> Vec<String> {
@@ -971,11 +1156,10 @@ fn stem(value: &str) -> String {
     }
     value.to_string()
 }
-fn lexical_score(text: &str, query: &[String]) -> i64 {
+fn lexical_score_terms(terms: &[String], query: &[String]) -> i64 {
     if query.is_empty() {
         return 0;
     }
-    let terms = lexical_terms(text);
     let matched = query
         .iter()
         .filter(|q| {
@@ -1041,6 +1225,16 @@ fn run_range(config: &Config) -> Result<i32, String> {
 
 fn run_raw(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
+    let selected = match config.raw_stream {
+        Some(RawStream::Stdout) => Some(StreamKind::Stdout),
+        Some(RawStream::Stderr) => Some(StreamKind::Stderr),
+        None => None,
+    };
+    if let Some(stream) = selected
+        && Some(stream) == store.metadata.redirected_stream
+    {
+        return Err(format!("{stream} was redirected and was not retained"));
+    }
     let mut reader = store.reader()?;
     let mut output = io::stdout().lock();
     match config.raw_stream {
@@ -1071,11 +1265,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
                 let path = storage::resolve_result(&dir, target)?;
                 let store = storage::read_result_path(&path)?;
                 let metadata = &store.metadata;
-                let state = if store.is_running() {
-                    "running"
-                } else {
-                    "complete"
-                };
+                let state = store.state();
                 let exit = if store.is_running() {
                     "unknown".to_string()
                 } else {
@@ -1120,6 +1310,11 @@ fn run_stats(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
     let metadata = &store.metadata;
     util::stdout_line(&format!("Result: {}", metadata.result_id))?;
+    if let Some(stream) = metadata.redirected_stream {
+        util::stdout_line(&format!(
+            "Scope: {stream} was redirected, not retained; sizes cover captured output only"
+        ))?;
+    }
     if store.is_running() {
         util::stdout_line("State: running (checkpoint snapshot)")?;
         util::stdout_line(&format!(
@@ -1130,7 +1325,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
             .saturating_sub(store.checkpoint_unix_ms().unwrap_or_default());
         util::stdout_line(&format!("CheckpointAge: {age} ms"))?;
     } else {
-        util::stdout_line("State: complete")?;
+        util::stdout_line(&format!("State: {}", store.state()))?;
     }
     util::stdout_line(&format!(
         "Command: {}",
@@ -1162,6 +1357,9 @@ fn run_stats(config: &Config) -> Result<i32, String> {
     util::stdout_line(&format!("Store: {}", store.path.display()))?;
     util::stdout_line(&format!("Created: {}", metadata.created_at))?;
     util::stdout_line(&format!("Tool: {}", metadata.tool_version))?;
+    if metadata.drain_truncated {
+        util::stdout_line("Drain: truncated; observed byte counts are lower bounds")?;
+    }
     util::stdout_line(&format!("Format: {}", store.format_version))?;
     util::stdout_line(&format!(
         "Index: indexed_lines={} truncated={}",
@@ -1207,7 +1405,11 @@ fn run_command(config: &Config) -> Result<i32, String> {
     let record = serde_json::json!({
         "argv": argv,
         "cwd": metadata.cwd,
-        "exact": exact,
+        "exact": exact && metadata.cwd_native.as_ref().map_or_else(
+            || native_path::legacy_is_exact(&metadata.cwd),
+            |path| matches!(path, native_path::NativePath::Utf8(text) if !text.is_empty() && text == &metadata.cwd),
+        ),
+        "cwd_native": metadata.cwd_native,
     });
     util::stdout_line(&serde_json::to_string(&record).map_err(|error| error.to_string())?)?;
     Ok(0)
@@ -1222,6 +1424,9 @@ fn run_list(config: &Config) -> Result<i32, String> {
     };
     let mut entries = storage::scan_store(&store_dir, filter.as_deref())?;
     entries.extend(watch::list_entries(&store_dir, filter.as_deref())?);
+    if config.live_only {
+        entries.retain(|entry| entry.running);
+    }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.start_ms));
     let omitted = entries.len().saturating_sub(config.limit);
     util::stdout_line("id | kind | state | timestamp | exit | bytes | lines | command")?;
@@ -1620,7 +1825,7 @@ fn run_batch(config: &Config) -> Result<i32, String> {
             };
             let worker_dir = dir.clone();
             handles.push(std::thread::spawn(move || {
-                let result = capture::capture_command(&argv, Some(&worker_dir), false);
+                let result = capture::capture_command(&argv, Some(&worker_dir), false, None);
                 (index, intent, argv, result)
             }));
         }
@@ -1634,9 +1839,9 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                 Ok(capture) => capture,
                 Err(code) => {
                     if let Err(error) = events::record(&dir, &intent, &argv, code, 0, None) {
-                        eprintln!(
+                        util::diagnostic_line(&format!(
                             "pira_ctx: warning: batch child completed but event recording failed: {error}"
-                        );
+                        ));
                     }
                     completed.push((index, code, 0, None, intent));
                     continue;
@@ -1653,15 +1858,15 @@ fn run_batch(config: &Config) -> Result<i32, String> {
                 capture.duration_ms,
                 Some(&stored.metadata),
             ) {
-                eprintln!(
+                util::diagnostic_line(&format!(
                     "pira_ctx: warning: batch child completed but event recording failed: {error}"
-                );
+                ));
             }
             completed.push((
                 index,
                 capture.exit_code,
                 capture.duration_ms,
-                Some(stored.metadata.result_id),
+                Some(storage::display_result_id(&dir, &stored.metadata.result_id)),
                 intent,
             ));
         }
@@ -1697,10 +1902,6 @@ fn open_target(config: &Config) -> Result<StoredResult, String> {
     storage::read_result_path(&path)
 }
 
-fn format_scored_line(line: &model::LineMeta, score: i64, text: &str) -> String {
-    format!("L{} {} score={}: {}", line.line, line.stream, score, text)
-}
-
 fn table_field(value: &str, maximum_bytes: usize) -> String {
     util::single_line_clip(&util::sanitize_terminal(value), maximum_bytes).replace('|', "\\|")
 }
@@ -1719,20 +1920,20 @@ mod output_format_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        exact_repetition_key, is_highly_repetitive, parse_history_time, retain_text_shape,
+        is_highly_repetitive, parse_history_time, repetition_key, retain_text_shape,
         stream_description,
     };
     use std::collections::HashMap;
 
     #[test]
-    fn exact_repetition_key_normalizes_dynamic_log_fields() {
+    fn repetition_key_normalizes_dynamic_log_fields() {
         let first = r#"{"time":"2026-07-11T14:43:02.198528+08:00","level":"INFO","msg":"loading plugin","id":"alpha"}"#;
         let second = r#"{"time":"2026-07-12T09:04:51.777001+08:00","level":"INFO","msg":"loading plugin","id":"beta"}"#;
-        assert_eq!(exact_repetition_key(first), exact_repetition_key(second));
+        assert_eq!(repetition_key(first), repetition_key(second));
     }
 
     #[test]
-    fn exact_repetition_policy_requires_broad_and_dominant_repetition() {
+    fn automatic_repetition_policy_requires_broad_and_dominant_repetition() {
         let repetitive = HashMap::from([
             ("common".to_string(), 60),
             ("secondary".to_string(), 20),

@@ -1,567 +1,623 @@
-use std::fs;
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use tree_sitter::Node;
 
+use crate::command::{CommandError, input_error, lsp_error};
 use crate::language::Language;
+use crate::lsp::{LspService, file_path_from_uri};
 use crate::model::ImportEdge;
 use crate::parse::{ParsedSyntax, parse_syntax};
-use crate::util::{absolute_lexical, display_path, one_line, read_source, source_slice};
+use crate::util::{
+    absolute_lexical, display_path, one_line, read_source, reject_symlink_components,
+};
 
-/// Extract imports from a source file.
-///
-/// Most languages use their native syntax tree. Lean is intentionally dispatched to its
-/// source-level module-header scanner: imports can only occur in the header, while parsing the
-/// complete body is both unnecessary and vulnerable to syntax extensions introduced by imports.
+const MAX_IMPORT_REFERENCES: usize = 10_000;
+
+struct ImportReference {
+    line: usize,
+    text: String,
+    position: Option<(usize, usize)>,
+    unsupported: &'static str,
+}
+
+/// Resolve syntax import references through a capable server, never filename guesses.
+/// The returned edges are not a complete build/runtime dependency graph.
 pub fn imports_from_path(
     path: &Path,
     language: Language,
-    cwd: &Path,
-) -> Result<Vec<ImportEdge>, String> {
-    if language == Language::Lean {
-        return lean_imports_from_source(path, &read_source(path)?, cwd);
+    root: &Path,
+    server_root: &Path,
+    service: &mut LspService,
+) -> Result<Vec<ImportEdge>, CommandError> {
+    if language.is_document() {
+        return Err(input_error("documents do not support import semantics"));
     }
-    let parsed = parse_syntax(path, language)?;
-    imports_from_syntax(&parsed, cwd)
-}
-
-fn imports_from_syntax(parsed: &ParsedSyntax, cwd: &Path) -> Result<Vec<ImportEdge>, String> {
-    let mut output = Vec::new();
-    match parsed.language {
-        Language::Python => collect_python(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Rust => {
-            let source_root = find_rust_source_root(&parsed.path, cwd);
-            collect_rust(
-                parsed.tree.root_node(),
-                parsed,
-                cwd,
-                &source_root,
-                &mut output,
-            )
-        }
-        Language::Java => collect_java(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::C | Language::Cpp | Language::Cuda => {
-            collect_c_family(parsed.tree.root_node(), parsed, cwd, &mut output)
-        }
-        Language::Bash => collect_bash(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Go => collect_go(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::JavaScript | Language::TypeScript => {
-            collect_ecmascript(parsed.tree.root_node(), parsed, cwd, &mut output)
-        }
-        Language::CSharp => collect_csharp(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::PowerShell => {
-            collect_powershell(parsed.tree.root_node(), parsed, cwd, &mut output)
-        }
-        Language::Php => collect_php(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Kotlin => collect_kotlin(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Lua => collect_lua(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Hcl => collect_hcl(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::R => collect_r(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Ruby => collect_ruby(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Swift => collect_swift(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Scala => collect_scala(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Dart => collect_dart(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Elixir => collect_elixir(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Julia => collect_julia(parsed.tree.root_node(), parsed, cwd, &mut output),
-        Language::Lean => {
-            return Err("Lean imports require the source-level header scanner".into());
-        }
-        Language::Json | Language::Jsonc | Language::Yaml | Language::Toml | Language::Markdown => {
-        }
+    reject_symlink_components(path).map_err(input_error)?;
+    if !path.starts_with(root) || !path.starts_with(server_root) {
+        return Err(input_error(
+            "import source must be inside the dependency root and --lsp-root",
+        ));
     }
-    output.sort_by(|left, right| {
-        left.line
-            .cmp(&right.line)
-            .then_with(|| left.text.cmp(&right.text))
-    });
+    let (source, references) = extract_imports(path, language).map_err(input_error)?;
+    service.require_definitions(language).map_err(lsp_error)?;
+    let mut output = Vec::with_capacity(references.len());
+    for reference in references {
+        let mut edge = ImportEdge {
+            source: path.to_path_buf(),
+            line: reference.line,
+            text: reference.text,
+            target: None,
+            target_label: reference.unsupported.into(),
+            resolution: "unsupported",
+        };
+        if let Some((row, column)) = reference.position {
+            let locations = service
+                .definition(path, language, &source, row, column)
+                .map_err(lsp_error)?;
+            let mut targets = BTreeSet::new();
+            let mut unsupported = false;
+            let mut blocked = false;
+            for location in locations {
+                let Some(target) = file_path_from_uri(&location.uri).map_err(lsp_error)? else {
+                    unsupported = true;
+                    continue;
+                };
+                let target = absolute_lexical(&target, root);
+                if !target.starts_with(root) || reject_symlink_components(&target).is_err() {
+                    blocked = true;
+                } else if !target.is_file() || target == path {
+                    // A server can return an import alias itself, a directory or a generated URI.
+                    // None establishes a distinct file dependency.
+                    unsupported = true;
+                } else {
+                    targets.insert(target);
+                }
+            }
+            let (resolution, label) = if blocked {
+                ("blocked", "outside-root-or-symlink")
+            } else if unsupported {
+                ("unsupported", "non-file-missing-or-self-definition")
+            } else if targets.len() > 1 {
+                ("ambiguous", "multiple-definition-files")
+            } else if let Some(target) = targets.into_iter().next() {
+                edge.target_label = display_path(&target, root);
+                edge.target = Some(target);
+                ("lsp", "")
+            } else {
+                ("unresolved", "no-definition")
+            };
+            edge.resolution = resolution;
+            if edge.target.is_none() {
+                edge.target_label = label.into();
+            }
+        }
+        output.push(edge);
+    }
     Ok(output)
 }
 
-fn collect_java(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "import_declaration" {
-        let text = node_text(node, parsed);
-        let module = text
-            .trim_start_matches("import ")
-            .trim_start_matches("static ")
-            .trim_end_matches(';')
-            .trim_end_matches(".*");
-        let mut relative = PathBuf::new();
-        for part in module.split('.') {
-            relative.push(part);
-        }
-        relative.set_extension("java");
-        let targets = ancestor_source_targets(
-            &parsed.path,
-            cwd,
-            &relative,
-            &["", "src", "src/main/java", "src/test/java"],
+fn extract_imports(
+    path: &Path,
+    language: Language,
+) -> Result<(String, Vec<ImportReference>), String> {
+    if language == Language::Lean {
+        let source = read_source(path)?;
+        let references = lean_imports_from_source(&source)?;
+        return Ok((source, references));
+    }
+    let parsed = parse_syntax(path, language)?;
+    let mut output = Vec::new();
+    collect(parsed.tree.root_node(), &parsed, &mut output)?;
+    Ok((parsed.source, output))
+}
+
+fn check_reference_limit(output: &[ImportReference]) -> Result<(), String> {
+    if output.len() > MAX_IMPORT_REFERENCES {
+        Err(format!(
+            "import reference inventory exceeds {MAX_IMPORT_REFERENCES}; narrow the source file"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn text<'a>(node: Node<'_>, parsed: &'a ParsedSyntax) -> &'a str {
+    &parsed.source[node.byte_range()]
+}
+
+fn push_reference(
+    statement: Node<'_>,
+    position: Option<(usize, usize)>,
+    reason: &'static str,
+    parsed: &ParsedSyntax,
+    output: &mut Vec<ImportReference>,
+) -> Result<(), String> {
+    output.push(ImportReference {
+        line: statement.start_position().row + 1,
+        text: import_text(text(statement, parsed)),
+        position,
+        unsupported: reason,
+    });
+    check_reference_limit(output)
+}
+
+fn import_text(source: &str) -> String {
+    let mut end = source.len().min(1024);
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = one_line(&source[..end]);
+    if end < source.len() {
+        result.push('…');
+    }
+    result
+}
+
+fn point(node: Node<'_>) -> (usize, usize) {
+    (node.start_position().row, node.start_position().column)
+}
+
+fn literal_reference(
+    statement: Node<'_>,
+    value: Option<Node<'_>>,
+    parsed: &ParsedSyntax,
+    output: &mut Vec<ImportReference>,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return push_reference(statement, None, "missing-import-operand", parsed, output);
+    };
+    // PIRA: only a direct literal operand is eligible. An arbitrary descendant string
+    // in a concatenation/call/interpolation does not identify its enclosing expression.
+    let raw = text(value, parsed);
+    let is_literal = matches!(
+        value.kind(),
+        "string"
+            | "string_literal"
+            | "system_lib_string"
+            | "interpreted_string_literal"
+            | "raw_string_literal"
+            | "string_lit"
+            | "raw_string"
+    );
+    let mut cursor = value.walk();
+    let dynamic = value.named_children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "interpolation"
+                | "interpolation_expression"
+                | "string_interpolation"
+                | "expansion"
+                | "simple_expansion"
+                | "command_substitution"
+                | "template_substitution"
+        )
+    });
+    if !is_literal || dynamic || raw.len() < 3 {
+        return push_reference(
+            statement,
+            None,
+            "dynamic-or-unsupported-import-operand",
+            parsed,
+            output,
         );
-        let (target, label, resolution) =
-            resolved_or_ambiguous(targets, module.split('.').next().unwrap_or(module), cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
     }
-    recurse(node, |child| collect_java(child, parsed, cwd, output));
+    let raw_offset = usize::from(parsed.language == Language::Dart && raw.starts_with(['r', 'R']));
+    let literal = &raw[raw_offset..];
+    let quote_bytes = if literal.starts_with("\"\"\"") || literal.starts_with("'''") {
+        3
+    } else if literal.starts_with(['\"', '\'', '`', '<']) {
+        1
+    } else {
+        return push_reference(
+            statement,
+            None,
+            "literal-delimiter-unsupported",
+            parsed,
+            output,
+        );
+    };
+    let (row, col) = point(value);
+    push_reference(
+        statement,
+        Some((row, col + raw_offset + quote_bytes)),
+        "",
+        parsed,
+        output,
+    )
 }
 
-fn collect_c_family(
+// Walk syntax reference tokens, not text split on punctuation. Servers alone assign identity.
+// Aliases/modifiers/comments are not references; wildcards remain explicitly unexpanded.
+fn named_references(
+    statement: Node<'_>,
     node: Node<'_>,
     parsed: &ParsedSyntax,
-    cwd: &Path,
-    output: &mut Vec<ImportEdge>,
-) {
-    if node.kind() == "preproc_include" {
-        let text = node_text(node, parsed);
-        let include = text
-            .split_once("include")
-            .map(|(_, rest)| rest.trim())
-            .unwrap_or_default();
-        let quoted = include.starts_with('"') && include.ends_with('"');
-        let name = include.trim_matches(['"', '<', '>']);
-        let target = quoted.then(|| parsed.path.parent().unwrap_or(cwd).join(name));
-        let (target, label, resolution) =
-            resolved_or_external(target.filter(|candidate| candidate.is_file()), name, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_c_family(child, parsed, cwd, output));
-}
-
-fn collect_bash(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "command" {
-        let text = node_text(node, parsed);
-        if text.starts_with("source ") || text.starts_with(". ") {
-            let argument = text
-                .split_once(' ')
-                .map(|(_, value)| value)
-                .unwrap_or_default();
-            let clean = argument.trim_matches(['\'', '"']);
-            let name = clean
-                .rsplit('/')
-                .next()
-                .unwrap_or(clean)
-                .trim_matches(['\'', '"']);
-            let candidate = parsed.path.parent().unwrap_or(cwd).join(name);
-            let (target, label, resolution) =
-                resolved_or_external(candidate.is_file().then_some(candidate), name, cwd);
-            output.push(edge(parsed, node, text, target, label, resolution));
-            return;
-        }
-    }
-    recurse(node, |child| collect_bash(child, parsed, cwd, output));
-}
-
-fn collect_go(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "import_spec"
-        && let Some(path_node) = node.child_by_field_name("path")
+    output: &mut Vec<ImportReference>,
+) -> Result<(), String> {
+    let kind = node.kind();
+    if kind.contains("comment")
+        || matches!(
+            kind,
+            "visibility_modifier" | "modifiers" | "annotation" | "attribute_item"
+        )
     {
-        let text = node_text(node, parsed);
-        let module = unquote(&source_slice(
-            &parsed.source,
-            path_node.start_byte(),
-            path_node.end_byte(),
-        ));
-        let (target, label, resolution) = resolved_or_external(None, &module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_go(child, parsed, cwd, output));
-}
-
-fn collect_ecmascript(
-    node: Node<'_>,
-    parsed: &ParsedSyntax,
-    cwd: &Path,
-    output: &mut Vec<ImportEdge>,
-) {
-    if matches!(node.kind(), "import_statement" | "export_statement")
-        && let Some(source_node) = node.child_by_field_name("source")
-    {
-        let text = node_text(node, parsed);
-        let module = unquote(&source_slice(
-            &parsed.source,
-            source_node.start_byte(),
-            source_node.end_byte(),
-        ));
-        let (target, label, resolution) = resolve_ecmascript(&parsed.path, &module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    if node.kind() == "call_expression"
-        && node
-            .child_by_field_name("function")
-            .is_some_and(|function| node_text(function, parsed) == "require")
-        && let Some(arguments) = node.child_by_field_name("arguments")
-        && let Some(source_node) = first_named_kind(arguments, "string")
-    {
-        let text = node_text(node, parsed);
-        let module = unquote(&source_slice(
-            &parsed.source,
-            source_node.start_byte(),
-            source_node.end_byte(),
-        ));
-        let (target, label, resolution) = resolve_ecmascript(&parsed.path, &module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_ecmascript(child, parsed, cwd, output));
-}
-
-fn collect_csharp(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "using_directive" {
-        let text = node_text(node, parsed);
-        let module = text
-            .trim_start_matches("global ")
-            .trim_start_matches("using ")
-            .trim_end_matches(';')
-            .trim();
-        let (target, label, resolution) = resolved_or_external(None, module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_csharp(child, parsed, cwd, output));
-}
-
-fn collect_powershell(
-    node: Node<'_>,
-    parsed: &ParsedSyntax,
-    cwd: &Path,
-    output: &mut Vec<ImportEdge>,
-) {
-    if node.kind() == "command" {
-        let text = node_text(node, parsed);
-        let lower = text.to_ascii_lowercase();
-        let argument = if lower.starts_with("import-module ") {
-            text.split_once(char::is_whitespace)
-                .map(|(_, rest)| rest.trim())
-        } else if text.starts_with(". ") {
-            text.split_once(' ').map(|(_, rest)| rest.trim())
-        } else {
-            None
-        };
-        if let Some(argument) = argument {
-            let module = unquote(
-                argument
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(argument)
-                    .trim_matches(['\'', '"']),
-            )
-            .replace('\\', "/");
-            let candidate = parsed.path.parent().unwrap_or(cwd).join(&module);
-            let (target, label, resolution) = resolved_or_external(
-                candidate.is_file().then_some(candidate),
-                module.trim_start_matches("./"),
-                cwd,
-            );
-            output.push(edge(parsed, node, text, target, label, resolution));
-            return;
-        }
-    }
-    recurse(node, |child| collect_powershell(child, parsed, cwd, output));
-}
-
-fn collect_php(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "namespace_use_declaration" {
-        let text = node_text(node, parsed);
-        let module = text.trim_start_matches("use ").trim_end_matches(';').trim();
-        let (target, label, resolution) = resolved_or_external(None, module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
+        return Ok(());
     }
     if matches!(
-        node.kind(),
-        "include_expression"
-            | "include_once_expression"
-            | "require_expression"
-            | "require_once_expression"
+        kind,
+        "wildcard_import" | "use_wildcard" | "asterisk" | "namespace_wildcard"
     ) {
-        let text = node_text(node, parsed);
-        if let Some(string) = descendant_kind(node, "string") {
-            let path = unquote(&source_slice(
-                &parsed.source,
-                string.start_byte(),
-                string.end_byte(),
-            ));
-            let candidate = parsed.path.parent().unwrap_or(cwd).join(&path);
-            let (target, label, resolution) =
-                resolved_or_external(candidate.is_file().then_some(candidate), &path, cwd);
-            output.push(edge(parsed, node, text, target, label, resolution));
-            return;
+        return push_reference(
+            statement,
+            None,
+            "wildcard-members-not-enumerated",
+            parsed,
+            output,
+        );
+    }
+    if matches!(kind, "aliased_import" | "use_as_clause")
+        && let Some(original) = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("path"))
+    {
+        return named_references(statement, original, parsed, output);
+    }
+    if kind == "import_alias" && parsed.language == Language::Kotlin {
+        return Ok(());
+    }
+    if matches!(kind, "import_alias" | "as_renamed_identifier")
+        && let Some(original) = node.named_child(0)
+    {
+        return named_references(statement, original, parsed, output);
+    }
+    if matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "property_identifier"
+            | "simple_identifier"
+            | "name"
+            | "operator_identifier"
+            | "self"
+            | "crate"
+            | "super"
+    ) && node.named_child_count() == 0
+    {
+        return push_reference(statement, Some(point(node)), "", parsed, output);
+    }
+    let mut cursor = node.walk();
+    for (index, child) in node.children(&mut cursor).enumerate() {
+        let field = node.field_name_for_child(index as u32);
+        if field == Some("alias")
+            || (parsed.language == Language::CSharp
+                && kind == "using_directive"
+                && field == Some("name"))
+        {
+            continue;
+        }
+        if child.is_named() {
+            named_references(statement, child, parsed, output)?;
         }
     }
-    recurse(node, |child| collect_php(child, parsed, cwd, output));
+    Ok(())
 }
 
-fn collect_kotlin(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "import_header" {
-        let text = node_text(node, parsed);
-        let module = text
-            .trim_start_matches("import ")
-            .split_once(" as ")
-            .map_or(text.trim_start_matches("import "), |(path, _)| path)
-            .trim_end_matches(".*")
-            .trim();
-        let relative = PathBuf::from(module.replace('.', "/")).with_extension("kt");
-        let targets = ancestor_source_targets(
-            &parsed.path,
-            cwd,
-            &relative,
-            &["", "src", "src/main/kotlin", "src/test/kotlin"],
-        );
-        let (target, label, resolution) =
-            resolved_or_ambiguous(targets, module.split('.').next().unwrap_or(module), cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_kotlin(child, parsed, cwd, output));
+fn first_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
 }
 
-fn collect_lua(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "function_call"
-        && node
-            .child_by_field_name("name")
-            .is_some_and(|name| node_text(name, parsed) == "require")
-        && let Some(arguments) = node.child_by_field_name("arguments")
-        && let Some(string) = descendant_kind(arguments, "string")
-    {
-        let text = node_text(node, parsed);
-        let module = unquote(&source_slice(
-            &parsed.source,
-            string.start_byte(),
-            string.end_byte(),
-        ));
-        let relative = PathBuf::from(module.replace('.', "/"));
-        let roots = [parsed.path.parent().unwrap_or(cwd), cwd];
-        let mut candidates = roots
-            .into_iter()
-            .flat_map(|root| {
-                [
-                    root.join(&relative).with_extension("lua"),
-                    root.join(&relative).join("init.lua"),
-                ]
-            })
-            .filter(|candidate| candidate.is_file())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.dedup();
-        let result = if candidates.len() == 1 {
-            checked_structural_target(candidates.remove(0), cwd)
-        } else if candidates.len() > 1 {
-            (None, format!("ambiguous:{module}"), "ambiguous")
-        } else {
-            resolved_or_external(None, &module, cwd)
-        };
-        output.push(edge(parsed, node, text, result.0, result.1, result.2));
-        return;
-    }
-    recurse(node, |child| collect_lua(child, parsed, cwd, output));
-}
-
-fn collect_hcl(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "block" {
-        let first_identifier = first_named_kind(node, "identifier");
-        if first_identifier.is_some_and(|identifier| node_text(identifier, parsed) == "module")
-            && let Some(body) = first_named_kind(node, "body")
+fn collect(
+    node: Node<'_>,
+    parsed: &ParsedSyntax,
+    output: &mut Vec<ImportReference>,
+) -> Result<(), String> {
+    let before = output.len();
+    let kind = node.kind();
+    let language = parsed.language;
+    let mut recognized = true;
+    match language {
+        Language::Python
+            if matches!(
+                kind,
+                "import_statement" | "import_from_statement" | "future_import_statement"
+            ) =>
         {
-            let mut cursor = body.walk();
-            for attribute in body
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "attribute")
+            named_references(node, node, parsed, output)?;
+        }
+        Language::Rust if kind == "use_declaration" => {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                named_references(node, argument, parsed, output)?;
+            }
+        }
+        Language::Rust if kind == "extern_crate_declaration" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                push_reference(node, Some(point(name)), "", parsed, output)?;
+            }
+        }
+        Language::Rust if kind == "mod_item" && node.child_by_field_name("body").is_none() => {
+            if let Some(name) = node.child_by_field_name("name") {
+                push_reference(node, Some(point(name)), "", parsed, output)?;
+            }
+        }
+        Language::JavaScript | Language::TypeScript
+            if matches!(kind, "import_statement" | "export_statement")
+                && node.child_by_field_name("source").is_some() =>
+        {
+            literal_reference(node, node.child_by_field_name("source"), parsed, output)?;
+        }
+        Language::JavaScript | Language::TypeScript if kind == "import_statement" => {
+            let source = first_child(node, "import_require_clause")
+                .and_then(|clause| clause.child_by_field_name("source"));
+            literal_reference(node, source, parsed, output)?;
+        }
+        Language::TypeScript if kind == "import_alias" => {
+            if let Some(original) = node.named_child(1) {
+                named_references(node, original, parsed, output)?;
+            }
+        }
+        Language::JavaScript | Language::TypeScript
+            if kind == "call_expression"
+                && node
+                    .child_by_field_name("function")
+                    .is_some_and(|name| matches!(text(name, parsed), "require" | "import")) =>
+        {
+            let argument = node
+                .child_by_field_name("arguments")
+                .and_then(|args| args.named_child(0));
+            literal_reference(node, argument, parsed, output)?;
+        }
+        Language::C | Language::Cpp | Language::Cuda if kind == "preproc_include" => {
+            literal_reference(node, node.child_by_field_name("path"), parsed, output)?;
+        }
+        Language::Go if kind == "import_spec" => {
+            literal_reference(node, node.child_by_field_name("path"), parsed, output)?;
+        }
+        Language::Bash
+            if kind == "command"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| matches!(text(name, parsed), "source" | ".")) =>
+        {
+            let argument = node.child_by_field_name("argument");
+            if let Some(value) = argument
+                .filter(|value| bash_literal(text(*value, parsed)).is_some_and(|v| !v.is_empty()))
             {
-                if first_named_kind(attribute, "identifier")
-                    .is_none_or(|identifier| node_text(identifier, parsed) != "source")
-                {
+                let (row, col) = point(value);
+                let quote = usize::from(text(value, parsed).starts_with(['\'', '"']));
+                push_reference(node, Some((row, col + quote)), "", parsed, output)?;
+            } else {
+                push_reference(node, None, "dynamic-shell-path", parsed, output)?;
+            }
+        }
+        _ if matches!(
+            (language, kind),
+            (
+                Language::Java | Language::Swift | Language::Scala,
+                "import_declaration"
+            ) | (Language::Kotlin, "import_header")
+                | (Language::CSharp, "using_directive")
+                | (Language::Php, "namespace_use_declaration")
+                | (Language::Julia, "using_statement" | "import_statement")
+        ) =>
+        {
+            named_references(node, node, parsed, output)?;
+        }
+        Language::Lua
+            if kind == "function_call"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| text(name, parsed) == "require") =>
+        {
+            literal_reference(
+                node,
+                node.child_by_field_name("arguments")
+                    .and_then(|args| args.named_child(0)),
+                parsed,
+                output,
+            )?;
+        }
+        Language::Php
+            if matches!(
+                kind,
+                "include_expression"
+                    | "include_once_expression"
+                    | "require_expression"
+                    | "require_once_expression"
+            ) =>
+        {
+            literal_reference(node, node.named_child(0), parsed, output)?;
+        }
+        Language::Ruby
+            if kind == "call"
+                && node.child_by_field_name("method").is_some_and(|name| {
+                    matches!(text(name, parsed), "require" | "require_relative" | "load")
+                }) =>
+        {
+            literal_reference(
+                node,
+                first_child(node, "argument_list").and_then(|args| args.named_child(0)),
+                parsed,
+                output,
+            )?;
+        }
+        Language::R
+            if kind == "call"
+                && node.child_by_field_name("function").is_some_and(|name| {
+                    matches!(
+                        text(name, parsed),
+                        "source" | "sys.source" | "library" | "require"
+                    )
+                }) =>
+        {
+            let function = node
+                .child_by_field_name("function")
+                .expect("matched function");
+            if matches!(text(function, parsed), "source" | "sys.source") {
+                let value = node.child_by_field_name("arguments").and_then(|args| {
+                    let mut cursor = args.walk();
+                    let arguments = args
+                        .children_by_field_name("argument", &mut cursor)
+                        .collect::<Vec<_>>();
+                    let file = arguments
+                        .iter()
+                        .find(|arg| {
+                            arg.child_by_field_name("name")
+                                .is_some_and(|name| text(name, parsed) == "file")
+                        })
+                        .or_else(|| {
+                            arguments
+                                .iter()
+                                .find(|arg| arg.child_by_field_name("name").is_none())
+                        });
+                    file.and_then(|arg| arg.child_by_field_name("value"))
+                });
+                literal_reference(node, value, parsed, output)?;
+            } else {
+                push_reference(
+                    node,
+                    None,
+                    "unevaluated-package-argument-unsupported",
+                    parsed,
+                    output,
+                )?;
+            }
+        }
+        Language::Elixir
+            if kind == "call"
+                && node.child_by_field_name("target").is_some_and(|name| {
+                    matches!(text(name, parsed), "alias" | "import" | "require" | "use")
+                }) =>
+        {
+            if let Some(module) = first_child(node, "arguments")
+                .and_then(|args| args.named_child(0))
+                .filter(|module| module.kind() == "alias")
+            {
+                push_reference(node, Some(point(module)), "", parsed, output)?;
+            } else {
+                push_reference(
+                    node,
+                    None,
+                    "macro-module-expansion-unsupported",
+                    parsed,
+                    output,
+                )?;
+            }
+        }
+        Language::Julia
+            if kind == "call_expression"
+                && node
+                    .named_child(0)
+                    .is_some_and(|name| text(name, parsed) == "include") =>
+        {
+            literal_reference(
+                node,
+                first_child(node, "argument_list").and_then(|args| args.named_child(0)),
+                parsed,
+                output,
+            )?;
+        }
+        Language::Dart
+            if matches!(kind, "library_import" | "library_export" | "part_directive") =>
+        {
+            collect_dart_uris(node, node, parsed, output)?;
+        }
+        Language::PowerShell
+            if kind == "command"
+                && (node
+                    .child_by_field_name("command_name")
+                    .is_some_and(|name| {
+                        text(name, parsed).eq_ignore_ascii_case("import-module")
+                    })
+                    || first_child(node, "command_invokation_operator")
+                        .is_some_and(|op| text(op, parsed) == ".")) =>
+        {
+            push_reference(
+                node,
+                None,
+                "shell-module-semantics-unsupported",
+                parsed,
+                output,
+            )?;
+        }
+        Language::Hcl
+            if kind == "block"
+                && first_child(node, "identifier")
+                    .is_some_and(|name| text(name, parsed) == "module") =>
+        {
+            push_reference(
+                node,
+                None,
+                "module-directory-membership-unsupported",
+                parsed,
+                output,
+            )?;
+        }
+        _ => recognized = false,
+    }
+    if recognized {
+        if output.len() == before {
+            push_reference(
+                node,
+                None,
+                "import-reference-syntax-unsupported",
+                parsed,
+                output,
+            )?;
+        }
+        return Ok(());
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect(child, parsed, output)?;
+    }
+    Ok(())
+}
+
+fn collect_dart_uris(
+    statement: Node<'_>,
+    node: Node<'_>,
+    parsed: &ParsedSyntax,
+    output: &mut Vec<ImportReference>,
+) -> Result<(), String> {
+    if node.kind() == "uri" {
+        return literal_reference(statement, node.named_child(0), parsed, output);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_dart_uris(statement, child, parsed, output)?;
+    }
+    Ok(())
+}
+
+fn bash_literal(argument: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut quote = None;
+    let mut chars = argument.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), _) => result.push(ch),
+            (None, '\'' | '"') => quote = Some(ch),
+            (_, '\\') => {
+                let next = chars.next()?;
+                if next == '\n' {
                     continue;
                 }
-                let text = node_text(attribute, parsed);
-                let Some(string) = descendant_kind(attribute, "string_lit") else {
-                    continue;
-                };
-                let source_path = unquote(&source_slice(
-                    &parsed.source,
-                    string.start_byte(),
-                    string.end_byte(),
-                ));
-                let candidate = parsed.path.parent().unwrap_or(cwd).join(&source_path);
-                let result = if candidate.is_file() {
-                    checked_structural_target(candidate, cwd)
-                } else {
-                    (None, source_path.clone(), "unresolved")
-                };
-                output.push(edge(parsed, attribute, text, result.0, result.1, result.2));
+                if quote == Some('"') && !matches!(next, '$' | '`' | '"' | '\\') {
+                    result.push('\\');
+                }
+                result.push(next);
             }
+            (_, '$' | '`') => return None,
+            (None, '~' | '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '<' | '>') => return None,
+            (None, ch) if ch.is_whitespace() => return None,
+            _ => result.push(ch),
         }
     }
-    recurse(node, |child| collect_hcl(child, parsed, cwd, output));
-}
-
-fn collect_r(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "call"
-        && let Some(function) = node.child_by_field_name("function")
-    {
-        let function_name = node_text(function, parsed);
-        if matches!(
-            function_name.as_str(),
-            "source" | "sys.source" | "library" | "require"
-        ) && let Some(arguments) = node.child_by_field_name("arguments")
-        {
-            let text = node_text(node, parsed);
-            let literal = descendant_kind(arguments, "string")
-                .or_else(|| descendant_kind(arguments, "identifier"));
-            if let Some(literal) = literal {
-                let value = unquote(&source_slice(
-                    &parsed.source,
-                    literal.start_byte(),
-                    literal.end_byte(),
-                ));
-                let result = if matches!(function_name.as_str(), "source" | "sys.source") {
-                    let candidate = parsed.path.parent().unwrap_or(cwd).join(&value);
-                    resolved_or_external(candidate.is_file().then_some(candidate), &value, cwd)
-                } else {
-                    resolved_or_external(None, &value, cwd)
-                };
-                output.push(edge(parsed, node, text, result.0, result.1, result.2));
-                return;
-            }
-        }
-    }
-    recurse(node, |child| collect_r(child, parsed, cwd, output));
-}
-
-fn collect_ruby(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "call"
-        && let Some(method) = node.child_by_field_name("method")
-    {
-        let method = node_text(method, parsed);
-        if matches!(method.as_str(), "require" | "require_relative" | "load")
-            && let Some(arguments) = first_named_kind(node, "argument_list")
-            && let Some(string) = descendant_kind(arguments, "string")
-        {
-            let module = unquote(&node_text(string, parsed));
-            let target = if method == "require_relative" {
-                resolve_relative_source(&parsed.path, &module, "rb")
-            } else {
-                None
-            };
-            let (target, label, resolution) = resolved_or_external(target, &module, cwd);
-            output.push(edge(
-                parsed,
-                node,
-                node_text(node, parsed),
-                target,
-                label,
-                resolution,
-            ));
-            return;
-        }
-    }
-    recurse(node, |child| collect_ruby(child, parsed, cwd, output));
-}
-
-fn collect_swift(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "import_declaration" {
-        let text = node_text(node, parsed);
-        let module = text.strip_prefix("import ").unwrap_or(&text).trim();
-        let (target, label, resolution) = resolved_or_external(None, module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_swift(child, parsed, cwd, output));
-}
-
-fn collect_scala(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "import_declaration" {
-        let text = node_text(node, parsed);
-        let module = text.strip_prefix("import ").unwrap_or(&text).trim();
-        let (target, label, resolution) = resolved_or_external(None, module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    recurse(node, |child| collect_scala(child, parsed, cwd, output));
-}
-
-fn collect_dart(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if matches!(
-        node.kind(),
-        "library_import" | "library_export" | "part_directive"
-    ) && let Some(string) = descendant_kind(node, "string_literal")
-    {
-        let module = unquote(&node_text(string, parsed));
-        let target = if module.starts_with("dart:") || module.starts_with("package:") {
-            None
-        } else {
-            resolve_relative_source(&parsed.path, &module, "dart")
-        };
-        let (target, label, resolution) = resolved_or_external(target, &module, cwd);
-        output.push(edge(
-            parsed,
-            node,
-            node_text(node, parsed),
-            target,
-            label,
-            resolution,
-        ));
-        return;
-    }
-    recurse(node, |child| collect_dart(child, parsed, cwd, output));
-}
-
-fn collect_elixir(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if node.kind() == "call"
-        && let Some(target_node) = node.child_by_field_name("target")
-    {
-        let target_name = node_text(target_node, parsed);
-        if matches!(target_name.as_str(), "alias" | "import" | "require" | "use")
-            && let Some(arguments) = first_named_kind(node, "arguments")
-            && let Some(module) = arguments.named_child(0)
-        {
-            let module = node_text(module, parsed);
-            let (target, label, resolution) = resolved_or_external(None, &module, cwd);
-            output.push(edge(
-                parsed,
-                node,
-                node_text(node, parsed),
-                target,
-                label,
-                resolution,
-            ));
-            return;
-        }
-    }
-    recurse(node, |child| collect_elixir(child, parsed, cwd, output));
-}
-
-fn collect_julia(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if matches!(node.kind(), "using_statement" | "import_statement") {
-        let text = node_text(node, parsed);
-        let module = text
-            .split_once(char::is_whitespace)
-            .map_or(text.as_str(), |(_, module)| module)
-            .trim();
-        let (target, label, resolution) = resolved_or_external(None, module, cwd);
-        output.push(edge(parsed, node, text, target, label, resolution));
-        return;
-    }
-    if node.kind() == "call_expression"
-        && let Some(function) = node.named_child(0)
-        && node_text(function, parsed) == "include"
-        && let Some(string) = descendant_kind(node, "string_literal")
-    {
-        let module = unquote(&node_text(string, parsed));
-        let target = resolve_relative_source(&parsed.path, &module, "jl");
-        let (target, label, resolution) = resolved_or_external(target, &module, cwd);
-        output.push(edge(
-            parsed,
-            node,
-            node_text(node, parsed),
-            target,
-            label,
-            resolution,
-        ));
-        return;
-    }
-    recurse(node, |child| collect_julia(child, parsed, cwd, output));
+    quote.is_none().then_some(result)
 }
 
 #[derive(Clone, Copy)]
@@ -692,11 +748,7 @@ impl<'a> LeanHeaderScanner<'a> {
     }
 }
 
-fn lean_imports_from_source(
-    path: &Path,
-    source: &str,
-    cwd: &Path,
-) -> Result<Vec<ImportEdge>, String> {
+fn lean_imports_from_source(source: &str) -> Result<Vec<ImportReference>, String> {
     let mut scanner = LeanHeaderScanner::new(source);
     consume_lean_header_keyword(&mut scanner, "module")?;
     consume_lean_header_keyword(&mut scanner, "prelude")?;
@@ -738,18 +790,18 @@ fn lean_imports_from_source(
                 .ok_or_else(|| format!("Lean import at line {line} has no module name"))?;
         }
         let module = scanner.token_text(module_token);
-        let relative = lean_module_path(module)
+        lean_module_path(module)
             .ok_or_else(|| format!("invalid Lean module name {module:?} at line {line}"))?;
-        let targets = ancestor_source_targets(path, cwd, &relative, &[""]);
-        let (target, target_label, resolution) = resolved_or_ambiguous(targets, module, cwd);
-        output.push(ImportEdge {
-            source: path.to_path_buf(),
+        let row_start = source[..module_token.start]
+            .rfind('\n')
+            .map_or(0, |at| at + 1);
+        output.push(ImportReference {
             line,
-            text: one_line(&source[start..module_token.end]),
-            target,
-            target_label,
-            resolution,
+            text: import_text(&source[start..module_token.end]),
+            position: Some((module_token.line - 1, module_token.start - row_start)),
+            unsupported: "",
         });
+        check_reference_limit(&output)?;
     }
     Ok(output)
 }
@@ -817,471 +869,154 @@ fn push_lean_module_segment(relative: &mut PathBuf, segment: &mut String) -> boo
     true
 }
 
-fn resolve_relative_source(path: &Path, module: &str, default_extension: &str) -> Option<PathBuf> {
-    let base = path.parent()?.join(module);
-    if base.is_file() {
-        return Some(base);
-    }
-    if base.extension().is_none() {
-        let with_extension = base.with_extension(default_extension);
-        if with_extension.is_file() {
-            return Some(with_extension);
-        }
-    }
-    None
-}
-
-fn resolve_ecmascript(
-    path: &Path,
-    module: &str,
-    cwd: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    if !module.starts_with('.') {
-        let package = if module.starts_with('@') {
-            module.split('/').take(2).collect::<Vec<_>>().join("/")
-        } else {
-            module.split('/').next().unwrap_or(module).to_owned()
-        };
-        return (None, format!("external:{package}"), "external");
-    }
-    let base = path.parent().unwrap_or(cwd).join(module);
-    let extensions = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"];
-    let target = if base.is_file() {
-        Some(base)
-    } else {
-        extensions
-            .iter()
-            .map(|extension| base.with_extension(extension))
-            .find(|candidate| candidate.is_file())
-            .or_else(|| {
-                extensions
-                    .iter()
-                    .map(|extension| base.join(format!("index.{extension}")))
-                    .find(|candidate| candidate.is_file())
-            })
-    };
-    resolved_or_external(target, module, cwd)
-}
-
-fn unquote(value: &str) -> String {
-    value.trim().trim_matches(['\'', '"', '`']).to_owned()
-}
-
-fn first_named_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-fn descendant_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-        if let Some(found) = descendant_kind(child, kind) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn node_text(node: Node<'_>, parsed: &ParsedSyntax) -> String {
-    one_line(&source_slice(
-        &parsed.source,
-        node.start_byte(),
-        node.end_byte(),
-    ))
-}
-
-fn edge(
-    parsed: &ParsedSyntax,
-    node: Node<'_>,
-    text: String,
-    target: Option<PathBuf>,
-    target_label: String,
-    resolution: &'static str,
-) -> ImportEdge {
-    ImportEdge {
-        source: parsed.path.clone(),
-        line: node.start_position().row + 1,
-        text,
-        target,
-        target_label,
-        resolution,
-    }
-}
-
-fn resolved_or_external(
-    target: Option<PathBuf>,
-    external: &str,
-    cwd: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    if let Some(target) = target {
-        return checked_structural_target(target, cwd);
-    }
-    (None, format!("external:{external}"), "external")
-}
-
-fn resolved_or_ambiguous(
-    mut targets: Vec<PathBuf>,
-    external: &str,
-    cwd: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    match targets.len() {
-        0 => (None, format!("external:{external}"), "external"),
-        1 => checked_structural_target(targets.remove(0), cwd),
-        _ => (None, format!("ambiguous:{external}"), "ambiguous"),
-    }
-}
-
-fn ancestor_source_targets(
-    path: &Path,
-    cwd: &Path,
-    relative: &Path,
-    prefixes: &[&str],
-) -> Vec<PathBuf> {
-    let mut targets = Vec::new();
-    let mut current = path.parent();
-    while let Some(root) = current {
-        if !root.starts_with(cwd) {
-            break;
-        }
-        for prefix in prefixes {
-            let candidate = root.join(prefix).join(relative);
-            if candidate.is_file() && !targets.contains(&candidate) {
-                targets.push(candidate);
-            }
-        }
-        if root == cwd {
-            break;
-        }
-        current = root.parent();
-    }
-    targets
-}
-
-fn recurse(node: Node<'_>, mut visit: impl FnMut(Node<'_>)) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit(child);
-    }
-}
-
-fn collect_python(node: Node<'_>, parsed: &ParsedSyntax, cwd: &Path, output: &mut Vec<ImportEdge>) {
-    if matches!(node.kind(), "import_statement" | "import_from_statement") {
-        let text = one_line(&source_slice(
-            &parsed.source,
-            node.start_byte(),
-            node.end_byte(),
-        ));
-        let modules = if let Some(rest) = text.strip_prefix("from ") {
-            rest.split_once(" import ")
-                .map(|(module, _)| vec![module])
-                .unwrap_or_default()
-        } else {
-            text.strip_prefix("import ")
-                .map(|rest| {
-                    rest.split(',')
-                        .filter_map(|part| part.split_whitespace().next())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        for module in modules {
-            let (target, label, resolution) = resolve_python(&parsed.path, module, cwd);
-            output.push(ImportEdge {
-                source: parsed.path.clone(),
-                line: node.start_position().row + 1,
-                text: text.clone(),
-                target,
-                target_label: label,
-                resolution,
-            });
-        }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_python(child, parsed, cwd, output);
-    }
-}
-
-fn resolve_python(
-    path: &Path,
-    module: &str,
-    cwd: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    let relative_count = module.bytes().take_while(|byte| *byte == b'.').count();
-    let module_name = &module[relative_count..];
-    let module_path = module_name.replace('.', "/");
-    let mut bases = Vec::new();
-    if relative_count == 0 {
-        let mut current = path.parent();
-        while let Some(base) = current {
-            if !base.starts_with(cwd) {
-                break;
-            }
-            bases.push(base.to_path_buf());
-            bases.push(base.join("src"));
-            if base == cwd {
-                break;
-            }
-            current = base.parent();
-        }
-    } else {
-        let mut base = path.parent().unwrap_or(cwd).to_path_buf();
-        if relative_count > 1 {
-            for _ in 1..relative_count {
-                base.pop();
-            }
-        }
-        bases.push(base);
-    }
-    let mut targets = Vec::new();
-    for mut base in bases {
-        if !module_path.is_empty() {
-            base.push(&module_path);
-        }
-        if let Some(target) = existing_module(&base, "py")
-            && !targets.contains(&target)
-        {
-            targets.push(target);
-        }
-    }
-    if targets.len() == 1 {
-        return checked_structural_target(targets.remove(0), cwd);
-    }
-    let external = module_name
-        .split('.')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(module)
-        .trim_start_matches('.');
-    if targets.len() > 1 {
-        return (None, format!("ambiguous:{external}"), "ambiguous");
-    }
-    (None, format!("external:{external}"), "external")
-}
-
-fn existing_module(base: &Path, extension: &str) -> Option<PathBuf> {
-    let file = base.with_extension(extension);
-    if file.is_file() {
-        return Some(file);
-    }
-    let package = base.join(format!("__init__.{extension}"));
-    package.is_file().then_some(package)
-}
-
-fn collect_rust(
-    node: Node<'_>,
-    parsed: &ParsedSyntax,
-    cwd: &Path,
-    source_root: &Path,
-    output: &mut Vec<ImportEdge>,
-) {
-    if node.kind() == "mod_item" && node.child_by_field_name("body").is_none() {
-        let text = one_line(&source_slice(
-            &parsed.source,
-            node.start_byte(),
-            node.end_byte(),
-        ));
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = source_slice(&parsed.source, name_node.start_byte(), name_node.end_byte());
-            let base = parsed.path.parent().unwrap_or(cwd).join(name.as_ref());
-            let target = existing_rust_module(&base).map(|path| absolute_lexical(&path, cwd));
-            let resolution = if target.is_some() {
-                "structural"
-            } else {
-                "unresolved"
-            };
-            let label = target
-                .as_deref()
-                .map(|path| display_path(path, cwd))
-                .unwrap_or_else(|| format!("module:{name}"));
-            output.push(ImportEdge {
-                source: parsed.path.clone(),
-                line: node.start_position().row + 1,
-                text,
-                target,
-                target_label: label,
-                resolution,
-            });
-        }
-        return;
-    }
-    if node.kind() == "use_declaration" {
-        let text = one_line(&source_slice(
-            &parsed.source,
-            node.start_byte(),
-            node.end_byte(),
-        ));
-        let path_text = text
-            .trim_start_matches("pub ")
-            .trim_start_matches("use ")
-            .trim_end_matches(';');
-        let (target, label, resolution) = resolve_rust(&parsed.path, path_text, cwd, source_root);
-        output.push(ImportEdge {
-            source: parsed.path.clone(),
-            line: node.start_position().row + 1,
-            text,
-            target,
-            target_label: label,
-            resolution,
-        });
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_rust(child, parsed, cwd, source_root, output);
-    }
-}
-
-fn existing_rust_module(base: &Path) -> Option<PathBuf> {
-    let file = base.with_extension("rs");
-    if file.is_file() {
-        return Some(file);
-    }
-    let module = base.join("mod.rs");
-    module.is_file().then_some(module)
-}
-
-fn resolve_rust(
-    path: &Path,
-    raw: &str,
-    cwd: &Path,
-    source_root: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    let normalized = raw.replace(' ', "");
-    let prefix = normalized
-        .split(['{', '*'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches("::");
-    let mut parts = prefix.split("::").filter(|part| !part.is_empty());
-    let first = parts.next().unwrap_or_default();
-    if matches!(first, "std" | "core" | "alloc") {
-        return (None, format!("external:{first}"), "external");
-    }
-    let mut base;
-    let mut segments = Vec::new();
-    match first {
-        "crate" => {
-            base = source_root.to_path_buf();
-            segments.extend(parts);
-        }
-        "self" => {
-            base = path.parent().unwrap_or(cwd).to_path_buf();
-            segments.extend(parts);
-        }
-        "super" => {
-            base = path.parent().unwrap_or(cwd).to_path_buf();
-            let mut remaining = parts.peekable();
-            while remaining.peek() == Some(&"super") {
-                remaining.next();
-                let Some(parent) = base.parent() else {
-                    return (None, "outside-workspace".into(), "blocked");
-                };
-                if !parent.starts_with(source_root) {
-                    return (None, "outside-workspace".into(), "blocked");
-                }
-                base = parent.to_path_buf();
-            }
-            segments.extend(remaining);
-        }
-        "" => return (None, "external:unknown".into(), "unresolved"),
-        local => {
-            base = path.parent().unwrap_or(cwd).to_path_buf();
-            segments.push(local);
-            segments.extend(parts);
-        }
-    }
-    if segments.is_empty() {
-        return (None, format!("external:{first}"), "unresolved");
-    }
-    // The longest prefix that names a file/module wins; trailing segments are imported items.
-    while !segments.is_empty() {
-        let mut candidate = base.clone();
-        for segment in &segments {
-            candidate.push(segment);
-        }
-        if let Some(target) = existing_rust_module(&candidate) {
-            return checked_structural_target(target, cwd);
-        }
-        segments.pop();
-    }
-    (None, format!("external:{first}"), "external")
-}
-
-fn checked_structural_target(
-    target: PathBuf,
-    cwd: &Path,
-) -> (Option<PathBuf>, String, &'static str) {
-    let lexical = absolute_lexical(&target, cwd);
-    let canonical_root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let canonical_target = fs::canonicalize(&lexical).unwrap_or_else(|_| lexical.clone());
-    if !canonical_target.starts_with(&canonical_root) {
-        return (None, "outside-workspace".into(), "blocked");
-    }
-    let label = display_path(&lexical, cwd);
-    (Some(lexical), label, "structural")
-}
-
-fn find_rust_source_root(path: &Path, cwd: &Path) -> PathBuf {
-    let mut current = path.parent().unwrap_or(cwd);
-    loop {
-        if current.join("lib.rs").is_file() || current.join("main.rs").is_file() {
-            return current.to_path_buf();
-        }
-        if current == cwd {
-            return cwd.to_path_buf();
-        }
-        let Some(parent) = current.parent() else {
-            return cwd.to_path_buf();
-        };
-        current = parent;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{imports_from_path, lean_module_path, resolve_rust};
+    use super::{extract_imports, lean_module_path};
     use crate::language::Language;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn resolves_multiple_leading_rust_super_components() {
+    fn bundled_import_syntax_retains_references_or_explicit_unsupported_occurrences() {
         let root = std::env::temp_dir().join(format!(
-            "pira-nav-rust-super-{}-{}",
+            "nav-import-syntax-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(root.join("a")).unwrap();
-        fs::write(root.join("lib.rs"), "mod c; mod a;").unwrap();
-        fs::write(root.join("c.rs"), "pub struct Thing;").unwrap();
-        let source = root.join("a/b.rs");
-        fs::write(&source, "use super::super::c::Thing;").unwrap();
-
-        let (target, _, resolution) = resolve_rust(&source, "super::super::c::Thing", &root, &root);
-        assert_eq!(resolution, "structural");
-        assert_eq!(target, Some(root.join("c.rs")));
-        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Expectations derive from grammar operand roles, not the old guessed target paths.
+        for (language, suffix, source, resolves) in [
+            (Language::Python, "py", "from x import y as z\n", true),
+            (
+                Language::Rust,
+                "rs",
+                "pub(crate) use x::{y as z, a};\n",
+                true,
+            ),
+            (Language::JavaScript, "js", "import x from './x';\n", true),
+            (
+                Language::TypeScript,
+                "ts",
+                "import x = require('./x');\n",
+                true,
+            ),
+            (Language::C, "c", "#include \"a.h\"\n", true),
+            (Language::Cpp, "cpp", "#include <a.h>\n", true),
+            (Language::Cuda, "cu", "#include \"a.h\"\n", true),
+            (Language::Go, "go", "package main\nimport \"x\"\n", true),
+            (Language::Java, "java", "import x.Y;\n", true),
+            (Language::Kotlin, "kt", "import x.Y as Z\n", true),
+            (Language::Swift, "swift", "import X\n", true),
+            (Language::Scala, "scala", "import x.Y\n", true),
+            (Language::CSharp, "cs", "using X.Y;\n", true),
+            (Language::Php, "php", "<?php use X\\Y as Z;\n", true),
+            (Language::Php, "php", "<?php require 'x.php';\n", true),
+            (Language::Lua, "lua", "require('x')\n", true),
+            (Language::Bash, "sh", "source \"x.sh\"\n", true),
+            (Language::Ruby, "rb", "require_relative 'x'\n", true),
+            (Language::R, "R", "source('x.R')\n", true),
+            (Language::R, "R", "library(x)\n", false),
+            (Language::Elixir, "ex", "alias X.Y\n", true),
+            (Language::Julia, "jl", "using X\n", true),
+            (Language::Julia, "jl", "include(\"x.jl\")\n", true),
+            (Language::Dart, "dart", "import 'x.dart';\n", true),
+            (Language::PowerShell, "ps1", "Import-Module x\n", false),
+            (
+                Language::Hcl,
+                "tf",
+                "module \"x\" { source = \"./x\" }\n",
+                false,
+            ),
+        ] {
+            let path = root.join(format!("sample.{suffix}"));
+            fs::write(&path, source).unwrap();
+            let (_, references) = extract_imports(&path, language)
+                .unwrap_or_else(|e| panic!("{language:?} {source:?}: {e}"));
+            assert!(
+                !references.is_empty(),
+                "{language:?}: import disappeared: {source:?}"
+            );
+            assert_eq!(
+                references.iter().any(|r| r.position.is_some()),
+                resolves,
+                "{language:?}: {source:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn blocks_rust_super_components_above_source_root() {
-        let root = PathBuf::from("/workspace/src");
-        let source = root.join("a.rs");
-        let (target, label, resolution) =
-            resolve_rust(&source, "super::super::outside", &root, &root);
-        assert!(target.is_none());
-        assert_eq!(label, "outside-workspace");
-        assert_eq!(resolution, "blocked");
+    fn csharp_resource_statements_are_not_imports() {
+        let root = std::env::temp_dir().join(format!(
+            "nav-import-roles-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.cs");
+        fs::write(
+            &path,
+            "class C { void F() { using (var x = Get()) { Work(); } } }",
+        )
+        .unwrap();
+        assert!(
+            extract_imports(&path, Language::CSharp)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r_source_queries_file_not_other_named_string_options() {
+        let root = std::env::temp_dir().join(format!(
+            "nav-r-import-roles-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.R");
+        fs::write(&path, "source(encoding='UTF-8', file='x.R')\n").unwrap();
+        let (source, references) = extract_imports(&path, Language::R).unwrap();
+        assert_eq!(references.len(), 1);
+        let (_, column) = references[0].position.unwrap();
+        assert!(
+            source[column..].starts_with("x.R"),
+            "queried wrong operand: {}",
+            &source[column..]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dynamic_operands_never_resolve_arbitrary_descendant_literals() {
+        let root = std::env::temp_dir().join(format!(
+            "nav-import-dynamic-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for (language, suffix, source) in [
+            (Language::JavaScript, "js", "require(prefix + './x');\n"),
+            (Language::Php, "php", "<?php require $prefix . 'x.php';\n"),
+            (Language::Lua, "lua", "require(prefix .. 'x')\n"),
+            (Language::Ruby, "rb", "require_relative \"#{prefix}/x\"\n"),
+            (Language::Bash, "sh", "source \"$BASE/x\"\n"),
+            (Language::C, "c", "#include HEADER\n"),
+            (Language::R, "R", "source(paste0(prefix, 'x.R'))\n"),
+        ] {
+            let path = root.join(format!("sample.{suffix}"));
+            fs::write(&path, source).unwrap();
+            let (_, references) = extract_imports(&path, language).unwrap();
+            assert_eq!(references.len(), 1, "{language:?}: {source:?}");
+            assert!(references[0].position.is_none(), "{language:?}: {source:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1304,10 +1039,10 @@ mod tests {
         )
         .unwrap();
 
-        let edges = imports_from_path(&source, Language::Lean, &root).unwrap();
+        let (_, edges) = extract_imports(&source, Language::Lean).unwrap();
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].target, Some(root.join("Demo/Base.lean")));
-        assert_eq!(edges[0].resolution, "structural");
+        assert!(edges[0].position.is_some());
+        assert_eq!(edges[0].position, Some((0, 7)));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1339,14 +1074,14 @@ mod tests {
         )
         .unwrap();
 
-        let edges = imports_from_path(&source, Language::Lean, &root).unwrap();
+        let (_, edges) = extract_imports(&source, Language::Lean).unwrap();
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[0].line, 4);
         assert_eq!(edges[0].text, "public meta import all Demo.Base");
-        assert_eq!(edges[0].target, Some(root.join("Demo/Base.lean")));
+        assert!(edges[0].position.is_some());
         assert_eq!(edges[1].line, 5);
         assert_eq!(edges[1].text, "import Demo.«Quoted Name»");
-        assert_eq!(edges[1].target, Some(root.join("Demo/Quoted Name.lean")));
+        assert_eq!(edges[1].position, Some((4, 7)));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1361,7 +1096,7 @@ mod tests {
         let source = root.join("Malformed.lean");
         fs::write(&source, "/- import Demo.Base\n").unwrap();
 
-        let error = imports_from_path(&source, Language::Lean, &root).unwrap_err();
+        let error = extract_imports(&source, Language::Lean).err().unwrap();
         assert!(error.contains("unterminated block comment"));
         let _ = fs::remove_dir_all(&root);
     }

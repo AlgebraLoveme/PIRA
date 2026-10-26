@@ -4,19 +4,33 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BROKEN_PIPE: &str = "__PIRA_CTX_BROKEN_PIPE__";
 pub const MAX_DISPLAY_READ_BYTES: u64 = 64 * 1024;
-pub const MAX_SEARCH_LINE_BYTES: u64 = 128 * 1024;
+pub const MAX_SEARCH_LINE_BYTES: u64 = 16 * 1024 * 1024;
 const DISPLAY_CLIP_BYTES: usize = 1200;
 
 pub struct BoundedStdout {
     remaining: usize,
     truncated: bool,
+    stderr: bool,
 }
 
 impl BoundedStdout {
     pub fn new(maximum_bytes: usize) -> Self {
+        Self::report(maximum_bytes, None)
+    }
+
+    pub fn report(maximum_bytes: usize, redirected: Option<crate::model::StreamKind>) -> Self {
         Self {
             remaining: maximum_bytes,
             truncated: false,
+            stderr: redirected == Some(crate::model::StreamKind::Stdout),
+        }
+    }
+
+    fn emit(&self, text: &str) -> Result<(), String> {
+        if self.stderr {
+            writeln!(io::stderr().lock(), "{text}").map_err(io_error)
+        } else {
+            stdout_line(text)
         }
     }
 
@@ -26,8 +40,10 @@ impl BoundedStdout {
         }
         let clean = sanitize_terminal(text);
         let needed = clean.len().saturating_add(1);
-        if needed <= self.remaining {
-            stdout_line(&clean)?;
+        // Reserve the marker even when the next line nearly fills the budget.
+        const RESERVE: usize = "[pira_ctx output truncated by byte limit]".len() + 1;
+        if needed <= self.remaining.saturating_sub(RESERVE) {
+            self.emit(&clean)?;
             self.remaining -= needed;
             return Ok(());
         }
@@ -35,11 +51,11 @@ impl BoundedStdout {
         let marker_needed = MARKER.len() + 1;
         let available = self.remaining.saturating_sub(marker_needed + 1);
         if available > 0 {
-            stdout_line(safe_prefix(&clean, available))?;
+            self.emit(safe_prefix(&clean, available))?;
             self.remaining = self.remaining.saturating_sub(available + 1);
         }
         if marker_needed <= self.remaining {
-            stdout_line(MARKER)?;
+            self.emit(MARKER)?;
         }
         self.remaining = 0;
         self.truncated = true;
@@ -55,9 +71,32 @@ pub fn io_error(error: io::Error) -> String {
     }
 }
 
+pub(crate) fn open_regular_file(path: &Path, label: &str) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    // Check both sides of open: nonblocking open also closes the FIFO replacement race.
+    if !std::fs::metadata(path)
+        .map_err(|e| format!("inspect {label}: {e}"))?
+        .is_file()
+    {
+        return Err(format!("{label} is not a regular file"));
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("open {label} {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!("{label} is not a regular file"));
+    }
+    Ok(file)
+}
+
 pub fn read_file_limited(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+    let file = open_regular_file(path, label)?;
     let mut bytes = Vec::new();
     file.take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -407,5 +446,120 @@ mod tests {
         assert!(excerpt.contains("NEEDLE"));
         assert!(excerpt.len() < 1_100);
         assert!(excerpt.contains("bytes omitted"));
+    }
+}
+
+// Pipes are ambiguous: Codex itself uses them. Only known non-display destinations bypass routing.
+#[cfg(unix)]
+fn is_data_destination(stream: &impl std::os::fd::AsFd) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    stream
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| std::fs::File::from(fd).metadata().ok())
+        .is_some_and(|metadata| {
+            let kind = metadata.file_type();
+            kind.is_file() || kind.is_char_device()
+        })
+}
+
+#[cfg(windows)]
+fn is_data_destination(stream: &impl std::os::windows::io::AsRawHandle) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_DISK, GetFileType};
+    // SAFETY: standard output/error own valid handles for the duration of this query.
+    matches!(
+        unsafe { GetFileType(stream.as_raw_handle()) },
+        FILE_TYPE_DISK | FILE_TYPE_CHAR
+    )
+}
+
+pub fn stdout_is_data_destination() -> bool {
+    use std::io::IsTerminal;
+    #[cfg(any(unix, windows))]
+    {
+        !io::stdout().is_terminal() && is_data_destination(&io::stdout())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+pub fn stderr_is_data_destination() -> bool {
+    use std::io::IsTerminal;
+    #[cfg(any(unix, windows))]
+    {
+        !io::stderr().is_terminal() && is_data_destination(&io::stderr())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+fn escape_diagnostic(text: &str) -> String {
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        if ch == '\\'
+            || ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
+/// Do not append wrapper diagnostics to a caller's redirected data stream.
+pub fn diagnostic_line(text: &str) {
+    let text = escape_diagnostic(text);
+    if !stderr_is_data_destination() {
+        let _ = writeln!(io::stderr().lock(), "{text}");
+    } else if !stdout_is_data_destination() {
+        let _ = writeln!(io::stdout().lock(), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_controls_are_escaped_without_erasing_identity() {
+        assert_eq!(
+            escape_diagnostic("x\x1b[31m\u{202e}\n\\"),
+            r"x\u{1b}[31m\u{202e}\n\\"
+        );
+        assert_eq!(escape_diagnostic("plain café"), "plain café");
+        assert_ne!(escape_diagnostic("\x1b"), escape_diagnostic(r"\u{1b}"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bounded_inputs_reject_fifo_and_directory_and_accept_regular_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("ctx-input-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        for path in [&dir, &fifo] {
+            assert!(
+                read_file_limited(path, 5, "input")
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+            assert!(
+                crate::storage::read_result_path(path)
+                    .unwrap_err()
+                    .contains("not a regular file")
+            );
+        }
+        let file = dir.join("plain");
+        std::fs::write(&file, b"hello").unwrap();
+        assert_eq!(read_file_limited(&file, 5, "input").unwrap(), b"hello");
+        assert!(read_file_limited(&file, 4, "input").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -8,7 +7,7 @@ use serde_json::Value;
 use crate::command::{CommandError, input_error};
 use crate::language::Language;
 use crate::lsp::{LspConfig, LspConfigs, auto_server_available};
-use crate::util::absolute_lexical;
+use crate::util::{absolute_lexical, open_regular_file};
 
 const MAX_LSP_CONFIG_BYTES: u64 = 64 * 1024;
 
@@ -33,6 +32,14 @@ impl LspOptions {
         self.native_only
     }
 
+    pub fn forces_language(&self, language: Language) -> bool {
+        self.default.executable.is_some()
+            || self
+                .languages
+                .get(&language)
+                .is_some_and(|server| server.executable.is_some())
+    }
+
     pub fn forced_lsp(&self) -> (bool, BTreeSet<Language>) {
         let all = self.default.executable.is_some();
         let languages = self
@@ -47,7 +54,7 @@ impl LspOptions {
         self.root.as_deref().unwrap_or(default_root)
     }
 
-    pub fn has_server(&self, language: Language) -> bool {
+    pub fn has_server(&self, language: Language, default_root: &Path) -> bool {
         self.languages
             .get(&language)
             .and_then(|server| server.executable.as_ref())
@@ -55,7 +62,7 @@ impl LspOptions {
             || self.default.executable.is_some()
             || (self.default.executable.is_none()
                 && !self.languages.contains_key(&language)
-                && auto_server_available(language))
+                && auto_server_available(language, self.root(default_root)))
     }
 
     pub fn config(&self, default_root: &Path) -> Result<LspConfigs, CommandError> {
@@ -118,12 +125,8 @@ fn build_config(
 }
 
 fn read_json(path: &Path, option: &str) -> Result<Value, CommandError> {
-    let file = File::open(path).map_err(|error| {
-        (
-            2,
-            format!("cannot open {option} file {}: {error}", path.display()),
-        )
-    })?;
+    let file =
+        open_regular_file(path).map_err(|error| input_error(format!("{option}: {error}")))?;
     let metadata = file.metadata().map_err(|error| {
         (
             2,
@@ -190,7 +193,9 @@ pub fn parse(
             if !supports_lsp(command) {
                 return Err((
                     2,
-                    format!("{option} is supported only by structural/LSP navigation commands"),
+                    format!(
+                        "{option} is supported only by structural, dependency, or LSP navigation commands"
+                    ),
                 ));
             }
             let value = args
@@ -282,6 +287,12 @@ pub fn parse(
             index += 1;
         } else {
             remaining.push(args[index].clone());
+            if crate::cli::option_takes_value(option)
+                && let Some(operand) = args.get(index + 1)
+            {
+                remaining.push(operand.clone());
+                index += 1;
+            }
             index += 1;
         }
     }
@@ -309,7 +320,10 @@ fn supports_native_structural(command: &str) -> bool {
 fn supports_lsp(command: &str) -> bool {
     matches!(
         command,
-        "outline"
+        "imports"
+            | "dependents"
+            | "deps"
+            | "outline"
             | "show"
             | "map"
             | "symbols"
