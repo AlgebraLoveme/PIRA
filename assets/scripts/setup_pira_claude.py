@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Connect shared PIRA policy through a Claude user rule, without a CLAUDE.md shim."""
+"""Connect isolated Claude-native PIRA policy through a Claude user rule, without a CLAUDE.md shim."""
 
 from __future__ import annotations
 
@@ -124,6 +124,9 @@ def source_policy(agent_dir: Path) -> Path:
     policy = agent_dir / "AGENTS.md"
     if not policy.is_file():
         raise RuntimeError(f"expected a readable PIRA policy at {policy}")
+    for source in (policy, *sorted((agent_dir / "modules").glob("*.md"))):
+        if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
+            raise RuntimeError(f"Claude policy source must be an independent regular file: {source}")
     try:
         content = policy.read_text(encoding="utf-8")
     except UnicodeError as error:
@@ -457,14 +460,17 @@ def tools_setup(repo_root: Path, *, verify: bool, dry_run: bool) -> None:
 
 def install(args: argparse.Namespace, repo_root: Path) -> None:
     agent_dir = expand(args.agent_dir)
-    if agent_dir != expand("~/agent"):
-        print(
-            "WARNING: PIRA policy module paths assume ~/agent; "
-            "a custom --agent-dir is for controlled testing."
-        )
     claude_dir = expand(args.claude_dir)
     for directory in (agent_dir, agent_dir / "modules", claude_dir):
         require_resolved_directory(directory)
+    if agent_dir != expand("~/agent-claude"):
+        raise RuntimeError(
+            "Claude policy paths require ~/agent-claude; custom --agent-dir is unsupported. "
+            "Keep Codex at ~/agent. To migrate an existing shared-source installation, "
+            "run --uninstall first (preserves profiles), then install from ~/agent-claude."
+        )
+    if claude_dir != expand("~/.claude"):
+        raise RuntimeError("Claude profile paths require ~/.claude; custom --claude-dir is unsupported.")
     policy = source_policy(agent_dir)
     entry = claude_dir / "rules" / RULE_FILE
     settings_path = claude_dir / "settings.json"
@@ -489,7 +495,7 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
     check_read_conflicts(settings, read_rules, claude_dir)
     print(f"PIRA module read allowance: {read_rule}")
     print(f"Claude private profile read allowance: {user_rule}")
-    print(f"Shared fallback profile read allowance: {shared_user_rule}")
+    print(f"Checkout fallback profile read allowance: {shared_user_rule}")
     legacy = legacy_without_pira(legacy_path)
     if entry.exists() or entry.is_symlink():
         install_entry(entry, policy, manifest, dry_run=True, copy_policy=copy_policy)
@@ -534,7 +540,7 @@ def install(args: argparse.Namespace, repo_root: Path) -> None:
             "Claude both-files mode": prior_mode == MODE,
             "PIRA module read permission": read_rule in allowed,
             "Claude private profile read permission": user_rule in allowed,
-            "Shared fallback profile read permission": shared_user_rule in allowed,
+            "Checkout fallback profile read permission": shared_user_rule in allowed,
             "legacy PIRA CLAUDE.md bridge absent": legacy is None,
             "install manifest": manifest_path.is_file(),
         }
@@ -622,7 +628,7 @@ def uninstall(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--agent-dir", default="~/agent", help="Canonical PIRA checkout, shared with Codex.")
+    parser.add_argument("--agent-dir", default="~/agent-claude", help="Claude-only checkout (must be ~/agent-claude); keep Codex at ~/agent.")
     parser.add_argument("--claude-dir", default="~/.claude", help="Claude Code user configuration directory.")
     parser.add_argument("--claude-bin", default="claude", help="Claude Code executable for version checking.")
     parser.add_argument("--user-mode", choices=("placeholder", "keep"), default="placeholder")

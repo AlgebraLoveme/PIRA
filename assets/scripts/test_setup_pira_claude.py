@@ -38,7 +38,10 @@ class ClaudeSetupTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name).resolve()
-        self.agent = root / "agent"
+        home = patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root)})
+        home.start()
+        self.addCleanup(home.stop)
+        self.agent = root / "agent-claude"
         self.claude = root / ".claude"
         (self.agent / "modules").mkdir(parents=True)
         (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\n", encoding="utf-8")
@@ -57,6 +60,140 @@ class ClaudeSetupTests(unittest.TestCase):
 
     def settings(self) -> dict[str, object]:
         return json.loads((self.claude / "settings.json").read_text(encoding="utf-8"))
+
+    def test_shared_source_file_aliases_are_refused_before_mutation(self) -> None:
+        for name in ("AGENTS.md", "modules/CODING_STYLE.md"):
+            source = self.agent / name
+            content = source.read_bytes()
+            shared = self.claude.parent / "shared-policy.md"
+            shared.write_bytes(content)
+            for alias in ("hardlink", "symlink"):
+                with self.subTest(name=name, alias=alias):
+                    source.unlink()
+                    try:
+                        if alias == "hardlink":
+                            os.link(shared, source)
+                        else:
+                            source.symlink_to(shared)
+                    except OSError as error:
+                        source.write_bytes(content)
+                        if getattr(error, "winerror", None) == 1314:
+                            continue  # Non-elevated Windows can lack symlink permission.
+                        raise
+                    try:
+                        with contextlib.redirect_stderr(io.StringIO()) as errors:
+                            self.assertEqual(self.run_setup(), 1)
+                        self.assertIn("independent regular file", errors.getvalue())
+                        self.assertEqual(shared.read_bytes(), content)
+                        self.assertFalse(self.entry.exists())
+                        self.assertFalse((self.claude / "settings.json").exists())
+                    finally:
+                        source.unlink()
+                        source.write_bytes(content)
+
+    def test_custom_production_paths_are_rejected_before_mutation(self) -> None:
+        for argument, path in (("--agent-dir", self.agent.with_name("custom-checkout")),
+                               ("--claude-dir", self.claude.with_name("custom-config"))):
+            original = {}
+            if argument == "--agent-dir":
+                (path / "modules").mkdir(parents=True)
+                for relative in ("AGENTS.md", "modules/CODING_STYLE.md"):
+                    target = path / relative
+                    target.write_bytes((setup.VERIFY_TOKEN + "\n").encode())
+                    original[target] = target.read_bytes()
+            with self.subTest(argument=argument), contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(self.run_setup(argument, str(path)), 1)
+                self.assertIn("unsupported", errors.getvalue())
+                for target, content in original.items():
+                    self.assertEqual(target.read_bytes(), content)
+                if not original:
+                    self.assertFalse(path.exists())
+                self.assertFalse(self.entry.exists())
+                self.assertFalse((self.claude / "settings.json").exists())
+
+    def test_explicit_shared_source_migration_preserves_profiles_and_unrelated_files(self) -> None:
+        settings = {"theme": "dark", "permissions": {"allow": ["Bash(echo safe)"]}}
+        (self.claude / "settings.json").write_bytes(setup.json_bytes(settings))
+        self.assertEqual(self.run_setup(), 0)
+        profile = self.claude / "pira" / "USER.md"
+        profile.write_bytes(b"Private Claude preferences\n")
+        legacy = self.agent.with_name("agent")
+        (legacy / "modules").mkdir(parents=True)
+        (legacy / "AGENTS.md").write_bytes((setup.VERIFY_TOKEN + "\nCodex policy\n").encode())
+        (legacy / "USER.md").write_bytes(b"Private original preferences\n")
+        (legacy / "modules" / "CODING_STYLE.md").write_bytes(b"Codex coding\n")
+        manifest_path = self.claude / "pira" / setup.MANIFEST
+        manifest = json.loads(manifest_path.read_bytes())
+        configured = self.settings()
+        for key, rule in (("module_read_rule", setup.module_read_rule(legacy)),
+                          ("shared_profile_read_rule", setup.shared_profile_read_rule(legacy))):
+            configured["permissions"]["allow"].remove(manifest[key])
+            configured["permissions"]["allow"].append(rule)
+            manifest[key] = rule
+        manifest["policy_path"] = str(legacy / "AGENTS.md")
+        manifest["policy_sha256"] = setup.sha256((legacy / "AGENTS.md").read_bytes())
+        manifest_path.write_bytes(setup.json_bytes(manifest))
+        (self.claude / "settings.json").write_bytes(setup.json_bytes(configured))
+        self.entry.unlink()
+        setup.install_entry(self.entry, legacy / "AGENTS.md", None, dry_run=False, copy_policy=os.name == "nt")
+        unrelated = self.claude / "CLAUDE.md"
+        unrelated.write_bytes(b"Unrelated instructions\n")
+        before = {path: path.read_bytes() for path in (manifest_path, profile, unrelated,
+                  self.claude / "settings.json", legacy / "AGENTS.md", legacy / "USER.md")}
+        self.assertEqual(self.run_setup(), 1)  # Never silently retarget an owned rule.
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_setup("--uninstall"), 0)  # Uses the old manifest, not new defaults.
+        self.assertEqual(self.settings(), settings)
+        self.assertEqual(self.run_setup(), 0)
+        self.assertEqual(self.run_setup("--verify"), 0)
+        self.assertEqual(self.run_setup(), 0)
+        for path in (profile, unrelated, legacy / "AGENTS.md", legacy / "USER.md"):
+            self.assertEqual(path.read_bytes(), before[path])
+        self.assertEqual(self.run_setup("--uninstall"), 0)
+        self.assertEqual(self.settings(), settings)
+
+    def test_dual_install_and_updates_keep_policies_and_profiles_isolated(self) -> None:
+        from assets.scripts.test_setup_pira import setup as codex
+        from assets.scripts.test_migrate_pira_stores import native_ctx_environment
+        home = self.claude.parent
+        codex_root = home / "agent"
+        (codex_root / "modules").mkdir(parents=True)
+        (codex_root / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nCodex policy\n", encoding="utf-8")
+        (codex_root / "modules" / "CODING_STYLE.md").write_bytes(b"Codex module\n")
+        (codex_root / "USER.md").write_bytes(b"Private Codex profile\n")
+        (self.agent / "USER.md").write_bytes(b"Private Claude fallback\n")
+        codex_args = ["--skip-tools", "--yes", "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]
+        with patch.dict(os.environ, {**native_ctx_environment(home), "SHELL": "/bin/sh"}, clear=True), \
+                patch.object(codex, "__file__", str(codex_root / "assets/scripts/setup_pira.py")), \
+                patch.object(codex, "migration_codex_binary", return_value=None):
+            self.assertEqual(codex.main(codex_args), 0)
+            config = home / ".codex" / "config.toml"
+            codex_files = (config, codex_root / "AGENTS.md", codex_root / "AGENTS.override.md",
+                           codex_root / "modules" / "CODING_STYLE.md", codex_root / "USER.md")
+            codex_before = {path: path.read_bytes() for path in codex_files}
+            self.assertEqual(self.run_setup(), 0)
+            self.assertEqual(self.run_setup("--verify"), 0)
+            (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nClaude update\n", encoding="utf-8")
+            (self.agent / "modules" / "CODING_STYLE.md").write_bytes(b"Claude module update\n")
+            self.assertEqual(self.run_setup(), 0)
+            self.assertEqual(self.entry.read_bytes(), (self.agent / "AGENTS.md").read_bytes())
+            for path, content in codex_before.items():
+                self.assertEqual(path.read_bytes(), content)
+            claude_files = (self.entry, self.claude / "settings.json", self.claude / "pira" / setup.MANIFEST,
+                            self.claude / "pira" / "USER.md", self.agent / "AGENTS.md",
+                            self.agent / "modules" / "CODING_STYLE.md", self.agent / "USER.md")
+            claude_before = {path: path.read_bytes() for path in claude_files}
+            (codex_root / "AGENTS.md").write_text(setup.VERIFY_TOKEN + "\nCodex update\n", encoding="utf-8")
+            self.assertEqual(codex.main(codex_args), 0)
+            self.assertEqual(codex.main([*codex_args, "--verify"]), 0)
+            for path, content in claude_before.items():
+                self.assertEqual(path.read_bytes(), content)
+            codex_updated = {path: path.read_bytes() for path in codex_files}
+            self.assertEqual(self.run_setup("--uninstall"), 0)
+            self.assertEqual(self.run_setup(), 0)
+            for path, content in codex_updated.items():
+                self.assertEqual(path.read_bytes(), content)
 
     def test_fresh_install_verify_rerun_and_uninstall(self) -> None:
         codex_config = self.claude.parent / ".codex" / "config.toml"
@@ -146,6 +283,11 @@ class ClaudeSetupTests(unittest.TestCase):
                 with self.subTest(target=target):
                     bridge.write_text(f"Local rules\n{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n",
                                       encoding="utf-8")
+                    if any(character.isspace() for character in target):
+                        before = bridge.read_bytes()
+                        self.assertEqual(self.run_setup(), 1)
+                        self.assertEqual(bridge.read_bytes(), before)
+                        continue  # Unquoted whitespace is not a supported legacy import.
                     self.assertEqual(self.run_setup(), 0)
                     self.assertEqual(bridge.read_text(encoding="utf-8"), "Local rules\n")
                     self.assertEqual((snapshot / "AGENTS.md").read_bytes(), policy)
@@ -190,7 +332,7 @@ class ClaudeSetupTests(unittest.TestCase):
                 if defect != "missing":
                     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                 policy.write_bytes(original + (b"edited\n" if defect == "modified" else b""))
-                target = policy.as_posix() + (" extra text" if defect == "edited-import" else "")
+                target = "~/custom-policy/AGENTS.md" + (" extra text" if defect == "edited-import" else "")
                 bridge.write_text(f"{setup.LEGACY_START}\n@{target}\n{setup.LEGACY_END}\n", encoding="utf-8")
                 before = {p: p.read_bytes() for p in (bridge, policy, manifest_path) if p.exists()}
                 self.assertEqual(self.run_setup(), 1)

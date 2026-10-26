@@ -95,21 +95,21 @@ Read on-demand PIRA instruction files exactly, using the native Read tool when a
 
 Load on demand (explicit or inferred):
 
-- `user_profile`: In Claude Code, use `~/.claude/pira/USER.md` when it exists; otherwise use `~/agent/USER.md`. In Codex, use `~/agent/USER.md`. Load it when user background, learning needs, communication preferences, or acting on the user’s behalf may materially affect the response. Skip ordinary factual/coding/research tasks needing no personalization.
-- `research`: `~/agent/modules/RESEARCH_POLICY.md` for factual analysis, online verification, evidence-based reporting, structured execution, or paper reading, summary, critique, or extraction.
-- `coding`: `~/agent/modules/CODING_STYLE.md` for implementation, debugging, or review.
-- `writing`: `~/agent/modules/SCIENTIFIC_WRITING.md` for scientific/technical prose, including polishing, drafting, rebuttals, and public-facing research writing.
-- `public_figure`: `~/agent/modules/PUBLIC_FIGURE_STYLE.md` for creating, styling, laying out, integrating, or releasing figures intended for external audiences or public artifacts, including papers, preprints, posters, talks, blogs, websites, documentation, READMEs, reports, repositories, and release assets.
-- `explain`: `~/agent/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
-- `guidance`: `~/agent/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
-- `maintenance`: `~/agent/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance and PIRA tool releases, not general project maintenance.
+- `user_profile`: Use `~/.claude/pira/USER.md` when it exists; otherwise use `~/agent-claude/USER.md`. Load it when user background, learning needs, communication preferences, or acting on the user’s behalf may materially affect the response. Skip ordinary factual/coding/research tasks needing no personalization.
+- `research`: `~/agent-claude/modules/RESEARCH_POLICY.md` for factual analysis, online verification, evidence-based reporting, structured execution, or paper reading, summary, critique, or extraction.
+- `coding`: `~/agent-claude/modules/CODING_STYLE.md` for implementation, debugging, or review.
+- `writing`: `~/agent-claude/modules/SCIENTIFIC_WRITING.md` for scientific/technical prose, including polishing, drafting, rebuttals, and public-facing research writing.
+- `public_figure`: `~/agent-claude/modules/PUBLIC_FIGURE_STYLE.md` for creating, styling, laying out, integrating, or releasing figures intended for external audiences or public artifacts, including papers, preprints, posters, talks, blogs, websites, documentation, READMEs, reports, repositories, and release assets.
+- `explain`: `~/agent-claude/modules/EXPLAIN_STYLE.md` for explanatory support, including concepts, non-obvious logic, comparisons, and outcomes.
+- `guidance`: `~/agent-claude/modules/GUIDANCE.md` for non-research practical/emotional guidance, not technical issues.
+- `maintenance`: `~/agent-claude/modules/MAINTENANCE.md` for PIRA configuration/module/rule maintenance and PIRA tool releases, not general project maintenance.
 
 Do not reload unchanged in-context modules unless the user asks or relevant context was lost.
 
 ### Constraints
 
 - Edit instruction files only on explicit user request.
-- PIRA policy sources are `~/agent/AGENTS.md` and explicitly referenced files unless the user adopts another. Generated `AGENTS.override.md` is setup-only; do not edit it manually.
+- PIRA policy sources are `~/agent-claude/AGENTS.md` and explicitly referenced files unless the user adopts another.
 
 ### Routing
 
@@ -124,20 +124,16 @@ Do not reload unchanged in-context modules unless the user asks or relevant cont
 ### Tool Selection
 
 - Use the lightest reliable tool first and deterministic, non-interactive commands when available.
-- Set cwd with the execution tool's working-directory option when available. Otherwise use the program's directory option (such as `git -C DIR`) or a subshell; never use a bare `cd` that persists across calls.
+- Claude's Bash tool has no working-directory option. Use the program's directory option (such as `git -C DIR`) or `(cd DIR && CMD)` in a subshell; never use a bare `cd` that persists across calls.
 - Repeated/reusable workflow → project script, not one-off shell. After creation, ask whether to standardize; review usability/generality.
 - Extend a compatible existing tool before creating another.
 
-### Concurrency
+### Independent Work and Native Subagents
 
-- Actively reduce wall-clock time by running independent, ready work concurrently when the added compute, token, and coordination costs are small. Keep concurrency within available memory, rate limits, and shared-resource capacity; avoid duplicate work and conflicting writes.
-- Batch all ready, independent actions whose targets, arguments, and scope are known into one execution round, including across tools and activity types. Defer an action only when an earlier result could change whether or how it should run, or a safety/approval constraint requires separation; retain the output-size exception below. Each action must remain valid if another fails or does not run. Never batch a destructive action whose safety depends on another batch member succeeding.
-- Batching alone does not imply parallel execution. Use supported concurrent tool calls or parallel subprocesses when safe. For sequential shell batching, join independent commands with `;` (`&` in `cmd.exe`), keeping required `pira_ctx` wrappers separate. Keep individual failures visible and prevent fail-fast settings from skipping independent commands.
-- Keep dependent steps inside a single command/script (for example, Python), with explicit prerequisite checks and failure propagation. Parallelize independent branches within that workflow when useful.
-- Continue ready work while other actions run. Wait only when further progress depends on their results; use the original invocation or a native blocking waiter rather than repeated status checks. Do not delay an actionable result merely to wait for unrelated work.
-- Read sufficient content to answer the current question and support the next decision; sufficiency takes priority over narrowing or splitting reads. Within that requirement, minimize irrelevant content and model round-trips together. Include predictably necessary context in the same batch rather than making tiny reads that require repeated follow-ups.
-- Batch ready, independent ordinary commands whenever possible; large raw output alone is not a reason to split them. Use the appropriate `pira_ctx` mode to keep returned evidence bounded, preserving exact output when required. Split execution rounds when proceeding requires model interpretation of earlier output, approval, or a new safety assessment. For `pira_nav` reads whose necessary combined output would exceed 10,000 tokens, first narrow targets and ranges; split only if the required evidence may still exceed that budget. Keep unaffected commands batched rather than splitting the whole round.
-- Keep outputs attributable and bounded; do not add speculative work merely to fill a batch or occupy a worker.
+- Use Claude's native subagents for substantial independent work when useful; keep small, tightly coupled tasks local. Give concurrent editors disjoint file ownership and preserve unrelated changes.
+- Non-fork subagents start fresh: do not assume they inherit the main conversation or previously read files. Explore and Plan skip instruction files. Pass the task scope, edit versus review-only authority, necessary instructions or module pointers, and expected deliverable explicitly. Include essential safety constraints directly when a worker cannot load instructions.
+- Continue ready independent work while workers run. Review their results and integrate required checks before claiming completion; do not recreate a separate scheduling system.
+- Batch independent ready commands when practical; keep dependent steps together with explicit failure propagation. Use bounded, attributable output and deterministic waits rather than repeated status polling.
 
 ### Error Fighting
 
@@ -172,7 +168,7 @@ If documented PIRA tool behavior fails locally, raise the mismatch immediately a
 
 ## PIRA Internal Tools
 
-If a needed tool is unavailable or raises an error unrelated to improper use (e.g., login required for `pira_team`), immediately ask for setup; do not bypass its rules. Follow each tool’s **Rules**. **Forms**: replace uppercase placeholders; brackets mark optional values, `...` repetition, `|` alternatives. **Examples** clarify only non-obvious semantics. Recommended forms do not restrict supported interfaces. Help teaches encouraged interfaces, not compatibility-only alternatives. Use tool-provided syntax; consult `TOOL help [COMMAND]` only for uncovered syntax/behavior, batching topics when supported.
+If a needed tool is unavailable or raises an error unrelated to improper use, immediately ask for setup; do not bypass its rules. Follow each tool’s **Rules**. **Forms**: replace uppercase placeholders; brackets mark optional values, `...` repetition, `|` alternatives. **Examples** clarify only non-obvious semantics. Recommended forms do not restrict supported interfaces. Help teaches encouraged interfaces, not compatibility-only alternatives. Use tool-provided syntax; consult `TOOL help [COMMAND]` only for uncovered syntax/behavior, batching topics when supported.
 
 The PIRA tools below may appear as native tool calls or as installed command-line programs. Use the native interface when exposed; otherwise invoke the same commands through the available shell tool (Claude Code: Bash). A missing same-named native tool does not mean the CLI is unavailable; check the command before asking for setup. Keep each tool's rules and syntax regardless of invocation route.
 
@@ -180,7 +176,8 @@ The PIRA tools below may appear as native tool calls or as installed command-lin
 
 #### Rules
 
-- In Codex, wrap every shell/exec invocation in `pira_ctx`, except PIRA internal-tool invocations and commands that only load PIRA modules. In Claude Code, run ordinary shell commands with native Bash so its permission rules see the actual command; use `pira_ctx` for long-running, large, or evidence-bearing output that needs retention or targeted retrieval. Use the native Read tool to load PIRA modules when available. Exception: invocations of PIRA setup entrypoints must run directly, not inside pira_ctx.
+- Use `pira_ctx` for shell output needing retention or targeted retrieval, such as tests, builds, and long-running or evidence-bearing commands. Run ordinary commands directly with native Bash so Claude's permission rules see the actual command. Invoke PIRA internal tools directly and load instruction modules with Read, not shell commands. Run PIRA setup entrypoints directly, never inside `pira_ctx`.
+- On Windows, invoke PIRA tools through the POSIX Bash tool, not PowerShell; express pipelines or compound commands inside `pira_ctx` as `bash -c '...'`.
 - Default to auto unless the full result is needed; then use `exact`, including for handwritten script output or mandatory file reads that require the complete content. Do not substitute an auto/capture synopsis for required full output. Also use `exact` for necessary original content or interactive terminal I/O. Use `check` when success status suffices (failures also show bounded diagnostics); `capture` for mandatory retention or a bounded synopsis when full output is not needed. Exit status does not verify output or coverage.
 - For auto/capture, use `--interest REGEX` before `--` when the task suggests decision-relevant wording, including contrary outcomes; omit arbitrary guesses. It ranks synopsis evidence; it does not filter output or cap replay. If a synopsis selects a nonmatching line and reports no retention/index truncation, no omitted indexed line matches. Never extend this guarantee to unretained or unindexed output.
 - Request enough evidence to avoid predictable follow-ups; stop when it answers the question. Search unknown locations; use known ranges directly. Use `range`/`transform` for missing detail or necessary exact content, `exec` only for custom analysis, and `raw` only after targeted inspection fails. Do not rerun merely to recover exact output.
@@ -268,44 +265,3 @@ No search matches succeeds. Query options with no applicable operation error.
 
 - Item's last line: `pira_nav show src/foo.rs::Foo::bar --range -1:-1`.
 - Mixed batch: `pira_nav query --show src/foo.py::bar --references src/foo.py::bar`.
-
-### `pira_team`: Technical Artifact Workers
-
-#### Rules
-
-- `pira_team` launches Codex workers. In Claude Code, use it only when a compatible Codex backend is already installed and configured; otherwise use Claude's native delegation tools when available, under the same general safety and ownership constraints. Do not install Codex solely because this section exists.
-- Delegate self-contained, workload-significant, independent technical artifact work: review/quality assessment or implementation, including fixes, of software, tests, specifications and formalizations. Keep small, tightly coupled tasks and standalone general research, writing or administration local. One worker is allowed, including for an independent review. For independent components, delegate all eligible work; assign disjoint ownership rather than reserving a component for the main agent.
-- Built-in subagent controls and concurrency-slot limits do not apply to Team; restrictions covering all delegation still apply. Team has no strict concurrency limit. Choose concurrency for independent workload, resources and cost.
-- Agent-to-agent communication may use ungrammatical fragments and any format or language for efficiency and precision, provided the meaning is clear and required schemas are respected. This permission does not change user-facing writing standards.
-- Supply the task, paths, edit ownership and handoff requirements through either `--task TEXT` or `--task-file FILE`. Use quoted inline text only when short, single-line and free of shell-sensitive characters such as quotes, dollar signs, backticks or backslashes; otherwise use a task file. Supply a dedicated, shell-simple quoted `--completion-gate TEXT` describing required outcomes and acceptance checks. Task files are inputs, not deliverable paths.
-- Use `--inject-review` for assessment, `--inject-implement` for implementation, and `--inject-fig` for public figure work; figure guidance composes with either or both flags and adds no edit authority. Workers receive scoped guidance and ctx/nav/dec instructions automatically. Implementation includes proportionate verification and final-diff inspection. Combining `--inject-review` and `--inject-implement` on a fresh run performs broad review first, then implementation in the same conversation after successful review, with one final handoff. Resume keeps received guidance and may add any of these flags; it cannot remove guidance or retroactively create that staged workflow.
-- Explicitly assign review-only or implementation authority; injection flags do not grant edit permission. Workers share the workspace and inherit supported caller execution permissions. Ownership and review-only scope are instructional, not per-file sandboxing. Review-only protects project artifacts, including tests, configuration, documentation, fixtures, lockfiles and expected outputs; disposable build/test outputs and authorized caches may change. Use check-only commands or disposable copies when validation would rewrite protected files. Shared-cache deletion requires explicit authorization. Workers cannot use native subagents. Default workers cannot delegate; root may explicitly grant `--allow-subteam` on run/resume for exactly main -> coordinator -> ordinary children. Coordinators cannot grant that flag or change store/config; children never inherit it.
-- Workers decide routine implementation details. They return `needs_decision` when a change exceeds delegated authority: intended behavior/claims/assumptions/public contracts, scope/ownership, architecture/dependencies, or consequential security, data-loss, platform or compatibility tradeoffs. Several reasonable local implementations alone do not require escalation. Resolve within your authority or ask the user, then resume with the answer and completion gate.
-- Coordinators own only their immediate children and tags, not siblings, ancestors or root runs. Finish and integrate required child work before reporting completion; the tool rejects `completed` while children are active. Root may see descendant activity/usage summaries and recursively interrupt its subtree, not read/tag grandchildren. `usage` is own cumulative usage; `descendants.usage` is separate, summed once per retained child across resumes, with explicit incomplete-accounting flags. These are interface boundaries, not filesystem security against same-user manual tampering.
-- Backend authentication is launcher-managed. Use Team to launch children; never retrieve/export credentials into tasks, files, logs or shell environments. The backend executable and connection/loader settings remain coordinator-selected, not worker-environment-controlled. Native Windows jobs isolate child launchers while retaining caller-owned outer-job limits.
-- `interrupt RUN_ID` is target-only and reports active children left running; `interrupt -r RUN_ID` (or `--recursive`) atomically gates descendant starts/resumes and confirms stopped owners or explicit failures. A later deliberate root resume clears the gate only after every owner settles; preexisting children cannot clear it. Preserve retained diagnostics and resumability; do not treat acceptance as completion.
-- Accept `completed` as satisfying the assigned gate; `incomplete` and `needs_decision` are not completion. Read the handoff and communicate key findings concisely. Do not routinely repeat worker review/validation or assemble another report; perform only necessary integration checks for uncovered interactions. Reopen for concrete conflicting evidence, a reported issue or an explicit review request. Publish workspace deliverables only when requested.
-- Handoffs and logs stay in tool-managed storage. Default stdout is a JSON receipt with `run_id`, `status`, `run_root` and `handoff_path`; `--output answer` prints the handoff. Use `read RUN_ID` for its content, `path RUN_ID` for its path, and `path RUN_ID .` for the run root. Default handoff lookup requires a terminal current revision; retain receipt paths for earlier results during resume. An optional `RELATIVE_FILE` selects an allowed managed diagnostic or flat artifact; for nested attachments, use ordinary file access under the returned handoff directory. `read RUN_ID manifest.json` exposes usage, revisions and diagnostic references. Keep the same store across commands: `--store DIR` overrides `PIRA_TEAM_DIR`.
-- Bookmark only workers or results likely to be reused: `run --label LABEL` or `bookmark RUN_REF --label LABEL`. Reusing an exact, case-sensitive label moves it to the new run and reports the previous target; old runs remain intact. Use `bookmarks` to list, `search QUERY` for case-insensitive literal label search, and `unbookmark LABEL` to remove only the mapping. Labels stay in the selected store, never worker input. Use `@LABEL` in place of a run ID; it resolves once per invocation. Keep run bookkeeping here, not in workbook ID lists; the workbook records useful outcomes and next steps.
-- Choose `--format auto|markdown|text|json|csv`; `--schema FILE` constrains JSON and `--columns JSON_ARRAY` checks CSV headers. The launcher checks delivery/format, not truth or gate satisfaction. Non-completed handoffs bypass schema/column checks. One same-conversation format repair is allowed; include its usage and disclose accounting gaps.
-- Use `--model` and `--effort` for explicit worker overrides. `config show` displays bundled defaults, saved overrides and their managed file path; `config set --main MODEL --model WORKER --effort EFFORT` saves an exact-main-model override, and `config reset --main MODEL` removes it. These commands launch no worker and require no caller session. Saved defaults apply to new runs; explicit flags win per field. Resumes retain their selected profile unless explicitly overridden. Do not change user defaults without authorization; test with temporary stores.
-- `run` and `resume` block without an execution deadline. Await the original invocation, not status/log polling; wait when no coordination is ready and surface each completion independently. Resume continues retained work; taskless resume keeps the assignment/gate. Replacement tasks and `steer` require a new explicit gate. `steer` redirects an active turn; `interrupt` stops it. Control acknowledgement is not completion; steering is unavailable during startup/repair. Failure or interruption may leave edits, with no automatic rollback. Inspect retained diagnostics/current files before recovery; do not blindly retry controls, rerun work or revert shared files.
-
-#### Forms
-
-```text
-pira_team run [--allow-subteam] [--inject-review] [--inject-implement] [--inject-fig] [--cwd DIR] [--label LABEL] [--model MODEL] [--effort EFFORT] [--format auto|markdown|text|json|csv] --task TASK --completion-gate TEXT
-pira_team resume RUN_ID [--allow-subteam] [--inject-review] [--inject-implement] [--inject-fig] [--task TASK --completion-gate TEXT] [--model MODEL] [--effort EFFORT]
-pira_team steer RUN_ID --task TASK --completion-gate TEXT
-pira_team interrupt [-r|--recursive] RUN_ID
-pira_team read|path RUN_ID [RELATIVE_FILE]
-pira_team bookmark RUN_REF --label LABEL
-pira_team unbookmark LABEL
-pira_team bookmarks [--limit N]
-pira_team search QUERY [--limit N]
-pira_team config show
-pira_team config set --main MODEL --model WORKER --effort EFFORT
-pira_team config reset --main MODEL
-```
-
-Replace `--task TASK` with `--task-file FILE` for file input. All commands accept `--store DIR`; run/resume also accept `--output artifact|answer`.

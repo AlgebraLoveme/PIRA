@@ -4,13 +4,13 @@ Use only for PIRA configuration, module, and rule maintenance and PIRA tool rele
 
 ## Maintenance Rules
 - After publishing a PIRA tool release, refresh the affected local installation and verify its installed version and release hash before reporting completion.
-- Keep memory defaults in `Memory System` in `~/agent/AGENTS.md`; this module maintains them but does not define ordinary memory handling.
-- Add files removed from the active scheme to `~/agent/assets/LEGACY_LIST.md`.
+- Keep memory defaults in `Memory System` in `~/agent-claude/AGENTS.md`; this module maintains them but does not define ordinary memory handling.
+- Add files removed from the active scheme to `~/agent-claude/assets/LEGACY_LIST.md`.
 - Overwrite with current policy only: no timestamps, question IDs, changelogs, or override chains.
 - After every maintenance write, immediately check and raise cross-file conflicts. For instruction or agent-configuration updates, remove introduced or obsolete redundancy without changing unrelated meaning; audit tracked touched files for unexpected personal information and every rule's intended scope. Generalize only deliberately and within the user's intended scope.
 - When an experimental rule conflicts with an established rule, preserve the established default unless the user explicitly approves a scope or routing change.
 - Place default or session-wide behavior in auto-loaded files, setup guidance in tracked templates or seed files, and local-only or sensitive context in local-only files.
-- Keep module loading and routing only in `~/agent/AGENTS.md`.
+- Keep module loading and routing only in `~/agent-claude/AGENTS.md`.
 - Prefer substantial, task-coherent modules. Keep tightly coupled work, such as implementation and testing, together. Split separable tasks when the content warrants independently useful modules; avoid tiny fragments that add loading and selection overhead.
 - Keep README public-phase only: public behavior, releases, artifacts, usage, and reproducible public validation—not local development candidates, pending work, private validation state, or rollout plans.
 - After commit and push, remove obsolete temporary backups created for the change.
