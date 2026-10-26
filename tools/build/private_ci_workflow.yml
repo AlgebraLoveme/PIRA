@@ -54,6 +54,50 @@ jobs:
           PY
       - name: Locked crate tests
         run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}
+      - name: Required Windows native Team checks
+        if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'
+        shell: bash
+        run: |
+          python -B - <<'PY_NATIVE'
+          import json, os, pathlib, re, shutil, subprocess, sys, tempfile
+          sys.path.insert(0, str(pathlib.Path('tools/build').resolve()))
+          import private_ci
+          binary = private_ci.provision_codex(pathlib.Path(os.environ['RUNNER_TEMP']) / 'pira-team-native-codex')
+          # Keep the pinned package and siblings intact; expose its entrypoint on task-local PATH.
+          shutil.copyfile(binary, binary.with_name('codex.exe'))
+          build = subprocess.run([
+              'cargo', 'test', '--locked', '--manifest-path', 'tools/Cargo.toml',
+              '-p', 'pira_team', '--lib', '--no-run', '--message-format=json',
+          ], check=True, stdout=subprocess.PIPE, text=True, encoding='utf-8')
+          executables = [item['executable'] for line in build.stdout.splitlines()
+                         if (item := json.loads(line)).get('reason') == 'compiler-artifact'
+                         and item.get('profile', {}).get('test') and item.get('executable')]
+          if len(executables) != 1:
+              raise SystemExit('Expected exactly one Team library test executable')
+          required = {
+              'backend::tests::installed_native_schema_supports_team_requests',
+              'tests::installed_native_launcher_preserves_exact_untrusted_project_keys',
+          }
+          with tempfile.TemporaryDirectory(prefix='pira-team-native-', dir=os.environ['RUNNER_TEMP']) as home:
+              environment = {key: value for key, value in os.environ.items()
+                             if key.upper() in {'PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT'}}
+              environment.update(HOME=home, USERPROFILE=home, LOCALAPPDATA=home,
+                                 CODEX_HOME=home, TMP=home, TEMP=home, TMPDIR=home,
+                                 PYTHONDONTWRITEBYTECODE='1')
+              environment['PATH'] = str(binary.parent) + os.pathsep + environment.get('PATH', '')
+              subprocess.run([str(binary), '--version'], check=True, env=environment)
+              result = subprocess.run([
+                  executables[0], 'installed_native_', '--ignored', '--nocapture',
+                  '--test-threads=1', '--format=pretty', '--color=never',
+              ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                  encoding='utf-8', env=environment, timeout=180)
+              print(result.stdout, end='', flush=True)
+              result.check_returncode()
+              outcomes = re.findall(r'^test (.+?) \.\.\. (.+)$', result.stdout, re.MULTILINE)
+              if (len(outcomes) != len(required)
+                      or {name for name, status in outcomes if status == 'ok'} != required):
+                  raise SystemExit('Required Windows native checks missing, skipped or unsuccessful')
+          PY_NATIVE
       - name: Build fake-backend test binary (Linux only)
         if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
         run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec

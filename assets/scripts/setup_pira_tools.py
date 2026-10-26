@@ -758,9 +758,17 @@ def check_team_initialize(command: list[str], env: dict[str, str], *, timeout: f
                         if result.get("config", {}).get("projects") != {project: {"trust_level": "untrusted"}}:
                             raise ValueError("project trust override did not preserve the exact untrusted cwd key")
                         project_folder = str(Path(project) / ".codex")
-                        if not any(layer.get("name", {}).get("dotCodexFolder") == project_folder
-                                   and layer.get("disabledReason")
-                                   for layer in result.get("layers", [])):
+                        def disabled_project_layer(layer: dict[str, object]) -> bool:
+                            folder = layer.get("name", {}).get("dotCodexFolder")
+                            if not isinstance(folder, str) or not layer.get("disabledReason"):
+                                return False
+                            try:
+                                # Physical identity handles Windows verbatim paths and aliases;
+                                # the config.projects trust key above must remain byte-exact.
+                                return Path(folder).samefile(project_folder)
+                            except (OSError, ValueError):
+                                return False
+                        if not any(disabled_project_layer(layer) for layer in result.get("layers", [])):
                             raise ValueError("untrusted project configuration layer was not disabled")
                         matched = True
                         return

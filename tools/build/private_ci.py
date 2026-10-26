@@ -20,7 +20,7 @@ import tempfile
 import sys
 
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team")
-POLICIES = ("main.md", "implementation.md", "review.md", "backend_contract.json", "worker_profiles.json")
+POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md", "backend_contract.json", "worker_profiles.json")
 BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
 
 NATIVE_CODEX_VERSION = "0.161.0"

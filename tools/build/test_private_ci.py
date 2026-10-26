@@ -147,6 +147,64 @@ class PrivateCITests(unittest.TestCase):
             self.result = ci.stage(self.root, tools)
         return destination
 
+    def test_windows_native_team_gate_requires_both_checks_and_isolates_environment(self):
+        from contextlib import redirect_stdout
+        stage = self.stage(('pira_team',))
+        workflow = (stage / '.github/workflows/private-pira-tests.yml').read_text()
+        step = workflow.split('- name: Required Windows native Team checks', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'", step)
+        self.assertNotIn('continue-on-error', step)
+        code = textwrap.dedent(step.split("<<'PY_NATIVE'\n", 1)[1].split('\n          PY_NATIVE', 1)[0])
+        binary = self.base / 'package' / 'codex-pinned.exe'
+        binary.parent.mkdir()
+        binary.write_bytes(b'fixture executable; never run')
+        required = [
+            'backend::tests::installed_native_schema_supports_team_requests',
+            'tests::installed_native_launcher_preserves_exact_untrusted_project_keys',
+        ]
+        passing = ''.join(f'test {name} ... ok\n' for name in required)
+        for scenario in ('success', 'absent', 'missing', 'ignored', 'failed', 'timeout'):
+            with self.subTest(scenario=scenario):
+                calls = []
+                def run(command, **options):
+                    calls.append(command)
+                    if command[0] == 'cargo':
+                        self.assertIn('--locked', command)
+                        self.assertIn('--no-run', command)
+                        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({
+                            'reason':'compiler-artifact', 'profile':{'test':True},
+                            'executable':str(self.base / 'team-tests.exe'),
+                        }) + '\n')
+                    environment = options['env']
+                    for key in ('OPENAI_API_KEY', 'GITHUB_TOKEN', 'CODEX_THREAD_ID', 'HTTP_PROXY'):
+                        self.assertNotIn(key, environment)
+                    self.assertEqual(environment['HOME'], environment['CODEX_HOME'])
+                    self.assertEqual(environment['TMP'], environment['HOME'])
+                    self.assertTrue(Path(environment['HOME']).is_dir())
+                    self.assertEqual(environment['PATH'].split(os.pathsep)[0], str(binary.parent))
+                    if command[-1] == '--version':
+                        return subprocess.CompletedProcess(command, 0)
+                    self.assertIn('--ignored', command)
+                    self.assertEqual(options['timeout'], 180)
+                    if scenario == 'timeout':
+                        raise subprocess.TimeoutExpired(command, 180)
+                    output = {'absent':'running 0 tests\n',
+                              'missing':f'test {required[0]} ... ok\n',
+                              'ignored':passing.replace(' ... ok', ' ... ignored')}.get(scenario, passing)
+                    return subprocess.CompletedProcess(command, 1 if scenario == 'failed' else 0, stdout=output)
+                with patch.object(ci, 'provision_codex', return_value=binary), \
+                        patch.object(subprocess, 'run', side_effect=run), \
+                        patch.dict(os.environ, {'RUNNER_TEMP':str(self.base),
+                            'OPENAI_API_KEY':'synthetic', 'GITHUB_TOKEN':'synthetic',
+                            'CODEX_THREAD_ID':'synthetic', 'HTTP_PROXY':'http://invalid'}), \
+                        redirect_stdout(io.StringIO()):
+                    if scenario == 'success':
+                        exec(code, {})
+                    else:
+                        with self.assertRaises((SystemExit, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+                            exec(code, {})
+                self.assertEqual(len(calls), 3)
+
     def test_staging_exclusions_dependencies_bytes_and_provenance(self):
         excluded = ['tools/src/pira_ctx/stores/private.rs',
                     'tools/src/pira_ctx/debug/private.rs',

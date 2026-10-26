@@ -161,32 +161,78 @@ else:
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.probe(mode)
 
-    def test_project_readback_requires_exact_key_and_disabled_layer(self):
-        peer = r'''
+    PROJECT_PEER = r'''
 import json, sys
-from pathlib import Path
 request = json.loads(sys.stdin.readline())
 print(json.dumps({"id": request["id"], "result": {"userAgent": "fixture"}}), flush=True)
 assert json.loads(sys.stdin.readline())["method"] == "initialized"
 request = json.loads(sys.stdin.readline())
 assert request["method"] == "config/read"
 project = request["params"]["cwd"]
-mode = sys.argv[1]
-key = '"' + project + '"' if mode == "quoted" else project
+key, folder, reason = json.loads(sys.argv[1])
 result = {"config": {"projects": {key: {"trust_level": "untrusted"}}},
-          "layers": [{"name": {"type": "project", "dotCodexFolder": str(Path(project) / ".codex")},
-                      "disabledReason": None if mode == "loaded" else "untrusted"}]}
+          "layers": [{"name": {"type": "project", "dotCodexFolder": folder},
+                      "disabledReason": reason}]}
 print(json.dumps({"id": request["id"], "result": result}), flush=True)
 sys.stdin.read()
 '''
-        for mode in ("exact", "quoted", "loaded"):
-            with self.subTest(mode=mode):
-                command = [sys.executable, "-u", "-c", peer, mode]
-                if mode == "exact":
-                    setup.check_team_initialize(command, dict(os.environ), project="/project.path")
-                else:
-                    with self.assertRaisesRegex(ValueError, "exact untrusted cwd key|layer was not disabled"):
-                        setup.check_team_initialize(command, dict(os.environ), project="/project.path")
+
+    def project_probe(self, project: str, key: str, folder: str, reason: str | None) -> None:
+        setup.check_team_initialize(
+            [sys.executable, "-u", "-c", self.PROJECT_PEER, json.dumps([key, folder, reason])],
+            dict(os.environ), project=project,
+        )
+
+    def test_project_readback_requires_exact_key_and_disabled_layer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = str(Path(temporary).resolve())
+            folder = Path(project) / ".codex"
+            folder.mkdir()
+            self.project_probe(project, project, str(folder), "untrusted")
+            with self.assertRaisesRegex(ValueError, "exact untrusted cwd key"):
+                self.project_probe(project, '"' + project + '"', str(folder), "untrusted")
+            with self.assertRaisesRegex(ValueError, "layer was not disabled"):
+                self.project_probe(project, project, str(folder), None)
+
+    def test_project_readback_accepts_physical_alias_but_not_alias_trust_key(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            (project / ".codex").mkdir(parents=True)
+            # A dot component works on every host without symlink privileges.
+            alias = str(project) + os.sep + "."
+            self.assertNotEqual(alias, str(project))
+            self.assertTrue(Path(alias).samefile(project))
+            self.project_probe(str(project), str(project), alias + os.sep + ".codex", "untrusted")
+            with self.assertRaisesRegex(ValueError, "exact untrusted cwd key"):
+                self.project_probe(str(project), alias, str(project / ".codex"), "untrusted")
+
+    @unittest.skipUnless(os.name == "nt", "Windows verbatim drive/UNC paths")
+    def test_project_readback_accepts_windows_verbatim_path_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            normal = str(Path(temporary).resolve())
+            if normal.startswith("\\\\?\\"):
+                normal = normal[4:]
+                if normal.startswith("UNC\\"):
+                    normal = "\\\\" + normal[4:]
+            folder = Path(normal) / ".codex"
+            folder.mkdir()
+            verbatim = "\\\\?\\UNC\\" + normal[2:] if normal.startswith("\\\\") else "\\\\?\\" + normal
+            for project, returned in [(verbatim, str(folder)), (normal, verbatim + "\\.codex")]:
+                with self.subTest(project=project):
+                    self.project_probe(project, project, returned, "untrusted")
+                    with self.assertRaisesRegex(ValueError, "layer was not disabled"):
+                        self.project_probe(project, project, returned, None)
+
+    def test_project_readback_rejects_unrelated_missing_and_invalid_layer_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".codex").mkdir()
+            other = root / "other" / ".codex"
+            other.mkdir(parents=True)
+            for folder in (str(other), str(root / "missing"), "bad\0path"):
+                with self.subTest(folder=folder), self.assertRaisesRegex(ValueError, "layer was not disabled"):
+                    self.project_probe(str(root), str(root), folder, "untrusted")
 
     def test_initialize_deadline_covers_silent_and_partial_output(self):
         for mode in ("silent", "partial"):
