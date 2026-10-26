@@ -95,6 +95,7 @@ class PrivateCITests(unittest.TestCase):
         files = {
             'AGENTS.md': b'fixture policy\r\n', 'modules/CODING_STYLE.md': b'fixture style',
             'modules/PUBLIC_FIGURE_STYLE.md': b'canonical figure policy\r\n',
+            'modules/SCIENTIFIC_WRITING.md': b'canonical writing policy\r\n',
             'tools/Cargo.toml': b'[workspace]\n', 'tools/Cargo.lock': b'lock',
             '.github/workflows/build-pira-tool-bundles.yml':
                 b'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n',
@@ -204,6 +205,33 @@ class PrivateCITests(unittest.TestCase):
                         with self.assertRaises((SystemExit, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
                             exec(code, {})
                 self.assertEqual(len(calls), 3)
+
+    def test_team_policy_include_closure_and_explicit_markdown_allowlist(self):
+        policies = ('main.md', 'coordinator.md', 'implementation.md', 'review.md',
+                    'assignment_contract.md', 'continue_task.md', 'edit_authority.md', 'fix_task.md',
+                    'handoff.md', 'help.md', 'implementation_stage.md', 'implementation_task.md',
+                    'ordinary_worker.md', 'repair_stage.md', 'repair_task.md', 'review_stage.md',
+                    'writing_application.md')
+        expected = {}
+        includes = []
+        for name in policies:
+            path = 'tools/src/pira_team/' + name
+            expected[path] = name.encode() + b' policy\r\n'
+            self.write(path, expected[path])
+            includes.append(f'include_str!("{name}");')
+        for module in ('PUBLIC_FIGURE_STYLE.md', 'SCIENTIFIC_WRITING.md'):
+            path = 'modules/' + module
+            expected[path] = self.files[path]
+            includes.append(f'include_str!("../../../{path}");')
+        self.write('tools/src/pira_team/lib.rs', '\n'.join(includes).encode())
+        unselected = 'tools/src/pira_team/unselected.md'
+        self.write(unselected, b'not a bundled runtime policy')
+        data = ci.verify(self.stage(('pira_team',)))
+        for name, content in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(data[name], content)
+        self.assertNotIn(unselected, data)
+
 
     def test_staging_exclusions_dependencies_bytes_and_provenance(self):
         excluded = ['tools/src/pira_ctx/stores/private.rs',

@@ -1,0 +1,1 @@
+Format repair only: edit the handoff, not project files. Preserve the substantive outcome.

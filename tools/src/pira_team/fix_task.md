@@ -1,0 +1,1 @@
+Apply verified findings from your completed review within the original assignment. Follow the injected coding policy and return the fix report through the existing output contract.

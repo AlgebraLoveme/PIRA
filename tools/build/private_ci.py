@@ -20,7 +20,11 @@ import tempfile
 import sys
 
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team")
-POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md", "backend_contract.json", "worker_profiles.json")
+POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md",
+            "assignment_contract.md", "continue_task.md", "edit_authority.md", "fix_task.md",
+            "handoff.md", "help.md", "implementation_stage.md", "implementation_task.md",
+            "ordinary_worker.md", "repair_stage.md", "repair_task.md", "review_stage.md",
+            "writing_application.md", "backend_contract.json", "worker_profiles.json")
 BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
 
 NATIVE_CODEX_VERSION = "0.161.0"
@@ -227,7 +231,7 @@ def digest(data: bytes) -> str:
 def selected(root: Path) -> list[Path]:
     # Runtime policy-mirror inputs used by Team Python tests (not user profiles).
     paths = [Path("AGENTS.md"), Path("modules/CODING_STYLE.md"),
-             Path("modules/PUBLIC_FIGURE_STYLE.md"),
+             Path("modules/PUBLIC_FIGURE_STYLE.md"), Path("modules/SCIENTIFIC_WRITING.md"),
              Path("tools/Cargo.toml"), Path("tools/Cargo.lock")]
     for tool in TOOLS:
         paths.append(Path(f"tools/crates/{tool}/Cargo.toml"))

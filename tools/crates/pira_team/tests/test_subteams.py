@@ -96,6 +96,27 @@ class SubteamTests(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=15)
         return process.returncode, stdout, stderr
 
+    def test_writing_guidance_child_preserves_store_boundary(self):
+        process, coordinator = self.start(extra=("--inject-write",))
+        child = self.command(coordinator, "run", "--task", "subteam-service",
+                             "--completion-gate", "Finish assigned child work", "--inject-write", operation="start")
+        child_id = child["run_id"]
+        writing = (Path(__file__).resolve().parents[4] / "modules/SCIENTIFIC_WRITING.md").read_text()
+        for run in (coordinator, child_id):
+            self.assertTrue(self.manifest(run)["inject_write"])
+            self.assertEqual((self.root / "logs" / run / "policy.md").read_text().count(writing), 1)
+        escape = self.root / "escape"
+        escape.mkdir()
+        escaped = self.command(coordinator, "run", "--inject-write", "--store", str(escape),
+                               "--task", "unused", "--completion-gate", "unused")
+        self.assertNotEqual(escaped["returncode"], 0)
+        self.assertIn("retained Team store", escaped["stderr"])
+        self.assertFalse(list(escape.iterdir()))
+        self.finish(child_id)
+        self.assertEqual(self.command(coordinator, operation="wait", handle=child["handle"])["returncode"], 0)
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
     def test_allowed_children_noninheritance_and_scoped_ownership(self):
         process, coordinator = self.start()
         other_process, sibling = self.start()
@@ -170,7 +191,7 @@ class SubteamTests(unittest.TestCase):
         self.assertFalse(active["descendants"]["usage_complete"])
         self.finish(child["run_id"])
         process2, _ = self.start(resume=coordinator, allow=False)
-        self.assertEqual(self.manifest(coordinator)["coordinator_policy_version"], 20)
+        self.assertEqual(self.manifest(coordinator)["coordinator_policy_version"], 22)
         self.assertNotIn("# Coordinator Team usage", self.manifest(coordinator)["phase_instructions"])
         # Permission is retained; child resume stays owned by coordinator and nondelegating.
         result = self.command(coordinator, "resume", child["run_id"], "--task", "ordinary", "--completion-gate", "x")

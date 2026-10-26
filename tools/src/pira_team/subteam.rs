@@ -214,6 +214,7 @@ fn invocation_options(args: &[String], store: &Path) -> Result<(), String> {
             "--inject-review",
             "--inject-implement",
             "--inject-fig",
+            "--inject-write",
             "--allow-fix",
             "--code-review",
             "-r",
@@ -766,6 +767,28 @@ mod tests {
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
+
+    #[test]
+    fn coordinator_writing_flag_accepts_no_value() {
+        assert!(
+            invocation_options(
+                &arguments(&["resume", "child", "--inject-write"]),
+                Path::new("."),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn coordinator_writing_flag_cannot_hide_subteam_grant() {
+        let error = invocation_options(
+            &arguments(&["run", "--inject-write", "--allow-subteam"]),
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert_eq!(error, "coordinators cannot grant --allow-subteam");
+    }
+
     #[test]
     fn authorization_distinguishes_task_data_from_options() {
         let store = std::env::current_dir().unwrap().canonicalize().unwrap();
