@@ -22,13 +22,18 @@ pub fn preflight(
     fs::create_dir(&output).map_err(|e| format!("create backend schema directory: {e}"))?;
     let mut cmd = Command::new(options.authentication.program());
     options.authentication.apply(&mut cmd);
-    cmd.args(["app-server", "generate-json-schema", "--out"])
-        .arg(&output)
-        .env("CODEX_HOME", run.join("codex-home"))
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(create(&dir.join("backend-check.log"))?);
+    cmd.args([
+        "app-server",
+        "generate-json-schema",
+        "--experimental",
+        "--out",
+    ])
+    .arg(&output)
+    .env("CODEX_HOME", run.join("codex-home"))
+    .current_dir(dir)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(create(&dir.join("backend-check.log"))?);
     if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("interrupted before native schema generation".into());
     }
@@ -38,8 +43,8 @@ pub fn preflight(
         let result = if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
             Err("interrupted during native schema generation".to_owned())
         } else {
-            child
-                .try_wait()
+            scope
+                .try_wait(&mut child)
                 .map_err(|e| format!("wait for native schema generation: {e}"))
         };
         match result {
@@ -48,13 +53,11 @@ pub fn preflight(
             Err(error) => {
                 scope.terminate();
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = scope.wait(&mut child);
                 return Err(error);
             }
         }
     };
-    #[cfg(windows)]
-    scope.terminate();
     if !status.success() {
         return Err(format!(
             "native schema generation failed ({status}); see backend-check.log"
@@ -109,7 +112,7 @@ fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Re
     let mut examples = vec![
         (
             "initialize",
-            json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}),
+            json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}),
         ),
         (
             "thread/inject_items",
@@ -118,13 +121,14 @@ fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Re
         (
             "turn/start",
             json!({"threadId":id,"input":text,"model":options.model,"effort":options.effort,
-            "cwd":options.cwd,"approvalPolicy":"never","sandboxPolicy":options.execution.sandbox}),
+            "cwd":options.cwd,"approvalPolicy":"never","sandboxPolicy":options.execution.sandbox,"serviceTierForTurn":options.service_tier.backend()}),
         ),
         (
             "turn/steer",
             json!({"threadId":id,"expectedTurnId":id,"input":text}),
         ),
         ("turn/interrupt", json!({"threadId":id,"turnId":id})),
+        ("turn/settings/update", options.service_tier.update(id, id)),
     ];
     thread["ephemeral"] = json!(false);
     examples.push(("thread/start", thread.clone()));
@@ -250,7 +254,13 @@ mod tests {
                     "network_access":network,"exclude_tmpdir_env_var":true,"exclude_slash_tmp":true}
             }))
             .unwrap();
-            validate_examples(&validator, &options).unwrap();
+            for tier in [
+                crate::service_tier::Tier::Standard,
+                crate::service_tier::Tier::Fast,
+            ] {
+                options.service_tier = tier;
+                validate_examples(&validator, &options).unwrap();
+            }
         }
         fs::remove_dir_all(&root).unwrap();
     }

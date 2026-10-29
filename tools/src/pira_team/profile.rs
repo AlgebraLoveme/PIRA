@@ -122,7 +122,8 @@ pub(crate) fn validate_session_id(id: &str) -> Result<(), String> {
 
 /// Verify caller identity using the matching session log, without requiring worker writes.
 pub(crate) fn caller_session() -> Result<String, String> {
-    let context = load().map_err(|_| "verified main session identity is unavailable")?;
+    let context =
+        load().map_err(|e| format!("verified main session identity is unavailable: {e}"))?;
     let id = context["caller_thread_id"]
         .as_str()
         .ok_or("missing main session identity")?;
@@ -131,6 +132,9 @@ pub(crate) fn caller_session() -> Result<String, String> {
 }
 
 pub fn load() -> Result<Value, String> {
+    if let Some(context) = crate::remote::delegated_context() {
+        return Ok(context);
+    }
     let thread = std::env::var("CODEX_THREAD_ID").map_err(|_| "CODEX_THREAD_ID is unavailable")?;
     if thread.is_empty()
         || thread.len() > 200
@@ -249,6 +253,8 @@ fn read_snapshot(file: File, len: u64, thread: &str) -> Result<Value, String> {
     let mut reader = BufReader::new(file.take(len));
     let mut latest = None;
     let mut matched = false;
+    // No boundary yet differs from a legacy task boundary without a turn ID.
+    let mut active_turn: Option<Option<String>> = None;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -274,9 +280,18 @@ fn read_snapshot(file: File, len: u64, thread: &str) -> Result<Value, String> {
                     return Err("parent session identity mismatch".into());
                 }
                 matched = true;
+            }
+            Some("event_msg") if record["payload"]["type"] == "task_started" => {
                 latest = None;
+                active_turn = Some(recorded_turn_id(&record["payload"])?.map(str::to_owned));
             }
             Some("turn_context") if matched => {
+                let turn_id = recorded_turn_id(&record["payload"])?;
+                if let Some(expected) = &active_turn
+                    && expected.as_deref() != turn_id
+                {
+                    return Err("parent turn context does not match active task identity".into());
+                }
                 // Replace the entire context atomically: never backfill fields from an older turn.
                 latest = Some(
                     json!({"model": record["payload"]["model"], "effort": record["payload"]["effort"],
@@ -294,6 +309,14 @@ fn read_snapshot(file: File, len: u64, thread: &str) -> Result<Value, String> {
         return Err("parent session identity was not verified".into());
     }
     latest.ok_or_else(|| "parent session has no recorded turn context".into())
+}
+
+fn recorded_turn_id(payload: &Value) -> Result<Option<&str>, String> {
+    match &payload["turn_id"] {
+        Value::Null => Ok(None),
+        Value::String(id) if !id.is_empty() => Ok(Some(id)),
+        _ => Err("malformed parent turn identity".into()),
+    }
 }
 
 /// A verified caller policy, translated to the native app-server representation.
@@ -565,11 +588,39 @@ mod tests {
     }
 
     #[test]
-    fn session_metadata_boundaries_reset_context_without_backfill() {
+    fn repeated_session_metadata_preserves_current_context() {
+        let log = SessionLog::new();
+        let metadata = json!({"type":"session_meta","payload":{"id":"caller"}});
+        let before = recorded_context();
+        fs::write(&log.0, &before).unwrap();
+        let expected = read(&log.0, "caller").unwrap();
+        fs::write(&log.0, format!("{before}{metadata}\n{metadata}\n")).unwrap();
+        assert_eq!(read(&log.0, "caller").unwrap(), expected);
+
+        let start = json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"T"}});
+        let mut payload = caller("current", "high");
+        payload["turn_id"] = json!("T");
+        let context = json!({"type":"turn_context","payload":payload});
+        fs::write(
+            &log.0,
+            format!("{metadata}\n{start}\n{metadata}\n{context}\n{metadata}\n"),
+        )
+        .unwrap();
+        let current = read(&log.0, "caller").unwrap();
+        assert_eq!(current["model"], "current");
+        assert_eq!(current["effort"], "high");
+        assert_eq!(
+            Execution::from_context(&current).unwrap().mode,
+            "workspace-write"
+        );
+    }
+
+    #[test]
+    fn task_boundaries_reset_context_without_backfill() {
         let log = SessionLog::new();
         let boundary = format!(
             "{}\n",
-            json!({"type":"session_meta","payload":{"id":"caller"}})
+            json!({"type":"event_msg","payload":{"type":"task_started"}})
         );
         let prefix = recorded_context() + &boundary;
         fs::write(&log.0, &prefix).unwrap();
@@ -596,7 +647,8 @@ mod tests {
         assert!(resolve(Some("explicit".into()), Some("high".into()), context).is_err());
 
         // Contexts before identity verification cannot supply the current settings.
-        fs::write(&log.0, format!("{latest}\n{boundary}")).unwrap();
+        let metadata = json!({"type":"session_meta","payload":{"id":"caller"}});
+        fs::write(&log.0, format!("{latest}\n{metadata}\n")).unwrap();
         assert_eq!(
             read(&log.0, "caller").unwrap_err(),
             "parent session has no recorded turn context"
@@ -606,6 +658,134 @@ mod tests {
             read(&log.0, "caller").unwrap_err(),
             "parent session identity was not verified"
         );
+    }
+
+    #[test]
+    fn task_identity_requires_fresh_matching_context_even_for_repeated_turn_id() {
+        let log = SessionLog::new();
+        let metadata = json!({"type":"session_meta","payload":{"id":"caller"}});
+        for task_id in [Value::Null, json!("T")] {
+            let start =
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":task_id}});
+            for context_id in [Value::Null, json!("T"), json!("other")] {
+                let mut payload = caller("new-model", "high");
+                payload["turn_id"] = context_id.clone();
+                let context = json!({"type":"turn_context","payload":payload});
+                // A boundary before the first session_meta still constrains later contexts.
+                for prefix in [
+                    format!("{start}\n{metadata}\n"),
+                    recorded_context() + &format!("{start}\n"),
+                ] {
+                    fs::write(&log.0, format!("{prefix}{context}\n{metadata}\n")).unwrap();
+                    if task_id == context_id {
+                        assert_eq!(read(&log.0, "caller").unwrap()["model"], "new-model");
+                        // Repeated task IDs are boundaries too, unlike repeated session IDs.
+                        fs::write(&log.0, format!("{prefix}{context}\n{start}\n{metadata}\n"))
+                            .unwrap();
+                        assert_eq!(
+                            read(&log.0, "caller").unwrap_err(),
+                            "parent session has no recorded turn context"
+                        );
+                    } else {
+                        // A later correct record must not hide a mismatched record.
+                        assert_eq!(
+                            read(&log.0, "caller").unwrap_err(),
+                            "parent turn context does not match active task identity"
+                        );
+                        let mut correct = context.clone();
+                        correct["payload"]["turn_id"] = task_id.clone();
+                        fs::write(&log.0, format!("{prefix}{context}\n{correct}\n")).unwrap();
+                        assert!(read(&log.0, "caller").is_err());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_turn_ids_never_reuse_older_context() {
+        let log = SessionLog::new();
+        for id in [json!(7), json!(""), json!({}), json!([]), json!(false)] {
+            for record in [
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}}),
+                json!({"type":"turn_context","payload":{"turn_id":id}}),
+            ] {
+                fs::write(&log.0, format!("{}{record}\n", recorded_context())).unwrap();
+                assert_eq!(
+                    read(&log.0, "caller").unwrap_err(),
+                    "malformed parent turn identity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_context_replaces_permissions_atomically() {
+        let log = SessionLog::new();
+        let start = json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"new"}});
+        let prefix = recorded_context() + &format!("{start}\n");
+        let mut current = caller("new-model", "high");
+        current["turn_id"] = json!("new");
+        let context_record = |payload: Value| json!({"type":"turn_context","payload":payload});
+        fs::write(
+            &log.0,
+            format!("{prefix}{}\n", context_record(current.clone())),
+        )
+        .unwrap();
+        let loaded = read(&log.0, "caller").unwrap();
+        let execution = Execution::from_context(&loaded).unwrap();
+        assert_eq!(execution.mode, "workspace-write");
+        assert_eq!(execution.sandbox["networkAccess"], false);
+        assert_eq!(execution.sandbox["excludeTmpdirEnvVar"], true);
+        assert_eq!(execution.sandbox["excludeSlashTmp"], true);
+        // Optional legacy fields absent in this context must not inherit old full-access values.
+        assert!(loaded["permission_profile"].is_null());
+        assert!(loaded["file_system_sandbox_policy"].is_null());
+        for field in ["approval_policy", "sandbox_policy", "cwd"] {
+            let mut partial = current.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            fs::write(&log.0, format!("{prefix}{}\n", context_record(partial))).unwrap();
+            let loaded = read(&log.0, "caller").unwrap();
+            assert!(loaded[field].is_null(), "{field}");
+            assert!(
+                resolve(Some("explicit".into()), Some("high".into()), loaded).is_err(),
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("approval_policy", json!("on-request")),
+            ("sandbox_policy", json!({"type":"read-only"})),
+            ("permission_profile", json!({"type":"restricted"})),
+            ("file_system_sandbox_policy", json!({"type":"restricted"})),
+        ] {
+            let mut changed = current.clone();
+            changed[field] = value;
+            fs::write(&log.0, format!("{prefix}{}\n", context_record(changed))).unwrap();
+            assert!(
+                Execution::from_context(&read(&log.0, "caller").unwrap()).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_context_must_be_fully_flushed_before_use() {
+        let log = SessionLog::new();
+        let start = json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"next"}});
+        let prefix = recorded_context() + &format!("{start}\n");
+        let mut payload = caller("new-model", "high");
+        payload["turn_id"] = json!("next");
+        let context = json!({"type":"turn_context","payload":payload}).to_string();
+        for tail in [&context[..context.len() / 2], context.as_str()] {
+            fs::write(&log.0, format!("{prefix}{tail}")).unwrap();
+            assert!(
+                read(&log.0, "caller")
+                    .unwrap_err()
+                    .contains("incomplete record")
+            );
+        }
+        fs::write(&log.0, format!("{prefix}{context}\n")).unwrap();
+        assert_eq!(read(&log.0, "caller").unwrap()["model"], "new-model");
     }
 
     #[test]
@@ -639,6 +819,14 @@ mod tests {
             (b"{\"type\":\"response_item\"}", "incomplete record"),
             (
                 b"{\"type\":\"turn_context\",\"payload\":",
+                "incomplete record",
+            ),
+            (
+                b"{\"type\":\"session_meta\",\"payload\":",
+                "incomplete record",
+            ),
+            (
+                b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"",
                 "incomplete record",
             ),
         ] {

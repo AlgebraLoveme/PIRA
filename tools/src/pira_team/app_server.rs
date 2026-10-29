@@ -21,7 +21,14 @@ const PENDING_CONTROLS: usize = 64;
 enum Event {
     Protocol(Value, std::ops::Range<u64>),
     Closed(String),
+    TierWriteFailed(u64, String),
     Control(Value, mpsc::Sender<Value>),
+}
+
+struct WriteRequest {
+    text: String,
+    // Only this request's delivery failure is control-local, not a fatal fault.
+    tier_id: Option<u64>,
 }
 
 fn relevant_event(value: &Value) -> bool {
@@ -87,11 +94,13 @@ fn logged_event(
 }
 
 struct Endpoint {
+    attempt_gate: crate::subteam::AttemptGate,
     address: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
     token: String,
+    epoch: String,
     turn: Arc<std::sync::Mutex<Option<String>>>,
     sandbox: Value,
     authentication: Option<crate::authentication::Server>,
@@ -100,17 +109,21 @@ struct Endpoint {
 impl Endpoint {
     fn start(
         run: &Path,
-        revision: &Value,
+        manifest: &Value,
         sandbox: &Value,
         sender: mpsc::SyncSender<Event>,
         mut controls: File,
         authentication: Option<crate::authentication::Server>,
     ) -> Result<Self, String> {
+        let attempt_gate = crate::subteam::AttemptGate::new(run, manifest)?;
+        let revision = &manifest["revision"];
         let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
         let address = listener.local_addr().map_err(|e| e.to_string())?;
         let mut bytes = [0_u8; 32];
         getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        getrandom::fill(&mut bytes).map_err(|e| e.to_string())?;
+        let epoch: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let turn = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -200,11 +213,13 @@ impl Endpoint {
             }
         });
         let endpoint = Self {
+            attempt_gate,
             address,
             stop,
             thread: Some(thread),
             path: run.join("control.json"),
             token,
+            epoch,
             turn,
             sandbox: sandbox.clone(),
             authentication,
@@ -215,25 +230,40 @@ impl Endpoint {
     }
 
     fn publish(&self, turn: Option<&str>) -> Result<(), String> {
+        self.attempt_gate.with_open(|| self.publish_locked(turn))
+    }
+
+    fn publish_locked(&self, turn: Option<&str>) -> Result<(), String> {
         lifecycle::save_json(
             &self.path,
             &json!({"address":self.address.to_string(),"token":self.token,"turn_id":turn,
+                "remote_epoch":self.epoch,"revision":self.revision,"tier_control":true,
                 "sandbox_policy":self.sandbox,"authentication":{"revision":self.revision,
                     "endpoint":self.authentication.as_ref().map(crate::authentication::Server::endpoint)}}),
         )
     }
 
     fn activate(&self, id: &str) -> Result<(), String> {
-        let mut turn = self.turn.lock().unwrap();
-        self.publish(Some(id))?;
-        *turn = Some(id.to_owned());
-        Ok(())
+        self.attempt_gate.with_open(|| {
+            let mut turn = self.turn.lock().unwrap();
+            self.publish_locked(Some(id))?;
+            *turn = Some(id.to_owned());
+            Ok(())
+        })
     }
 }
 impl Drop for Endpoint {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = fs::remove_file(&self.path);
+        // A blocked attempt must still clean up, but never erase a newer endpoint.
+        // Release the tree lock before waking/joining listener threads.
+        if let Ok(_lock) = self.attempt_gate.lock() {
+            if lifecycle::read_json(&self.path)
+                .is_ok_and(|endpoint| endpoint["remote_epoch"] == self.epoch)
+            {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
         let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(1));
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -344,13 +374,33 @@ fn control_request(
     task: &str,
     gate: Option<&str>,
 ) -> Result<Value, String> {
-    let endpoint = lifecycle::read_json(&run.join("control.json"))
-        .map_err(|e| format!("run has no readable control endpoint: {e}"))?;
-    if operation == "steer" {
+    let endpoint = lifecycle::read_json(&run.join("control.json")).map_err(|e| {
+        if operation == "tier" {
+            format!("no active owner/control endpoint; run unchanged: {e}")
+        } else {
+            format!("run has no readable control endpoint: {e}")
+        }
+    })?;
+    send_control(&endpoint, operation, task, gate)
+}
+
+fn send_control(
+    endpoint: &Value,
+    operation: &str,
+    task: &str,
+    gate: Option<&str>,
+) -> Result<Value, String> {
+    if operation == "tier" && endpoint["tier_control"] != true {
+        return Err("unsupported active owner: no service-tier control; run unchanged".into());
+    }
+    if matches!(operation, "steer" | "tier") {
         let caller = crate::profile::Execution::from_context(&crate::profile::load()?)?;
         // Bind policy to the capability snapshot, not a manifest from another revision.
         // PIRA: require the same represented policy; policy changes need interrupt/resume.
         if endpoint["sandbox_policy"] != caller.sandbox {
+            if operation == "tier" {
+                return Err("current caller permissions differ from active worker policy; tier rejected, run unchanged".into());
+            }
             return Err("current caller permissions differ from the active worker execution policy; interrupt then explicitly resume to inherit current permissions".into());
         }
     }
@@ -363,6 +413,12 @@ fn control_request(
         return Err("control endpoint must be loopback".into());
     }
     let frame = json!({"token":endpoint["token"], "turn_id":endpoint["turn_id"], "operation":operation, "task":task,"completion_gate":gate});
+    let mut frame = frame;
+    if operation == "tier" {
+        frame["service_tier"] = json!(task);
+        frame.as_object_mut().unwrap().remove("task");
+        frame.as_object_mut().unwrap().remove("completion_gate");
+    }
     let encoded = frame.to_string();
     if encoded.len() as u64 >= FRAME_LIMIT {
         return Err("control input exceeds 64 KiB".into());
@@ -378,6 +434,17 @@ fn control_request(
     writeln!(stream, "{encoded}").map_err(|e| format!("control delivery outcome unknown: {e}"))?;
     let response = read_frame(&mut stream)
         .map_err(|e| format!("control delivery outcome unknown; do not blindly retry: {e}"))?;
+    if operation == "tier" {
+        // Preserve structured rejected/unknown publication outcomes for the CLI.
+        let mut response = response;
+        if response["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("delivery outcome unknown"))
+        {
+            response["status"] = json!("unknown");
+        }
+        return Ok(response);
+    }
     if response["status"] != "accepted" {
         return Err(response["error"]
             .as_str()
@@ -385,6 +452,52 @@ fn control_request(
             .into());
     }
     Ok(response)
+}
+
+/// Public epoch only: never expose the native control capability to remote grants.
+pub(super) fn control_target(run: &Path) -> Result<Value, String> {
+    let manifest = lifecycle::read_json(&run.join("manifest.json"))?;
+    let endpoint = match std::fs::symlink_metadata(run.join("control.json")) {
+        Ok(_) => lifecycle::read_json(&run.join("control.json"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(
+        json!({"revision":manifest["revision"],"subtree_epoch":manifest["subtree_epoch"],
+        "control_epoch":endpoint["remote_epoch"],"turn_id":endpoint["turn_id"]}),
+    )
+}
+
+pub(super) fn require_control_target(run: &Path, expected: &Value) -> Result<(), String> {
+    if control_target(run)? != *expected {
+        return Err(
+            "stale signed control target; revision/turn/endpoint epoch changed; no effect sent"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn control_bound(
+    run: &Path,
+    operation: &str,
+    task: &str,
+    gate: Option<&str>,
+    expected: &Value,
+) -> Result<Value, String> {
+    let endpoint = lifecycle::read_json(&run.join("control.json"))?;
+    let manifest = lifecycle::read_json(&run.join("manifest.json"))?;
+    if expected["revision"] != manifest["revision"]
+        || expected["subtree_epoch"] != manifest["subtree_epoch"]
+        || expected["revision"] != endpoint["revision"]
+        || expected["control_epoch"] != endpoint["remote_epoch"]
+        || expected["turn_id"] != endpoint["turn_id"]
+    {
+        return Err("stale signed control target; no effect sent".into());
+    }
+    // Send using precisely this checked endpoint/token snapshot, never reread a
+    // resumed endpoint after authorization. Native turn checks close send races.
+    send_control(&endpoint, operation, task, gate)
 }
 
 pub struct Turn {
@@ -395,9 +508,10 @@ pub struct Turn {
 }
 
 struct Server {
+    attempt_gate: crate::subteam::AttemptGate,
     child: Child,
     scope: crate::process::Scope,
-    writer: Option<mpsc::SyncSender<String>>,
+    writer: Option<mpsc::SyncSender<WriteRequest>>,
     writer_thread: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
     events: mpsc::Receiver<Event>,
@@ -424,15 +538,24 @@ impl Server {
         run: &Path,
         dir: &Path,
         handoff: &Path,
+        attempt_gate: crate::subteam::AttemptGate,
         sender: mpsc::SyncSender<Event>,
         events: mpsc::Receiver<Event>,
         controls: mpsc::Receiver<Event>,
     ) -> Result<Self, String> {
+        // A revision can contain multiple staged/repair attempts. Never let recovery
+        // mistake a previous backend binding for a preflight or startup crash.
+        match fs::remove_file(run.join("runtime.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("invalidate previous backend identity: {error}")),
+        }
         let request_schema = crate::backend::preflight(options, run, dir)?;
         if crate::CANCELLED.load(Ordering::SeqCst) {
             return Err("interrupted before app-server launch".into());
         }
         let mut cmd = command(options, run, dir, handoff);
+        crate::set_worker_launcher(&mut cmd)?;
         cmd.stdout(Stdio::piped())
             .stderr(create(&dir.join("stderr.log"))?);
         let mut log = create(&dir.join("events.jsonl"))?;
@@ -489,7 +612,8 @@ impl Server {
                 }
             }
         });
-        let (writer, writer_thread) = request_writer(writer, fault.clone(), sender.clone());
+        let (writer, writer_thread) =
+            request_writer(writer, fault.clone(), sender.clone(), pipe_stop.clone());
         let reader_fault = fault.clone();
         let output = sender.clone();
         let reader_stop = pipe_stop.clone();
@@ -528,6 +652,7 @@ impl Server {
             }
         });
         Ok(Self {
+            attempt_gate,
             child,
             scope,
             writer: Some(writer),
@@ -553,15 +678,19 @@ impl Server {
         })
     }
     fn send(&mut self, value: Value) -> Result<(), String> {
+        let tier_id = if value["method"] == "turn/settings/update" {
+            value["id"].as_u64()
+        } else {
+            None
+        };
         let text = value.to_string();
         if text.len() as u64 > RPC_LIMIT {
             return Err("app-server request exceeds 16 MiB".into());
         }
+        let writer = self.writer.as_ref().ok_or("app-server stdin closed")?;
         writeln!(self.requests, "{text}").map_err(|e| e.to_string())?;
-        self.writer
-            .as_ref()
-            .ok_or("app-server stdin closed")?
-            .try_send(text)
+        writer
+            .try_send(WriteRequest { text, tier_id })
             .map_err(|_| "app-server request queue full or writer closed".into())
     }
     fn send_request(&mut self, method: &str, params: Value) -> Result<u64, String> {
@@ -576,7 +705,15 @@ impl Server {
         if crate::CANCELLED.load(Ordering::SeqCst) {
             return Err("interrupted during worker startup".into());
         }
-        let id = self.send_request(method, params)?;
+        let id = if method == "turn/start" {
+            // Admission is enqueueing the start request, not waiting for its ACK.
+            // Never hold tree.lock across backend I/O or control-thread joins.
+            self.attempt_gate
+                .clone()
+                .with_open(|| self.send_request(method, params))?
+        } else {
+            self.send_request(method, params)?
+        };
         if method == "turn/start" {
             self.start_pending = Some(self.received_end);
         }
@@ -605,7 +742,7 @@ impl Server {
                     }
                     self.pending.end = frame.end;
                 }
-                Ok(Event::Closed(error)) => return Err(error),
+                Ok(Event::Closed(error) | Event::TierWriteFailed(_, error)) => return Err(error),
                 Ok(Event::Control(_, reply)) => {
                     let _ = reply
                         .send(json!({"status":"rejected","error":"worker has no active turn"}));
@@ -803,15 +940,25 @@ fn request_writer(
     mut writer: impl Write + Send + 'static,
     fault: Arc<std::sync::Mutex<Option<String>>>,
     events: mpsc::SyncSender<Event>,
-) -> (mpsc::SyncSender<String>, std::thread::JoinHandle<()>) {
-    let (sender, requests) = mpsc::sync_channel::<String>(PENDING_CONTROLS + 1);
+    stopped: Arc<AtomicBool>,
+) -> (mpsc::SyncSender<WriteRequest>, std::thread::JoinHandle<()>) {
+    let (sender, requests) = mpsc::sync_channel::<WriteRequest>(PENDING_CONTROLS + 1);
     let thread = std::thread::spawn(move || {
-        for text in requests {
-            if let Err(error) = writeln!(writer, "{text}").and_then(|_| writer.flush()) {
+        while let Ok(request) = requests.recv() {
+            if let Err(error) = writeln!(writer, "{}", request.text).and_then(|_| writer.flush()) {
                 let error = format!("write app-server request: {error}");
-                *fault.lock().unwrap() = Some(error.clone());
-                let _ = events.try_send(Event::Closed(error));
-                break;
+                // A failed/partial frame makes all further writes unsafe. Close the
+                // input queue before notifying the owner; never retry the frame.
+                drop(requests);
+                if let Some(id) = request.tier_id {
+                    // Keep stdout and its workload alive. Delivery is unknown,
+                    // including flush failures after bytes may have been accepted.
+                    let _ = deliver_event(&events, Event::TierWriteFailed(id, error), &stopped);
+                } else {
+                    *fault.lock().unwrap() = Some(error.clone());
+                    let _ = events.try_send(Event::Closed(error));
+                }
+                return;
             }
         }
     });
@@ -825,7 +972,7 @@ pub fn turn(
     task: &str,
     manifest: &mut Value,
     handoff: &Path,
-    guidance: (bool, bool, bool),
+    guidance: (bool, bool, bool, bool),
 ) -> Result<Turn, String> {
     let build_roots = crate::build_roots::configured()?;
     for root in &build_roots {
@@ -840,7 +987,7 @@ pub fn turn(
     let mut controls = create(&dir.join("controls.jsonl"))?;
     let endpoint = Endpoint::start(
         run,
-        &manifest["revision"],
+        manifest,
         &options.execution.sandbox,
         control_sender,
         controls.try_clone().map_err(|e| e.to_string())?,
@@ -854,12 +1001,21 @@ pub fn turn(
             None
         },
     )?;
-    let mut server = Server::new(options, run, dir, handoff, sender, events, control_events)?;
+    let mut server = Server::new(
+        options,
+        run,
+        dir,
+        handoff,
+        endpoint.attempt_gate.clone(),
+        sender,
+        events,
+        control_events,
+    )?;
     // Server owns cleanup before the fallible binding write; no separate spawn rollback.
-    crate::subteam::bind(run, &manifest["revision"], &server.scope)?;
+    crate::subteam::bind(run, &manifest["revision"], &server.scope, dir)?;
     let mut stopping: Option<(&str, Instant)> = None;
     let outcome = (|| -> Result<(String, Option<String>), String> {
-        server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}))
+        server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))
         .map_err(|e| if crate::CANCELLED.load(Ordering::SeqCst) { e } else { format!("native Codex strict-config stdio initialization failed: {e}; inspect stderr.log and update Codex/Team to compatible builds. This is separate from the interactive shared daemon") })?;
         server.send(json!({"method":"initialized"}))?;
         let policy = fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?;
@@ -903,17 +1059,19 @@ pub fn turn(
         // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
         manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
         if options.allow_subteam {
-            manifest["coordinator_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+            manifest["coordinator_policy_version"] = json!(crate::COORDINATOR_POLICY_VERSION);
         }
         manifest["inject_review"] = json!(guidance.0);
         manifest["inject_implement"] = json!(guidance.1);
         manifest["inject_fig"] = json!(guidance.2);
+        manifest["inject_write"] = json!(guidance.3);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
+        let tier = crate::service_tier::Tier::retained(manifest)?;
         let started = server.request(
             "turn/start",
             json!({"threadId":thread_id,"input":[{"type":"text","text":task}],
         "model":options.model,"effort":options.effort,"cwd":options.cwd,"approvalPolicy":"never",
-        "sandboxPolicy":options.execution.sandbox}),
+        "sandboxPolicy":options.execution.sandbox,"serviceTierForTurn":tier.backend()}),
         )?;
         let turn_id = started["turn"]["id"]
             .as_str()
@@ -931,6 +1089,7 @@ pub fn turn(
 
         let mut pending_controls: HashMap<u64, (String, String, String, mpsc::Sender<Value>)> =
             HashMap::new();
+        let mut pending_tier: Option<(u64, crate::service_tier::Tier, mpsc::Sender<Value>)> = None;
         loop {
             if stopping.is_none() && crate::CANCELLED.load(Ordering::SeqCst) {
                 let status = "interrupted";
@@ -970,8 +1129,53 @@ pub fn turn(
                     }
                     return Ok(("failed".into(), Some(error)));
                 }
+                Event::TierWriteFailed(id, error) => {
+                    // No more writes are safe, but the reader/watchdog still
+                    // distinguish surviving work from a true backend/output fault.
+                    server.writer.take();
+                    if pending_tier.as_ref().is_some_and(|pending| pending.0 == id) {
+                        let (_, _, reply) = pending_tier.take().unwrap();
+                        let mut response = json!({"status":"unknown","publication":"unknown",
+                            "error":format!("tier delivery outcome unknown; stdin closed: {error}; backend output remains monitored; do not blindly retry"),
+                            "actual_service_tier":null});
+                        if let Err(error) = writeln!(
+                            controls,
+                            "{}",
+                            json!({"request_id":id,"operation":"tier","response":response})
+                        ) {
+                            response["diagnostic_warning"] =
+                                json!(format!("tier acknowledgement log failed: {error}"));
+                        }
+                        let _ = reply.send(response);
+                    }
+                }
                 Event::Control(request, reply) => {
                     let op = request["operation"].as_str().unwrap_or("");
+                    if op == "tier" {
+                        let update = crate::service_tier::active_update(
+                            &request,
+                            &thread_id,
+                            &turn_id,
+                            stopping.is_some(),
+                            pending_tier.is_some(),
+                        );
+                        match update {
+                            Err(error) => {
+                                let _ = reply.send(json!({"status":"rejected","error":error}));
+                            }
+                            Ok((tier, params)) => match server
+                                .send_request("turn/settings/update", params)
+                            {
+                                Ok(id) => {
+                                    pending_tier = Some((id, tier, reply));
+                                }
+                                Err(error) => {
+                                    let _ = reply.send(json!({"status":"rejected","error":error}));
+                                }
+                            },
+                        }
+                        continue;
+                    }
                     let task = request["task"].as_str().unwrap_or("");
                     let gate = request["completion_gate"].as_str().unwrap_or("");
                     if request["turn_id"] != turn_id
@@ -1017,6 +1221,27 @@ pub fn turn(
                         return Err("unexpected approval/tool request refused".into());
                     }
                     if let Some(id) = value["id"].as_u64() {
+                        if pending_tier.as_ref().is_some_and(|pending| pending.0 == id) {
+                            let (_, tier, reply) = pending_tier.take().unwrap();
+                            let mut response = crate::service_tier::publication(
+                                tier,
+                                &turn_id,
+                                &value,
+                                manifest,
+                                |state| lifecycle::save_json(&run.join("manifest.json"), state),
+                            );
+                            // A tier-control diagnostic failure must not terminate model work.
+                            if let Err(error) = writeln!(
+                                controls,
+                                "{}",
+                                json!({"request_id":id,"operation":"tier","response":response})
+                            ) {
+                                response["diagnostic_warning"] =
+                                    json!(format!("tier acknowledgement log failed: {error}"));
+                            }
+                            let _ = reply.send(response);
+                            continue;
+                        }
                         if let Some((op, task, gate, reply)) = pending_controls.remove(&id) {
                             let response = if let Some(error) = value.get("error") {
                                 json!({"status":"rejected","error":error.to_string()})
@@ -1243,9 +1468,19 @@ mod tests {
         let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let fault = Arc::new(std::sync::Mutex::new(None));
         let (events, _) = mpsc::sync_channel(1);
-        let (writer, thread) = request_writer(Recorded(bytes.clone()), fault.clone(), events);
+        let (writer, thread) = request_writer(
+            Recorded(bytes.clone()),
+            fault.clone(),
+            events,
+            Arc::new(AtomicBool::new(false)),
+        );
         for text in ["initialize", "initialized", "turn/start"] {
-            writer.try_send(text.into()).unwrap();
+            writer
+                .try_send(WriteRequest {
+                    text: text.into(),
+                    tier_id: None,
+                })
+                .unwrap();
         }
         drop(writer);
         thread.join().unwrap();
@@ -1254,6 +1489,97 @@ mod tests {
             b"initialize\ninitialized\nturn/start\n"
         );
         assert!(fault.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn tier_flush_failure_survives_full_event_queue_and_disables_writes() {
+        struct FlushFailure(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fault = Arc::new(std::sync::Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (events, receiver) = mpsc::sync_channel(1);
+        events
+            .try_send(Event::Protocol(json!("already queued"), 0..1))
+            .unwrap();
+        let (writer, thread) =
+            request_writer(FlushFailure(bytes.clone()), fault.clone(), events, stopped);
+        writer
+            .try_send(WriteRequest {
+                text: "tier-frame".into(),
+                tier_id: Some(7),
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Protocol(_, _)
+        ));
+        let Event::TierWriteFailed(id, error) =
+            receiver.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("tier failure became a fatal transport event")
+        };
+        assert_eq!(id, 7);
+        assert!(error.contains("write app-server request"));
+        thread.join().unwrap();
+        assert!(fault.lock().unwrap().is_none());
+        assert_eq!(*bytes.lock().unwrap(), b"tier-frame\n");
+        assert!(matches!(
+            writer.try_send(WriteRequest {
+                text: "never retry".into(),
+                tier_id: Some(8)
+            }),
+            Err(mpsc::TrySendError::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn shutdown_releases_pending_tier_write_failure_without_fatal_fault() {
+        struct Failing(mpsc::Sender<()>);
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0.send(()).unwrap();
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let fault = Arc::new(std::sync::Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (entered, failed) = mpsc::channel();
+        let (events, receiver) = mpsc::sync_channel(1);
+        events
+            .try_send(Event::Protocol(json!("already queued"), 0..1))
+            .unwrap();
+        let (writer, thread) =
+            request_writer(Failing(entered), fault.clone(), events, stopped.clone());
+        writer
+            .try_send(WriteRequest {
+                text: "tier-frame".into(),
+                tier_id: Some(7),
+            })
+            .unwrap();
+        failed.recv_timeout(Duration::from_secs(3)).unwrap();
+        stopped.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        assert!(fault.lock().unwrap().is_none());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Protocol(_, _)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
@@ -1283,16 +1609,35 @@ mod tests {
             },
             fault.clone(),
             events,
+            Arc::new(AtomicBool::new(false)),
         );
-        writer.try_send("steer".into()).unwrap();
+        writer
+            .try_send(WriteRequest {
+                text: "steer".into(),
+                tier_id: None,
+            })
+            .unwrap();
         started.recv_timeout(Duration::from_secs(3)).unwrap();
         // The caller can still admit interruption while the transport is blocked.
         for _ in 0..PENDING_CONTROLS {
-            writer.try_send("steer".into()).unwrap();
+            writer
+                .try_send(WriteRequest {
+                    text: "steer".into(),
+                    tier_id: None,
+                })
+                .unwrap();
         }
-        writer.try_send("interrupt".into()).unwrap();
+        writer
+            .try_send(WriteRequest {
+                text: "interrupt".into(),
+                tier_id: None,
+            })
+            .unwrap();
         assert!(matches!(
-            writer.try_send("overflow".into()),
+            writer.try_send(WriteRequest {
+                text: "overflow".into(),
+                tier_id: None
+            }),
             Err(mpsc::TrySendError::Full(_))
         ));
         release.send(()).unwrap();
@@ -1309,7 +1654,14 @@ mod tests {
                 .unwrap()
                 .contains("write app-server request")
         );
-        assert!(writer.try_send("closed".into()).is_err());
+        assert!(
+            writer
+                .try_send(WriteRequest {
+                    text: "closed".into(),
+                    tier_id: None
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -1409,4 +1761,266 @@ mod tests {
                 .contains("delivery outcome unknown")
         );
     }
+    struct AttemptFixture {
+        root: PathBuf,
+        run: PathBuf,
+        manifest: Value,
+    }
+    impl AttemptFixture {
+        fn new() -> Self {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).unwrap();
+            let name: String = random.iter().map(|b| format!("{b:02x}")).collect();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("pira-attempt-race-{name}"));
+            crate::private_dir(&root).unwrap();
+            let run = root.join("fixture-run");
+            crate::private_dir(&run).unwrap();
+            let manifest = json!({"run_id":"fixture-run","creator_main_session_id":"fixture-root","parent_run_id":null,"revision":1,"subtree_epoch":0,"status":"running"});
+            lifecycle::save_json(&run.join("manifest.json"), &manifest).unwrap();
+            lifecycle::save_json(&run.join("tree.json"),&json!({"version":1,"epoch":0,"blocked":false,"members":{"fixture-run":{"active":true,"revision":1,"blocked":false}}})).unwrap();
+            Self {
+                root,
+                run,
+                manifest,
+            }
+        }
+        fn endpoint(&self, label: &str) -> Endpoint {
+            attempt_endpoint(&self.run, &self.manifest, &self.root.join(label)).unwrap()
+        }
+    }
+    impl Drop for AttemptFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    fn attempt_endpoint(run: &Path, manifest: &Value, log: &Path) -> Result<Endpoint, String> {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        Endpoint::start(
+            run,
+            manifest,
+            &json!({"type":"dangerFullAccess"}),
+            sender,
+            crate::create(log)?,
+            None,
+        )
+    }
+
+    #[test]
+    fn recursive_gate_serializes_forced_same_revision_rollover_and_next_turn_admission() {
+        let f = AttemptFixture::new();
+        let a = f.endpoint("controls-A");
+        a.activate("turn-A").unwrap();
+        let target = control_target(&f.run).unwrap();
+        let (checked, check_seen) = mpsc::channel();
+        let (release, hold_check) = mpsc::channel();
+        let run = f.run.clone();
+        let signed = target.clone();
+        let interrupt = std::thread::spawn(move || {
+            crate::subteam::after_bound_check(move || {
+                checked.send(()).unwrap();
+                hold_check.recv_timeout(Duration::from_secs(8)).unwrap();
+            });
+            crate::subteam::close_bound_gate_for_test(&run, &signed)
+        });
+        check_seen.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (contended, contention_seen) = mpsc::channel();
+        let run = f.run.clone();
+        let manifest = f.manifest.clone();
+        let log = f.root.join("controls-B");
+        let started = Arc::new(AtomicBool::new(false));
+        let model_started = started.clone();
+        let rollover = std::thread::spawn(move || {
+            crate::subteam::on_lock_contention(move || {
+                contended.send(()).unwrap();
+            });
+            let publication = attempt_endpoint(&run, &manifest, &log);
+            let published = publication.is_ok();
+            drop(publication);
+            let admission = crate::subteam::AttemptGate::new(&run, &manifest)
+                .unwrap()
+                .with_open(|| {
+                    model_started.store(true, Ordering::SeqCst);
+                    Ok(())
+                });
+            (published, admission)
+        });
+        // The contender has reached the real native tree lock while A's checked
+        // critical section is paused. No sleeps or scheduling guess establish it.
+        let contention = contention_seen.recv_timeout(Duration::from_secs(3));
+        let during = control_target(&f.run).unwrap();
+        release.send(()).unwrap();
+        interrupt.join().unwrap().unwrap();
+        let (published, admission) = rollover.join().unwrap();
+        assert!(
+            contention.is_ok(),
+            "B did not contend on the checked tree critical section"
+        );
+        assert_eq!(during, target);
+        assert!(!published);
+        assert!(admission.is_err());
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(a.activate("late-turn").is_err());
+        assert_eq!(control_target(&f.run).unwrap(), target);
+        drop(a);
+        assert!(!f.run.join("control.json").exists()); // blocked owners still clear their endpoint
+    }
+
+    #[test]
+    fn stale_recursive_target_cannot_gate_published_next_attempt_or_clear_its_endpoint() {
+        let f = AttemptFixture::new();
+        let a = f.endpoint("controls-A");
+        a.activate("turn-A").unwrap();
+        let target_a = control_target(&f.run).unwrap();
+        let b = f.endpoint("controls-B");
+        b.activate("turn-B").unwrap();
+        let target_b = control_target(&f.run).unwrap();
+        assert_ne!(target_a, target_b);
+        drop(a);
+        assert_eq!(control_target(&f.run).unwrap(), target_b);
+        let error = crate::subteam::close_bound_gate_for_test(&f.run, &target_a).unwrap_err();
+        assert!(error.contains("stale"), "{error}");
+        assert_eq!(
+            lifecycle::read_json(&f.run.join("tree.json")).unwrap()["blocked"],
+            false
+        );
+        assert_eq!(control_target(&f.run).unwrap(), target_b);
+        let gate = crate::subteam::AttemptGate::new(&f.run, &f.manifest).unwrap();
+        let admitted = gate.with_open(|| Ok("B turn admitted")).unwrap();
+        assert_eq!(admitted, "B turn admitted");
+        crate::subteam::close_bound_gate_for_test(&f.run, &target_b).unwrap();
+        assert!(
+            gate.with_open(|| Err::<(), _>("must not reach a new model turn".into()))
+                .unwrap_err()
+                .contains("gate is closed")
+        );
+        assert!(b.activate("late-B-turn").is_err());
+    }
+
+    #[test]
+    fn old_or_absent_owner_is_unsupported_without_touching_it() {
+        let root = std::env::temp_dir().join(format!(
+            "tier-old-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(
+            control_request(&root, "tier", "fast", None)
+                .unwrap_err()
+                .contains("no active owner")
+        );
+        let old = "{\"address\":\"127.0.0.1:1\",\"turn_id\":\"old\"}";
+        fs::write(root.join("control.json"), old).unwrap();
+        assert!(
+            control_request(&root, "tier", "fast", None)
+                .unwrap_err()
+                .contains("unsupported active owner")
+        );
+        assert_eq!(fs::read_to_string(root.join("control.json")).unwrap(), old);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tier_endpoint_requires_capability_and_preserves_publication_outcomes() {
+        let root = std::env::temp_dir().join(format!(
+            "tier-endpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        lifecycle::save_json(&root.join("tree.json"), &json!({"version":1,"epoch":0,"blocked":false,
+            "members":{root.file_name().unwrap().to_str().unwrap():{"active":true,"revision":1,"blocked":false}}})).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let endpoint = Endpoint::start(
+            &root,
+            &json!({"revision":1,"subtree_epoch":0,"parent_run_id":null}),
+            &json!({"type":"dangerFullAccess"}),
+            sender,
+            create(&root.join("controls.jsonl")).unwrap(),
+            None,
+        )
+        .unwrap();
+        let exchange = |token: String, turn: &str| {
+            let address = endpoint.address;
+            let turn = turn.to_owned();
+            std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"token":token,"operation":"tier","turn_id":turn,"service_tier":"fast"})
+                )
+                .unwrap();
+                read_frame(&mut stream).unwrap()
+            })
+        };
+        let invalid = exchange("wrong synthetic capability".into(), "active")
+            .join()
+            .unwrap();
+        assert_eq!(invalid["status"], "rejected");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let startup = exchange(endpoint.token.clone(), "active").join().unwrap();
+        assert_eq!(startup["status"], "rejected");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        endpoint.activate("active").unwrap();
+        for response in [
+            json!({"status":"accepted","publication":"applied","actual_service_tier":null}),
+            json!({"status":"rejected","publication":"targetUnavailable"}),
+            json!({"status":"unknown","publication":"unknown"}),
+        ] {
+            let client = exchange(endpoint.token.clone(), "active");
+            let Event::Control(request, reply) =
+                receiver.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("not a control")
+            };
+            let (_, params) =
+                crate::service_tier::active_update(&request, "thread", "active", false, false)
+                    .unwrap();
+            assert_eq!(
+                params,
+                json!({"threadId":"thread","turnId":"active","serviceTier":"fast"})
+            );
+            reply.send(response.clone()).unwrap();
+            assert_eq!(client.join().unwrap(), response);
+        }
+        let client = exchange(endpoint.token.clone(), "previous");
+        let Event::Control(request, reply) = receiver.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("not a control")
+        };
+        assert!(
+            crate::service_tier::active_update(&request, "thread", "active", false, false).is_err()
+        );
+        reply
+            .send(json!({"status":"rejected","error":"stale turn"}))
+            .unwrap();
+        assert_eq!(client.join().unwrap()["status"], "rejected");
+        // The owner and endpoint remain usable after all rejected/unknown controls.
+        assert!(!endpoint.stop.load(Ordering::SeqCst));
+        drop(endpoint);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
+
+#[cfg(all(test, unix))]
+#[path = "tier_control_tests.rs"]
+mod tier_control_tests;

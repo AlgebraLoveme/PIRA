@@ -1,0 +1,1 @@
+IMPLEMENTATION STAGE. Review has successfully finished. Use the retained review and managed checkpoint for authorized fixes, then verify the final diff and impact. Do not repeat the broad review unnecessarily. Edit authority comes from the assigned task, not guidance injection flags. The final completion gate applies to the complete assignment.

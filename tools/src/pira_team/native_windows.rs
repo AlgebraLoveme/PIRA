@@ -142,6 +142,14 @@ unsafe extern "system" {
     fn AssignProcessToJobObject(job: Raw, process: Raw) -> i32;
     fn TerminateJobObject(job: Raw, status: u32) -> i32;
     fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> Raw;
+    fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
+    fn QueryInformationJobObject(
+        job: Raw,
+        class: i32,
+        information: Raw,
+        size: u32,
+        returned: *mut u32,
+    ) -> i32;
     fn IsProcessInJob(process: Raw, job: Raw, result: *mut i32) -> i32;
     fn CreateNamedPipeW(
         name: *const u16,
@@ -372,6 +380,50 @@ pub fn in_job(name: &str) -> io::Result<bool> {
     let mut result = 0;
     checked(unsafe { IsProcessInJob(GetCurrentProcess(), job.0, &mut result) })?;
     Ok(result != 0)
+}
+
+/// Return the kernel session that owns the process namespace.
+pub fn session_id(pid: u32) -> io::Result<u32> {
+    let mut session = 0;
+    checked(unsafe { ProcessIdToSessionId(pid, &mut session) })?;
+    Ok(session)
+}
+
+/// Prove the recorded named scope is empty in its original OS session namespace.
+pub fn job_empty(name: &str, expected_session: u32) -> io::Result<bool> {
+    if session_id(std::process::id())? != expected_session {
+        return Err(io::Error::other(
+            "backend job belongs to a different OS session",
+        ));
+    }
+    let job = match Handle::checked(unsafe { OpenJobObjectW(4, 0, wide(name).as_ptr()) }) {
+        Ok(job) => job,
+        // A named job exists until both its handles and associated processes are gone.
+        Err(error) if error.raw_os_error() == Some(2) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    #[repr(C)]
+    struct Accounting {
+        user_time: i64,
+        kernel_time: i64,
+        period_user_time: i64,
+        period_kernel_time: i64,
+        page_faults: u32,
+        total_processes: u32,
+        active_processes: u32,
+        terminated_processes: u32,
+    }
+    let mut accounting: Accounting = unsafe { mem::zeroed() };
+    checked(unsafe {
+        QueryInformationJobObject(
+            job.0,
+            1, // JobObjectBasicAccountingInformation
+            (&mut accounting as *mut Accounting).cast(),
+            mem::size_of::<Accounting>() as u32,
+            ptr::null_mut(),
+        )
+    })?;
+    Ok(accounting.active_processes == 0)
 }
 
 struct LocalMemory(Raw);

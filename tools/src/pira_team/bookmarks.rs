@@ -1,5 +1,5 @@
 //! Main-session-scoped management pointers; never part of worker inputs or configuration.
-use crate::{lifecycle, profile::defaults, storage};
+use crate::{profile::defaults, storage};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -227,14 +227,16 @@ fn persist(root: &Path, index: &Index) -> Result<(), String> {
     result
 }
 
-fn run_reference(root: &Path, id: &str) -> Value {
-    json!({"run_id":id,"run_root":root.join(id)})
+fn run_reference(root: &Path, id: &str, session: &str) -> Result<Value, String> {
+    if let Some(reference) = crate::remote::routing::reference_for(root, id, session)? {
+        return Ok(reference);
+    }
+    storage::locate_for(root, id, session)?;
+    Ok(json!({"run_id":id,"run_root":root.join(id)}))
 }
 
 fn visible_reference(root: &Path, id: &str, session: &str) -> Option<Value> {
-    storage::locate_for(root, id, session)
-        .ok()
-        .map(|_| run_reference(root, id))
+    run_reference(root, id, session).ok()
 }
 
 fn lookup(index: &Index, label: &str, session: &str) -> Result<String, String> {
@@ -258,7 +260,12 @@ pub fn assign(root: &Path, reference: &str, label: &str) -> Result<Value, String
     let session = crate::profile::caller_session()?;
     validate_label(label)?;
     // Reject inaccessible targets before creating any lock/metadata files.
-    storage::locate_for(root, reference, &session)?;
+    let initial = if let Some(alias) = reference.strip_prefix('@') {
+        resolve_for(root, alias, &session)?
+    } else {
+        reference.to_owned()
+    };
+    run_reference(root, &initial, &session)?;
     let root = root_if_present(root)?.ok_or("Team store does not exist")?;
     let _lock = lock(&root)?;
     let mut index = load(&root)?;
@@ -268,9 +275,7 @@ pub fn assign(root: &Path, reference: &str, label: &str) -> Result<Value, String
         storage::validate_run_id(reference)?;
         reference.to_owned()
     };
-    let run = storage::locate_for(&root, &id, &session)?;
-    lifecycle::private_path(&run, true)?;
-    lifecycle::private_path(&run.join("manifest.json"), false)?;
+    let current = run_reference(&root, &id, &session)?;
     let previous = index
         .scoped
         .get(&(session.clone(), label.to_owned()))
@@ -284,7 +289,7 @@ pub fn assign(root: &Path, reference: &str, label: &str) -> Result<Value, String
     }
     Ok(
         json!({"label":label,"previous":previous.as_deref().and_then(|id| visible_reference(&root,id,&session)),
-        "current":run_reference(&root,&id),"changed":changed}),
+        "current":current,"changed":changed}),
     )
 }
 
@@ -324,9 +329,12 @@ fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, Strin
     let mut matches = Vec::new();
     let mut has_more = false;
     for ((owner, label), id) in index.scoped {
-        if owner != session || visible_reference(&root, &id, &session).is_none() {
+        if owner != session {
             continue;
         }
+        let Some(reference) = visible_reference(&root, &id, &session) else {
+            continue;
+        };
         if query
             .as_ref()
             .is_some_and(|q| !label.to_lowercase().contains(q))
@@ -337,7 +345,7 @@ fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, Strin
             has_more = true;
             break;
         }
-        matches.push(json!({"label":label,"run_id":id,"run_root":root.join(&id)}));
+        matches.push(json!({"label":label,"run_id":id,"run_root":reference["run_root"]}));
     }
     Ok(json!({"matches":matches,"has_more":has_more}))
 }

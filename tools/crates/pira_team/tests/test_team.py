@@ -1629,7 +1629,7 @@ class TeamTests(unittest.TestCase):
 
     def test_nested_workers_are_rejected(self) -> None:
         self.env["PIRA_TEAM_CHILD"] = "1"
-        for op in ("run", "resume", "steer", "interrupt", "read", "path"):
+        for op in ("run", "resume", "steer", "interrupt", "read", "path", "wait", "tier", "resolve"):
             with self.subTest(op=op):
                 result = subprocess.run([str(self.bin), op], env=self.env, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
@@ -1908,7 +1908,12 @@ class TeamTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text())
         manifest["status"] = "running"
         manifest_path.write_text(json.dumps(manifest))
-        self.assertIn("ambiguous recovery", self.access("resume", receipt["run_id"]).stderr)
+        before = manifest_path.read_bytes()
+        refused = self.access("resume", receipt["run_id"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("refusing automatic replay", refused.stderr)
+        self.assertIn("interrupt -r RUN_ID", refused.stderr)
+        self.assertEqual(manifest_path.read_bytes(), before)
         manifest["status"] = "completed"
         del manifest["transport"]
         manifest_path.write_text(json.dumps(manifest))

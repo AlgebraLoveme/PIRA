@@ -31,8 +31,97 @@ fn command_encodes_project_trust_as_a_toml_value() {
     }
 }
 
+// Probe functionality, not PATH presence: Windows Store aliases can resolve but fail.
+fn project_trust_python_with(
+    mut usable: impl FnMut(&mut Command) -> Result<bool, String>,
+) -> Result<Command, String> {
+    let mut failures = Vec::new();
+    for (program, prefix) in [
+        ("python3", &[][..]),
+        ("python", &[][..]),
+        ("py", &["-3"][..]),
+    ] {
+        let mut probe = Command::new(program);
+        probe.env_clear().stdin(std::process::Stdio::null());
+        for name in ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = std::env::var_os(name) {
+                probe.env(name, value);
+            }
+        }
+        probe.args(prefix).args([
+            "-I",
+            "-c",
+            "import sys; assert sys.version_info >= (3, 11); print('pira-team-python-ok')",
+        ]);
+        match usable(&mut probe) {
+            Ok(true) => {
+                let mut command = Command::new(program);
+                command.args(prefix);
+                return Ok(command);
+            }
+            Ok(false) => failures.push(format!("{program}: not functional Python 3.11+")),
+            Err(error) => failures.push(format!("{program}: {error}")),
+        }
+    }
+    Err(format!(
+        "native project-trust probe requires working Python 3.11+ on PATH (python3, python, or py -3): {}",
+        failures.join("; ")
+    ))
+}
+
+fn project_trust_python() -> Result<Command, String> {
+    project_trust_python_with(|probe| {
+        let output = probe.output().map_err(|error| error.to_string())?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim() == "pira-team-python-ok")
+    })
+}
+
 #[test]
-#[ignore = "requires installed native Codex and Python 3; no credentials or model calls"]
+fn project_trust_python_falls_back_from_store_alias_to_python() {
+    let mut attempted = Vec::new();
+    let command = project_trust_python_with(|probe| {
+        let program = probe.get_program().to_string_lossy().into_owned();
+        attempted.push(program.clone());
+        assert!(probe.get_args().any(|arg| arg == "-I"));
+        assert!(probe.get_envs().all(|(key, _)| {
+            ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"]
+                .iter()
+                .any(|allowed| key == *allowed)
+        }));
+        Ok(program == "python")
+    })
+    .unwrap();
+    assert_eq!(attempted, ["python3", "python"]);
+    assert_eq!(command.get_program(), "python");
+    assert_eq!(command.get_args().count(), 0);
+}
+
+#[test]
+fn project_trust_python_uses_py_launcher_and_reports_exhaustion() {
+    let mut attempted = Vec::new();
+    let command = project_trust_python_with(|probe| {
+        let program = probe.get_program().to_string_lossy().into_owned();
+        attempted.push(program.clone());
+        if program == "python3" {
+            Err("not found".into())
+        } else {
+            Ok(program == "py")
+        }
+    })
+    .unwrap();
+    assert_eq!(attempted, ["python3", "python", "py"]);
+    assert_eq!(command.get_program(), "py");
+    assert_eq!(command.get_args().collect::<Vec<_>>(), ["-3"]);
+    let error = project_trust_python_with(|_| Ok(false)).unwrap_err();
+    assert!(error.contains("Python 3.11+"));
+    for program in ["python3:", "python:", "py:"] {
+        assert!(error.contains(program));
+    }
+}
+
+#[test]
+#[ignore = "requires installed native Codex and Python 3.11+; no credentials or model calls"]
 fn installed_native_launcher_preserves_exact_untrusted_project_keys() {
     let root = std::env::temp_dir().join(format!(
         "team-project-trust-{}-{}",
@@ -83,7 +172,7 @@ fn installed_native_launcher_preserves_exact_untrusted_project_keys() {
                 .chain(cmd.get_args())
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect();
-            let mut probe = Command::new("python3");
+            let mut probe = project_trust_python()?;
             probe.env_clear();
             for name in ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] {
                 if let Some(value) = std::env::var_os(name) {

@@ -1,0 +1,1 @@
+Edit authority comes from the assigned task, not guidance injection flags.
