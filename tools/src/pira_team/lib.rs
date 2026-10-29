@@ -8,6 +8,8 @@ mod lifecycle;
 mod native;
 mod process;
 mod profile;
+mod remote;
+mod service_tier;
 mod storage;
 mod subteam;
 
@@ -43,6 +45,7 @@ struct Options {
     store: PathBuf,
     model: String,
     effort: String,
+    service_tier: service_tier::Tier,
     profile_sources: Value,
     execution: profile::Execution,
     task: String,
@@ -136,6 +139,7 @@ fn parse_using(
     let mut cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut store = None;
     let (mut model, mut effort, mut task, mut task_file) = (None, None, None, None);
+    let mut service_tier = None;
     let mut output = "artifact".to_string();
     let mut format = "auto".to_string();
     let (mut schema, mut columns) = (None, None);
@@ -213,6 +217,11 @@ fn parse_using(
             "--store" => store = Some(PathBuf::from(value)),
             "--model" => model = Some(value.clone()),
             "--effort" => effort = Some(value.clone()),
+            "--service-tier" => set_once(
+                &mut service_tier,
+                service_tier::Tier::parse(value)?,
+                "--service-tier",
+            )?,
             "--task" => set_once(&mut task, value.clone(), "task")?,
             "--task-file" => set_once(&mut task_file, PathBuf::from(value), "--task-file")?,
             "--timeout" => {
@@ -274,6 +283,7 @@ fn parse_using(
         model,
         effort,
         profile_sources,
+        service_tier: service_tier.unwrap_or(service_tier::Tier::Standard),
         execution,
         task,
         label,
@@ -429,6 +439,7 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     for setting in [
         format!("sandbox_mode={}", json!(options.execution.mode)),
         "approval_policy=\"never\"".to_owned(),
+        "features.fast_mode=true".to_owned(),
         format!("model={}", json!(options.model)),
         format!("model_reasoning_effort={}", json!(options.effort)),
         format!("model_instructions_file={}", json!(dir.join("policy.md"))),
@@ -529,6 +540,32 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     cmd
 }
 
+fn worker_path(launcher: &Path, inherited: Option<&std::ffi::OsStr>) -> Result<String, String> {
+    let directory = launcher.parent().ok_or("Team launcher has no directory")?;
+    let mut paths = vec![directory.to_path_buf()];
+    if let Some(inherited) = inherited {
+        paths.extend(std::env::split_paths(inherited).filter(|path| path != directory));
+    }
+    std::env::join_paths(paths)
+        .map_err(|_| "cannot represent Team launcher directory in worker PATH")?
+        .into_string()
+        .map_err(|_| "worker PATH must be UTF-8 for native shell configuration".into())
+}
+
+fn set_worker_launcher(command: &mut Command) -> Result<(), String> {
+    let launcher = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|_| "cannot resolve current Team launcher for worker shells")?;
+    let path = worker_path(&launcher, std::env::var_os("PATH").as_deref())?;
+    // Match executable-bound child authentication without changing the backend
+    // process PATH or its independently retained executable/provider selection.
+    command.arg("-c").arg(format!(
+        "shell_environment_policy.set.PATH={}",
+        json!(path).to_string().replace('\u{7f}', "\\u007f")
+    ));
+    Ok(())
+}
+
 /// Execute the Team CLI and return its process exit code.
 pub fn run() -> i32 {
     #[cfg(unix)]
@@ -542,7 +579,7 @@ pub fn run() -> i32 {
             cancel_worker as *const () as libc::sighandler_t,
         );
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || matches!(args[0].as_str(), "help" | "--help" | "-h") {
         print!("{HELP}");
         return 0;
@@ -550,6 +587,15 @@ pub fn run() -> i32 {
     if args == ["--version"] {
         println!("pira_team {}", env!("CARGO_PKG_VERSION"));
         return 0;
+    }
+    if let Some(outcome) = remote::dispatch(&mut args) {
+        return match outcome {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("pira_team: {error}");
+                1
+            }
+        };
     }
     if let Err(error) = subteam::authorize(&args) {
         eprintln!("pira_team: {error}");
@@ -567,7 +613,9 @@ pub fn run() -> i32 {
             }
         }
     }
-    let outcome = if matches!(args[0].as_str(), "read" | "path") {
+    let outcome = if args[0] == "wait" {
+        storage::wait(&args)
+    } else if matches!(args[0].as_str(), "read" | "path") {
         storage::access(&args)
     } else if matches!(
         args[0].as_str(),
@@ -576,7 +624,7 @@ pub fn run() -> i32 {
         bookmarks::command(&args)
     } else if args[0] == "config" {
         profile::defaults::command(&args, storage::default_root)
-    } else if matches!(args[0].as_str(), "resume" | "steer" | "interrupt") {
+    } else if matches!(args[0].as_str(), "resume" | "steer" | "interrupt" | "tier") {
         lifecycle::existing(&args)
     } else {
         parse(&args).and_then(lifecycle::launch)
@@ -593,6 +641,122 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_path_prefers_parent_launcher_and_preserves_ambient_order() {
+        let launcher = Path::new("/staged team/bin/pira_team");
+        let inherited = std::env::join_paths([
+            Path::new("/ambient/bin"),
+            Path::new("/other tools/bin"),
+            Path::new("/staged team/bin"),
+        ])
+        .unwrap();
+        let path = worker_path(launcher, Some(&inherited)).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/staged team/bin"),
+                PathBuf::from("/ambient/bin"),
+                PathBuf::from("/other tools/bin"),
+            ]
+        );
+        assert_eq!(
+            std::env::split_paths(&worker_path(launcher, None).unwrap()).collect::<Vec<_>>(),
+            [PathBuf::from("/staged team/bin")]
+        );
+    }
+
+    #[test]
+    fn worker_launcher_setting_does_not_redirect_backend_process() {
+        let backend = Path::new("/ambient/bin/selected-codex");
+        let mut command = Command::new(backend);
+        command.env("UNCHANGED_TOOL_SETTING", "fixture");
+        set_worker_launcher(&mut command).unwrap();
+        assert_eq!(command.get_program(), backend.as_os_str());
+        assert!(!command.get_envs().any(|(name, _)| name == "PATH"));
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == "UNCHANGED_TOOL_SETTING"
+                    && value == Some(std::ffi::OsStr::new("fixture")))
+        );
+        let setting = command
+            .get_args()
+            .find_map(|arg| {
+                arg.to_str()?
+                    .strip_prefix("shell_environment_policy.set.PATH=")
+            })
+            .unwrap();
+        let path: String = serde_json::from_str(setting).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).next().unwrap(),
+            std::env::current_exe()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_path_executes_staged_launcher_instead_of_different_ambient_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "pira-team-launcher-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        private_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let staged = root.join("staged parent");
+        let ambient = root.join("ambient launcher");
+        for directory in [&staged, &ambient] {
+            private_dir(directory).unwrap();
+            let program = directory.join("pira_team");
+            fs::write(&program, "#!/bin/sh\nprintf '%s' \"$0\"\n").unwrap();
+            fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let selected = |path: &std::ffi::OsStr| {
+            let output = Command::new("pira_team")
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            PathBuf::from(String::from_utf8(output.stdout).unwrap())
+                .canonicalize()
+                .unwrap()
+        };
+        let inherited = std::env::join_paths([&ambient]).unwrap();
+        assert_eq!(selected(&inherited), ambient.join("pira_team"));
+        let path = worker_path(&staged.join("pira_team"), Some(&inherited)).unwrap();
+        assert_eq!(
+            selected(std::ffi::OsStr::new(&path)),
+            staged.join("pira_team")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_path_rejects_unrepresentable_native_shell_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let inherited = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        assert!(
+            worker_path(Path::new("/staged/pira_team"), Some(&inherited))
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+    }
     pub(super) fn options(extra: &[&str]) -> Result<Options, String> {
         let mut args = vec![
             "run",

@@ -54,7 +54,8 @@
           "effort",
           "cwd",
           "approvalPolicy",
-          "sandboxPolicy"
+          "sandboxPolicy",
+          "serviceTierForTurn"
         ],
         "turn/steer": [
           "threadId",
@@ -64,6 +65,11 @@
         "turn/interrupt": [
           "threadId",
           "turnId"
+        ],
+        "turn/settings/update": [
+          "threadId",
+          "turnId",
+          "serviceTier"
         ]
       },
       "definitions": {
@@ -176,6 +182,11 @@
     "ClientNotification.json": {
       "signals": [
         "initialized"
+      ]
+    },
+    "v2/TurnSettingsUpdateResponse.json": {
+      "fields": [
+        "status"
       ]
     }
   }

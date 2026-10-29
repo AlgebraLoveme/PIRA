@@ -111,6 +111,45 @@ pub(crate) fn validate_run_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait for retained settlement without creating a new worker turn.
+pub fn wait(args: &[String]) -> Result<(), String> {
+    let (mut root, mut reference) = (None, None);
+    let mut rest = args.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg == "--store" {
+            crate::set_once(
+                &mut root,
+                PathBuf::from(rest.next().ok_or("missing --store")?),
+                "--store",
+            )?;
+        } else if arg.starts_with('-') {
+            return Err(format!("unsupported wait option {arg}"));
+        } else {
+            crate::set_once(&mut reference, arg.clone(), "RUN_ID")?;
+        }
+    }
+    let root = root.map(Ok).unwrap_or_else(default_root)?;
+    let run = locate(
+        &root,
+        &reference.ok_or("expected wait RUN_ID [--store DIR]")?,
+    )?;
+    loop {
+        let manifest = crate::lifecycle::read_json(&run.join("manifest.json"))?;
+        if manifest["status"] != "running" {
+            println!(
+                "{}",
+                serde_json::json!({"run_id":manifest["run_id"],"status":manifest["status"],
+                "run_root":run,"handoff_path":manifest["result"]})
+            );
+            return Ok(());
+        }
+        if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("waiting client stopped; worker was not interrupted".into());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 const UNAVAILABLE: &str = "run unavailable to this main session";
 
 pub fn locate(root: &Path, reference: &str) -> Result<PathBuf, String> {
@@ -201,7 +240,7 @@ pub(crate) fn creator_session(run: &Path) -> Result<String, String> {
     Ok(owner.to_owned())
 }
 
-fn artifact_path(run: &Path) -> Result<PathBuf, String> {
+pub(super) fn artifact_path(run: &Path) -> Result<PathBuf, String> {
     let path = managed_path(run, Path::new("manifest.json"))?;
     let file = File::open(path).map_err(|e| format!("open run manifest: {e}"))?;
     let mut bytes = Vec::new();
@@ -246,7 +285,7 @@ fn artifact_path(run: &Path) -> Result<PathBuf, String> {
     Ok(relative)
 }
 
-fn managed_path(run: &Path, relative: &Path) -> Result<PathBuf, String> {
+pub(super) fn managed_path(run: &Path, relative: &Path) -> Result<PathBuf, String> {
     let parts: Vec<_> = relative.components().collect();
     if parts.is_empty() || parts.iter().any(|p| !matches!(p, Component::Normal(_))) {
         return Err("managed file must be a relative path without traversal".into());

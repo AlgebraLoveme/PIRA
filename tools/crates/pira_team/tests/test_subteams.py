@@ -4,9 +4,13 @@ import json
 import os
 from pathlib import Path
 import socket
+import shlex
+import sys
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock, MagicMock, patch
+import subteam_fixture
 import test_team
 from native_fixture import Boundary, process_exit_waiter, wait_owner
 
@@ -46,7 +50,7 @@ class SubteamTests(unittest.TestCase):
 
     def root_command(self, *args):
         return subprocess.run([str(self.bin), *map(str, args), "--store", str(self.root / "logs")],
-                              env=self.env, capture_output=True, text=True, timeout=30)
+                              env=self.env, capture_output=True, text=True, encoding="utf-8", timeout=30)
 
     def start(self, *, allow=True, resume=None, extra=(), pass_fds=()):
         args = (["resume", resume] if resume else ["run", "--model", "test-model", "--effort", "high", "--cwd", str(self.root)])
@@ -54,14 +58,14 @@ class SubteamTests(unittest.TestCase):
         if allow:
             args += ["--allow-subteam"]
         process = subprocess.Popen([str(self.bin), *args, "--store", str(self.root / "logs")], env=self.env,
-                                   pass_fds=pass_fds, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                   pass_fds=pass_fds, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
         try:
             self.wait_stderr_notice(process, "pira_team active:")
         except AssertionError as error:
-            logs = "\n".join(p.read_text() for p in (self.root / "logs").glob("*/stderr.log"))
+            logs = "\n".join(p.read_text(encoding="utf-8") for p in (self.root / "logs").glob("*/stderr.log"))
             raise AssertionError(f"{error}\nbackend diagnostics:\n{logs}") from error
         runs = [p.parent for p in (self.root / "logs").glob("*/control.json")]
-        run = next(p for p in runs if json.loads((p / "manifest.json").read_text())["parent_run_id"] is None
+        run = next(p for p in runs if json.loads((p / "manifest.json").read_text(encoding="utf-8"))["parent_run_id"] is None
                    and p.name not in [r for _, r in self.processes]) if not resume else self.root / "logs" / resume
         self.processes.append((process, run.name))
         return process, run.name
@@ -69,7 +73,7 @@ class SubteamTests(unittest.TestCase):
     def request(self, run, **request):
         with socket.socket() as client:
             client.settimeout(30)
-            client.connect(tuple(json.loads((self.sockets / (run + ".sock")).read_text())))
+            client.connect(tuple(json.loads((self.sockets / (run + ".sock")).read_text(encoding="utf-8"))))
             with client.makefile("rwb") as stream:
                 stream.write(json.dumps(request).encode() + b"\n")
                 stream.flush()
@@ -77,7 +81,11 @@ class SubteamTests(unittest.TestCase):
                 if not response:
                     raise ConnectionError("fixture backend exited before replying")
                 result = json.loads(response)
-        self.assertNotIn("fixture_error", result, result)
+                self.assertNotIn("fixture_error", result, result)
+                if request.get("operation") in ("finish", "capacity_failure"):
+                    self.assertEqual(result, {"ok": True})
+                    stream.write(b"ack\n")
+                    stream.flush()
         return result
 
     def command(self, run, *args, **extra):
@@ -87,7 +95,7 @@ class SubteamTests(unittest.TestCase):
         return self.command(parent, "run", "--task", task, "--completion-gate", "Finish assigned child work", operation="start", **extra)
 
     def manifest(self, run):
-        return json.loads((self.root / "logs" / run / "manifest.json").read_text())
+        return json.loads((self.root / "logs" / run / "manifest.json").read_text(encoding="utf-8"))
 
     def finish(self, run):
         self.request(run, operation="finish")
@@ -96,15 +104,103 @@ class SubteamTests(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=15)
         return process.returncode, stdout, stderr
 
+    def wrap_backend(self, depth=1):
+        # Retain non-exec wrappers above the marked Python protocol peer.
+        backend = self.root / "codex"
+        peer = self.root / "protocol-peer.py"
+        backend.rename(peer)
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(peer))}"
+        for level in range(depth):
+            wrapper = backend if level == depth - 1 else self.root / f"wrapper-{level}"
+            wrapper.write_text(f'#!/bin/sh\nexec 3<&0\n{command} "$@" <&3 3<&- &\nwait "$!"\n')
+            wrapper.chmod(0o700)
+            command = shlex.quote(str(wrapper))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX non-exec wrapper fixture")
+    def test_wrapped_backend_verifies_owner_and_preserves_delegation_limits(self):
+        self.wrap_backend(depth=2)
+        process, coordinator = self.start()
+        no_hints = {"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None}
+        child = self.child(coordinator, env=no_hints)
+        self.assertIn("run_id", child, child)
+        rejected = self.command(child["run_id"], "run", "--task", "x",
+                                "--completion-gate", "x", env=no_hints)
+        self.assertNotEqual(rejected["returncode"], 0, rejected)
+        self.assertIn("not an authorized coordinator", rejected["stderr"])
+        grant = self.command(coordinator, "run", "--allow-subteam", "--task", "x",
+                             "--completion-gate", "x", env=no_hints)
+        self.assertNotEqual(grant["returncode"], 0, grant)
+        self.assertIn("cannot grant --allow-subteam", grant["stderr"])
+        self.assertEqual(len(list((self.root / "logs").iterdir())), 2)
+        self.finish(child["run_id"])
+        self.assertEqual(self.command(coordinator, operation="wait", handle=child["handle"])["returncode"], 0)
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX non-exec wrapper fixture")
+    def test_wrapped_backend_rejects_unrelated_pid_stale_birth_and_revision(self):
+        self.wrap_backend()
+        process, coordinator = self.start()
+        path = self.root / "logs" / coordinator / "runtime.json"
+        original = path.read_bytes()
+        runtime = json.loads(original)
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE, env=self.env) as unrelated:
+            for field, value in (("backend_pid", unrelated.pid),
+                                 ("backend_birth", runtime["backend_birth"] + 1),
+                                 ("revision", runtime["revision"] + 1)):
+                with self.subTest(field=field):
+                    try:
+                        path.write_text(json.dumps({**runtime, field: value}))
+                        rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x",
+                                                env={"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None})
+                        self.assertNotEqual(rejected["returncode"], 0, rejected)
+                        self.assertIn("runtime does not match actual worker ancestry", rejected["stderr"])
+                        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                    finally:
+                        path.write_bytes(original)
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
+    def test_backend_rejects_malformed_birth_and_revision(self):
+        # Direct ownership discriminates malformed-state acceptance from the wrapper bug.
+        process, coordinator = self.start()
+        run = self.root / "logs" / coordinator
+        runtime, manifest = run / "runtime.json", run / "manifest.json"
+        originals = {path: path.read_bytes() for path in (runtime, manifest)}
+        missing = object()
+        for paths, field in (((runtime,), "backend_birth"), ((runtime,), "revision"),
+                             ((manifest,), "revision"), ((runtime, manifest), "revision")):
+            for value in (missing, None, "invalid", -1, 1.5, True, {}, []):
+                with self.subTest(files=[p.name for p in paths], field=field, value=repr(value)):
+                    try:
+                        for path in paths:
+                            state = json.loads(originals[path])
+                            if value is missing:
+                                state.pop(field)
+                            else:
+                                state[field] = value
+                            path.write_text(json.dumps(state))
+                        rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x",
+                                                env={"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None})
+                        self.assertNotEqual(rejected["returncode"], 0, rejected)
+                        self.assertIn("runtime does not match actual worker ancestry", rejected["stderr"])
+                        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                    finally:
+                        for path, original in originals.items():
+                            path.write_bytes(original)
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
     def test_writing_guidance_child_preserves_store_boundary(self):
         process, coordinator = self.start(extra=("--inject-write",))
         child = self.command(coordinator, "run", "--task", "subteam-service",
                              "--completion-gate", "Finish assigned child work", "--inject-write", operation="start")
         child_id = child["run_id"]
-        writing = (Path(__file__).resolve().parents[4] / "modules/SCIENTIFIC_WRITING.md").read_text()
+        writing = (Path(__file__).resolve().parents[4] / "modules/SCIENTIFIC_WRITING.md").read_text(encoding="utf-8")
         for run in (coordinator, child_id):
             self.assertTrue(self.manifest(run)["inject_write"])
-            self.assertEqual((self.root / "logs" / run / "policy.md").read_text().count(writing), 1)
+            self.assertEqual((self.root / "logs" / run / "policy.md").read_text(encoding="utf-8").count(writing), 1)
         escape = self.root / "escape"
         escape.mkdir()
         escaped = self.command(coordinator, "run", "--inject-write", "--store", str(escape),
@@ -129,8 +225,8 @@ class SubteamTests(unittest.TestCase):
         self.assertEqual(native["parent_run_id"], coordinator)
         self.assertEqual(native["execution_permissions"]["sandbox_policy"], parent["execution_permissions"]["sandbox_policy"])
         self.assertEqual(native["creator_main_session_id"], parent["thread_id"])
-        self.assertNotIn("# Coordinator Team usage", (self.root / "logs" / child_id / "policy.md").read_text())
-        self.assertIn("# Coordinator Team usage", (self.root / "logs" / coordinator / "policy.md").read_text())
+        self.assertNotIn("# Coordinator Team usage", (self.root / "logs" / child_id / "policy.md").read_text(encoding="utf-8"))
+        self.assertIn("# Coordinator Team usage", (self.root / "logs" / coordinator / "policy.md").read_text(encoding="utf-8"))
         for run in (coordinator, sibling):
             for op in ("read", "path", "interrupt", "bookmark"):
                 args = ("--label", "forbidden") if op == "bookmark" else ()
@@ -174,7 +270,7 @@ class SubteamTests(unittest.TestCase):
         self.assertEqual(self.wait(process)[0], 0)
         fake_env = dict(self.env, PIRA_TEAM_CHILD="1", PIRA_TEAM_CONTEXT=str(self.root / "logs" / coordinator))
         result = subprocess.run([str(self.bin), "read", coordinator, "manifest.json", "--store", str(self.root / "logs")],
-                                env=fake_env, capture_output=True, text=True)
+                                env=fake_env, capture_output=True, text=True, encoding="utf-8")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ancestry", result.stderr)
 
@@ -227,23 +323,23 @@ class SubteamTests(unittest.TestCase):
     def test_recursive_active_subtree_and_stale_endpoint(self):
         process, coordinator = self.start()
         child = self.child(coordinator)
-        (self.root / "logs" / child["run_id"] / "control.json").write_text('{"address":"127.0.0.1:1","token":"stale"}')
+        (self.root / "logs" / child["run_id"] / "control.json").write_text('{"address":"127.0.0.1:1","token":"stale"}', encoding="utf-8")
         result = self.root_command("interrupt", "-r", coordinator)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "stopped")
         self.assertNotEqual(self.wait(process)[0], 0)
         self.assertEqual(self.manifest(child["run_id"])["status"], "interrupted")
-        self.assertTrue(json.loads((self.root / "logs" / coordinator / "tree.json").read_text())["blocked"])
+        self.assertTrue(json.loads((self.root / "logs" / coordinator / "tree.json").read_text(encoding="utf-8"))["blocked"])
 
     def test_legacy_default_and_explicit_root_resume_grant(self):
         first = self.launch("ordinary")
         self.assertEqual(first.returncode, 0, first.stderr)
         coordinator = json.loads(first.stdout)["run_id"]
         path = self.root / "logs" / coordinator / "manifest.json"
-        manifest = json.loads(path.read_text())
+        manifest = json.loads(path.read_text(encoding="utf-8"))
         manifest.pop("allow_subteam")
         manifest["worker_policy_version"] = 17
-        path.write_text(json.dumps(manifest))
+        path.write_text(json.dumps(manifest), encoding="utf-8")
         original = (path.parent / "policy.md").read_bytes()
         process, _ = self.start(allow=False, resume=coordinator)
         self.assertFalse(self.manifest(coordinator)["allow_subteam"])
@@ -275,7 +371,7 @@ class SubteamTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.manifest(child["run_id"])["status"], "interrupted")
             self.wait(process)
-            tree = json.loads((self.root / "logs" / coordinator / "tree.json").read_text())
+            tree = json.loads((self.root / "logs" / coordinator / "tree.json").read_text(encoding="utf-8"))
             self.assertTrue(tree["blocked"])
             self.assertTrue(all(not member["active"] for member in tree["members"].values()))
         finally:
@@ -285,7 +381,7 @@ class SubteamTests(unittest.TestCase):
         import select
         process, coordinator = self.start()
         child = self.child(coordinator)
-        runtime = json.loads((self.root / "logs" / coordinator / "runtime.json").read_text())
+        runtime = json.loads((self.root / "logs" / coordinator / "runtime.json").read_text(encoding="utf-8"))
         pid = runtime["backend_pid"]
         wait_exit = process_exit_waiter(pid)
         process.kill()  # This fixture owns the live Popen handle, not a persisted PID.
@@ -298,7 +394,7 @@ class SubteamTests(unittest.TestCase):
         self.assertFalse(self.manifest(coordinator)["usage_complete"])
         recovered = self.manifest(coordinator)
         self.assertTrue(recovered["revisions"][0]["recovered"])
-        self.assertEqual(json.loads((self.root / "logs" / coordinator / "revisions/000001/manifest.json").read_text())["status"], "interrupted")
+        self.assertEqual(json.loads((self.root / "logs" / coordinator / "revisions/000001/manifest.json").read_text(encoding="utf-8"))["status"], "interrupted")
         process2, _ = self.start(resume=coordinator, allow=False)
         self.finish(coordinator)
         self.assertEqual(self.wait(process2)[0], 0)
@@ -402,7 +498,7 @@ class SubteamTests(unittest.TestCase):
 
     def test_nested_file_auth_uses_verified_parent_home(self):
         source = self.root / "original-home/auth.json"
-        source.write_text("fixture authentication, not real credentials")
+        source.write_text("fixture authentication, not real credentials", encoding="utf-8")
         self.env["TEAM_TEST_AUTH_SOURCE"] = str(source)
         self.env["TEAM_FORBID_API_KEY"] = "1"
         process, coordinator = self.start()
@@ -421,20 +517,20 @@ class SubteamTests(unittest.TestCase):
             process = subprocess.Popen([str(self.bin), "run", "--task", "ordinary", "--completion-gate", "x",
                 "--model", "test-model", "--effort", "high", "--cwd", str(self.root),
                 "--store", str(self.root / "logs")], env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             self.wait_stderr_notice(process, "pira_team run_id:")
             run, = (self.root / "logs").iterdir()
             self.processes.append((process, run.name))
             boundary.reached()
             collision = run / f"runtime.{process.pid}.tmp"
-            collision.write_text("preexisting fixture, not owned by binding save")
+            collision.write_text("preexisting fixture, not owned by binding save", encoding="utf-8")
             boundary.release()
             code, _, stderr = self.wait(process)
             self.assertNotEqual(code, 0)
             self.assertIn(collision.name, stderr)
-            self.assertEqual(collision.read_text(), "preexisting fixture, not owned by binding save")
+            self.assertEqual(collision.read_text(encoding="utf-8"), "preexisting fixture, not owned by binding save")
             self.assertEqual(self.manifest(run.name)["status"], "failed")
-            self.assertFalse(json.loads((run / "tree.json").read_text())["members"][run.name]["active"])
+            self.assertFalse(json.loads((run / "tree.json").read_text(encoding="utf-8"))["members"][run.name]["active"])
             self.assertFalse((run / "control.json").exists())
         finally:
             boundary.close()
@@ -449,7 +545,7 @@ class SubteamTests(unittest.TestCase):
                      ("run", "--allow-subteam", "--task", "x", "--completion-gate", "x")):
             with self.subTest(args=args):
                 result = subprocess.run([str(self.bin), *args, "--store", str(self.root / "logs")],
-                                        env=forged, text=True, capture_output=True, timeout=5)
+                                        env=forged, text=True, encoding="utf-8", capture_output=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("identity", result.stderr)
 
@@ -474,7 +570,7 @@ class SubteamTests(unittest.TestCase):
         child_id = child["run_id"]
         # A worker knowing every ordinary management field still has the wrong
         # kernel peer PID/executable and cannot redeem the child's credential.
-        runtime = json.loads((self.root / "logs" / coordinator / "runtime.json").read_text())
+        runtime = json.loads((self.root / "logs" / coordinator / "runtime.json").read_text(encoding="utf-8"))
         claim = {"child":child_id, "revision":1, "epoch":self.manifest(child_id)["subtree_epoch"], "runtime":runtime}
         probe = self.request(coordinator, operation="auth_probe", claim=claim)
         self.assertFalse(probe["accepted"])
@@ -500,7 +596,7 @@ class SubteamTests(unittest.TestCase):
                     self.env.pop("CODEX_API_KEY", None)
                     self.env.pop("TEAM_EXPECT_AUTH_SHA256", None)
                     source = self.root / "original-home/auth.json"
-                    source.write_text("synthetic file authentication")
+                    source.write_text("synthetic file authentication", encoding="utf-8")
                     self.env.update(TEAM_TEST_AUTH_SOURCE=str(source), TEAM_FORBID_API_KEY="1")
                 process, coordinator = self.start()
                 candidate = json.dumps({"format":"json", "content":"{broken"})
@@ -538,7 +634,7 @@ class SubteamTests(unittest.TestCase):
         hijack = self.root / "other-backend"
         hijack.mkdir()
         program = hijack / "codex"
-        program.write_text("#!/bin/sh\nexit 77\n")
+        program.write_text("#!/bin/sh\nexit 77\n", encoding="utf-8")
         program.chmod(0o700)
         result = self.command(coordinator, "run", "--task", "ordinary", "--completion-gate", "x", env={
             "PATH":str(hijack) + os.pathsep + self.env["PATH"], "OPENAI_BASE_URL":"https://different.invalid/not-selected"})
@@ -551,7 +647,7 @@ class SubteamTests(unittest.TestCase):
         key = self.api_key()
         process, coordinator = self.start()
         path = self.root / "logs" / coordinator / "control.json"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         for fault in ("closed", "stale"):
             with self.subTest(fault=fault):
                 control = json.loads(original)
@@ -561,13 +657,13 @@ class SubteamTests(unittest.TestCase):
                     missing = self.root / "missing-endpoint"
                     missing.mkdir(exist_ok=True)
                     control["authentication"]["endpoint"] = {"kind":"relative", "root":str(missing), "name":"credential.sock"}
-                path.write_text(json.dumps(control))
+                path.write_text(json.dumps(control), encoding="utf-8")
                 result = self.command(coordinator, "run", "--task", "ordinary", "--completion-gate", "x")
                 self.assertNotEqual(result["returncode"], 0)
                 self.assertIn("authentication", result["stderr"])
                 state = json.loads(self.root_command("read", coordinator, "manifest.json").stdout)
                 self.assertFalse(any(run["active"] for run in state["descendants"]["runs"]))
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
         self.no_credential_artifacts(key)
@@ -576,14 +672,14 @@ class SubteamTests(unittest.TestCase):
         key = self.api_key()
         process, coordinator = self.start()
         path = self.root / "logs" / coordinator / "control.json"
-        original = path.read_text()
+        original = path.read_text(encoding="utf-8")
         if os.name == "nt":
             from multiprocessing.connection import Listener
             address = r"\\.\pipe\team-foreign-auth-" + coordinator
             with Listener(address, family="AF_PIPE") as listener:
                 control = json.loads(original)
                 control["authentication"]["endpoint"] = {"kind":"pipe", "name":address}
-                path.write_text(json.dumps(control))
+                path.write_text(json.dumps(control), encoding="utf-8")
                 def accept_foreign():
                     with listener.accept() as connection:
                         try:
@@ -615,7 +711,7 @@ class SubteamTests(unittest.TestCase):
                     listener.listen()
                     endpoint = {"kind":"abstract", "name":address}
                 control["authentication"]["endpoint"] = endpoint
-                path.write_text(json.dumps(control))
+                path.write_text(json.dumps(control), encoding="utf-8")
                 try:
                     result = self.command(coordinator, "run", "--task", "ordinary", "--completion-gate", "x")
                     self.assertNotEqual(result["returncode"], 0)
@@ -625,10 +721,70 @@ class SubteamTests(unittest.TestCase):
                         self.assertEqual(connection.recv(1), b"")
                 finally:
                     listener.close()
-        path.write_text(original)
+        path.write_text(original, encoding="utf-8")
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
         self.no_credential_artifacts(key)
+
+
+class FixtureCompletionTests(unittest.TestCase):
+    def test_completion_requires_reply_then_ack(self):
+        for operation, arguments in (("finish", ()), ("capacity_failure", ("capacity",))):
+            with self.subTest(operation=operation):
+                connection, stream, complete = Mock(), Mock(), Mock()
+                def acknowledge(limit):
+                    stream.flush.assert_called_once_with()
+                    self.assertEqual(json.loads(stream.write.call_args.args[0]), {"ok": True})
+                    complete.assert_not_called()
+                    return b"ack\n"
+                stream.readline.side_effect = acknowledge
+                subteam_fixture.complete_after_ack(connection, stream, operation, complete)
+                connection.settimeout.assert_called_once_with(5)
+                stream.readline.assert_called_once_with(5)
+                complete.assert_called_once_with(*arguments)
+
+    def test_bad_or_disconnected_ack_does_not_complete(self):
+        for operation in ("finish", "capacity_failure"):
+            for acknowledgement in (b"", b"no\n", b"ackx\n"):
+                with self.subTest(operation=operation, acknowledgement=acknowledgement):
+                    complete = Mock()
+                    stream = Mock()
+                    stream.readline.return_value = acknowledgement
+                    with self.assertRaisesRegex(ValueError, "completion acknowledgement"):
+                        subteam_fixture.complete_after_ack(Mock(), stream, operation, complete)
+                    complete.assert_not_called()
+
+    def test_ack_timeout_remains_visible_and_does_not_complete(self):
+        complete, stream = Mock(), Mock()
+        stream.readline.side_effect = TimeoutError("ack deadline")
+        with self.assertRaisesRegex(TimeoutError, "ack deadline"):
+            subteam_fixture.complete_after_ack(Mock(), stream, "finish", complete)
+        complete.assert_not_called()
+
+    def test_request_acknowledges_only_successful_terminal_reply(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.sockets = Path(temporary)
+            (self.sockets / "fixture.sock").write_text('["127.0.0.1", 1]', encoding="utf-8")
+            for operation, result in (("finish", {"ok": True}), ("capacity_failure", {"ok": True}),
+                                      ("identity", {"pid": 1}), ("finish", {"fixture_error": "failed"})):
+                with self.subTest(operation=operation, result=result):
+                    client, stream = MagicMock(), MagicMock()
+                    client.__enter__.return_value = client
+                    client.makefile.return_value.__enter__.return_value = stream
+                    def reply():
+                        self.assertEqual(stream.write.call_count, 1, "ACK sent before reply was read")
+                        return json.dumps(result).encode("utf-8") + b"\n"
+                    stream.readline.side_effect = reply
+                    with patch.object(socket, "socket", return_value=client):
+                        if "fixture_error" in result:
+                            with self.assertRaisesRegex(AssertionError, "fixture_error"):
+                                SubteamTests.request(self, "fixture", operation=operation)
+                        else:
+                            self.assertEqual(SubteamTests.request(self, "fixture", operation=operation), result)
+                    terminal = operation in ("finish", "capacity_failure") and "fixture_error" not in result
+                    self.assertEqual(stream.write.call_count, 2 if terminal else 1)
+                    if terminal:
+                        self.assertEqual(stream.write.call_args.args, (b"ack\n",))
 
 
 if __name__ == "__main__":

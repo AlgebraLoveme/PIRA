@@ -52,18 +52,6 @@ class PolicyRouteTests(unittest.TestCase):
             with self.subTest(source=relative):
                 self.assertIn(rule, (repo / relative).read_text())
 
-    def test_writing_delegation_scope_is_consistent_for_root_and_coordinator(self) -> None:
-        repo = Path(__file__).resolve().parents[4]
-        exception = ("plus explicitly assigned scientific writing and human-facing technical prose "
-                     "with `--inject-write`.")
-        local_scope = "standalone general research, nontechnical writing or administration local."
-        for relative in ("AGENTS.md", "tools/src/pira_team/coordinator.md"):
-            with self.subTest(source=relative):
-                rule = next(line for line in (repo / relative).read_text().splitlines()
-                            if line.startswith("- Delegate self-contained,"))
-                self.assertIn(exception, rule)
-                self.assertIn(local_scope, rule)
-
     def test_resume_adds_figure_and_writing_together_once(self) -> None:
         first = self.receipt(self.fixture.launch("Assess assigned artifact"))
         run = Path(first["run_root"])

@@ -231,6 +231,9 @@ impl Authentication {
 
 #[cfg(unix)]
 fn resolve_program() -> Result<PathBuf, String> {
+    if let Some(program) = crate::remote::delegated_backend() {
+        return Ok(program);
+    }
     use std::os::unix::fs::PermissionsExt;
     let paths = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
     for directory in std::env::split_paths(&paths) {
@@ -249,6 +252,9 @@ fn resolve_program() -> Result<PathBuf, String> {
 }
 #[cfg(windows)]
 fn resolve_program() -> Result<PathBuf, String> {
+    if let Some(program) = crate::remote::delegated_backend() {
+        return Ok(program);
+    }
     native::windows::resolve_program().map_err(|_| "cannot retain selected Codex executable".into())
 }
 

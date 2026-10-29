@@ -1,9 +1,12 @@
 pira_team — retained technical artifact workers for review and implementation
 Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inject-implement] [--inject-fig] [--inject-write] [OPTIONS]
        pira_team resume RUN_ID [--inject-review] [--inject-implement] [--inject-fig] [--inject-write] [--task TASK --completion-gate TEXT] [OPTIONS]
+       pira_team tier RUN_ID standard|fast [--store DIR]
        pira_team steer RUN_ID --task TASK --completion-gate TEXT [--store DIR]
        pira_team interrupt [-r|--recursive] RUN_ID [--store DIR]
        pira_team read|path RUN_ID [RELATIVE_FILE] [--store DIR]
+       pira_team wait RUN_ID [--store DIR]
+       pira_team resolve REQUEST_ID [--store DIR]
        pira_team bookmark RUN_REF --label LABEL [--store DIR]
        pira_team unbookmark LABEL [--store DIR]
        pira_team bookmarks [--limit N] [--store DIR]
@@ -17,6 +20,14 @@ Root-only --allow-subteam on run/resume authorizes one coordinator level; childr
 Run options: --cwd DIR --store DIR --model MODEL --effort EFFORT --label LABEL
              --format auto|markdown|text|json|csv --schema FILE --columns JSON_ARRAY
              --output artifact|answer
+Run/resume accept --service-tier standard|fast. New runs default to standard; resume retains
+the chosen run tier. Tier controls require a new-feature active local owner, including repair.
+They publish settings for subsequent captures in the current turn, never interrupt, replay,
+restart, inject input or create a turn. Captured steps and frozen consumers are unchanged.
+Receipts distinguish desired tier/publication from actual tier (unknown), not billed speed.
+Only an applied acknowledgement updates run intent; failed persistence reports unknown durability.
+Rejected/unconfirmed publication leaves future intent unchanged. Never blindly retry unknown delivery.
+No active turn or unsupported owner is an error; no migration or automatic next-turn fallback.
 Resume can override model/effort/output. Taskless resume retains the assignment's gate.
 A replacement task or steer requires its dedicated --completion-gate; no semantic gate
 validation is performed. Completed means the worker reports the gate satisfied.
@@ -108,7 +119,15 @@ Steering is unavailable during startup/repair. Normal interruption retains the c
 Steering validates current caller permissions and requires the same represented sandbox policy
 as the active endpoint; changed or unverifiable policies require interrupt then explicit resume.
 Interruption remains available with verified caller identity even if execution policy changes.
-Concurrent resumes and orphaned running state fail closed. Legacy ephemeral runs cannot resume.
+Concurrent resumes and unsettled running state fail closed; resume never replays an
+abandoned attempt automatically. Use interrupt -r RUN_ID for guarded settlement,
+then inspect retained diagnostics and external side effects before deliberate resume.
+Recovery requires the exclusive owner lock, current-attempt identity evidence, verified
+launcher/backend exit and an empty owned process group or Windows job. Missing or stale
+evidence (including a crash before backend binding) fails closed. An unavailable endpoint
+or missing PID alone is insufficient. No persisted PID/group is signalled for termination.
+Recovered abandoned attempts are interrupted, never completed, with incomplete usage.
+Legacy ephemeral runs cannot resume.
 Legacy retained runs need an explicit completion gate on first migration; their history is kept.
 The original base prefix is retained; current worker instructions are directly injected on
 migration, and current handoff/gate are supplied each turn. Cache hits are not guaranteed.
@@ -143,6 +162,10 @@ not model access, notification semantics or actual shell sandbox behavior. Authe
 is launcher-managed and detached after each invocation. All raw logs remain tool-managed.
 Worker shells inherit the invoking environment on launch/resume, except session/store identity,
 authentication sockets and named credential patterns. Team supplies its own handoff/guard/stores.
+Worker shell PATH starts with the canonical invoking Team launcher's directory, so bare
+pira_team child commands use that same launcher, including staged local coordinators.
+Other inherited PATH entries retain their order. Backend process PATH and the selected
+Codex executable/provider remain unchanged; executable-equality authentication is retained.
 Unknown variables pass through; this is not a secret detector. Existing absolute directories in
 CARGO_HOME, CARGO_TARGET_DIR, PIP_CACHE_DIR, UV_CACHE_DIR, PYTHONPYCACHEPREFIX, MYPY_CACHE_DIR,
 npm_config_cache, NPM_CONFIG_CACHE, YARN_CACHE_FOLDER, GOCACHE, GOMODCACHE, GRADLE_USER_HOME,
@@ -177,3 +200,154 @@ control/event-log value; file-backed authentication and shell exclusions are pre
 Delegated backend executable and provider/proxy/loader selectors remain coordinator-selected;
 a worker cannot redirect its inherited authentication through environment overrides. Ordinary
 task/build variables remain inherited.
+
+
+Remote execution (opt-in)
+Only a verified root main chooses --host. It may launch an individual worker or a
+complete --allow-subteam coordinator tree on one Linux machine. All children stay
+on that host and use native server-local admission, ownership, usage and recursive
+controls. Coordinators/ordinary workers cannot select a host or make remote hops.
+Default local commands, stores and old runs keep their existing semantics; no
+local run is automatically migrated. Remote filesystem paths grant no local scope.
+
+Normal remote launch selects the endpoint ONCE:
+  pira_team run --host HOST --remote-user USER --remote-endpoint-id PUBLIC_NONCE \
+    --remote-exe ABS --remote-backend ABS --remote-store ABS --remote-cwd ABS \
+    --authority-key LOCAL_ABS --task TASK --completion-gate TEXT [--allow-subteam] \
+    [--store LOCAL_TEAM_STORE] [--label LABEL] [--detach]
+The launcher durably retains a signed request and ordinary run_id before contacting
+the server; stderr prints that ID before submission. Request IDs are automatic.
+After launch use ordinary read/resume/steer/interrupt/wait RUN_ID (or @LABEL),
+without endpoint, key or controller options. Use the same local Team store as at
+launch. Explicit --remote-state remains a private transport controller location;
+it does not change the ordinary route store or require that option on followups.
+Bookmarks/list/search use the same main-session-scoped local index as local runs.
+
+read RUN_ID returns raw handoff bytes; read RUN_ID manifest.json returns the raw
+manifest, including descendant summaries; read RUN_ID artifacts/report.md returns
+that raw UTF-8 file. Remote file reads are limited to 2 MiB. wait RUN_ID waits for
+retained settlement without starting a model turn, for local or remote runs.
+Normal remote receipts have run_id/status/run_root/handoff_path; the two path
+fields are null because server files are not local filesystem paths. Remote path
+fails explicitly: use read to retrieve files. Live remote tier control and remote
+schema files are unsupported; launch/resume --service-tier remains supported.
+
+After network loss, use ordinary read RUN_ID manifest.json or wait RUN_ID.
+The server worker continues independently, stops normally and retains results.
+An accepted operation is observed, not replayed. An absent initial submission may
+be reconciled with its exact retained allocation/request and current equivalent
+execution authority. An absent pending resume is NOT submitted by read/wait;
+only an explicit matching resume may submit it. Pending controls/resumes bind
+stable IDs, payload and target epoch before transport; changed uncertain intent
+fails closed. A successful full-access observation settles accepted uncertain
+resume delivery. It can separately retire an old control when the native epoch
+has changed, retaining its signed identity and unknown outcome, not claiming an
+acknowledgement or reissuing it. Reads remain available after policy tightening; no implicit
+model turn is created to recover a result. No notification or app wakeup is
+required for recovery, and the hosting app may not wake an offline MAIN.
+Routes and authority remain bound to the original verified root main session;
+an unrelated fresh session cannot claim a job. Local routing records are private
+launcher metadata, never fabricated native manifests or worker input.
+
+Explicit request-ID compatibility transport is retained below. Its launch also
+registers an ordinary run_id in the default local Team store BEFORE submission,
+even with an explicit --remote-state. If stdout/run_id is lost, public
+  pira_team resolve REQUEST_ID [--store LOCAL_TEAM_STORE]
+returns the retained ordinary handle without contacting the server or starting
+work. Its status is unknown until read/wait observes the server. MAIN never needs
+to inspect private routing records or reconstruct endpoint options to recover.
+
+Lower-level compatibility transport (explicit --request-id; structured views):
+Usage: pira_team remote-keygen --authority-key LOCAL_ABS
+       pira_team run REMOTE --remote-cwd ABS --task TASK --completion-gate TEXT [--allow-subteam] [--detach]
+       pira_team resume REMOTE --run-request ORIGINAL_REQUEST [--allow-subteam] [--detach] [--task TASK --completion-gate TEXT]
+       pira_team attach REMOTE
+       pira_team read REMOTE [--artifact | --file RELATIVE_FILE | --operation-id KEY]
+       pira_team steer REMOTE --operation-id KEY --task TASK --completion-gate TEXT
+       pira_team interrupt REMOTE --operation-id KEY [-r|--recursive]
+       pira_team remote-check REMOTE
+REMOTE means all of:
+  --host HOST --remote-user USER --remote-endpoint-id PUBLIC_NONCE
+  --remote-exe ABS --remote-backend ABS
+  --remote-store ABS --remote-state LOCAL_ABS --authority-key LOCAL_ABS --request-id KEY
+HOST is an SSH alias/hostname, not shell syntax; USER explicitly selects the SSH
+account. Remote executable/backend/store/cwd are explicit absolute canonical Linux
+paths, without . or .. components. --remote-exe is the actual candidate binary,
+not a wrapper; --remote-backend selects the existing server-side Codex executable.
+Candidate/backend directories enter the supervisor PATH for server-local tools.
+Remote workers inherit the server launcher environment, not the local client's.
+--remote-endpoint-id is the independently provisioned 64-hex PUBLIC endpoint nonce,
+not a credential; use a different nonce for each independent host/candidate enrollment.
+--remote-state and --authority-key are local launcher-private paths, never remote
+workspace paths. --task-file is local input sent as task text; -- TASK is supported.
+Lower-level --cwd/--store/--schema/--label are rejected. Remote run/resume accept --service-tier standard|fast with the same default/retention
+rules as local runs. Live tier changes via --host are unsupported; no remote tier
+control operation is defined. Endpoint-side bookmarks, config and path are unsupported. Lower-level read defaults to a structured manifest view; --artifact or --file
+adds UTF-8 content up to 2 MiB, never credentials/backend state. --operation-id reads
+a retained control receipt instead. Root cannot read grandchildren's
+content; a coordinator's root-visible manifest retains descendant summaries only.
+
+Provision trust separately, before submission: remote-keygen verifies the local
+root identity and full-access/approval-never context, generates an Ed25519 key via
+ssh-keygen, and prints the PUBLIC allowed-signers enrollment line. A trusted
+operator/root installs only that public line in the fixed sibling file
+<actual-remote-executable>.allowed-signers, owned by OS root/the SSH account with
+safe ancestors and no group/other writes. Submit cannot enroll a key or choose a
+trust file. Enroll ONE exact root principal per candidate; same-principal key
+rotation is allowed, but wildcard/CSV/multiple-root enrollment is rejected.
+Separately provision <actual-remote-executable>.remote-endpoint.json:
+{"version":2,"endpoint_id":"64hex public nonce","user":"SSH username","exe":"canonical candidate path"}.
+The server checks this fixed descriptor, not just a caller-supplied host alias.
+Never send the private key, local sessions or credentials to the server,
+task, environment or logs. Protect the unencrypted private authority key locally.
+OpenSSH ssh and ssh-keygen signing/verification support are required. Transport
+uses strict host-key checks, batch mode, no PTY and no agent forwarding; no public
+listener or system service is installed. Backend authentication stays server-side
+and launcher-managed. remote-check reports availability, not model/auth validity.
+remote-check executes the selected backend's --version and requires fresh
+full-access/approval-never. Before effects, clients separately negotiate signed
+protocol/scope/capabilities using policy-agnostic metadata reads: these do not
+probe the backend, allocate runs, or write controller state. Missing required
+capabilities or protocol/scope mismatch fails before submission/control effects.
+Resume checks authenticated retained topology, including coordinator promotion by
+an earlier resume; omitting --allow-subteam later does not remove its capability requirement.
+
+Signed protocol v2 grants bind root principal, host/user/executable/backend/store,
+operation, request/run, task/argv and execution policy, with bounded validity.
+The trust boundary is a protected trusted launcher/signing key and trusted SSH
+endpoint, not remote attestation of a local process. Task data is untrusted; same
+OS user is not isolation from reading/modifying private stores or key material.
+Run/resume/steer require fresh full-access/approval-never; restricted filesystem
+policy translation is unsupported, never elevated. Verified same-root read, attach
+and interrupt remain available after caller policy tightening without local state
+writes. Steer must match the active execution policy. Only the root can grant
+--allow-subteam; children cannot inherit delegation authority for another level.
+
+Submission persists its request identity before acknowledgement. Retry the SAME
+--request-id and identical payload to reconcile uncertain delivery; a different
+payload under that ID rejects. Resume uses a NEW --request-id plus --run-request
+for the original submission. Attach/read never resume or inject a model turn.
+Distinct request IDs share a controller directory without a global client lock.
+Same-ID concurrent persistence can fail busy; its immutable signed request and
+server ownership/deduplication rules remain unchanged. No network effect is retried
+automatically, and server lifetime ownership locks are not relaxed.
+--run-request must select that original run request, never another resume.
+--detach returns durable acceptance, not worker completion; otherwise attach waits.
+Lower-level results are structured JSON views/receipts, not local filesystem paths.
+Dropping SSH/attach means unknown connectivity, not worker success or stoppage.
+The detached supervisor retains state independently; the SSH server must permit
+retained same-user processes. No system-service/cgroup-policy bypass is attempted.
+Partial records/crashed claims fail closed without automatic replay; accepted
+expired requests may reconcile only. Inspect history, errors, artifacts, usage and
+external effects before deliberate resume; crash accounting can remain incomplete.
+No exactly-once guarantee is made for arbitrary task side effects. Controls bind
+one revision/turn epoch. After unknown control delivery, reconcile the SAME
+--operation-id; do not reissue an effect under a new ID. A stale control cannot
+act on a later resumed turn. The client reads the retained operation receipt first;
+changed intent/epoch under the same operation ID rejects. Use read --operation-id
+to inspect unknown delivery without resending an effect.
+Acknowledgement is acceptance, not owner exit: await
+settlement before resume. Control command exit success delivers a receipt; inspect
+result.status and completion_confirmed, including failed_or_unknown/unknown states.
+Remote interrupt targets only the authorized scope;
+-r/--recursive applies the native host-local subtree boundary.

@@ -89,7 +89,11 @@ pub fn save_json(path: &Path, value: &Value) -> Result<(), String> {
     let result = (|| {
         writeln!(file, "{value:#}").map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        fs::rename(&temp, path).map_err(|e| e.to_string())
+        fs::rename(&temp, path).map_err(|e| e.to_string())?;
+        if crate::remote::delegated_context().is_some() {
+            crate::remote::sync_dir(path.parent().ok_or("missing remote metadata parent")?)?;
+        }
+        Ok(())
     })();
     drop(file);
     if result.is_err() {
@@ -131,7 +135,7 @@ fn owner(run: &Path) -> Result<File, String> {
 
 const FIX_TASK: &str = include_str!("fix_task.md");
 
-pub fn launch(mut options: Options) -> Result<(), String> {
+pub fn launch(options: Options) -> Result<(), String> {
     for path in [
         &options.store,
         &options.cwd,
@@ -141,6 +145,11 @@ pub fn launch(mut options: Options) -> Result<(), String> {
         options.execution.require_writable(path)?;
     }
     let run = crate::prepare_store(&options.store)?;
+    launch_at(options, run)
+}
+
+// Remote requests allocate and durably bind the run before acknowledging submission.
+pub(super) fn launch_at(mut options: Options, run: PathBuf) -> Result<(), String> {
     let _owner = owner(&run)?;
     let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
         "creator_main_session_id":options.execution.caller_thread_id,"parent_run_id":null,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
@@ -170,6 +179,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut inject_write = None;
     let mut allow_subteam = None;
     let mut recursive = false;
+    let mut service_tier = None;
     let mut gate = None;
     let (mut model, mut effort, mut output, mut task_file, mut task) =
         (None, None, None, None, None);
@@ -236,6 +246,11 @@ pub fn existing(args: &[String]) -> Result<(), String> {
             }
             "--model" if op == "resume" => model = Some(value.clone()),
             "--effort" if op == "resume" => effort = Some(value.clone()),
+            "--service-tier" if op == "resume" => crate::set_once(
+                &mut service_tier,
+                crate::service_tier::Tier::parse(value)?,
+                "--service-tier",
+            )?,
             "--timeout" if op == "resume" => {
                 return Err("--timeout is no longer supported; use interrupt to stop a run".into());
             }
@@ -250,6 +265,24 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     if positional.is_empty() || positional.len() > 2 || (op == "interrupt" && positional.len() != 1)
     {
         return Err("expected RUN_ID and, for resume/steer, --task or --task-file".into());
+    }
+    if op == "tier" {
+        if positional.len() != 2 || task.is_some() || task_file.is_some() || gate.is_some() {
+            return Err("expected tier RUN standard|fast [--store DIR]".into());
+        }
+        let tier = crate::service_tier::Tier::parse(&positional[1])?;
+        let root = root.map(Ok).unwrap_or_else(storage::default_root)?;
+        let session = profile::caller_session()?;
+        let run = storage::locate_for(&root, &positional[0], &session)?;
+        private_path(&run, true)?;
+        let mut receipt = app_server::control(&run, "tier", tier.name(), None)?;
+        receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
+        println!("{receipt}");
+        return if receipt["status"] == "accepted" {
+            Ok(())
+        } else {
+            Err("tier not acknowledged as applied; inspect the structured receipt and original workload outcome".into())
+        };
     }
     // Keep the former positional form for existing callers; never silently choose between inputs.
     if let Some(legacy) = positional.get(1) {
@@ -300,7 +333,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         );
     }
     if manifest["status"] == "running" {
-        return Err("run was left running without its owner; refusing ambiguous recovery (artifacts remain readable explicitly)".into());
+        return Err("run retains unsettled running state; refusing automatic replay; use interrupt -r RUN_ID for guarded settlement, inspect retained diagnostics and external side effects, then explicitly resume".into());
     }
     if ![
         "completed",
@@ -361,6 +394,9 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         model,
         effort,
         profile_sources: sources,
+        service_tier: service_tier
+            .map(Ok)
+            .unwrap_or_else(|| crate::service_tier::Tier::retained(&manifest))?,
         execution,
         task,
         label: None,
@@ -473,10 +509,13 @@ fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(
         manifest.as_object_mut().unwrap().remove(key);
     }
     for (key,value) in json!({"status":"running","model":options.model,"effort":options.effort,
-        "profile_sources":options.profile_sources,"cwd":options.cwd,"task":options.task,
+        "profile_sources":options.profile_sources,"service_tier":options.service_tier.name(),"tier_publication":null,"cwd":options.cwd,"task":options.task,
         "contract":options.contract.description(),"navigation":options.navigation,"completion_gate":options.completion_gate,"ctx_store":options.ctx_store,"dec_store":options.dec_store,"dec_workspace":options.dec_workspace,"output":options.output,
         "sandbox":options.execution.mode,"execution_permissions":{"source":"verified-caller-turn-context","caller_thread_id":options.execution.caller_thread_id,"sandbox_policy":options.execution.sandbox,"approval_policy":"never"},"timeout_seconds":null,"attempts":[],"repairs":0,"revision_usage":{},"logs":dir}).as_object().unwrap() {
         manifest[key] = value.clone();
+    }
+    if crate::remote::delegated_context().is_some() {
+        manifest["execution_permissions"]["source"] = json!("launcher-signed-delegation-v2");
     }
     begin_revision(&snapshot, || {
         save_json(&run.join("manifest.json"), manifest)

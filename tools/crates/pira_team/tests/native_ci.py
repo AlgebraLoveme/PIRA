@@ -38,6 +38,20 @@ def main():
                 "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
                 "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",
                 "test_team.TeamTests.test_explicit_api_auth_does_not_link_file_auth"]))
+            suite.addTests(loader.loadTestsFromNames([
+                "test_orphan_recovery.OrphanRecoveryTests." + name for name in (
+                    "test_target_only_abandoned_owner_retains_artifacts_and_explicit_resume",
+                    "test_missing_control_does_not_authorize_live_owner_settlement",
+                    "test_missing_or_mismatched_identity_evidence_fails_closed",
+                    "test_live_backend_and_reused_scope_refused_without_signaling",
+                    "test_existing_snapshot_republished_without_overwrite_or_duplicate_history",
+                    "test_stale_control_failure_cannot_settle_a_resumed_revision",
+                    "test_concurrent_recovery_and_resume_preserve_single_attempt_admission",
+                    "test_resume_preflight_missing_or_stale_revision_runtime_refused",
+                    "test_same_revision_repair_preflight_rejects_previous_and_legacy_bindings",
+                    "test_legacy_single_attempt_binding_remains_supported",
+                    "test_abandoned_resume_preserves_prior_history_and_cumulative_usage",
+                )]))
         else:
             suite = loader.discover(str(tests), pattern="test_*.py")
         result = unittest.TextTestRunner(verbosity=2).run(suite)

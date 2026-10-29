@@ -132,6 +132,9 @@ pub(crate) fn caller_session() -> Result<String, String> {
 }
 
 pub fn load() -> Result<Value, String> {
+    if let Some(context) = crate::remote::delegated_context() {
+        return Ok(context);
+    }
     let thread = std::env::var("CODEX_THREAD_ID").map_err(|_| "CODEX_THREAD_ID is unavailable")?;
     if thread.is_empty()
         || thread.len() > 200

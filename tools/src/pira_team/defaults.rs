@@ -88,7 +88,7 @@ pub(crate) fn root_if_present(root: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(root))
 }
 
-fn create_root(root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn create_root(root: &Path) -> Result<PathBuf, String> {
     if let Some(root) = root_if_present(root)? {
         return Ok(root);
     }

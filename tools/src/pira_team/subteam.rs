@@ -21,7 +21,7 @@ fn discover() -> Result<Option<Caller>, String> {
     discover_from(std::process::id())
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "linux", windows, test))]
 fn marker(arguments: &[String]) -> Result<Option<PathBuf>, String> {
     if !arguments
         .windows(3)
@@ -38,6 +38,64 @@ fn marker(arguments: &[String]) -> Result<Option<PathBuf>, String> {
         .transpose()
 }
 
+#[cfg(target_os = "linux")]
+fn inspect(pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
+    inspect_linux_using(
+        pid,
+        crate::native::metadata,
+        crate::native::arguments,
+        crate::native::executable,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn inspect_linux_using(
+    pid: u32,
+    mut metadata: impl FnMut(u32) -> std::io::Result<crate::native::Metadata>,
+    arguments: impl FnOnce(u32) -> std::io::Result<Vec<String>>,
+    executable: impl FnOnce(u32) -> std::io::Result<PathBuf>,
+) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
+    let before = match metadata(pid) {
+        Ok(metadata) => metadata,
+        Err(error) if crate::native::missing(&error) => crate::native::Metadata {
+            pid,
+            parent: 0,
+            birth: 0,
+            alive: false,
+        },
+        Err(_) => return Err("cannot verify process identity".into()),
+    };
+    if !before.alive {
+        return Ok((before.with_executable(PathBuf::new()), None));
+    }
+    let arguments = arguments(pid).map_err(|_| "cannot verify Team process ancestry")?;
+    let candidate = marker(&arguments);
+    let mut path = PathBuf::new();
+    let run = match candidate {
+        Ok(None) => None,
+        candidate => {
+            // No SSH/name/UID boundary is trusted. Only a possible backend
+            // marker needs exe access; unmarked ancestors are still traversed.
+            path = executable(pid).map_err(|_| "cannot verify process identity")?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name.starts_with("codex") || name.starts_with("python") {
+                candidate?
+            } else {
+                None
+            }
+        }
+    };
+    if metadata(pid).map_err(|_| "cannot verify process identity")? != before {
+        return Err("process identity changed during ancestry inspection".into());
+    }
+    Ok((before.with_executable(path), run))
+}
+
+#[cfg(not(target_os = "linux"))]
 fn inspect(pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
     let identity = match crate::native::identity(pid) {
         Ok(identity) => identity,
@@ -105,12 +163,18 @@ fn discover_using(
     mut pid: u32,
     mut inspect: impl FnMut(u32) -> Result<(crate::native::Identity, Option<PathBuf>), String>,
 ) -> Result<Option<Caller>, String> {
+    const MISMATCH: &str = "Team runtime does not match actual worker ancestry";
     let initial = pid;
     let mut child_birth = u64::MAX;
+    let mut caller: Option<Caller> = None;
     for _ in 0..64 {
         let (identity, candidate) = inspect(pid)?;
         if !identity.alive || identity.birth > child_birth {
-            return Ok(None);
+            return if caller.is_some() {
+                Err(MISMATCH.into())
+            } else {
+                Ok(None)
+            };
         }
         if pid != initial
             && let Some(path) = candidate
@@ -118,22 +182,38 @@ fn discover_using(
             let run = path
                 .canonicalize()
                 .map_err(|_| "Team context unavailable")?;
-            let runtime = read_json(&run.join("runtime.json"))?;
-            let manifest = read_json(&run.join("manifest.json"))?;
-            if runtime["backend_pid"] != pid
-                || runtime["revision"] != manifest["revision"]
-                || runtime["backend_birth"]
-                    .as_u64()
-                    .is_some_and(|born| born != identity.birth)
-            {
-                return Err("Team runtime does not match actual worker ancestry".into());
+            if let Some(bound) = &caller {
+                if bound.run != run {
+                    return Err(MISMATCH.into());
+                }
+            } else {
+                let runtime = read_json(&run.join("runtime.json"))?;
+                let manifest = read_json(&run.join("manifest.json"))?;
+                let revision = runtime["revision"].as_u64().ok_or(MISMATCH)?;
+                if Some(revision) != manifest["revision"].as_u64() {
+                    return Err(MISMATCH.into());
+                }
+                caller = Some(Caller { run, runtime });
             }
-            return Ok(Some(Caller { run, runtime }));
+        }
+        // Persistent wrappers own the backend scope; their marked descendants
+        // identify the context, but only the exact retained owner grants authority.
+        if let Some(bound) = &caller
+            && bound.runtime["backend_pid"] == pid
+        {
+            if bound.runtime["backend_birth"].as_u64() != Some(identity.birth) {
+                return Err(MISMATCH.into());
+            }
+            return Ok(caller);
         }
         child_birth = identity.birth;
         pid = identity.parent;
         if pid <= if cfg!(windows) { 4 } else { 1 } {
-            return Ok(None);
+            return if caller.is_some() {
+                Err(MISMATCH.into())
+            } else {
+                Ok(None)
+            };
         }
     }
     Err("Team ancestry exceeds 64 levels".into())
@@ -145,6 +225,9 @@ struct Caller {
     runtime: Value,
 }
 fn caller_binding() -> Result<Option<Caller>, String> {
+    if crate::remote::delegated_context().is_some() {
+        return Ok(None);
+    }
     static CALLER: OnceLock<Result<Option<Caller>, String>> = OnceLock::new();
     CALLER.get_or_init(discover).clone()
 }
@@ -243,14 +326,27 @@ pub fn default_store() -> Result<Option<PathBuf>, String> {
     Ok(caller_run()?.map(|run| run.parent().unwrap().to_owned()))
 }
 
-pub fn bind(run: &Path, revision: &Value, scope: &crate::process::Scope) -> Result<(), String> {
+pub fn bind(
+    run: &Path,
+    revision: &Value,
+    scope: &crate::process::Scope,
+    attempt_dir: &Path,
+) -> Result<(), String> {
     let backend =
         crate::native::identity(scope.pid).map_err(|_| "cannot bind native backend identity")?;
     let launcher = crate::native::current()?;
+    #[cfg(windows)]
+    let backend_job_session = Some(
+        crate::native::windows::session_id(scope.pid)
+            .map_err(|_| "cannot bind backend job OS session")?,
+    );
+    #[cfg(not(windows))]
+    let backend_job_session: Option<u32> = None;
     save_json(
         &run.join("runtime.json"),
         &json!({"backend_pid":scope.pid,"backend_birth":backend.birth,
-        "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"backend_job":scope.job_name(),"revision":revision}),
+        "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"backend_job":scope.job_name(),
+        "revision":revision,"attempt_logs":attempt_dir,"backend_job_session":backend_job_session}),
     )
 }
 
@@ -354,6 +450,64 @@ fn read_tree(root: &Path) -> Result<Value, String> {
     Ok(tree)
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_BOUND_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static ON_LOCK_CONTENTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn after_bound_check(hook: impl FnOnce() + 'static) {
+    AFTER_BOUND_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+pub(super) fn on_lock_contention(hook: impl FnOnce() + 'static) {
+    ON_LOCK_CONTENTION.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// A short native tree critical section shared by endpoint transitions, model
+/// turn admission and recursive interrupt. Never retain it across RPC waits.
+#[derive(Clone)]
+pub(super) struct AttemptGate {
+    root: PathBuf,
+    member: String,
+    revision: Value,
+    epoch: Value,
+}
+impl AttemptGate {
+    pub(super) fn new(run: &Path, manifest: &Value) -> Result<Self, String> {
+        if !manifest["revision"].is_u64() || !manifest["subtree_epoch"].is_u64() {
+            return Err("missing attempt revision/subtree epoch".into());
+        }
+        Ok(Self {
+            root: tree_root(run, manifest)?,
+            member: id(run).to_owned(),
+            revision: manifest["revision"].clone(),
+            epoch: manifest["subtree_epoch"].clone(),
+        })
+    }
+    pub(super) fn lock(&self) -> Result<File, String> {
+        lock(&self.root)
+    }
+    pub(super) fn with_open<T>(
+        &self,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _lock = self.lock()?;
+        let tree = read_tree(&self.root)?;
+        let member = &tree["members"][&self.member];
+        if tree["blocked"] != false
+            || tree["epoch"] != self.epoch
+            || member["active"] != true
+            || member["blocked"] == true
+            || member["revision"] != self.revision
+            || CANCELLED.load(Ordering::SeqCst)
+        {
+            return Err("subtree attempt gate is closed or stale; no new turn admitted".into());
+        }
+        action()
+    }
+}
+
 pub fn lock(root: &Path) -> Result<File, String> {
     let file = OpenOptions::new()
         .read(true)
@@ -367,6 +521,13 @@ pub fn lock(root: &Path) -> Result<File, String> {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                #[cfg(test)]
+                {
+                    let hook = ON_LOCK_CONTENTION.with(|slot| slot.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(10))
             }
             Err(e) => return Err(format!("subtree lock unavailable: {e}")),
@@ -589,52 +750,227 @@ fn bound_backend_alive(
         Err(_) => Err("cannot verify orphan backend exit".into()),
     }
 }
-fn backend_alive(run: &Path) -> Result<bool, String> {
-    let runtime = read_json(&run.join("runtime.json"))?;
-    let pid = runtime["backend_pid"]
+fn recorded_identity(runtime: &Value, role: &str) -> Result<(u32, u64), String> {
+    let pid = runtime[format!("{role}_pid")]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
-        .ok_or("missing native backend identity")?;
-    if let Some(birth) = runtime["backend_birth"].as_u64() {
-        return bound_backend_alive(pid, birth, crate::native::identity);
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            format!("missing native {role} PID identity; refusing ownerless settlement")
+        })?;
+    let birth = runtime[format!("{role}_birth")]
+        .as_u64()
+        .filter(|birth| *birth > 0)
+        .ok_or_else(|| {
+            format!("missing native {role} birth identity; refusing ownerless settlement")
+        })?;
+    Ok((pid, birth))
+}
+
+fn scope_empty(runtime: &Value, backend: u32) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let _ = runtime;
+        // process::spawn establishes a separate session/group led by the backend.
+        // A dead leader can leave live members. Probe only; never terminate a
+        // persisted group (its numeric ID may have been reused).
+        let group = i32::try_from(backend)
+            .ok()
+            .filter(|group| *group > 1)
+            .ok_or("invalid retained backend process group")?;
+        if unsafe { libc::kill(-group, 0) } == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(format!("backend scope exit unconfirmed: {error}"))
+        }
     }
     #[cfg(windows)]
     {
-        Err("legacy backend exit cannot be verified; inspect the original invocation".into())
-    }
-    #[cfg(unix)]
-    {
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-            .output()
-            .map_err(|e| format!("verify orphan backend exit: {e}"))?;
-        if !output.status.success() {
-            if output.status.code() == Some(1)
-                && output.stdout.is_empty()
-                && output.stderr.is_empty()
-            {
-                return Ok(false);
-            }
-            return Err("could not verify orphan backend exit".into());
-        }
-        let command =
-            String::from_utf8(output.stdout).map_err(|_| "invalid backend process evidence")?;
-        if let Some((_, value)) = command.split_once(MARKER) {
-            let path = serde_json::Deserializer::from_str(value)
-                .into_iter::<String>()
-                .next()
-                .ok_or("missing orphan context")?
-                .map_err(|_| "invalid orphan context")?;
-            return Ok(Path::new(&path) == run);
-        }
-        Ok(false)
+        let _ = backend;
+        let name = runtime["backend_job"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or("missing retained backend job identity")?;
+        let session = runtime["backend_job_session"]
+            .as_u64()
+            .and_then(|session| u32::try_from(session).ok())
+            .ok_or("missing retained backend job OS session")?;
+        crate::native::windows::job_empty(name, session)
+            .map_err(|error| format!("backend scope exit unconfirmed: {error}"))
     }
 }
 
+fn terminal(status: &Value) -> bool {
+    matches!(
+        status.as_str(),
+        Some(
+            "completed" | "needs_decision" | "incomplete" | "interrupted" | "timed_out" | "failed"
+        )
+    )
+}
+
+// Caller holds run.lock throughout. Match resume's run.lock -> tree.lock order;
+// never wait for an owner while holding tree.lock (its finalizer needs that lock).
+fn settle_stopped(run: &Path, revision: &Value, _owner: &File) -> Result<Value, String> {
+    let mut current = read_json(&run.join("manifest.json"))?;
+    let number = current["revision"]
+        .as_u64()
+        .ok_or("missing retained revision")?;
+    if current["revision"] != *revision || current["run_id"] != id(run) {
+        return Err("attempt changed during interruption; refusing stale settlement".into());
+    }
+    let root = tree_root(run, &current)?;
+    let _tree_lock = lock(&root)?;
+    let mut tree = read_tree(&root)?;
+    let member = &tree["members"][id(run)];
+    if member["revision"] != *revision {
+        return Err("subtree revision does not match interrupted attempt".into());
+    }
+    if current["status"] == "running" {
+        let runtime = read_json(&run.join("runtime.json"))?;
+        if runtime["revision"] != *revision {
+            return Err("runtime revision does not match interrupted attempt".into());
+        }
+        let attempts = current["attempts"]
+            .as_array()
+            .filter(|attempts| !attempts.is_empty())
+            .ok_or("missing current attempt evidence")?;
+        let attempt = attempts.last().unwrap();
+        if attempt["status"] != "running"
+            || attempt["logs"].as_str().is_none()
+            || if runtime["attempt_logs"].is_null() {
+                // Legacy bindings are unambiguous only before any repair/stage retry.
+                attempts.len() != 1
+            } else {
+                runtime["attempt_logs"] != attempt["logs"]
+            }
+        {
+            return Err(
+                "runtime does not identify the current attempt; refusing ambiguous recovery".into(),
+            );
+        }
+        let (launcher, birth) = recorded_identity(&runtime, "launcher")?;
+        if (!member["launcher_pid"].is_null() || !member["launcher_birth"].is_null())
+            && (member["launcher_pid"] != launcher || member["launcher_birth"] != birth)
+        {
+            return Err("subtree launcher identity does not match interrupted attempt".into());
+        }
+        if bound_backend_alive(launcher, birth, crate::native::identity)
+            .map_err(|e| format!("launcher exit unconfirmed: {e}"))?
+        {
+            return Err("recorded launcher is still alive; refusing ownerless settlement".into());
+        }
+        let (backend, birth) = recorded_identity(&runtime, "backend")?;
+        if bound_backend_alive(backend, birth, crate::native::identity)? {
+            return Err("owner crashed with running state; backend stop unconfirmed; retry interrupt only after the original backend exits".into());
+        }
+        if !scope_empty(&runtime, backend)? {
+            return Err("backend process scope is not empty; refusing ownerless settlement".into());
+        }
+        let snapshot = run.join(format!("revisions/{number:06}/manifest.json"));
+        if snapshot
+            .try_exists()
+            .map_err(|e| format!("inspect revision snapshot: {e}"))?
+        {
+            let retained = read_json(&snapshot)?;
+            if retained["revision"] != number
+                || !terminal(&retained["status"])
+                || retained["run_id"] != id(run)
+                || retained["parent_run_id"] != current["parent_run_id"]
+                || retained["creator_main_session_id"] != current["creator_main_session_id"]
+                || retained["thread_id"] != current["thread_id"]
+            {
+                return Err("invalid crashed revision snapshot; retained for inspection".into());
+            }
+            current = retained;
+        } else {
+            let history = current["revisions"]
+                .as_array_mut()
+                .ok_or("invalid crashed revision history")?;
+            if history.iter().any(|entry| entry["revision"] == number) {
+                return Err(
+                    "crashed revision history has no matching snapshot; retained for inspection"
+                        .into(),
+                );
+            }
+            let record = json!({"revision":number,"status":"interrupted","usage":current["revision_usage"],"manifest":format!("revisions/{number:06}/manifest.json"),"recovered":true});
+            current["revisions"].as_array_mut().unwrap().push(record);
+            current["status"] = json!("interrupted");
+            current["active_turn"] = Value::Null;
+            current["usage_complete"] = json!(false);
+            current["error"] = json!(
+                "crashed owner reconciled by explicit interruption after launcher and backend exit"
+            );
+            save_json(&snapshot, &current)?;
+        }
+        save_json(&run.join("manifest.json"), &current)?;
+    } else if !terminal(&current["status"]) {
+        return Err("attempt has no recognized terminal state".into());
+    }
+    tree["members"][id(run)]["active"] = json!(false);
+    save_json(&root.join("tree.json"), &tree)?;
+    Ok(json!({"run_id":id(run),"status":current["status"],"stopped":true}))
+}
+
+fn owner_file(run: &Path) -> Result<File, String> {
+    let path = run.join("run.lock");
+    crate::lifecycle::private_path(&path, false)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("owner lock unavailable: {e}"))
+}
+
 pub fn interrupt(run: &Path, recursive: bool) -> Result<Value, String> {
+    interrupt_expected(run, recursive, None)
+}
+
+pub(super) fn interrupt_bound(
+    run: &Path,
+    recursive: bool,
+    target: &Value,
+) -> Result<Value, String> {
+    interrupt_expected(run, recursive, Some(target))
+}
+
+fn interrupt_expected(
+    run: &Path,
+    recursive: bool,
+    target: Option<&Value>,
+) -> Result<Value, String> {
     let manifest = read_json(&run.join("manifest.json"))?;
     if !recursive {
-        let mut receipt = crate::app_server::control(run, "interrupt", "", None)?;
+        let attempt = match target {
+            Some(expected) => {
+                crate::app_server::control_bound(run, "interrupt", "", None, expected)
+            }
+            None => crate::app_server::control(run, "interrupt", "", None),
+        };
+        let mut receipt = match attempt {
+            Ok(receipt) => receipt,
+            Err(error) if manifest["status"] == "running" => {
+                // A missing endpoint is not exit evidence. The exclusive lock and
+                // both birth-bound native identities must independently prove it.
+                let recovery = (|| {
+                    let owner = owner_file(run)?;
+                    owner
+                        .try_lock()
+                        .map_err(|e| format!("owner lock unavailable: {e}"))?;
+                    if let Some(expected) = target {
+                        crate::app_server::require_control_target(run, expected)?;
+                    }
+                    settle_stopped(run, &manifest["revision"], &owner)
+                })();
+                recovery
+                    .map_err(|reason| format!("{error}; ownerless settlement refused: {reason}"))?
+            }
+            Err(error) => return Err(error),
+        };
         receipt["active_children_left_running"] = json!(
             summary(run)?["runs"]
                 .as_array()
@@ -647,45 +983,15 @@ pub fn interrupt(run: &Path, recursive: bool) -> Result<Value, String> {
         return Ok(receipt);
     }
     let root = tree_root(run, &manifest)?;
-    let targets = {
-        let _lock = lock(&root)?;
-        let path = root.join("tree.json");
-        let mut tree = if path.exists() {
-            read_tree(&root)?
-        } else {
-            json!({"version":1,"blocked":false,"epoch":0,"members":{}})
-        };
-        let targets: Vec<String> = if root == run {
-            tree["blocked"] = json!(true);
-            let mut ids: Vec<String> = tree["members"]
-                .as_object()
-                .ok_or("invalid subtree members")?
-                .keys()
-                .cloned()
-                .collect();
-            if !ids.iter().any(|v| v == id(run)) {
-                ids.push(id(run).to_owned());
-            }
-            ids
-        } else {
-            tree["members"][id(run)]["blocked"] = json!(true);
-            vec![id(run).to_owned()]
-        };
-        save_json(&path, &tree)?;
-        targets
-    };
+    let targets = close_gate(run, &manifest, target)?;
     // Gate watchers cover startup, repairs and stale/missing endpoints. Wait on the
     // native owner lock, not an acceptance receipt; never signal a persisted PID.
     let mut results = Vec::new();
-    for target in targets {
+    for (target, revision) in targets {
         let child = root.parent().unwrap().join(&target);
         let deadline = Instant::now() + Duration::from_secs(12);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(child.join("run.lock"));
         let result = (|| -> Result<Value, String> {
-            let file = file.map_err(|e| format!("owner lock unavailable: {e}"))?;
+            let file = owner_file(&child)?;
             if root != run {
                 let _ = crate::app_server::control(&child, "interrupt", "", None);
             }
@@ -698,51 +1004,7 @@ pub fn interrupt(run: &Path, recursive: bool) -> Result<Value, String> {
                     Err(e) => return Err(format!("owner did not confirm stopped: {e}")),
                 }
             }
-            let mut current = read_json(&child.join("manifest.json"))?;
-            if current["status"] == "running" {
-                // A crashed launcher cannot prove its backend stopped. Preserve the
-                // ambiguity instead of claiming completion or killing by stale PID.
-                if backend_alive(&child)? {
-                    return Err("owner crashed with running state; backend stop unconfirmed; descendants gated and interrupted; retry recursive interrupt after the original backend exits".into());
-                }
-                let number = current["revision"]
-                    .as_u64()
-                    .ok_or("missing crashed revision")?;
-                let snapshot = child.join(format!("revisions/{number:06}/manifest.json"));
-                if snapshot.exists() {
-                    let terminal = read_json(&snapshot)?;
-                    if terminal["revision"] != number
-                        || terminal["status"] == "running"
-                        || terminal["run_id"] != target
-                    {
-                        return Err(
-                            "invalid crashed revision snapshot; retained for inspection".into()
-                        );
-                    }
-                    current = terminal;
-                } else {
-                    current["status"] = json!("interrupted");
-                    current["active_turn"] = Value::Null;
-                    current["usage_complete"] = json!(false);
-                    current["error"] = json!(
-                        "crashed owner reconciled by recursive interruption after backend exit"
-                    );
-                    let record = json!({"revision":number,"status":"interrupted","usage":current["revision_usage"],"manifest":format!("revisions/{number:06}/manifest.json"),"recovered":true});
-                    current["revisions"]
-                        .as_array_mut()
-                        .ok_or("invalid crashed revision history")?
-                        .push(record);
-                    save_json(&snapshot, &current)?;
-                }
-                save_json(&child.join("manifest.json"), &current)?;
-            }
-            let _lock = lock(&root)?;
-            let mut tree = read_tree(&root)?;
-            tree["members"][&target]["active"] = json!(false);
-            tree["members"][&target]["revision"] = current["revision"].clone();
-            save_json(&root.join("tree.json"), &tree)?;
-            current["run_id"] = json!(target);
-            Ok(json!({"run_id":target,"status":current["status"],"stopped":true}))
+            settle_stopped(&child, &revision, &file)
         })();
         results.push(match result {
             Ok(result) => result,
@@ -758,12 +1020,80 @@ pub fn interrupt(run: &Path, recursive: bool) -> Result<Value, String> {
     }
 }
 
+// Publication/admission take the same tree lock. An A-target gate cannot be
+// checked, then applied after B becomes visible in the same revision.
+fn close_gate(
+    run: &Path,
+    manifest: &Value,
+    target: Option<&Value>,
+) -> Result<Vec<(String, Value)>, String> {
+    let root = tree_root(run, manifest)?;
+    let _lock = lock(&root)?;
+    let path = root.join("tree.json");
+    let mut tree = if path.exists() {
+        read_tree(&root)?
+    } else {
+        json!({"version":1,"blocked":false,"epoch":0,"members":{}})
+    };
+    if let Some(expected) = target {
+        crate::app_server::require_control_target(run, expected)?;
+        if tree["epoch"] != expected["subtree_epoch"]
+            || tree["members"][id(run)]["revision"] != expected["revision"]
+        {
+            return Err(
+                "stale signed recursive control; subtree admission epoch/revision changed".into(),
+            );
+        }
+    }
+    #[cfg(test)]
+    {
+        let hook = AFTER_BOUND_CHECK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    let targets: Vec<String> = if root == run {
+        tree["blocked"] = json!(true);
+        let mut ids: Vec<String> = tree["members"]
+            .as_object()
+            .ok_or("invalid subtree members")?
+            .keys()
+            .cloned()
+            .collect();
+        if !ids.iter().any(|v| v == id(run)) {
+            ids.push(id(run).to_owned());
+        }
+        ids
+    } else {
+        tree["members"][id(run)]["blocked"] = json!(true);
+        vec![id(run).to_owned()]
+    };
+    let attempts: Vec<_> = targets
+        .into_iter()
+        .map(|target| {
+            let revision = if tree["members"][&target]["revision"].is_null() && target == id(run) {
+                manifest["revision"].clone()
+            } else {
+                tree["members"][&target]["revision"].clone()
+            };
+            (target, revision)
+        })
+        .collect();
+    save_json(&path, &tree)?;
+    Ok(attempts)
+}
+#[cfg(test)]
+pub(super) fn close_bound_gate_for_test(run: &Path, target: &Value) -> Result<(), String> {
+    close_gate(run, &read_json(&run.join("manifest.json"))?, Some(target)).map(|_| ())
+}
+
 // Shared Team clauses are copied verbatim except coordinator-specific authority.
 pub const POLICY: &str = include_str!("coordinator.md");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("native_boundary_tests.rs");
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -897,6 +1227,202 @@ mod tests {
         std::fs::remove_dir_all(run).unwrap();
     }
 
+    struct DiscoveryFixture {
+        run: PathBuf,
+        processes: Vec<(crate::native::Identity, Option<PathBuf>)>,
+    }
+    impl DiscoveryFixture {
+        fn new(owner: u32) -> Self {
+            let run = std::env::temp_dir().join(format!(
+                "team-discovery-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&run).unwrap();
+            save_json(
+                &run.join("runtime.json"),
+                &json!({"backend_pid":owner,"backend_birth":owner,"revision":2}),
+            )
+            .unwrap();
+            save_json(&run.join("manifest.json"), &json!({"revision":2})).unwrap();
+            let processes = [(32, 24), (24, 16), (16, 12), (12, 1)]
+                .into_iter()
+                .map(|(pid, parent)| {
+                    (
+                        crate::native::Identity {
+                            pid,
+                            parent,
+                            birth: u64::from(pid),
+                            executable: PathBuf::new(),
+                            alive: true,
+                        },
+                        (pid == 24).then_some(run.clone()),
+                    )
+                })
+                .collect();
+            Self { run, processes }
+        }
+        fn inspect(&self, pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
+            self.processes
+                .iter()
+                .find(|(identity, _)| identity.pid == pid)
+                .cloned()
+                .ok_or_else(|| "unexpected fixture PID".into())
+        }
+        fn discover(&self) -> Result<Option<Caller>, String> {
+            discover_using(32, |pid| self.inspect(pid))
+        }
+    }
+    impl Drop for DiscoveryFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.run).unwrap();
+        }
+    }
+
+    #[test]
+    fn discovery_accepts_direct_and_wrapped_retained_owners() {
+        for owner in [24, 16, 12] {
+            let mut fixture = DiscoveryFixture::new(owner);
+            // Repeated matching markers on wrappers must not change the binding.
+            fixture.processes[2].1 = Some(fixture.run.clone());
+            let caller = fixture.discover().unwrap().unwrap();
+            assert_eq!(caller.run, fixture.run.canonicalize().unwrap());
+            assert_eq!(caller.runtime["backend_pid"], owner);
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_malformed_birth() {
+        for owner in [24, 12] {
+            let fixture = DiscoveryFixture::new(owner);
+            let path = fixture.run.join("runtime.json");
+            let valid = read_json(&path).unwrap();
+            for birth in [
+                None,
+                Some(Value::Null),
+                Some(json!("24")),
+                Some(json!(-1)),
+                Some(json!(24.0)),
+                Some(json!(true)),
+                Some(json!({})),
+                Some(json!([])),
+            ] {
+                let mut runtime = valid.clone();
+                runtime.as_object_mut().unwrap().remove("backend_birth");
+                if let Some(value) = &birth {
+                    runtime["backend_birth"] = value.clone();
+                }
+                save_json(&path, &runtime).unwrap();
+                assert!(
+                    fixture.discover().is_err(),
+                    "owner={owner}, birth={birth:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_malformed_revisions() {
+        let fixture = DiscoveryFixture::new(24);
+        let runtime_path = fixture.run.join("runtime.json");
+        let manifest_path = fixture.run.join("manifest.json");
+        let valid = read_json(&runtime_path).unwrap();
+        for revision in [
+            None,
+            Some(Value::Null),
+            Some(json!("2")),
+            Some(json!(-1)),
+            Some(json!(2.0)),
+            Some(json!(true)),
+            Some(json!({})),
+            Some(json!([])),
+        ] {
+            for targets in [
+                vec!["runtime"],
+                vec!["manifest"],
+                vec!["runtime", "manifest"],
+            ] {
+                let mut runtime = valid.clone();
+                let mut manifest = json!({"revision":2});
+                for (name, value) in [("runtime", &mut runtime), ("manifest", &mut manifest)] {
+                    if targets.contains(&name) {
+                        value.as_object_mut().unwrap().remove("revision");
+                        if let Some(revision) = &revision {
+                            value["revision"] = revision.clone();
+                        }
+                    }
+                }
+                save_json(&runtime_path, &runtime).unwrap();
+                save_json(&manifest_path, &manifest).unwrap();
+                assert!(
+                    fixture.discover().is_err(),
+                    "targets={targets:?}, revision={revision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_unrelated_or_recycled_owner() {
+        for (field, value) in [("backend_pid", 99), ("backend_birth", 13)] {
+            let fixture = DiscoveryFixture::new(12);
+            let path = fixture.run.join("runtime.json");
+            let mut runtime = read_json(&path).unwrap();
+            runtime[field] = json!(value);
+            save_json(&path, &runtime).unwrap();
+            assert!(fixture.discover().is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_conflicting_context() {
+        let mut fixture = DiscoveryFixture::new(12);
+        let other = DiscoveryFixture::new(12);
+        fixture.processes[2].1 = Some(other.run.clone());
+        assert!(fixture.discover().is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_broken_wrapper_chain() {
+        for broken in [
+            "dead wrapper",
+            "dead owner",
+            "birth order",
+            "missing owner",
+            "cycle",
+        ] {
+            let mut fixture = DiscoveryFixture::new(12);
+            match broken {
+                "dead wrapper" => fixture.processes[2].0.alive = false,
+                "dead owner" => fixture.processes[3].0.alive = false,
+                "birth order" => fixture.processes[2].0.birth = 25,
+                "missing owner" => fixture.processes[2].0.parent = 1,
+                "cycle" => fixture.processes[2].0.parent = 16,
+                _ => unreachable!(),
+            }
+            assert!(fixture.discover().is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn discovery_propagates_inspection_errors() {
+        let fixture = DiscoveryFixture::new(12);
+        let result = discover_using(32, |pid| {
+            if pid == 16 {
+                Err("cannot verify process identity".into())
+            } else {
+                fixture.inspect(pid)
+            }
+        });
+        assert_eq!(
+            result.err().as_deref(),
+            Some("cannot verify process identity")
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_native_ancestry_probe_is_available() {
@@ -927,5 +1453,47 @@ mod tests {
             )))
             .is_err()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unlinked_live_executable_never_becomes_missing_worker_or_exited_backend() {
+        struct Probe {
+            child: std::process::Child,
+            dir: PathBuf,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "team-unlinked-executable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let executable = dir.join("codex-fixture");
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        let probe = Probe {
+            child: std::process::Command::new(&executable)
+                .arg("30")
+                .spawn()
+                .unwrap(),
+            dir,
+        };
+        let pid = probe.child.id();
+        let original = crate::native::identity(pid).unwrap();
+        assert!(original.alive);
+        std::fs::remove_file(executable).unwrap();
+        let error = crate::native::identity(pid).unwrap_err();
+        assert!(!crate::native::missing(&error), "{error}");
+        assert!(inspect(pid).is_err());
+        assert!(bound_backend_alive(pid, original.birth, crate::native::identity).is_err());
     }
 }

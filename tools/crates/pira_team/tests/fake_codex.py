@@ -32,6 +32,57 @@ if args[:2] == ["app-server", "generate-json-schema"]:
     fixture = runpy.run_path(os.environ["TEAM_TEST_BACKEND_FIXTURE"])
     fixture["write_schemas"](args[args.index("--out") + 1], contract, os.environ.get("TEAM_BAD_BACKEND", ""))
     sys.exit(0)
+if real_codex := os.environ.get("TEAM_REAL_COORDINATOR_CODEX"):
+    home = Path(os.environ["CODEX_HOME"])
+    manifest = json.loads((home.parent / "manifest.json").read_text())
+    if manifest["parent_run_id"] is None:
+        from urllib.parse import urlparse
+        url = os.environ["TEAM_LOCAL_RESPONSES_URL"]
+        endpoint = urlparse(url)
+        assert endpoint.scheme == "http" and endpoint.hostname == "127.0.0.1" and endpoint.port
+        assert endpoint.username is None and endpoint.password is None
+        config = [
+            'model_provider="relocation_probe"',
+            'model_providers.relocation_probe.name="Offline abandonment fixture"',
+            "model_providers.relocation_probe.base_url=" + json.dumps(url),
+            'model_providers.relocation_probe.wire_api="responses"',
+            'model_providers.relocation_probe.requires_openai_auth=false',
+            'model_providers.relocation_probe.request_max_retries=0',
+            'model_providers.relocation_probe.stream_max_retries=0',
+            'features.shell_snapshot=false',
+        ]
+        command = [real_codex, *args, *[arg for value in config for arg in ("-c", value)]]
+        if os.environ.get("TEAM_PAUSE_AT") == "capacity-terminal":
+            import subprocess
+            # The Python proxy is Team's registered backend identity, not its
+            # Codex subprocess. Keep the same shell settings without advertising
+            # a second ancestry marker on the subprocess's command line.
+            forwarded, settings = [], {}
+            index = 0
+            prefix = "shell_environment_policy.set."
+            while index < len(command):
+                if command[index] == "-c" and command[index + 1].startswith(prefix):
+                    key, value = command[index + 1][len(prefix):].split("=", 1)
+                    settings[key] = json.loads(value)
+                    index += 2
+                else:
+                    forwarded.append(command[index])
+                    index += 1
+            forwarded += ["-c", "shell_environment_policy.set={" + ",".join(
+                key + "=" + json.dumps(value) for key, value in settings.items()) + "}"]
+            # Hold the terminal before Team sees it: scope cleanup cannot yet
+            # have started. Keep stdin open so the real backend remains active.
+            peer = subprocess.Popen(forwarded, stdin=sys.stdin, stdout=subprocess.PIPE, text=True)
+            for line in peer.stdout:
+                event = json.loads(line)
+                if event.get("method") == "turn/completed" and event["params"]["turn"]["status"] == "failed":
+                    pause_at("capacity-terminal")
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            code = peer.wait(timeout=10)
+            Path(os.environ["TEAM_REAL_COORDINATOR_EXIT"]).write_text(json.dumps({"returncode": code}))
+            sys.exit(code)
+        os.execv(real_codex, command)
 assert args[:3] == ["app-server", "--strict-config", "--stdio"]
 sandbox = json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("sandbox_mode=")))
 if os.environ.get("TEAM_ASSERT_BUILD_ENV"):
@@ -217,7 +268,10 @@ def finish(status="completed"):
                 final = candidate if isinstance(candidate, str) else json.dumps(candidate)
             notify("item/completed", {"item":{"type":"agentMessage", "phase":"final_answer", "text":final}})
     state_path.write_text(json.dumps(state))
-    turn = {"id": active, "status": status}
+    turn = {"id": active, "status": "failed" if status == "capacity" else status}
+    if status == "capacity":
+        turn["error"] = {"message": "Selected model is at capacity. Please try a different model.",
+                         "codexErrorInfo": "serverOverloaded"}
     error_stage = os.environ.get("TEAM_COMPLETED_ERROR")
     if status == "completed" and (error_stage == "all"
             or (error_stage == "implementation" and "IMPLEMENTATION STAGE." in state.get("phase", ""))
@@ -253,13 +307,15 @@ while True:
         if line is None:
             finish()
             continue
+        if line == "capacity":
+            finish("capacity")
+            continue
         if not line:
             break
     elif b"\n" not in buffer:
         ready = select.select([sys.stdin, service_read], [], [], wait)[0]
         if service_read in ready:
-            os.read(service_read, 1)
-            finish()
+            finish("capacity" if os.read(service_read, 1) == b"F" else "completed")
             continue
         if not ready:
             finish("failed" if task == "failed" else "completed")
@@ -351,11 +407,11 @@ while True:
             import runpy
             sys.path.insert(0, str(Path(os.environ["TEAM_SUBTEAM_FIXTURE"]).parent))
             fixture = runpy.run_path(os.environ["TEAM_SUBTEAM_FIXTURE"])
-            def complete_subteam():
+            def complete_subteam(status="completed"):
                 if os.name == "nt":
-                    native_input.put(None)
+                    native_input.put("capacity" if status == "capacity" else None)
                 else:
-                    os.write(service_write, b"1")
+                    os.write(service_write, b"F" if status == "capacity" else b"1")
             subteam_service = fixture["start"](args, state, home, complete_subteam)
         repair = task.startswith("Repair only the output format")
         if repair and os.environ.get("TEAM_REPAIR_CRASH"): sys.exit(8)
