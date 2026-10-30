@@ -318,6 +318,28 @@ mod tests {
 
     #[test]
     fn owner_lock_never_rewrites_linked_targets_and_keeps_exclusion() {
+        // A parallel test can fork while this lock is held, retaining its file
+        // reference until exec even after we close ours. Isolate without retries.
+        const CHILD_ENV: &str = "PIRA_CTX_TEST_ISOLATED_WATCH_OWNER";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "watch::state::tests::owner_lock_never_rewrites_linked_targets_and_keeps_exclusion",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed"),
+                "isolated owner-lock test failed: {}\n{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("ctx-owner-links-{}", std::process::id()));
         storage::ensure_private_dir(&dir).unwrap();
         for kind in ["ordinary", "symlink", "hardlink"] {
