@@ -917,50 +917,74 @@ class SetupPiraToolsTests(unittest.TestCase):
             request.call_args.args[0],
         )
 
+    def test_version_help_lists_write_alias(self) -> None:
+        self.assertIn("write=VERSION", setup.build_parser().format_help())
+
     def test_parses_per_tool_versions(self) -> None:
         self.assertEqual(
             setup.parse_versions(
-                ["ctx=1.6.0", "pira_nav=0.11.0", "svg=0.1.0", "team=0.2.0"]
+                ["ctx=1.6.0", "pira_nav=0.11.0", "svg=0.1.0", "team=0.2.0", "write=0.1.0"]
             ),
             {
                 "pira_ctx": "1.6.0",
                 "pira_nav": "0.11.0",
                 "pira_svg_check": "0.1.0",
                 "pira_team": "0.2.0",
+                "pira_write_check": "0.1.0",
             },
         )
 
-    def test_selector_accepts_pira_svg_check_and_rejects_unsafe_names(self) -> None:
-        selector = setup.load_selector()
-        self.assertEqual(selector.validate_tool_name("pira_svg_check"), "pira_svg_check")
-        with self.assertRaises(selector.SelectionError):
-            selector.validate_tool_name("../pira_svg_check")
+    def test_selector_accepts_checkers_and_rejects_unsafe_names(self) -> None:
+        for tool in ("pira_svg_check", "pira_write_check"):
+            selector = setup.load_selector()
+            self.assertEqual(selector.validate_tool_name(tool), tool)
+            with self.assertRaises(selector.SelectionError):
+                selector.validate_tool_name("../" + tool)
 
-    def test_selector_installs_pira_svg_check_atomically(self) -> None:
-        selector = setup.load_selector()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "downloaded-pira-svg-check"
-            source.write_bytes(b"pira-svg-check-binary")
-            record = {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
-            installed = selector.install_binary(
-                source,
-                record,
-                root / "bin",
-                tool_name="pira_svg_check",
+    def test_selector_installs_checkers_atomically(self) -> None:
+        for tool in ("pira_svg_check", "pira_write_check"):
+            selector = setup.load_selector()
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / ("downloaded-" + tool)
+                source.write_bytes((tool + "-binary").encode())
+                record = {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+                source.chmod(0o755)
+                for platform_key in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"):
+                    selected, selected_record = selector.select_binary(
+                        platform_key, tool_name=tool, bundle_dir=root,
+                        manifest={"schema_version": 1, "tool_name": tool,
+                                  "binaries": {platform_key: {**record, "path": source.name}}},
+                    )
+                    self.assertEqual(selected, source.resolve())
+                    installed = selector.install_binary(
+                        selected, selected_record, root / "bin", tool_name=tool,
+                    )
+                    self.assertEqual(installed.name, tool)
+                    self.assertEqual(installed.read_bytes(), source.read_bytes())
+
+    def test_selection_includes_available_checkers(self) -> None:
+        for tool in ("pira_svg_check", "pira_write_check"):
+            index = self.index()
+            index["tools"][tool] = {
+                "version": "0.1.0",
+                "binaries": {},
+            }
+            self.assertEqual(
+                setup.selected_tools(index, ["pira_ctx", tool]),
+                ["pira_ctx", tool],
             )
-            self.assertEqual(installed.name, "pira_svg_check")
-            self.assertEqual(installed.read_bytes(), source.read_bytes())
 
-    def test_default_selection_includes_released_pira_svg_check(self) -> None:
+    def test_default_selection_includes_checker_only_when_released(self) -> None:
         index = self.index()
-        index["tools"]["pira_svg_check"] = {
-            "version": "0.1.0",
-            "binaries": {},
-        }
+        index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
+        self.assertEqual(setup.selected_tools(index, None), ["pira_ctx", "pira_team"])
+        with self.assertRaisesRegex(RuntimeError, "requested tool is not released"):
+            setup.selected_tools(index, ["pira_write_check"])
+        index["tools"]["pira_write_check"] = {"version": "0.1.0", "binaries": {}}
         self.assertEqual(
-            setup.selected_tools(index, ["pira_ctx", "pira_svg_check"]),
-            ["pira_ctx", "pira_svg_check"],
+            setup.selected_tools(index, None),
+            ["pira_ctx", "pira_team", "pira_write_check"],
         )
 
     def test_finds_release_containing_exact_version_asset(self) -> None:

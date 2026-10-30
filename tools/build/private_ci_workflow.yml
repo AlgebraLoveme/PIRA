@@ -9,7 +9,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        crate: [pira_ctx, pira_dec, pira_nav, pira_svg_check, pira_team]
+        crate: @TEST_TOOLS@
+@TEST_EXTRA@
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:
@@ -54,6 +55,24 @@ jobs:
           PY
       - name: Locked crate tests
         run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}
+      - name: Native writing checker parity and release tests
+        if: matrix.crate == 'pira_write_check'
+        shell: bash
+        run: |
+          cargo fmt --manifest-path tools/Cargo.toml -p pira_write_check -- --check
+          cargo build --locked --manifest-path tools/Cargo.toml -p pira_write_check
+          cargo test --locked --release --manifest-path tools/Cargo.toml -p pira_write_check
+          cargo build --locked --release --manifest-path tools/Cargo.toml -p pira_write_check
+          python -B - <<'PY_CHECKER'
+          import os, pathlib, subprocess, sys
+          name = 'pira_write_check.exe' if sys.platform == 'win32' else 'pira_write_check'
+          for profile in ('debug', 'release'):
+              binary = (pathlib.Path('tools/target') / profile / name).resolve(strict=True)
+              subprocess.run([
+                  sys.executable, '-B', '-m', 'unittest', 'discover',
+                  '-s', 'tools/crates/pira_write_check/tests', '-p', 'test_cli_parity.py', '-v',
+              ], env=dict(os.environ, PIRA_WRITE_CHECK_BIN=str(binary)), check=True)
+          PY_CHECKER
       - name: Required Windows native Team checks
         if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'
         shell: bash

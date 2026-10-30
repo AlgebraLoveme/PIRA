@@ -1,0 +1,281 @@
+[
+  {
+    "name": "supplied-sol-regression",
+    "text": "Proposition 3.8 replaces the source’s explicit inductive construction with a compactness-based existence proof, failing to preserve the essential proof argument despite a valid theorem and faithful unrelated parts.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 162,
+        "span": "despite",
+        "category": "contrast/concession"
+      }
+    ]
+  },
+  {
+    "name": "mathematical-negation",
+    "text": "No node is both open and closed; it is not empty.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 1,
+        "span": "No",
+        "category": "negation"
+      },
+      {
+        "line": 1,
+        "column": 40,
+        "span": "not",
+        "category": "negation"
+      }
+    ]
+  },
+  {
+    "name": "necessary-qualification",
+    "text": "The trial may stop if no participants enroll.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 11,
+        "span": "may",
+        "category": "hedging/modality"
+      },
+      {
+        "line": 1,
+        "column": 23,
+        "span": "no",
+        "category": "negation"
+      }
+    ]
+  },
+  {
+    "name": "legitimate-contrast",
+    "text": "The error is bounded, but the estimate is conservative.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 23,
+        "span": "but",
+        "category": "contrast/concession"
+      }
+    ]
+  },
+  {
+    "name": "ambiguous-singletons-omitted",
+    "text": "We can sort or filter; items appear in Mayfair.",
+    "expected": []
+  },
+  {
+    "name": "month-name-is-still-configured-hit",
+    "text": "In May, birds might appear.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 4,
+        "span": "May",
+        "category": "hedging/modality"
+      },
+      {
+        "line": 1,
+        "column": 15,
+        "span": "might",
+        "category": "hedging/modality"
+      }
+    ]
+  },
+  {
+    "name": "fenced-code-is-not-exempt",
+    "text": "```python\nif not ready: pass  # only a demo\n```",
+    "expected": [
+      {
+        "line": 2,
+        "column": 4,
+        "span": "not",
+        "category": "negation"
+      },
+      {
+        "line": 2,
+        "column": 23,
+        "span": "only",
+        "category": "minimization"
+      }
+    ]
+  },
+  {
+    "name": "quoted-and-negated-mentions",
+    "text": "'not' is a token, not an instruction.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 2,
+        "span": "not",
+        "category": "negation"
+      },
+      {
+        "line": 1,
+        "column": 19,
+        "span": "not",
+        "category": "negation"
+      }
+    ]
+  },
+  {
+    "name": "overlapping-phrases",
+    "text": "It is likely, even though valid, not necessarily useful.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 4,
+        "span": "is likely",
+        "category": "hedging/modality"
+      },
+      {
+        "line": 1,
+        "column": 7,
+        "span": "likely",
+        "category": "hedging/modality"
+      },
+      {
+        "line": 1,
+        "column": 15,
+        "span": "even though",
+        "category": "contrast/concession"
+      },
+      {
+        "line": 1,
+        "column": 20,
+        "span": "though",
+        "category": "contrast/concession"
+      },
+      {
+        "line": 1,
+        "column": 34,
+        "span": "not",
+        "category": "negation"
+      },
+      {
+        "line": 1,
+        "column": 34,
+        "span": "not necessarily",
+        "category": "hedging/modality"
+      }
+    ]
+  },
+  {
+    "name": "unicode-tabs-crlf",
+    "text": "π\tNOT now\r\nIt could\tbe useful.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 3,
+        "span": "NOT",
+        "category": "negation"
+      },
+      {
+        "line": 2,
+        "column": 4,
+        "span": "could\tbe",
+        "category": "hedging/modality"
+      }
+    ]
+  },
+  {
+    "name": "mixed-contraction-apostrophes",
+    "text": "It isn't proven and it can’t fail.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 4,
+        "span": "isn't",
+        "category": "negation"
+      },
+      {
+        "line": 1,
+        "column": 24,
+        "span": "can’t",
+        "category": "negation"
+      }
+    ]
+  },
+  {
+    "name": "substrings-and-underscores",
+    "text": "notice notebook Mayfair onlyness withoutness nobody nowhere not_x xnot noté énot.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 46,
+        "span": "nobody",
+        "category": "negation"
+      },
+      {
+        "line": 1,
+        "column": 53,
+        "span": "nowhere",
+        "category": "negation"
+      }
+    ]
+  },
+  {
+    "name": "independent-reassurance",
+    "text": "The script failed, but only a little work remains.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 20,
+        "span": "but",
+        "category": "contrast/concession"
+      },
+      {
+        "line": 1,
+        "column": 24,
+        "span": "only",
+        "category": "minimization"
+      },
+      {
+        "line": 1,
+        "column": 29,
+        "span": "a little",
+        "category": "minimization"
+      }
+    ]
+  },
+  {
+    "name": "independent-concession",
+    "text": "Although imperfect, it might be sufficient.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 1,
+        "span": "Although",
+        "category": "contrast/concession"
+      },
+      {
+        "line": 1,
+        "column": 24,
+        "span": "might",
+        "category": "hedging/modality"
+      }
+    ]
+  },
+  {
+    "name": "unconfigured-paraphrase",
+    "text": "The reasoning looks acceptable in the remaining sections.",
+    "expected": []
+  },
+  {
+    "name": "wrapped-phrase-not-matched",
+    "text": "It could\nbe useful.",
+    "expected": []
+  },
+  {
+    "name": "phrase-verb-not-appearance",
+    "text": "The figures appear to agree; artifacts appear in the image.",
+    "expected": [
+      {
+        "line": 1,
+        "column": 13,
+        "span": "appear to",
+        "category": "hedging/modality"
+      }
+    ]
+  }
+]

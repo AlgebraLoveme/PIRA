@@ -2,6 +2,12 @@ name: Build PIRA tool bundles
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish publicly only after required acceptance results are approved
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -51,6 +57,9 @@ jobs:
           - tool: pira_team
             script: tools/build/build_pira_team_platform_bins.py
             needs_zig: false
+          - tool: pira_write_check
+            script: tools/build/build_pira_write_check_platform_bins.py
+            needs_zig: false
           - tool: pira_svg_check
             script: tools/build/build_pira_svg_check_platform_bins.py
             needs_zig: false
@@ -75,7 +84,13 @@ jobs:
             tools.build.test_build_pira_ctx_platform_bins \
             tools.build.test_package_github_release
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
-          cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}"
+          # The copied/unlinked live-executable fixture is prohibited on macOS.
+          test_args=()
+          if [[ "${TOOL}" == "pira_team" ]]; then
+            echo "SKIPPED: macOS unlinked live executable fixture (known kernel-held process risk)."
+            test_args=(-- --skip unlinked_live_executable_never_becomes_missing_worker_or_exited_backend)
+          fi
+          cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}" "${test_args[@]}"
           if [[ "${TOOL}" == "pira_team" ]]; then
             cargo build --manifest-path tools/Cargo.toml --locked --package pira_team --package pira_dec
             PIRA_TEAM_BIN="$PWD/tools/target/debug/pira_team" PIRA_DEC_BIN="$PWD/tools/target/debug/pira_dec" TEAM_TEST_SLOW_PREFLIGHT=1 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tools/crates/pira_team/tests -p 'test_*.py' -v
@@ -182,12 +197,13 @@ jobs:
             --source-sha "${GITHUB_SHA}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish immutable-versioned release
+      - name: Prepare immutable-versioned draft or approved public release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           ASSETS_DIR: ${{ runner.temp }}/pira-release-assets
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
         run: |
           set -euo pipefail
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
@@ -207,7 +223,11 @@ jobs:
           gh release upload "${TAG}" "${ASSETS_DIR}"/* \
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
-          gh release edit "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --draft=false \
-            --latest
+          if [[ "${PUBLISH_RELEASE}" == "true" ]]; then
+            gh release edit "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --draft=false \
+              --latest
+          else
+            echo "Draft retained: ${TAG}; public publication requires acceptance approval."
+          fi

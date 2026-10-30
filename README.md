@@ -195,13 +195,13 @@ py -3 assets/scripts/setup_pira_tools.py --verify # verify without writing
 py -3 assets/scripts/setup_pira_tools.py --version ctx=1.7.0 --version svg=0.1.0
 ```
 
-The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, `svg=VERSION`, or `team=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup and `pira_team` model calls need network access; the other tools operate locally. Restart the shell or agent process if setup says the new PATH is not active yet.
+The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verifies their recorded size, SHA-256 checksum, and reported tool version before installation. `--version ctx=VERSION`, `dec=VERSION`, `nav=VERSION`, `svg=VERSION`, `team=VERSION`, or `write=VERSION` selects a concrete cloud-built version and may be repeated; unspecified tools use the latest release. Exact-version history begins with this release system, so versions never published by it are reported as unavailable. `--tool NAME` limits installation to one tool and may be repeated. `--force` reinstalls an already matching copy; `--install-dir PATH` changes the destination; `--no-path` leaves PATH management to you. Setup and `pira_team` model calls need network access; the other tools operate locally. Restart the shell or agent process if setup says the new PATH is not active yet.
 
 ### Maintainer release procedure
 
 For pre-release Windows/Linux validation without touching public branches, use the [private CI snapshot workflow](tools/build/PRIVATE_CI.md). It tests reviewed source snapshots in an explicitly selected private repository and never publishes a release.
 
-PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and publishes a new GitHub Release containing versioned assets for all five tools. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After the workflow succeeds, a fresh clone of `master` plus the setup script installs the latest release automatically.
+PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and prepares versioned assets for all six standard tools in a draft GitHub Release by default (`publish_release=false`). Only after required acceptance approval, explicitly dispatch with `publish_release=true` or publish the retained draft through a later guarded edit. A successful draft build does not change the public release used by setup. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After public publication, a fresh clone of `master` plus the setup script installs the latest release automatically.
 
 </details>
 
@@ -505,6 +505,17 @@ Validation used pinned real fixtures with retained upstream provenance, hashes, 
 
 </details>
 
+### `pira_write_check`: native English lexical review markers
+
+The Rust checker scans explicit UTF-8 files for configured literal English words
+and phrases, retaining exact locations, source context and every overlapping
+occurrence. Findings prompt review of necessity in context; they are not semantic
+verdicts and never trigger automatic rewriting. Warnings exit `0`; input errors
+exit `2`. The default JSON lexicon is embedded in the executable. See
+[`tools/crates/pira_write_check/README.md`](tools/crates/pira_write_check/README.md)
+for usage, Unicode semantics and limitations. Release availability follows the
+selected published manifest used by setup.
+
 ### `pira_svg_check`: conservative SVG text-legibility warnings
 
 Run `pira_svg_check FIGURE.svg` on a finalized SVG. It warns about low contrast, clipped or masked text, text overlap, and visible strokes crossing text; findings are review prompts and return exit code `0`, while analysis errors return `2`. Opaque label backgrounds are supported, and only semantic `<text>` can be analyzed reliably, so a clear report never replaces inspection at the final display size. See [`tools/crates/pira_svg_check/README.md`](tools/crates/pira_svg_check/README.md) for options and limits.
@@ -688,9 +699,10 @@ other agent platforms has not been equally tested.
 - `tools/build/build_pira_nav_platform_bins.py` — package-isolated release entry point for `pira_nav`
 - `tools/build/build_pira_svg_check_platform_bins.py` — package-isolated release entry point for `pira_svg_check`
 - `tools/build/build_pira_team_platform_bins.py` — package-isolated release entry point for `pira_team`
-- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all five tools, builds every platform twice, and publishes direct GitHub Release assets
+- `tools/build/build_pira_write_check_platform_bins.py` — package-isolated release entry point for `pira_write_check`
+- `.github/workflows/build-pira-tool-bundles.yml` — owner-dispatched build from `master` that tests all six standard tools, builds every platform twice, and prepares draft GitHub Release assets by default
 - `tools/build/package_github_release.py` — validates build archives and produces the versioned release assets and checksum index consumed by setup
-- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, `tools/src/pira_svg_check/`, and `tools/src/pira_team/` — public Rust implementations
+- `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, `tools/src/pira_svg_check/`, `tools/src/pira_team/`, and `tools/src/pira_write_check/` — public Rust implementations
 - GitHub Releases — published platform executables; generated binaries are not stored on a second branch or in the source tree
 
 PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.

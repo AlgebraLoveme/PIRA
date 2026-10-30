@@ -1,0 +1,20 @@
+[package]
+name = "pira_write_check"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Read-only English lexical marker review prompts for PIRA writing"
+license = "Apache-2.0"
+repository = "https://github.com/AlgebraLoveme/PIRA"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+path = "../../src/pira_write_check/lib.rs"
+
+[[bin]]
+name = "pira_write_check"
+path = "../../src/pira_write_check/main.rs"

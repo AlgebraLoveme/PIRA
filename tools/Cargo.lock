@@ -1055,6 +1055,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pira_write_check"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

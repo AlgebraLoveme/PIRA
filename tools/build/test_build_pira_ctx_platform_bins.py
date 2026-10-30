@@ -21,6 +21,15 @@ class RustToolsTests(unittest.TestCase):
         self.assertEqual(builder.TOOL_NAME, "pira_svg_check")
         self.assertEqual(builder.TARGETS["windows-x64"].exe_name, "pira_svg_check.exe")
 
+    def test_configures_write_checker_and_embedded_inventory(self) -> None:
+        builder.configure_tool("pira_write_check")
+        self.assertEqual(builder.TOOL_NAME, "pira_write_check")
+        self.assertEqual(builder.TARGETS["windows-x64"].exe_name, "pira_write_check.exe")
+        self.assertFalse(builder.USES_C_COMPILER)
+        builder.require_release_inputs()
+        self.assertEqual(builder.cargo_package_version(), "0.1.0")
+        self.assertTrue((builder.TOOLS_DIR / "src/pira_write_check/lexicon.json").is_file())
+
     def test_rejects_unsafe_workspace_tool_name(self) -> None:
         with self.assertRaises(builder.BuildError):
             builder.configure_tool("../pira_svg_check")

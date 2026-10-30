@@ -19,13 +19,13 @@ and eligible untracked source changes), then inspect the reported stage director
 
 ```bash
 python3 -B tools/build/private_ci.py stage
-# Optional CI subset (repeat --test-tool); default tests all five tools:
+# Optional CI subset (repeat --test-tool); default tests all six tools:
 python3 -B tools/build/private_ci.py stage --test-tool pira_ctx --test-tool pira_team
 ```
 
 Staging is local-only and prints JSON including `stage`, `original_head`, dirty
 state/status fingerprint, counts, and tested tools. `--root PATH` selects another
-source checkout. All five workspace members are staged even with a test subset,
+source checkout. All six workspace members are staged even with a test subset,
 because Cargo workspace resolution and setup tests need shared inputs. The independent
 Linux/Windows setup job always runs, including when Team is excluded from the crate subset.
 
@@ -34,7 +34,9 @@ explicit Team runtime policies, policy-mirror test inputs, the SVG font configur
 and setup regression dependencies are copied. Hidden/cache/store/auth/profile/debug/
 generated directories, live smoke tests and benchmark artifacts are excluded; there
 is no recursive copy of `tools/`. The allowlist lives in `selected()`; maintain it
-when production/test dependencies change. Literal Rust `include!`, `include_str!`
+when production/test dependencies change. The exact retained Team dependency
+`tools/src/pira_team/tier_fixture.py` is explicitly selected; other runtime Python
+files are not recursively selected. Literal Rust `include!`, `include_str!`
 and `include_bytes!` dependencies must be selected; dynamic includes and arbitrary
 runtime file dependencies are not inferred. Source bytes are copied unchanged.
 
@@ -77,8 +79,20 @@ for review until the maintainer explicitly removes them.
 
 The staged push workflow reuses the exact checkout pin from the source release
 workflow, disables credential persistence, checks hashes, and runs locked crate
-tests on native Linux and Windows. A separate Linux/Windows setup job runs all explicitly
-staged setup tests: unified setup, tool/backend preflight, and store configuration.
+tests on native Linux and Windows. The writing checker additionally runs on native
+macOS; only the checker receives that extra matrix entry. Each checker host runs
+debug and release Rust tests (including retained lexical expectations), formatting,
+and debug/release builds. Python CLI parity runs against both executable profiles
+when the retained oracle is available; otherwise its tests explicitly skip while
+Rust lexical fixtures still run. The snapshot always requires the checker's runtime
+`lexicon.json` and `tests/evaluation.json`; it optionally selects only
+`tools/dev/pira_write_check/check.py` and its `lexicon.json`, not the development tree.
+Before staging, the source owner must supply the checker manifest, Rust sources,
+tests and lexical fixtures, and update workspace membership and `Cargo.lock` together.
+This helper does not change them or any writing policy.
+
+A separate Linux/Windows setup job runs all explicitly staged setup tests: unified
+setup, tool/backend preflight, and store configuration.
 That job first builds source Ctx with locked Cargo into `tools/target` (45-minute
 job budget), then injects the absolute host `pira_ctx`/`pira_ctx.exe` path as
 `PIRA_TEST_CTX_BINARY` into the isolated test environment. The exact native event

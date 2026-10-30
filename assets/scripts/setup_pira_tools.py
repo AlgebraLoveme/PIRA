@@ -263,6 +263,7 @@ def parse_versions(values: list[str] | None) -> dict[str, str]:
         "dec": "pira_dec",
         "nav": "pira_nav",
         "svg": "pira_svg_check",
+        "write": "pira_write_check",
         "team": "pira_team",
     }
     versions: dict[str, str] = {}
@@ -543,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--version",
         action="append",
         help=(
-            "Pin one tool as ctx=VERSION, dec=VERSION, nav=VERSION, svg=VERSION, or team=VERSION; "
+            "Pin one tool as ctx=VERSION, dec=VERSION, nav=VERSION, svg=VERSION, team=VERSION, or write=VERSION; "
             "repeatable. "
             "Unspecified tools use latest. Exact history begins with cloud releases."
         ),

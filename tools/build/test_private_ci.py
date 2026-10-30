@@ -115,6 +115,13 @@ class PrivateCITests(unittest.TestCase):
             'assets/scripts/test_team_store_relocation.py': b'# helper tests',
             'assets/scripts/team_relocation_fixture.py': b'# native fixture',
             'tools/build/private_ci.py': b'# provisioning helper',
+            'tools/src/pira_team/tier_fixture.py': b'# maintained tier fixture\r\n',
+            'tools/src/pira_team/tier_control_tests.rs': b'const T: &str = include_str!("tier_fixture.py");\n',
+            'tools/src/pira_write_check/lexicon.json': b'{"scope": ["only"]}\r\n',
+            'tools/crates/pira_write_check/tests/evaluation.json': b'[]\r\n',
+            'tools/crates/pira_write_check/tests/test_cli_parity.py': b'# optional oracle parity',
+            'tools/dev/pira_write_check/check.py': b'# retained oracle',
+            'tools/dev/pira_write_check/lexicon.json': b'{"scope": ["only"]}\r\n',
             'assets/LEGACY_LIST.md': b'# fixture legacy list',
             'tools/select_tool_for_platform.py': b'# fixture',
             'tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf': b'<fontconfig/>',
@@ -147,6 +154,108 @@ class PrivateCITests(unittest.TestCase):
         with patch.object(ci.tempfile, 'mkdtemp', return_value=str(destination)):
             self.result = ci.stage(self.root, tools)
         return destination
+
+    def test_team_runtime_python_include_is_explicit_and_byte_preserving(self):
+        self.write('tools/src/pira_team/unselected.py', b'not a reviewed runtime fixture')
+        data = ci.verify(self.stage())
+        name = 'tools/src/pira_team/tier_fixture.py'
+        self.assertEqual(data[name], self.files[name])
+        self.assertNotIn('tools/src/pira_team/unselected.py', data)
+
+    def test_checker_snapshot_inputs_and_native_matrix(self):
+        self.write('tools/src/pira_write_check/lib.rs', b'include_str!("lexicon.json");')
+        self.write('tools/crates/pira_write_check/tests/check.rs', b'include_str!("evaluation.json");')
+        self.write('tools/dev/pira_write_check/private.json', b'not selected')
+        data = ci.verify(self.stage())
+        for name in ('tools/src/pira_write_check/lexicon.json',
+                     'tools/crates/pira_write_check/tests/evaluation.json',
+                     'tools/crates/pira_write_check/tests/test_cli_parity.py',
+                     'tools/dev/pira_write_check/check.py',
+                     'tools/dev/pira_write_check/lexicon.json',
+                     'modules/SCIENTIFIC_WRITING.md'):
+            self.assertEqual(data[name], self.files[name])
+        self.assertNotIn('tools/dev/pira_write_check/private.json', data)
+        self.assertEqual(self.result['tested_tools'],
+                         ['pira_ctx', 'pira_dec', 'pira_nav', 'pira_svg_check', 'pira_team', 'pira_write_check'])
+        workflow = data['.github/workflows/private-pira-tests.yml'].decode()
+        self.assertIn('os: [ubuntu-latest, windows-latest]', workflow)
+        self.assertIn('- os: macos-latest\n            crate: pira_write_check', workflow)
+        self.assertEqual(workflow.count('macos-latest'), 1)
+        self.assertNotIn('@TEST_', workflow)
+        self.assertIn('cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}', workflow)
+        step = workflow.split('- name: Native writing checker parity and release tests', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("if: matrix.crate == 'pira_write_check'", step)
+        self.assertNotIn('continue-on-error', step)
+        self.assertIn('cargo fmt --manifest-path tools/Cargo.toml -p pira_write_check -- --check', step)
+        self.assertIn('cargo test --locked --release --manifest-path tools/Cargo.toml -p pira_write_check', step)
+        for profile in ('', '--release '):
+            self.assertIn(f'cargo build --locked {profile}--manifest-path tools/Cargo.toml -p pira_write_check', step)
+        # Independent baseline gates must not become conditional on checker selection.
+        for job in ('setup', 'native_relocation'):
+            self.assertIn(f'  {job}:\n    if: github.event.repository.private == true\n', workflow)
+
+    def test_checker_subset_without_oracle_retains_lexical_fixtures(self):
+        for name in ('tools/dev/pira_write_check/check.py', 'tools/dev/pira_write_check/lexicon.json'):
+            (self.root / name).unlink()
+        data = ci.verify(self.stage(('pira_write_check',)))
+        self.assertNotIn('tools/dev/pira_write_check/check.py', data)
+        self.assertNotIn('tools/dev/pira_write_check/lexicon.json', data)
+        self.assertIn('tools/crates/pira_write_check/tests/evaluation.json', data)
+        workflow = data['.github/workflows/private-pira-tests.yml'].decode()
+        self.assertIn('crate: ["pira_write_check"]', workflow)
+        self.assertIn('macos-latest', workflow)
+
+    def test_nonchecker_subset_does_not_add_macos(self):
+        workflow = (self.stage(('pira_ctx',)) / '.github/workflows/private-pira-tests.yml').read_text()
+        self.assertNotIn('macos-latest', workflow)
+        self.assertNotIn('@TEST_', workflow)
+
+    def test_missing_required_checker_inventory_fails_staging(self):
+        for name in ('tools/src/pira_write_check/lexicon.json',
+                     'tools/crates/pira_write_check/tests/evaluation.json'):
+            with self.subTest(name=name):
+                path = self.root / name
+                path.unlink()
+                try:
+                    with self.assertRaises(FileNotFoundError):
+                        ci.stage(self.root)
+                finally:
+                    path.write_bytes(self.files[name])
+
+    def test_checker_parity_selects_each_native_profile_and_propagates_failure(self):
+        workflow = (self.stage(('pira_write_check',)) / '.github/workflows/private-pira-tests.yml').read_text()
+        code = textwrap.dedent(workflow.split("<<'PY_CHECKER'\n", 1)[1].split('\n          PY_CHECKER', 1)[0])
+        for system in ('darwin', 'linux', 'win32'):
+            binary_name = 'pira_write_check.exe' if system == 'win32' else 'pira_write_check'
+            binaries = []
+            for profile in ('debug', 'release'):
+                binary = self.base / 'target' / profile / binary_name
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.touch()  # Inert fixture, not a copied or executed binary.
+                binaries.append(binary.resolve())
+            def resolve(path, *, strict=False):
+                self.assertTrue(strict)
+                self.assertIn(path, [Path('tools/target') / profile / binary_name
+                                     for profile in ('debug', 'release')])
+                return self.base / 'target' / path.parent.name / binary_name
+            for fails in (False, True):
+                with self.subTest(system=system, fails=fails), \
+                        patch.object(sys, 'platform', system), \
+                        patch.object(Path, 'resolve', autospec=True, side_effect=resolve), \
+                        patch.object(subprocess, 'run', side_effect=(
+                            [subprocess.CompletedProcess([], 0), subprocess.CalledProcessError(1, 'parity')]
+                            if fails else [subprocess.CompletedProcess([], 0)] * 2)) as run:
+                    if fails:
+                        with self.assertRaises(subprocess.CalledProcessError):
+                            exec(code, {})
+                    else:
+                        exec(code, {})
+                    self.assertEqual(run.call_count, 2)
+                    for call, binary in zip(run.call_args_list, binaries):
+                        self.assertEqual(call.args[0], [sys.executable, '-B', '-m', 'unittest', 'discover',
+                            '-s', 'tools/crates/pira_write_check/tests', '-p', 'test_cli_parity.py', '-v'])
+                        self.assertEqual(call.kwargs['env']['PIRA_WRITE_CHECK_BIN'], str(binary))
+                        self.assertTrue(call.kwargs['check'])
 
     def test_windows_native_team_gate_requires_both_checks_and_isolates_environment(self):
         from contextlib import redirect_stdout

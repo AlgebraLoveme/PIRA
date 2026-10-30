@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import sys
 
-TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team")
+TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team", "pira_write_check")
 POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md",
             "assignment_contract.md", "continue_task.md", "edit_authority.md", "fix_task.md",
             "handoff.md", "help.md", "implementation_stage.md", "implementation_task.md",
@@ -252,6 +252,7 @@ def selected(root: Path) -> list[Path]:
                         continue
                     paths.append((Path(parent) / name).relative_to(root))
     paths.extend(Path("tools/src/pira_team") / name for name in POLICIES)
+    paths.append(Path("tools/src/pira_team/tier_fixture.py"))
     paths.append(Path("tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf"))
     paths.extend(Path(name) for name in (
         "assets/scripts/setup_pira.py", "assets/scripts/test_setup_pira.py",
@@ -261,6 +262,15 @@ def selected(root: Path) -> list[Path]:
         "assets/scripts/setup_migration_choices.py", "assets/scripts/test_setup_migration_choices.py",
         "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
         "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
+    paths.extend(Path(name) for name in (
+        "tools/src/pira_write_check/lexicon.json",
+        "tools/crates/pira_write_check/tests/evaluation.json",
+    ))
+    # Optional retained development oracle; Rust lexical fixtures are self-contained.
+    for name in ("tools/dev/pira_write_check/check.py", "tools/dev/pira_write_check/lexicon.json"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            paths.append(Path(name))
     paths.append(Path("tools/build/private_ci.py"))
     paths.extend(Path(name) for name in NATIVE_RELOCATION_INPUTS)
     return sorted(set(paths))
@@ -309,9 +319,11 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
                   "original_dirty": bool(original_status), "original_status_sha256": digest(original_status),
                   "source_file_count": len(data), "per_tool_file_counts": counts, "tested_tools": list(test_tools)}
     data["SNAPSHOT_PROVENANCE.json"] = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
+    extra_tests = ""
+    if "pira_write_check" in test_tools:
+        extra_tests = "        include:\n          - os: macos-latest\n            crate: pira_write_check"
     data[".github/workflows/private-pira-tests.yml"] = workflow.replace(
-        "crate: [pira_ctx, pira_dec, pira_nav, pira_svg_check, pira_team]",
-        "crate: " + json.dumps(list(test_tools))).encode()
+        "@TEST_TOOLS@", json.dumps(list(test_tools))).replace("@TEST_EXTRA@", extra_tests).encode()
     data[".gitattributes"] = b"* -text\n"
     manifest = "".join(f"{digest(content)}  {name}\n" for name, content in sorted(data.items()))
     data["SOURCE_SHA256SUMS"] = manifest.encode()
