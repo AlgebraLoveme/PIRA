@@ -650,6 +650,93 @@ class TeamTests(unittest.TestCase):
         manifest = json.loads(self.access("read", run.name, "manifest.json").stdout)
         self.assertFalse(manifest["usage_complete"])
 
+    def launch_with_closed_output(
+        self, output: str, closed_streams: tuple[str, ...], *extra: str,
+    ) -> tuple[subprocess.CompletedProcess[bytes], Path]:
+        store = self.root / "logs"
+        before = set(store.iterdir()) if store.exists() else set()
+        read_fd, write_fd = os.pipe()
+        # A valid write handle with no readers produces a broken pipe on POSIX
+        # and Windows. Merely closing fd 1/2 can instead make Rust discard output.
+        os.close(read_fd)
+        try:
+            result = subprocess.run(
+                [str(self.bin), "run", "--task", "review", "--completion-gate", "Report checks",
+                 "--model", "test-model", "--effort", "high", "--cwd", str(self.root),
+                 "--store", str(store), "--output", output, *extra],
+                env=self.env, stdin=subprocess.DEVNULL,
+                stdout=write_fd if "stdout" in closed_streams else subprocess.PIPE,
+                stderr=write_fd if "stderr" in closed_streams else subprocess.PIPE,
+                timeout=10,
+            )
+        finally:
+            os.close(write_fd)
+        created = (set(store.iterdir()) if store.exists() else set()) - before
+        self.assertEqual(len(created), 1, f"runs={created}; result={result}")
+        return result, created.pop()
+
+    def assert_published_output(self, run: Path, content: bytes) -> dict:
+        manifest = json.loads((run / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "completed")
+        self.assertIsNone(manifest["active_turn"])
+        self.assertNotIn("error", manifest)
+        self.assertEqual(manifest["revisions"][-1]["status"], "completed")
+        self.assertEqual(Path(manifest["result"]).read_bytes(), content)
+        self.assertEqual((run / manifest["artifact"]).read_bytes(), content)
+        snapshot = run / "revisions" / f'{manifest["revision"]:06}' / "manifest.json"
+        self.assertEqual(json.loads(snapshot.read_text()), manifest)
+        tree = json.loads((run / "tree.json").read_text())
+        self.assertFalse(tree["members"][run.name]["active"])
+        self.assertTrue(all(not member["active"] for member in tree["members"].values()))
+        retained = self.access("read", run.name)
+        self.assertEqual(retained.returncode, 0, retained.stderr)
+        self.assertEqual(retained.stdout.encode(), content)
+        return manifest
+
+    def test_final_output_closed_stdout(self) -> None:
+        for output in ("artifact", "answer"):
+            for closed_streams in (("stdout",), ("stdout", "stderr")):
+                with self.subTest(output=output, closed_streams=closed_streams):
+                    result, run = self.launch_with_closed_output(output, closed_streams)
+                    # Exact exit 1 excludes panic exits, signals and native crash codes.
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    if result.stderr is not None:
+                        self.assertIn(b"pira_team:", result.stderr)
+                        self.assertNotIn(b"panicked", result.stderr)
+                    manifest = self.assert_published_output(run, b"ANSWER review")
+                    snapshot = run / "revisions/000001/manifest.json"
+                    original = snapshot.read_bytes()
+                    # A fresh CLI must acquire the owner lock after failed output.
+                    resumed = self.access("resume", run.name, "--task", "after output failure", "--output", "artifact")
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                    self.assertEqual(json.loads(resumed.stdout)["status"], "completed")
+                    current = self.assert_published_output(run, b"ANSWER after output failure")
+                    self.assertEqual(current["revision"], 2)
+                    self.assertEqual(snapshot.read_bytes(), original)
+                    self.assertEqual(Path(manifest["result"]).read_bytes(), b"ANSWER review")
+
+    def test_postpublication_usage_warning_closed_stderr(self) -> None:
+        self.env["TEAM_NO_USAGE"] = "1"
+        result, run = self.launch_with_closed_output("artifact", ("stderr",))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["status"], "completed")
+        self.assertTrue(Path(receipt["run_root"]).samefile(run))
+        manifest = self.assert_published_output(run, b"ANSWER review")
+        self.assertFalse(manifest["usage_complete"])
+
+    def test_postpublication_repair_warning_closed_stderr(self) -> None:
+        content = b'{"fixed":true}'
+        self.env["TEAM_CANDIDATE"] = self.candidate('{"fixed":')
+        self.env["TEAM_REPAIRED"] = self.candidate(content.decode())
+        result, run = self.launch_with_closed_output("answer", ("stderr",), "--format", "json")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout, content)
+        manifest = self.assert_published_output(run, content)
+        self.assertEqual(manifest["repairs"], 1)
+        self.assertTrue(manifest["usage_complete"])
+        self.assertEqual([attempt["status"] for attempt in manifest["attempts"]], ["invalid", "validated"])
+
     def test_shared_rules_mirror_main_policy(self):
         root = Path(__file__).resolve().parents[4]
         main = (root / "AGENTS.md").read_text()

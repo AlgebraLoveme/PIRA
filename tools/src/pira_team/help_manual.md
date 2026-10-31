@@ -59,6 +59,8 @@ The launcher gives the worker a direct file path in artifacts/ for its handoff. 
 has a new immutable-by-contract revision artifact. Default stdout is a JSON receipt with
 only run_id, status, run_root and handoff_path. --output answer prints exact
 handoff bytes. Nothing is automatically published into the project workspace.
+If final stdout delivery fails, run/resume exits 1 after owner cleanup without
+changing the retained outcome or handoff. Stderr diagnostics are best-effort.
 read RUN_ID manifest.json retrieves usage, revisions, repairs, format, completion gate and
 artifact/log references; path RUN_ID manifest.json returns its path. Earlier revision metadata
 is available at revisions/NNNNNN/manifest.json. Repair and incomplete-accounting warnings

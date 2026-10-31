@@ -587,7 +587,7 @@ pub fn run() -> i32 {
                 0
             }
             Err(error) => {
-                eprintln!("pira_team: {error}");
+                notice(format_args!("pira_team: {error}"));
                 1
             }
         };
@@ -600,13 +600,13 @@ pub fn run() -> i32 {
         return match outcome {
             Ok(()) => 0,
             Err(error) => {
-                eprintln!("pira_team: {error}");
+                notice(format_args!("pira_team: {error}"));
                 1
             }
         };
     }
     if let Err(error) = subteam::authorize(&args) {
-        eprintln!("pira_team: {error}");
+        notice(format_args!("pira_team: {error}"));
         return 1;
     }
     if matches!(args[0].as_str(), "run" | "resume")
@@ -616,7 +616,7 @@ pub fn run() -> i32 {
             Ok(Some(code)) => return code,
             Ok(None) => {}
             Err(error) => {
-                eprintln!("pira_team: {error}");
+                notice(format_args!("pira_team: {error}"));
                 return 1;
             }
         }
@@ -640,7 +640,7 @@ pub fn run() -> i32 {
     match outcome {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("pira_team: {error}");
+            notice(format_args!("pira_team: {error}"));
             1
         }
     }

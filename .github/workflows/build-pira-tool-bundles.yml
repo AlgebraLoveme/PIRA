@@ -88,7 +88,8 @@ jobs:
           test_args=()
           if [[ "${TOOL}" == "pira_team" ]]; then
             echo "SKIPPED: macOS unlinked live executable fixture (known kernel-held process risk)."
-            test_args=(-- --skip unlinked_live_executable_never_becomes_missing_worker_or_exited_backend)
+            # Parallel forks can retain other tests' owner locks; serialize Team.
+            test_args=(-- --test-threads=1 --skip unlinked_live_executable_never_becomes_missing_worker_or_exited_backend)
           fi
           cargo test --manifest-path tools/Cargo.toml --locked --package "${TOOL}" "${test_args[@]}"
           if [[ "${TOOL}" == "pira_team" ]]; then
@@ -162,7 +163,7 @@ jobs:
             tools.build.test_build_pira_ctx_platform_bins `
             tools.build.test_package_github_release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --manifest-path tools/Cargo.toml --workspace --locked
+          cargo test --manifest-path tools/Cargo.toml --workspace --locked -- --test-threads=1
 
   publish:
     name: Publish GitHub Release

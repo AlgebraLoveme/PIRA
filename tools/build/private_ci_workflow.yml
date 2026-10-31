@@ -54,7 +54,7 @@ jobs:
               env.write('FONTCONFIG_FILE=' + str(config) + chr(10))
           PY
       - name: Locked crate tests
-        run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}
+        run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }} -- --test-threads=1
       - name: Native writing checker parity and release tests
         if: matrix.crate == 'pira_write_check'
         shell: bash
@@ -124,9 +124,12 @@ jobs:
                       or {name for name, status in outcomes if status == 'ok'} != required):
                   raise SystemExit('Required current native checks missing, skipped or unsuccessful')
           PY_NATIVE
-      - name: Build fake-backend test binary (Linux only)
-        if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
+      - name: Build fake-backend test binaries
+        if: matrix.crate == 'pira_team'
         run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec
+      - name: Required native Windows lifecycle and output delivery contracts
+        if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'
+        run: python -B tools/crates/pira_team/tests/native_ci.py
       - name: Fake-backend contracts (no model calls; POSIX fixture)
         if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
         shell: bash

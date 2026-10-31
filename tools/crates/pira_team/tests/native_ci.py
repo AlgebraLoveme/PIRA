@@ -33,11 +33,27 @@ def main():
         sys.path.insert(0,str(tests))
         loader = unittest.TestLoader()
         if os.name == "nt":
-            suite = loader.loadTestsFromName("test_subteams")
+            import test_subteams
+            # These two non-exec shell-wrapper fixtures require POSIX. Keep the
+            # remaining suite's no-skips gate, including newly added tests.
+            posix_wrappers = {
+                "test_wrapped_backend_rejects_unrelated_pid_stale_birth_and_revision",
+                "test_wrapped_backend_verifies_owner_and_preserves_delegation_limits",
+            }
+            suite = loader.loadTestsFromNames([
+                "test_subteams.SubteamTests." + name
+                for name in loader.getTestCaseNames(test_subteams.SubteamTests)
+                if name not in posix_wrappers
+            ])
             suite.addTests(loader.loadTestsFromNames([
                 "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
                 "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",
-                "test_team.TeamTests.test_explicit_api_auth_does_not_link_file_auth"]))
+                "test_team.TeamTests.test_explicit_api_auth_does_not_link_file_auth",
+                "test_team.TeamTests.test_final_output_closed_stdout",
+                "test_team.TeamTests.test_postpublication_usage_warning_closed_stderr",
+                "test_team.TeamTests.test_postpublication_repair_warning_closed_stderr",
+                "test_team.TeamTests.test_final_answer_and_full_logs",
+                "test_team.TeamTests.test_artifact_receipt_hides_answer_and_preserves_report"]))
             suite.addTests(loader.loadTestsFromNames([
                 "test_orphan_recovery.OrphanRecoveryTests." + name for name in (
                     "test_target_only_abandoned_owner_retains_artifacts_and_explicit_resume",

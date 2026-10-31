@@ -46,6 +46,8 @@ invocation; use interrupt for a hung worker. Failure can leave partial edits.
 The JSON receipt contains run_id, status, run_root, and handoff_path. Format checks
 validate delivery/format, not findings or completion. At most one format repair
 preserves substantive work. needs_decision/incomplete bypass schema/columns.
+Final stdout delivery failure exits 1 after cleanup; the retained outcome and
+handoff remain available through read. Warnings are best-effort on stderr.
 
 EXAMPLES
   pira_team run --task 'Review src/parser.rs' --completion-gate 'Report actionable findings' --inject-review

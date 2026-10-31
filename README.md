@@ -102,6 +102,20 @@ The macOS/Linux and Windows wrappers support the same options. If Python is miss
 
 </details>
 
+## Remote Team setup
+
+For a Linux server, make sure `ssh YOUR_SERVER` works in your terminal. PIRA can help you set this up. Then ask PIRA to configure remote Team on that server.
+
+<details>
+<summary>Setup instructions for the agent</summary>
+
+1. Confirm the SSH account, project workspace and authorized server resources. Run full PIRA setup on the server where needed and verify the complete toolset, compatible Codex installation and server-side authentication. Preserve existing configuration and histories; ask the user to complete any required login.
+2. Follow `pira_team help remote` and `pira_team remote-keygen --help` to provision the authority key, public signer enrollment and endpoint descriptor. Keep the private key local and use the server’s own Codex authentication; do not copy local credentials to the server.
+3. Verify the prepared endpoint and run a small smoke task through ordinary `pira_team run --host YOUR_SERVER` with the documented endpoint options, explicit remote workspace, task and completion gate. Stay attached by default. Check the retained outcome and handoff before declaring setup complete.
+4. Retain the ordinary run ID or label and use `read`, `wait`, `resume`, `steer` and `interrupt` from the original main session and local Team store. Host options are needed at launch, not on ordinary follow-ups. Keep each delegated subteam on one host.
+
+</details>
+
 ## Setup options
 
 <details>

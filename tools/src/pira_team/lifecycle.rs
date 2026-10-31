@@ -584,29 +584,35 @@ fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(
     save_json(&snapshot.join("manifest.json"), manifest)?;
     save_json(&run.join("manifest.json"), manifest)?;
     if manifest["repairs"].as_u64().unwrap_or(0) > 0 {
-        eprintln!(
+        crate::notice(format_args!(
             "pira_team warning: format repair attempted; inspect pira_team read {} manifest.json for attempts and usage",
             manifest["run_id"].as_str().unwrap()
-        );
+        ));
     }
     if manifest["usage_complete"] != true {
-        eprintln!(
+        crate::notice(format_args!(
             "pira_team warning: usage accounting incomplete; retained totals may undercount; inspect pira_team read {} manifest.json",
             manifest["run_id"].as_str().unwrap()
-        );
+        ));
     }
     match outcome {
         Ok(content) => {
-            if options.output == "answer" {
-                print!("{content}");
+            // Output delivery must return through watcher/owner cleanup, even
+            // when the caller has closed its pipe. The durable outcome is final.
+            let mut stdout = std::io::stdout().lock();
+            let output = if options.output == "answer" {
+                write!(stdout, "{content}")
             } else {
-                println!(
+                writeln!(
+                    stdout,
                     "{}",
                     json!({"status":manifest["status"],"run_id":manifest["run_id"],
                     "run_root":run,"handoff_path":manifest["result"]})
-                );
-            }
-            Ok(())
+                )
+            };
+            output
+                .and_then(|()| stdout.flush())
+                .map_err(|error| format!("write final output: {error}; logs: {}", dir.display()))
         }
         Err(error) => Err(format!("{error}; logs: {}", dir.display())),
     }
