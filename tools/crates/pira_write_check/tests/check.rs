@@ -256,7 +256,9 @@ fn direct_help_is_structured_and_embeds_separate_guidance() {
                 include_str!("../../../src/pira_write_check/help.md")
             )
         );
-        let mut remainder = text.as_str();
+        // Heading extraction accepts checkout newlines; emitted-byte equality stays exact above.
+        let normalized = text.replace("\r\n", "\n");
+        let mut remainder = normalized.as_str();
         for section in [
             "USAGE",
             "OPTIONS",
@@ -386,6 +388,7 @@ fn documented_examples_execute_with_default_and_custom_markers() {
     tmp.file("-draft.md", b"not");
     tmp.file("custom.json", br#"{"custom":["sensor"]}"#);
     let help = String::from_utf8(cli(&["--help"]).stdout).unwrap();
+    let help = help.replace("\r\n", "\n");
     let examples = help
         .split_once("\nEXAMPLES\n")
         .unwrap()
