@@ -27,7 +27,15 @@ class RustToolsTests(unittest.TestCase):
         self.assertEqual(builder.TARGETS["windows-x64"].exe_name, "pira_write_check.exe")
         self.assertFalse(builder.USES_C_COMPILER)
         builder.require_release_inputs()
-        self.assertEqual(builder.cargo_package_version(), "0.1.0")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "crates/pira_write_check/Cargo.toml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('[workspace.metadata]\nversion = "9.9.9"\n'
+                                '[package]\nname = "pira_write_check"\nversion = "1.2.3"\n',
+                                encoding="utf-8")
+            with patch.object(builder, "TOOLS_DIR", root):
+                self.assertEqual(builder.cargo_package_version(), "1.2.3")
         self.assertTrue((builder.TOOLS_DIR / "src/pira_write_check/lexicon.json").is_file())
 
     def test_rejects_unsafe_workspace_tool_name(self) -> None:
