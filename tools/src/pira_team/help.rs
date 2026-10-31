@@ -10,10 +10,16 @@ pub(super) fn topic(name: &str) -> Option<&'static str> {
         "config show" | "config set" | "config reset" => "config",
         _ => name,
     };
-    COMMANDS.split("\n# ").find_map(|section| {
+    section(COMMANDS, name)
+}
+
+fn section<'a>(commands: &'a str, name: &str) -> Option<&'a str> {
+    commands.split("\n# ").find_map(|section| {
+        // Splitting a CRLF boundary on LF leaves its preceding CR in this section.
+        let section = section.strip_suffix('\r').unwrap_or(section);
         let section = section.strip_prefix("# ").unwrap_or(section);
         let (heading, body) = section.split_once('\n')?;
-        (heading == name).then_some(body)
+        (heading.strip_suffix('\r').unwrap_or(heading) == name).then_some(body)
     })
 }
 
@@ -56,6 +62,24 @@ pub(super) fn dispatch(args: &[String]) -> Option<Result<&'static str, String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_topics_preserve_bodies_with_lf_and_crlf() {
+        let source = "# run\nRUN BODY\n\n# resume\nRESUME BODY\n\n# safety\nSAFE BODY\n";
+        for newline in ["\n", "\r\n"] {
+            let commands = source.replace('\n', newline);
+            for (name, body) in [
+                ("run", "RUN BODY"),
+                ("resume", "RESUME BODY"),
+                ("safety", "SAFE BODY"),
+            ] {
+                let expected = format!("{body}{newline}");
+                assert_eq!(section(&commands, name), Some(expected.as_str()));
+            }
+            assert_eq!(section(&commands, "missing"), None);
+            assert_eq!(section(&commands, "run\r"), None);
+        }
+    }
 
     #[test]
     fn help_routing_leaves_runtime_arguments_untouched() {
