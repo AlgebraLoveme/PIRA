@@ -1,4 +1,4 @@
-use pira_write_check::{ADVISORY, DEFAULT_LEXICON, Lexicon, PROMPT};
+use pira_write_check::{ADVISORY, DEFAULT_LEXICON, Lexicon, PROMPT, VERSION};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -243,23 +243,203 @@ fn report(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 #[test]
-fn direct_help_version_and_usage_errors() {
+fn direct_help_is_structured_and_embeds_separate_guidance() {
     for option in ["--help", "-h"] {
         let out = cli(&[option]);
         assert!(out.status.success());
-        assert!(String::from_utf8(out.stdout).unwrap().contains(ADVISORY));
+        assert!(out.stderr.is_empty());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "pira_write_check {VERSION}\n\n{}",
+                include_str!("../../../src/pira_write_check/help.md")
+            )
+        );
+        let mut remainder = text.as_str();
+        for section in [
+            "USAGE",
+            "OPTIONS",
+            "INPUT AND REVIEW",
+            "EXAMPLES",
+            "EXIT STATUS",
+        ] {
+            remainder = remainder.split_once(&format!("\n{section}\n")).unwrap().1;
+        }
+        for required in [
+            "--json",
+            "--lexicon FILE",
+            "--lexicon=FILE",
+            "-h, --help",
+            "-V, --version",
+            "default: text report",
+            "default: embedded English lexicon",
+            "regular UTF-8 files",
+            "Unicode scalar columns",
+            "raw source",
+            "No stdin",
+            "rewriting",
+            ADVISORY,
+        ] {
+            assert!(text.contains(required), "missing help contract: {required}");
+        }
     }
+}
+#[test]
+fn direct_version_uses_package_version() {
     for option in ["--version", "-V"] {
         let out = cli(&[option]);
         assert!(out.status.success());
-        assert_eq!(out.stdout, b"pira_write_check 0.1.0\n");
+        assert!(out.stderr.is_empty());
+        assert_eq!(
+            out.stdout,
+            format!("pira_write_check {VERSION}\n").as_bytes()
+        );
     }
-    for args in [vec![], vec!["--unknown"], vec!["--lexicon"], vec!["--json"]] {
+}
+#[test]
+fn usage_errors_keep_stderr_and_exit_two() {
+    for (args, reason) in [
+        (vec![], "at least one explicit FILE is required"),
+        (vec!["--unknown"], "unknown option: --unknown"),
+        (vec!["--lexicon"], "--lexicon requires a file"),
+        (vec!["--json"], "at least one explicit FILE is required"),
+        (vec!["--unknown", "--help"], "unknown option: --unknown"),
+        (
+            vec!["--lexicon", "--help"],
+            "at least one explicit FILE is required",
+        ),
+    ] {
         let out = cli(&args);
         assert_eq!(out.status.code(), Some(2));
         assert!(out.stdout.is_empty());
-        assert!(String::from_utf8(out.stderr).unwrap().contains("Usage:"));
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(error.contains(reason), "{error}");
+        assert!(error.contains("Usage:"));
     }
+}
+#[test]
+fn help_version_short_circuit_in_encounter_order() {
+    let help = cli(&["--help"]).stdout;
+    let version = cli(&["--version"]).stdout;
+    for (args, expected) in [
+        (vec!["--help", "--unknown"], &help),
+        (vec!["--help", "--version"], &help),
+        (vec!["--version", "--help"], &version),
+        (vec!["--json", "--help"], &help),
+        (vec!["--lexicon=", "--help"], &help),
+    ] {
+        let out = cli(&args);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert_eq!(&out.stdout, expected);
+    }
+    let tmp = Fixture::new();
+    for (option, expected) in [("-h", &help), ("-V", &version)] {
+        let out = cli(&[arg(&tmp.0.join("missing")), option]);
+        assert!(out.status.success());
+        assert!(out.stderr.is_empty());
+        assert_eq!(&out.stdout, expected);
+    }
+}
+#[test]
+fn delimiter_and_lexicon_values_preserve_help_and_version_filenames() {
+    let tmp = Fixture::new();
+    tmp.file("draft.md", b"sensor");
+    tmp.file("custom.json", br#"{"custom":["sensor"]}"#);
+    for name in ["--help", "-h", "--version", "-V", "--"] {
+        tmp.file(name, b"not");
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .current_dir(&tmp.0)
+            .args(["--json", "--", name])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}");
+        assert_eq!(report(&out)["warnings"][0]["path"], name);
+        assert_eq!(report(&out)["warnings"][0]["span"], "not");
+
+        tmp.file(name, br#"{"named":["sensor"]}"#);
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .current_dir(&tmp.0)
+            .args([
+                "draft.md",
+                "--json",
+                "--lexicon",
+                "custom.json",
+                "--lexicon",
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}");
+        assert_eq!(
+            report(&out)["warnings"][0]["matches"][0]["category"],
+            "named"
+        );
+    }
+}
+#[test]
+fn documented_examples_execute_with_default_and_custom_markers() {
+    let tmp = Fixture::new();
+    tmp.file("draft.md", b"not sensor");
+    tmp.file("notes.txt", b"perhaps");
+    tmp.file("-draft.md", b"not");
+    tmp.file("custom.json", br#"{"custom":["sensor"]}"#);
+    let help = String::from_utf8(cli(&["--help"]).stdout).unwrap();
+    let examples = help
+        .split_once("\nEXAMPLES\n")
+        .unwrap()
+        .1
+        .split_once("\nEXIT STATUS\n")
+        .unwrap()
+        .0;
+    for line in examples.lines().filter(|line| !line.trim().is_empty()) {
+        let args: Vec<_> = line
+            .trim()
+            .strip_prefix("pira_write_check ")
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .current_dir(&tmp.0)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{line}");
+        assert!(out.stderr.is_empty());
+        if args.contains(&"--json") {
+            assert_eq!(report(&out)["errors"], json!([]));
+            assert_eq!(report(&out)["warnings"][0]["span"], "not");
+            assert_eq!(report(&out)["warnings"].as_array().unwrap().len(), 1);
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            let count = if args.contains(&"notes.txt") { 2 } else { 1 };
+            assert!(text.contains(&format!(
+                "{count} marker occurrence(s), {count} review group(s), 0 input error(s)."
+            )));
+            let marker = if args.iter().any(|arg| arg.starts_with("--lexicon")) {
+                "sensor"
+            } else {
+                "not"
+            };
+            assert!(
+                text.contains(&format!("(marker: \"{marker}\")")),
+                "{line}: {text}"
+            );
+        }
+    }
+}
+#[test]
+fn default_text_clean_scan_is_advisory_and_exits_zero() {
+    let tmp = Fixture::new();
+    let source = tmp.file("clean.md", b"The sensor records six distinct pulses.");
+    let out = cli(&[arg(&source)]);
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("0 marker occurrence(s), 0 review group(s), 0 input error(s). {ADVISORY}\n")
+    );
 }
 #[test]
 fn cli_json_exact_expectations_determinism_and_unchanged_files() {

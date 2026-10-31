@@ -10,13 +10,29 @@ regular files are followed. No recursion, extension filtering or stdin.
 
 ```sh
 cargo build --locked --manifest-path tools/Cargo.toml -p pira_write_check
-# Or use cargo run with the same package:
-tools/target/debug/pira_write_check draft.md
+# Examples using the built binary (default Cargo target directory):
+tools/target/debug/pira_write_check draft.md notes.txt
 tools/target/debug/pira_write_check --json draft.md
 tools/target/debug/pira_write_check --lexicon custom.json draft.md
+tools/target/debug/pira_write_check --lexicon=custom.json draft.md
+tools/target/debug/pira_write_check -- -draft.md
 tools/target/debug/pira_write_check --help
 tools/target/debug/pira_write_check --version
 ```
+
+## CLI help and defaults
+
+`-h`/`--help` shows purpose, USAGE, OPTIONS, input/review guidance, EXAMPLES and
+EXIT STATUS. The [help source](../../src/pira_write_check/help.md) is embedded
+at compile time. Text output and the embedded English lexicon are the defaults.
+`--json` selects JSON. `--lexicon FILE` and `--lexicon=FILE` select custom JSON;
+the last selection wins. Options may follow filenames until `--`.
+
+Help/version return immediately when encountered before `--`, before later
+arguments or file validation. Earlier argument errors still fail. The separate
+`--lexicon` form consumes the next argument as its path, including `--help`,
+`--version` or `--`. After the filename delimiter, every argument is a filename.
+Thus `pira_write_check -- --help` scans a file named `--help`.
 
 ## Review and matching contract
 
@@ -79,8 +95,9 @@ arbitrarily large or adversarial files.
 
 ## Source and integration
 
-- `tools/src/pira_write_check/{lib.rs,main.rs,lexicon.json}`: implementation and
-  separate tracked inventory, embedded at compile time with `include_str!`.
+- `tools/src/pira_write_check/{lib.rs,main.rs}`: implementation.
+- `tools/src/pira_write_check/{help.md,lexicon.json}`: separate tracked help and
+  inventory, embedded at compile time with `include_str!`.
 - `tools/crates/pira_write_check/`: Cargo manifest, README and native tests.
 - The development prototype/oracle is excluded from this source checkout. The
   native implementation, embedded inventory and retained lexical fixtures are

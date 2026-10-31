@@ -117,6 +117,7 @@ class PrivateCITests(unittest.TestCase):
             'tools/build/private_ci.py': b'# provisioning helper',
             'tools/src/pira_team/tier_fixture.py': b'# maintained tier fixture\r\n',
             'tools/src/pira_team/tier_control_tests.rs': b'const T: &str = include_str!("tier_fixture.py");\n',
+            'tools/src/pira_write_check/help.md': b'checker help\r\n',
             'tools/src/pira_write_check/lexicon.json': b'{"scope": ["only"]}\r\n',
             'tools/crates/pira_write_check/tests/evaluation.json': b'[]\r\n',
             'tools/crates/pira_write_check/tests/test_cli_parity.py': b'# optional oracle parity',
@@ -163,11 +164,12 @@ class PrivateCITests(unittest.TestCase):
         self.assertNotIn('tools/src/pira_team/unselected.py', data)
 
     def test_checker_snapshot_inputs_and_native_matrix(self):
-        self.write('tools/src/pira_write_check/lib.rs', b'include_str!("lexicon.json");')
+        self.write('tools/src/pira_write_check/lib.rs', b'include_str!("lexicon.json"); include_str!("help.md");')
         self.write('tools/crates/pira_write_check/tests/check.rs', b'include_str!("evaluation.json");')
         self.write('tools/dev/pira_write_check/private.json', b'not selected')
         data = ci.verify(self.stage())
         for name in ('tools/src/pira_write_check/lexicon.json',
+                     'tools/src/pira_write_check/help.md',
                      'tools/crates/pira_write_check/tests/evaluation.json',
                      'tools/crates/pira_write_check/tests/test_cli_parity.py',
                      'tools/dev/pira_write_check/check.py',
@@ -212,6 +214,7 @@ class PrivateCITests(unittest.TestCase):
 
     def test_missing_required_checker_inventory_fails_staging(self):
         for name in ('tools/src/pira_write_check/lexicon.json',
+                     'tools/src/pira_write_check/help.md',
                      'tools/crates/pira_write_check/tests/evaluation.json'):
             with self.subTest(name=name):
                 path = self.root / name
@@ -342,7 +345,8 @@ class PrivateCITests(unittest.TestCase):
     def test_team_policy_include_closure_and_explicit_markdown_allowlist(self):
         policies = ('main.md', 'coordinator.md', 'implementation.md', 'review.md',
                     'assignment_contract.md', 'continue_task.md', 'edit_authority.md', 'fix_task.md',
-                    'handoff.md', 'help.md', 'implementation_stage.md', 'implementation_task.md',
+                    'handoff.md', 'help.md', 'help_commands.md', 'help_manual.md',
+                    'implementation_stage.md', 'implementation_task.md',
                     'ordinary_worker.md', 'repair_stage.md', 'repair_task.md', 'review_stage.md',
                     'writing_application.md')
         expected = {}

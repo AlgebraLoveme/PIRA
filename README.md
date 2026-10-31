@@ -31,21 +31,20 @@ PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol a
 
 > **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. Claude branch features may lag behind. The instructions below install PIRA for Codex from `master`.
 
-## Quick start with Codex
+## Install or update with Codex
 
-PIRA installs to `~/agent` by default. Ask Codex to install or update it with the prompt below, or use the command-line and inspect-first options that follow.
+PIRA installs to `~/agent` by default. Before updating, close active PIRA sessions. Start a fresh Codex session and send:
+
+```text
+Install or update PIRA, including its tools, following https://github.com/AlgebraLoveme/PIRA. Preserve my existing preferences and local changes.
+```
+
+<details>
+<summary>Technical installation and update instructions</summary>
 
 Setup is safe to rerun: it preserves an existing `USER.md`, backs up user-level Codex files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
 
-### Install or update through Codex
-
-Before updating, close all active PIRA sessions. Start a fresh Codex session, then ask it to update PIRA:
-
-```text
-Install/Update PIRA including tools according to https://github.com/AlgebraLoveme/PIRA
-```
-
-For an existing installation, you can simply ask: **“Update PIRA to sync with GitHub, including refreshing local tools.”** A complete update has three parts:
+### Complete update procedure
 
 1. **Sync the checkout.** Locate the existing installation, check its remote and local changes, and fast-forward from the public `master` branch when safe. Preserve local work; stop for conflicts rather than resetting or discarding changes.
 2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Preserve existing choices with `--execution-mode keep`, `--user-mode keep` and `--legacy keep`; retain custom configuration/install paths and version pins. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
@@ -53,7 +52,7 @@ For an existing installation, you can simply ask: **“Update PIRA to sync with 
 
 Pulling Git alone does not refresh executables. Setup installs the latest **published tool releases**, which may lag source changes on `master`; an update report should distinguish the checkout revision from installed tool versions. The commands below explicitly select the recommended configuration rather than preserve every existing preference.
 
-### Recommended one-line install or update
+### Command-line install or update
 
 The recommended command installs or updates PIRA, then connects it to Codex. It:
 - uses the existing `~/agent` git checkout when present, otherwise clones PIRA into `~/agent`;
@@ -75,19 +74,7 @@ Windows PowerShell:
 if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --user-mode placeholder --legacy remove
 ```
 
-If you are updating PIRA and intentionally do not use `USER.md`, choose `--user-mode keep`:
-
-macOS/Linux:
-
-```bash
-cd ~/agent && git pull --ff-only && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --user-mode keep --legacy remove
-```
-
-Windows PowerShell:
-
-```powershell
-Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --user-mode keep --legacy remove
-```
+To preserve an existing installation’s preferences, use `--execution-mode keep --user-mode keep --legacy keep` instead of the corresponding flags above.
 
 `git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
 
@@ -112,6 +99,8 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 ```
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
+
+</details>
 
 ## Setup options
 
@@ -199,6 +188,8 @@ The updater obtains binaries from `AlgebraLoveme/PIRA` GitHub Releases and verif
 
 ### Maintainer release procedure
 
+Before release, review CLI help and usage documentation for the affected tools and update them as needed, following the shared style described in [Maintenance Rules](modules/MAINTENANCE.md#maintenance-rules).
+
 For pre-release Windows/Linux validation without touching public branches, use the [private CI snapshot workflow](tools/build/PRIVATE_CI.md). It tests reviewed source snapshots in an explicitly selected private repository and never publishes a release.
 
 PIRA has one source/install branch: `master`. Change tool source there and bump the affected Cargo package version, run local source tests, then push `master`. In GitHub Actions, manually run **Build PIRA tool bundles** from `master`. The owner-gated workflow runs the workspace tests natively on Windows, builds all five supported platforms twice, rejects non-reproducible output, and prepares versioned assets for all six standard tools in a draft GitHub Release by default (`publish_release=false`). Only after required acceptance approval, explicitly dispatch with `publish_release=true` or publish the retained draft through a later guarded edit. A successful draft build does not change the public release used by setup. No local cross-platform build, generated-binary commit, or release branch is part of the procedure. After public publication, a fresh clone of `master` plus the setup script installs the latest release automatically.
@@ -260,7 +251,7 @@ Information moves upward only when its lasting value increases. Activity stays i
 
 ## PIRA Internal Tools
 
-PIRA includes five native tools for agent continuity, repository work, figure validation, and delegation. Built-in command help provides exact syntax.
+PIRA includes six native tools for agent continuity, repository work, figure validation, writing review, and delegation. Built-in command help provides exact syntax.
 
 | Tool | What problem it solves |
 |---|---|
@@ -268,6 +259,7 @@ PIRA includes five native tools for agent continuity, repository work, figure va
 | `pira_dec` | Records important choices in a consistent, searchable form. |
 | `pira_nav` | Provides portable lexical/structural navigation and language-server-backed dependency/semantic navigation. |
 | `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
+| `pira_write_check` | Flags English negation, contrast, hedging and minimization markers for contextual review. |
 | `pira_team` | Delegates technical artifact review or implementation to fresh Codex workers, returning tool-managed handoffs to the main agent. |
 
 ### Agent-level evaluation
@@ -511,7 +503,8 @@ The Rust checker scans explicit UTF-8 files for configured literal English words
 and phrases, retaining exact locations, source context and every overlapping
 occurrence. Findings prompt review of necessity in context; they are not semantic
 verdicts and never trigger automatic rewriting. Warnings exit `0`; input errors
-exit `2`. The default JSON lexicon is embedded in the executable. See
+exit `2`. The default JSON lexicon is embedded in the executable. Use `pira_write_check --help`
+for options, examples, marker interpretation and exit statuses. See
 [`tools/crates/pira_write_check/README.md`](tools/crates/pira_write_check/README.md)
 for usage, Unicode semantics and limitations. Release availability follows the
 selected published manifest used by setup.
@@ -523,6 +516,10 @@ Run `pira_svg_check FIGURE.svg` on a finalized SVG. It warns about low contrast,
 For reproducible font selection, use `--isolated-fonts --font-dir DIR` with explicitly named supplied families. Normal system-font discovery remains the default. Reference-based analysis must preserve renderer pixels; unsupported or lossy analysis fails explicitly instead of reporting clear. Clipping warnings indicate measured pixel loss, not merely a clipping declaration.
 
 ### `pira_team`: scoped technical workers
+
+`pira_team --help` lists commands and topics. Use `pira_team COMMAND --help`
+for focused syntax, `pira_team help remote` for remote interfaces, and
+`pira_team help manual` for the full safety, recovery, session and transport reference.
 
 `pira_team` delegates substantial reviews and implementation tasks to Codex workers, keeping your main agent focused on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
 

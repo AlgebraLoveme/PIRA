@@ -279,9 +279,7 @@ fn emit(report: &Report, json: bool) {
     );
 }
 fn help() {
-    println!(
-        "pira_write_check {VERSION} — English lexical review markers\n\nUsage: pira_write_check [OPTIONS] FILE...\n\n  --json             Emit a JSON report\n  --lexicon FILE     Literal category-to-marker-list JSON (default: embedded)\n  --                 End options, for dash-prefixed filenames\n  -h, --help         Show help\n  -V, --version      Show version\n\n{ADVISORY}\nCase-insensitive literals; phrases allow spaces/tabs within raw source lines.\nOne-based Unicode scalar columns, not bytes or visual tab stops.\nExplicit regular UTF-8 files only; no stdin, recursion, network or rewriting.\nMarker warnings exit 0; input/lexicon/usage errors exit 2."
-    );
+    print!("pira_write_check {VERSION}\n\n{}", include_str!("help.md"));
 }
 fn usage_error(reason: &str) -> i32 {
     eprintln!("pira_write_check: {reason}\nUsage: pira_write_check [OPTIONS] FILE... (see --help)");

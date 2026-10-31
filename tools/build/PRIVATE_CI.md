@@ -33,7 +33,9 @@ Only crate manifests, Cargo workspace/lockfile, Rust source, Rust/Python/SVG tes
 explicit Team runtime policies, policy-mirror test inputs, the SVG font configuration,
 and setup regression dependencies are copied. Hidden/cache/store/auth/profile/debug/
 generated directories, live smoke tests and benchmark artifacts are excluded; there
-is no recursive copy of `tools/`. The allowlist lives in `selected()`; maintain it
+is no recursive copy of `tools/`. Team's `help.md`, `help_commands.md` and
+`help_manual.md` are explicitly retained alongside its runtime policies.
+The allowlist lives in `selected()`; maintain it
 when production/test dependencies change. The exact retained Team dependency
 `tools/src/pira_team/tier_fixture.py` is explicitly selected; other runtime Python
 files are not recursively selected. Literal Rust `include!`, `include_str!`
@@ -85,7 +87,7 @@ debug and release Rust tests (including retained lexical expectations), formatti
 and debug/release builds. Python CLI parity runs against both executable profiles
 when the retained oracle is available; otherwise its tests explicitly skip while
 Rust lexical fixtures still run. The snapshot always requires the checker's runtime
-`lexicon.json` and `tests/evaluation.json`; it optionally selects only
+`help.md`, `lexicon.json` and `tests/evaluation.json`; it optionally selects only
 `tools/dev/pira_write_check/check.py` and its `lexicon.json`, not the development tree.
 Before staging, the source owner must supply the checker manifest, Rust sources,
 tests and lexical fixtures, and update workspace membership and `Cargo.lock` together.

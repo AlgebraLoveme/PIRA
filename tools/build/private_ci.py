@@ -22,7 +22,8 @@ import sys
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team", "pira_write_check")
 POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md",
             "assignment_contract.md", "continue_task.md", "edit_authority.md", "fix_task.md",
-            "handoff.md", "help.md", "implementation_stage.md", "implementation_task.md",
+            "handoff.md", "help.md", "help_commands.md", "help_manual.md",
+            "implementation_stage.md", "implementation_task.md",
             "ordinary_worker.md", "repair_stage.md", "repair_task.md", "review_stage.md",
             "writing_application.md", "backend_contract.json", "worker_profiles.json")
 BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
@@ -291,6 +292,7 @@ def selected(root: Path) -> list[Path]:
         "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
         "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
     paths.extend(Path(name) for name in (
+        "tools/src/pira_write_check/help.md",
         "tools/src/pira_write_check/lexicon.json",
         "tools/crates/pira_write_check/tests/evaluation.json",
     ))

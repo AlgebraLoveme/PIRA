@@ -48,7 +48,7 @@ class PolicyRouteTests(unittest.TestCase):
         repo = Path(__file__).resolve().parents[4]
         rule = ("Select only optional guidance directly required by the assigned task; "
                 "never blanket-inject all policies. Keep applicable quality requirements intact.")
-        for relative in ("AGENTS.md", "tools/src/pira_team/coordinator.md", "tools/src/pira_team/help.md"):
+        for relative in ("AGENTS.md", "tools/src/pira_team/coordinator.md", "tools/src/pira_team/help_manual.md"):
             with self.subTest(source=relative):
                 self.assertIn(rule, (repo / relative).read_text())
 

@@ -4,6 +4,7 @@ mod authentication;
 mod backend;
 mod bookmarks;
 mod build_roots;
+mod help;
 mod lifecycle;
 mod native;
 mod process;
@@ -38,7 +39,6 @@ const REVIEW_POLICY: &str = include_str!("review.md");
 const WRITING_POLICY: &str = include_str!("../../../modules/SCIENTIFIC_WRITING.md");
 const WRITING_APPLICATION: &str = include_str!("writing_application.md");
 const FIGURE_POLICY: &str = include_str!("../../../modules/PUBLIC_FIGURE_STYLE.md");
-const HELP: &str = include_str!("help.md");
 
 struct Options {
     cwd: PathBuf,
@@ -580,9 +580,17 @@ pub fn run() -> i32 {
         );
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || matches!(args[0].as_str(), "help" | "--help" | "-h") {
-        print!("{HELP}");
-        return 0;
+    if let Some(outcome) = help::dispatch(&args) {
+        return match outcome {
+            Ok(text) => {
+                print!("{text}");
+                0
+            }
+            Err(error) => {
+                eprintln!("pira_team: {error}");
+                1
+            }
+        };
     }
     if args == ["--version"] {
         println!("pira_team {}", env!("CARGO_PKG_VERSION"));
@@ -807,11 +815,39 @@ mod tests {
                 .unwrap(),
             "provide --inject-write only once"
         );
-        assert!(HELP.contains("--inject-write"));
+        assert!(help::topic("run").unwrap().contains("--inject-write"));
         assert_eq!(
             WRITING_POLICY,
             include_str!("../../../modules/SCIENTIFIC_WRITING.md")
         );
+    }
+
+    #[test]
+    fn help_run_examples_keep_documented_defaults() {
+        let review = options(&["--task", "Review src/parser.rs", "--inject-review"]).unwrap();
+        assert_eq!(review.task, "Review src/parser.rs");
+        assert!(review.inject_review);
+        assert!(!review.inject_implement);
+        assert_eq!(review.output, "artifact");
+        assert_eq!(review.contract.format, "auto");
+        assert_eq!(review.service_tier.name(), "standard");
+        assert_eq!(review.navigation, "nav");
+        assert!(!review.allow_subteam);
+        let dash_task = options(&["--", "-task starting with a dash"]).unwrap();
+        assert_eq!(dash_task.task, "-task starting with a dash");
+    }
+
+    #[test]
+    fn help_looking_task_values_keep_runtime_parsing() {
+        for args in [
+            vec!["--task", "--help"],
+            vec!["--task", "-h"],
+            vec!["--task=--help"],
+            vec!["--", "--help"],
+        ] {
+            let expected = if args.contains(&"-h") { "-h" } else { "--help" };
+            assert_eq!(options(&args).unwrap().task, expected);
+        }
     }
 
     #[test]
