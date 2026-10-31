@@ -120,7 +120,35 @@ configuration publication in both entry points, including unified setup's
 owner's fail-closed relocation checks; passing installer tests alone does not
 validate those histories.
 
-## Pinned native relocation job
+## Current native Team/setup target
+
+Both existing Linux and Windows Team matrix entries provision official stable
+Codex **0.166.0** in `RUNNER_TEMP/pira-team-native-codex`, using the explicit
+`provision_codex(..., profile="team")` target. Official release assets and SHA-256:
+
+- `codex-x86_64-unknown-linux-musl.tar.gz`: `a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978`
+- `codex-x86_64-pc-windows-msvc.exe.zip`: `bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d`
+
+These are downloaded from `https://github.com/openai/codex/releases/download/rust-v0.166.0/`.
+Linux retains its sole named executable. Windows retains the complete reviewed
+54-entry layout (48 files, six directories), including `bin/codex-exec-server.exe`;
+its exact manifest requires version 0.166.0 and that `execServer` path. All other
+inventory, path, mode, manifest, hash, empty-destination and isolation checks remain
+strict. Downloads and individual expanded files remain bounded to **512 MiB**;
+only this current target's aggregate Windows expansion ceiling is **1 GiB**.
+The observed Windows package expands to 615,131,495 bytes, above the old ceiling.
+
+Each host runs the actual setup `check_team_runtime(["pira_team"], binary)` check
+(stable version, required app-server flags, experimental protocol schema export
+and strict-config initialization), followed by both required ignored Rust native
+schema/project-trust tests. Missing, skipped, unsuccessful or timed-out checks fail
+the job. Runtime checks use a disposable allowlisted HOME/CODEX_HOME/environment;
+Windows exposes a task-local `codex.exe` copy beside the intact official layout,
+while Linux already has the `codex` entrypoint. No installation, login or model
+calls occur. Local helper regressions mock executables; actual native host passes
+require the separate private Actions run.
+
+## Pinned historical native relocation job
 
 The independent `native_relocation` job targets x64 Linux and Windows and provisions
 only official Codex **0.161.0** under `RUNNER_TEMP/pira-relocation-codex`. The helper
@@ -129,6 +157,11 @@ user-approved SHA-256 pins before extracting or executing any binary:
 
 - `codex-x86_64-unknown-linux-musl.tar.gz`: `b1efb95097660d7f2e5a3887618a23f2ea1b0d548078bf92b0f7a5d229a0cef2`
 - `codex-x86_64-pc-windows-msvc.exe.zip`: `a7493348634867c905f7298211923c57eb01dfe45400207a423c5453b190b11a`
+
+The default provisioner and `provision-codex` CLI remain historical 0.161.0;
+download, per-file and aggregate extraction bounds remain **512 MiB**. Current
+Team/setup checks do not promote this historical fixture, its format admission,
+retained-history migration guards or receipts to 0.166.0.
 
 Linux extraction accepts exactly the asset's named executable member. Windows
 extraction accepts the exact 53-entry official 0.161.0 package inventory (47 files,

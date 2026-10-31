@@ -73,17 +73,19 @@ jobs:
                   '-s', 'tools/crates/pira_write_check/tests', '-p', 'test_cli_parity.py', '-v',
               ], env=dict(os.environ, PIRA_WRITE_CHECK_BIN=str(binary)), check=True)
           PY_CHECKER
-      - name: Required Windows native Team checks
-        if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'
+      - name: Required current native Team and setup checks
+        if: matrix.crate == 'pira_team'
         shell: bash
         run: |
           python -B - <<'PY_NATIVE'
           import json, os, pathlib, re, shutil, subprocess, sys, tempfile
           sys.path.insert(0, str(pathlib.Path('tools/build').resolve()))
           import private_ci
-          binary = private_ci.provision_codex(pathlib.Path(os.environ['RUNNER_TEMP']) / 'pira-team-native-codex')
+          binary = private_ci.provision_codex(
+              pathlib.Path(os.environ['RUNNER_TEMP']) / 'pira-team-native-codex', profile='team')
           # Keep the pinned package and siblings intact; expose its entrypoint on task-local PATH.
-          shutil.copyfile(binary, binary.with_name('codex.exe'))
+          if sys.platform == 'win32':
+              shutil.copyfile(binary, binary.with_name('codex.exe'))
           build = subprocess.run([
               'cargo', 'test', '--locked', '--manifest-path', 'tools/Cargo.toml',
               '-p', 'pira_team', '--lib', '--no-run', '--message-format=json',
@@ -104,7 +106,12 @@ jobs:
                                  CODEX_HOME=home, TMP=home, TEMP=home, TMPDIR=home,
                                  PYTHONDONTWRITEBYTECODE='1')
               environment['PATH'] = str(binary.parent) + os.pathsep + environment.get('PATH', '')
-              subprocess.run([str(binary), '--version'], check=True, env=environment)
+              subprocess.run([
+                  sys.executable, '-B', '-c',
+                  "import sys; sys.path.insert(0, 'assets/scripts'); import setup_pira_tools; "
+                  "print(setup_pira_tools.check_team_runtime(['pira_team'], sys.argv[1]))",
+                  str(binary),
+              ], check=True, env=environment, stdin=subprocess.DEVNULL, timeout=60)
               result = subprocess.run([
                   executables[0], 'installed_native_', '--ignored', '--nocapture',
                   '--test-threads=1', '--format=pretty', '--color=never',
@@ -115,7 +122,7 @@ jobs:
               outcomes = re.findall(r'^test (.+?) \.\.\. (.+)$', result.stdout, re.MULTILINE)
               if (len(outcomes) != len(required)
                       or {name for name, status in outcomes if status == 'ok'} != required):
-                  raise SystemExit('Required Windows native checks missing, skipped or unsuccessful')
+                  raise SystemExit('Required current native checks missing, skipped or unsuccessful')
           PY_NATIVE
       - name: Build fake-backend test binary (Linux only)
         if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'

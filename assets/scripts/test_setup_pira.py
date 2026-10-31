@@ -36,6 +36,12 @@ class AutoRecapTests(unittest.TestCase):
         legacy_temp = patch.object(setup.stores.tempfile, "gettempdir", return_value=physical_home)
         legacy_temp.start()
         self.addCleanup(legacy_temp.stop)
+        # Synthetic configuration tests must not select the host's Codex backend.
+        which = setup.tool_setup.shutil.which
+        backend = patch.object(setup.tool_setup.shutil, "which", side_effect=lambda name, *args, **kwargs:
+                               None if name == "codex" else which(name, *args, **kwargs))
+        backend.start()
+        self.addCleanup(backend.stop)
         # Native file operations stay real; registry persistence uses a private test double.
         if setup.os.name == "nt":
             from unittest.mock import MagicMock
@@ -60,7 +66,8 @@ class AutoRecapTests(unittest.TestCase):
                      ("PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "SystemDrive")}
         with patch.dict(os.environ, {**execution, "HOME": "do-not-inherit",
                                     "OPENAI_API_KEY": "synthetic-do-not-inherit",
-                                    "CODEX_HOME": "do-not-inherit"}, clear=True):
+                                    "CODEX_HOME": "do-not-inherit"}, clear=True), \
+             patch.object(setup.tool_setup.shutil, "which", return_value="/ambient/codex"):
             fixture = AutoRecapTests()
             try:
                 fixture.setUp()
@@ -68,6 +75,7 @@ class AutoRecapTests(unittest.TestCase):
                     self.assertEqual(os.environ[key], value)
                 home = os.environ["HOME"]
                 self.assertNotEqual(home, "do-not-inherit")
+                self.assertIsNone(setup.tool_setup.selected_codex_binary(Path(home) / "unused"))
                 for key in ("USERPROFILE", "LOCALAPPDATA", "APPDATA", "TMPDIR", "TMP", "TEMP"):
                     self.assertEqual(os.environ[key], home)
                 for key in ("OPENAI_API_KEY", "CODEX_HOME"):
@@ -174,7 +182,7 @@ class AutoRecapTests(unittest.TestCase):
                 with patch.dict(setup.os.environ, {"HOME": str(home), "USERPROFILE": str(home), "LOCALAPPDATA": str(home)}), \
                      patch.object(setup.tool_setup.shutil, "which", return_value=None), \
                      patch.object(setup.tool_setup, "install_codex", side_effect=install) as installer, \
-                     patch.object(setup.tool_setup, "check_team_runtime", return_value="codex-cli 0.161.0") as check, \
+                     patch.object(setup.tool_setup, "check_team_runtime", return_value="codex-cli 0.166.0") as check, \
                      patch.object(setup.stores.migration, "team_backend", return_value=helper), \
                      patch.object(setup.stores, "historical_store_paths", side_effect=lambda tool: [source.parent] if tool == "pira_team" else []), \
                      patch.object(setup, "ensure_agent_dir"), patch.object(setup, "ensure_user_md"), \

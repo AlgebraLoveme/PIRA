@@ -28,7 +28,7 @@ import setup_pira_stores as stores
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 RETIRED_TOOLS = {"pira_codenav"}
-TEAM_CODEX_MIN_VERSION = (0, 159, 0)
+TEAM_CODEX_MIN_VERSION = (0, 166, 0)
 CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
 MAX_CODEX_BYTES = 512 * 1024 * 1024
 CODEX_PACKAGE_DIR = ".pira-codex"
@@ -832,7 +832,7 @@ def check_team_protocol(executable: str) -> None:
             command.extend(["-c", setting])
         schema_dir = root / "schema"
         result = subprocess.run(
-            [executable, "app-server", "generate-json-schema", "--out", str(schema_dir)],
+            [executable, "app-server", "generate-json-schema", "--experimental", "--out", str(schema_dir)],
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
             check=False, env=env,
         )

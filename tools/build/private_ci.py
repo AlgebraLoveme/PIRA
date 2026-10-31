@@ -94,6 +94,25 @@ WINDOWS_CODEX_MEMBERS = (
 )
 WINDOWS_CODEX_MANIFEST = {'layoutVersion': 1, 'version': '0.161.0', 'target': 'x86_64-pc-windows-msvc', 'variant': 'codex', 'entrypoint': 'codex-x86_64-pc-windows-msvc.exe', 'resourcesDir': 'codex-resources', 'pathDir': 'codex-path'}
 MAX_CODEX_BYTES = 512 * 1024 * 1024
+# Current protocol/setup checks are independent of the historical relocation fixture.
+TEAM_CODEX_VERSION = "0.166.0"
+TEAM_CODEX_ASSETS = {
+    "linux": ("codex-x86_64-unknown-linux-musl.tar.gz",
+              "a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978",
+              "codex-x86_64-unknown-linux-musl"),
+    "win32": ("codex-x86_64-pc-windows-msvc.exe.zip",
+              "bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d",
+              "codex-x86_64-pc-windows-msvc.exe"),
+}
+# Exact 54-entry official 0.166.0 ZIP: the historical layout plus exec-server.
+TEAM_WINDOWS_CODEX_MEMBERS = (
+    WINDOWS_CODEX_MEMBERS[0], 'bin/codex-exec-server.exe', *WINDOWS_CODEX_MEMBERS[1:],
+)
+TEAM_WINDOWS_CODEX_MANIFEST = {
+    **WINDOWS_CODEX_MANIFEST, 'version': TEAM_CODEX_VERSION,
+    'execServer': 'bin/codex-exec-server.exe',
+}
+MAX_TEAM_EXPANDED_CODEX_BYTES = 1024 * 1024 * 1024
 NATIVE_RELOCATION_INPUTS = (
     "assets/scripts/team_store_relocation.py",
     "assets/scripts/test_team_store_relocation.py",
@@ -101,14 +120,19 @@ NATIVE_RELOCATION_INPUTS = (
 )
 
 
-def extract_windows_codex(archive: Path, directory: Path) -> None:
+def extract_windows_codex(archive: Path, directory: Path, *, profile: str = "relocation") -> None:
     """Retain the entire pinned relative layout, never extract archive-selected paths."""
+    if profile not in ("relocation", "team"):
+        raise ValueError(f"Unknown Codex CI profile: {profile}")
+    inventory = TEAM_WINDOWS_CODEX_MEMBERS if profile == "team" else WINDOWS_CODEX_MEMBERS
+    manifest = TEAM_WINDOWS_CODEX_MANIFEST if profile == "team" else WINDOWS_CODEX_MANIFEST
+    aggregate_limit = MAX_TEAM_EXPANDED_CODEX_BYTES if profile == "team" else MAX_CODEX_BYTES
     if directory.is_symlink() or not directory.is_dir() or any(directory.iterdir()):
         raise RuntimeError("Windows Codex extraction requires an empty plain directory")
     with zipfile.ZipFile(archive) as package:
         members = package.infolist()
-        if (len(members) != len(WINDOWS_CODEX_MEMBERS)
-                or {item.filename for item in members} != set(WINDOWS_CODEX_MEMBERS)):
+        if (len(members) != len(inventory)
+                or {item.filename for item in members} != set(inventory)):
             raise RuntimeError("Unexpected Codex archive member inventory")
         total = 0
         for item in members:
@@ -121,14 +145,14 @@ def extract_windows_codex(archive: Path, directory: Path) -> None:
                     or (not directory_entry and not 0 < item.file_size <= MAX_CODEX_BYTES)):
                 raise RuntimeError("Unsafe Codex archive member")
             total += item.file_size
-        if total > MAX_CODEX_BYTES:
+        if total > aggregate_limit:
             raise RuntimeError("Invalid expanded Codex size")
         if package.getinfo('codex-package.json').file_size > 4096:
             raise RuntimeError("Invalid Codex package manifest size")
-        if json.loads(package.read('codex-package.json')) != WINDOWS_CODEX_MANIFEST:
+        if json.loads(package.read('codex-package.json')) != manifest:
             raise RuntimeError("Unexpected Codex package manifest")
         # All names have matched literal reviewed constants, including directories.
-        for name in WINDOWS_CODEX_MEMBERS:
+        for name in inventory:
             target = directory / name
             if name.endswith('/'):
                 target.mkdir()
@@ -145,14 +169,14 @@ def extract_windows_codex(archive: Path, directory: Path) -> None:
                 raise RuntimeError("Truncated Codex member")
 
 
-def extract_codex(archive: Path, member_name: str, destination: Path) -> None:
+def extract_codex(archive: Path, member_name: str, destination: Path, *, profile: str = "relocation") -> None:
     """Extract the pinned platform layout without trusting archive paths or modes."""
     try:
         with ExitStack() as stack:
             if archive.name.endswith(".zip"):
                 if member_name != WINDOWS_CODEX_MANIFEST['entrypoint'] or destination.name != member_name:
                     raise RuntimeError("Unexpected Windows Codex entrypoint")
-                extract_windows_codex(archive, destination.parent)
+                extract_windows_codex(archive, destination.parent, profile=profile)
                 return
             else:
                 package = stack.enter_context(tarfile.open(archive, "r:gz"))
@@ -178,14 +202,18 @@ def extract_codex(archive: Path, member_name: str, destination: Path) -> None:
         raise RuntimeError(f"Invalid Codex archive: {error}") from error
 
 
-def provision_codex(directory: Path) -> Path:
-    """Provision only the pinned CI binary in a new explicit task-local directory."""
-    if sys.platform not in NATIVE_CODEX_ASSETS or platform.machine().lower() not in ("amd64", "x86_64"):
+def provision_codex(directory: Path, *, profile: str = "relocation") -> Path:
+    """Provision a pinned CI package; default remains the historical relocation target."""
+    if profile not in ("relocation", "team"):
+        raise ValueError(f"Unknown Codex CI profile: {profile}")
+    version = TEAM_CODEX_VERSION if profile == "team" else NATIVE_CODEX_VERSION
+    assets = TEAM_CODEX_ASSETS if profile == "team" else NATIVE_CODEX_ASSETS
+    if sys.platform not in assets or platform.machine().lower() not in ("amd64", "x86_64"):
         raise RuntimeError("Native relocation CI requires x64 Linux or Windows")
     if directory.exists() or directory.is_symlink():
         raise RuntimeError(f"Refusing to overwrite Codex destination: {directory}")
-    asset, expected, member = NATIVE_CODEX_ASSETS[sys.platform]
-    url = f"https://github.com/openai/codex/releases/download/rust-v{NATIVE_CODEX_VERSION}/{asset}"
+    asset, expected, member = assets[sys.platform]
+    url = f"https://github.com/openai/codex/releases/download/rust-v{version}/{asset}"
     directory.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".pira-native-codex-", dir=directory.parent) as temporary:
         root = Path(temporary)
@@ -204,7 +232,7 @@ def provision_codex(directory: Path) -> Path:
         package = root / "bin"
         package.mkdir()
         binary = package / (member if sys.platform == "win32" else "codex")
-        extract_codex(archive, member, binary)
+        extract_codex(archive, member, binary, profile=profile)
         binary.chmod(0o755)
         home = root / "home"
         home.mkdir()
@@ -217,7 +245,7 @@ def provision_codex(directory: Path) -> Path:
                                     capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
         except subprocess.TimeoutExpired as error:
             raise RuntimeError("Pinned Codex version check timed out") from error
-        if result.returncode or result.stdout.strip() != f"codex-cli {NATIVE_CODEX_VERSION}":
+        if result.returncode or result.stdout.strip() != f"codex-cli {version}":
             raise RuntimeError("Pinned Codex binary version check failed")
         if directory.exists() or directory.is_symlink():
             raise RuntimeError(f"Codex destination appeared during provisioning: {directory}")

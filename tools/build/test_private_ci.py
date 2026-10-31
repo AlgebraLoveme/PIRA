@@ -10,7 +10,7 @@ import sys
 import textwrap
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import private_ci as ci
 
@@ -257,24 +257,26 @@ class PrivateCITests(unittest.TestCase):
                         self.assertEqual(call.kwargs['env']['PIRA_WRITE_CHECK_BIN'], str(binary))
                         self.assertTrue(call.kwargs['check'])
 
-    def test_windows_native_team_gate_requires_both_checks_and_isolates_environment(self):
+    def test_current_native_team_gate_requires_setup_and_both_rust_checks_on_each_host(self):
         from contextlib import redirect_stdout
         stage = self.stage(('pira_team',))
         workflow = (stage / '.github/workflows/private-pira-tests.yml').read_text()
-        step = workflow.split('- name: Required Windows native Team checks', 1)[1].split('\n      - name:', 1)[0]
-        self.assertIn("if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'", step)
+        step = workflow.split('- name: Required current native Team and setup checks', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("if: matrix.crate == 'pira_team'\n", step)
         self.assertNotIn('continue-on-error', step)
         code = textwrap.dedent(step.split("<<'PY_NATIVE'\n", 1)[1].split('\n          PY_NATIVE', 1)[0])
-        binary = self.base / 'package' / 'codex-pinned.exe'
-        binary.parent.mkdir()
-        binary.write_bytes(b'fixture executable; never run')
         required = [
             'backend::tests::installed_native_schema_supports_team_requests',
             'tests::installed_native_launcher_preserves_exact_untrusted_project_keys',
         ]
         passing = ''.join(f'test {name} ... ok\n' for name in required)
-        for scenario in ('success', 'absent', 'missing', 'ignored', 'failed', 'timeout'):
-            with self.subTest(scenario=scenario):
+        for system, scenario in ((system, scenario) for system in ('linux', 'win32')
+                                 for scenario in ('success', 'setup-failed', 'setup-timeout',
+                                                  'absent', 'missing', 'ignored', 'failed', 'timeout')):
+            with self.subTest(system=system, scenario=scenario):
+                binary = self.base / system / scenario / ('codex-pinned.exe' if system == 'win32' else 'codex')
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(b'inert fixture; never executed')
                 calls = []
                 def run(command, **options):
                     calls.append(command)
@@ -292,7 +294,22 @@ class PrivateCITests(unittest.TestCase):
                     self.assertEqual(environment['TMP'], environment['HOME'])
                     self.assertTrue(Path(environment['HOME']).is_dir())
                     self.assertEqual(environment['PATH'].split(os.pathsep)[0], str(binary.parent))
-                    if command[-1] == '--version':
+                    if command[0] == sys.executable:
+                        self.assertEqual(command[1:3], ['-B', '-c'])
+                        self.assertEqual(command[-1], str(binary))
+                        self.assertEqual(options['stdin'], subprocess.DEVNULL)
+                        self.assertEqual(options['timeout'], 60)
+                        self.assertTrue(options['check'])
+                        setup = Mock()
+                        with patch.dict(sys.modules, {'setup_pira_tools': setup}), \
+                                patch.object(sys, 'argv', ['-c', str(binary)]), \
+                                patch.object(sys, 'path', list(sys.path)):
+                            exec(command[3], {})
+                        setup.check_team_runtime.assert_called_once_with(['pira_team'], str(binary))
+                        if scenario == 'setup-failed':
+                            raise subprocess.CalledProcessError(1, command)
+                        if scenario == 'setup-timeout':
+                            raise subprocess.TimeoutExpired(command, 60)
                         return subprocess.CompletedProcess(command, 0)
                     self.assertIn('--ignored', command)
                     self.assertEqual(options['timeout'], 180)
@@ -302,7 +319,8 @@ class PrivateCITests(unittest.TestCase):
                               'missing':f'test {required[0]} ... ok\n',
                               'ignored':passing.replace(' ... ok', ' ... ignored')}.get(scenario, passing)
                     return subprocess.CompletedProcess(command, 1 if scenario == 'failed' else 0, stdout=output)
-                with patch.object(ci, 'provision_codex', return_value=binary), \
+                with patch.object(ci, 'provision_codex', return_value=binary) as provision, \
+                        patch.object(sys, 'platform', system), \
                         patch.object(subprocess, 'run', side_effect=run), \
                         patch.dict(os.environ, {'RUNNER_TEMP':str(self.base),
                             'OPENAI_API_KEY':'synthetic', 'GITHUB_TOKEN':'synthetic',
@@ -313,7 +331,13 @@ class PrivateCITests(unittest.TestCase):
                     else:
                         with self.assertRaises((SystemExit, subprocess.CalledProcessError, subprocess.TimeoutExpired)):
                             exec(code, {})
-                self.assertEqual(len(calls), 3)
+                provision.assert_called_once_with(self.base / 'pira-team-native-codex', profile='team')
+                self.assertEqual(len(calls), 2 if scenario.startswith('setup-') else 3)
+                self.assertEqual(binary.with_name('codex.exe').exists(), system == 'win32')
+        historical = workflow.split('  native_relocation:\n', 1)[1]
+        self.assertIn('Codex 0.161.0', historical)
+        self.assertIn('private_ci.py provision-codex --directory', historical)
+        self.assertNotIn("profile='team'", historical)
 
     def test_team_policy_include_closure_and_explicit_markdown_allowlist(self):
         policies = ('main.md', 'coordinator.md', 'implementation.md', 'review.md',
@@ -605,6 +629,12 @@ class PrivateCITests(unittest.TestCase):
 
 
 class NativeCodexProvisionTests(unittest.TestCase):
+    profile = 'relocation'
+    version = ci.NATIVE_CODEX_VERSION
+    assets = ci.NATIVE_CODEX_ASSETS
+    windows_members = ci.WINDOWS_CODEX_MEMBERS
+    windows_manifest = ci.WINDOWS_CODEX_MANIFEST
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -613,13 +643,13 @@ class NativeCodexProvisionTests(unittest.TestCase):
         self.version_checks = []
 
     def archive(self, system, names=None):
-        asset, _, member = ci.NATIVE_CODEX_ASSETS[system]
+        asset, _, member = self.assets[system]
         output = io.BytesIO()
-        names = names or (ci.WINDOWS_CODEX_MEMBERS if system == "win32" else [member])
+        names = names or (self.windows_members if system == "win32" else [member])
         if system == "win32":
             with zipfile.ZipFile(output, "w") as package:
                 for name in names:
-                    payload = (json.dumps(ci.WINDOWS_CODEX_MANIFEST).encode() if name == 'codex-package.json'
+                    payload = (json.dumps(self.windows_manifest).encode() if name == 'codex-package.json'
                                else b'' if name.endswith('/') else b'fixture binary')
                     package.writestr(name, payload)
         else:
@@ -630,13 +660,14 @@ class NativeCodexProvisionTests(unittest.TestCase):
                     package.addfile(entry, io.BytesIO(b"fixture binary"))
         return asset, member, output.getvalue()
 
-    def provision(self, system, payload, *, expected=None, version="codex-cli 0.161.0"):
-        asset, _, member = ci.NATIVE_CODEX_ASSETS[system]
+    def provision(self, system, payload, *, expected=None, version=None):
+        asset, _, member = self.assets[system]
+        version = version or f'codex-cli {self.version}'
         def run(command, **kwargs):
             self.version_checks.append(command)
             self.assertEqual(command[1:], ["--version"])
             if system == 'win32':
-                self.assertEqual(Path(command[0]).name, ci.WINDOWS_CODEX_MANIFEST['entrypoint'])
+                self.assertEqual(Path(command[0]).name, self.windows_manifest['entrypoint'])
                 self.assertTrue((Path(command[0]).parent / 'codex-code-mode-host.exe').is_file())
                 self.assertTrue((Path(command[0]).parent / 'codex-resources/voice/manifest.json').is_file())
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
@@ -646,12 +677,12 @@ class NativeCodexProvisionTests(unittest.TestCase):
             self.assertTrue(Path(kwargs["env"]["CODEX_HOME"]).is_relative_to(self.root))
             return subprocess.CompletedProcess(command, 0, version, "")
         with patch.object(ci.sys, "platform", system), patch.object(ci.platform, "machine", return_value="AMD64"), \
-             patch.dict(ci.NATIVE_CODEX_ASSETS, {system: (asset, expected or ci.digest(payload), member)}), \
+             patch.dict(self.assets, {system: (asset, expected or ci.digest(payload), member)}), \
              patch.dict(os.environ, {"CODEX_API_KEY": "synthetic-private", "OPENAI_API_KEY": "synthetic-private"}), \
              patch.object(ci, "urlopen", return_value=io.BytesIO(payload)) as fetch, \
              patch.object(ci.subprocess, "run", side_effect=run):
-            result = ci.provision_codex(self.destination)
-            fetch.assert_called_once_with("https://github.com/openai/codex/releases/download/rust-v0.161.0/" + asset,
+            result = ci.provision_codex(self.destination, profile=self.profile)
+            fetch.assert_called_once_with(f"https://github.com/openai/codex/releases/download/rust-v{self.version}/" + asset,
                                           timeout=60)
             return result
 
@@ -670,10 +701,10 @@ class NativeCodexProvisionTests(unittest.TestCase):
                 self.assertEqual(binary.read_bytes(), b"fixture binary")
                 if system == 'win32':
                     self.assertEqual({p.relative_to(self.destination).as_posix() + ('/' if p.is_dir() else '')
-                                      for p in self.destination.rglob('*')}, set(ci.WINDOWS_CODEX_MEMBERS))
+                                      for p in self.destination.rglob('*')}, set(self.windows_members))
                     self.assertEqual(json.loads((self.destination / 'codex-package.json').read_text()),
-                                     ci.WINDOWS_CODEX_MANIFEST)
-                    self.assertEqual(len(ci.WINDOWS_CODEX_MEMBERS), 53)
+                                     self.windows_manifest)
+                    self.assertEqual(len(self.windows_members), 53 if self.profile == 'relocation' else 54)
                 else:
                     self.assertEqual(list(self.destination.iterdir()), [binary])
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["linux", "win32"])
@@ -688,7 +719,7 @@ class NativeCodexProvisionTests(unittest.TestCase):
 
     def test_unexpected_members_and_links_are_rejected(self):
         for system in ("linux", "win32"):
-            member = ci.NATIVE_CODEX_ASSETS[system][2]
+            member = self.assets[system][2]
             for names in (["../escaped"], [member, "unexpected"]):
                 with self.subTest(system=system, names=names):
                     _, _, payload = self.archive(system, names)
@@ -697,7 +728,7 @@ class NativeCodexProvisionTests(unittest.TestCase):
                     self.assertEqual(list(self.root.iterdir()), [])
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w:gz") as package:
-            entry = tarfile.TarInfo(ci.NATIVE_CODEX_ASSETS["linux"][2])
+            entry = tarfile.TarInfo(self.assets["linux"][2])
             entry.type, entry.linkname = tarfile.SYMTYPE, "../elsewhere"
             package.addfile(entry)
         with self.assertRaisesRegex(RuntimeError, "archive member"):
@@ -705,7 +736,7 @@ class NativeCodexProvisionTests(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w") as package:
-            entry = zipfile.ZipInfo(ci.NATIVE_CODEX_ASSETS["win32"][2])
+            entry = zipfile.ZipInfo(self.assets["win32"][2])
             entry.create_system = 3
             entry.external_attr = (ci.stat.S_IFLNK | 0o777) << 16
             package.writestr(entry, "../elsewhere")
@@ -750,7 +781,8 @@ class NativeCodexProvisionTests(unittest.TestCase):
                             package.writestr(item.filename, data)
                     payload = packed.getvalue()
                 limit = max(len(payload) + 1, 20000) if attack == 'expanded-size' else ci.MAX_CODEX_BYTES
-                with patch.object(ci, 'MAX_CODEX_BYTES', limit), self.assertRaises(RuntimeError):
+                with patch.object(ci, 'MAX_CODEX_BYTES', limit), \
+                        patch.object(ci, 'MAX_TEAM_EXPANDED_CODEX_BYTES', limit), self.assertRaises(RuntimeError):
                     self.provision('win32', payload)
                 self.assertEqual(self.version_checks, [])
                 self.assertEqual(list(self.root.iterdir()), [])
@@ -771,13 +803,120 @@ class NativeCodexProvisionTests(unittest.TestCase):
         with patch.object(ci.sys, "platform", "linux"), patch.object(ci.platform, "machine", return_value="x86_64"), \
              patch.object(ci, "urlopen") as fetch:
             with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
-                ci.provision_codex(self.destination)
+                ci.provision_codex(self.destination, profile=self.profile)
             self.assertEqual(marker.read_bytes(), b"unrelated")
             fetch.assert_not_called()
         with patch.object(ci.platform, "machine", return_value="arm64"), patch.object(ci, "urlopen") as fetch:
             with self.assertRaisesRegex(RuntimeError, "x64 Linux or Windows"):
-                ci.provision_codex(self.root / "new")
+                ci.provision_codex(self.root / "new", profile=self.profile)
             fetch.assert_not_called()
+
+
+class CurrentTeamCodexProvisionTests(NativeCodexProvisionTests):
+    # Run the same extraction/auth/failure contracts against both independent pins.
+    profile = 'team'
+    version = ci.TEAM_CODEX_VERSION
+    assets = ci.TEAM_CODEX_ASSETS
+    windows_members = ci.TEAM_WINDOWS_CODEX_MEMBERS
+    windows_manifest = ci.TEAM_WINDOWS_CODEX_MANIFEST
+
+    def test_exact_pins(self):
+        self.assertEqual(ci.TEAM_CODEX_VERSION, '0.166.0')
+        self.assertEqual(ci.TEAM_CODEX_ASSETS['linux'][1],
+                         'a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978')
+        self.assertEqual(ci.TEAM_CODEX_ASSETS['win32'][1],
+                         'bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d')
+        self.assertEqual(set(ci.TEAM_WINDOWS_CODEX_MEMBERS) - set(ci.WINDOWS_CODEX_MEMBERS),
+                         {'bin/codex-exec-server.exe'})
+        self.assertTrue(set(ci.WINDOWS_CODEX_MEMBERS) < set(ci.TEAM_WINDOWS_CODEX_MEMBERS))
+        self.assertEqual(ci.TEAM_WINDOWS_CODEX_MANIFEST, {
+            **ci.WINDOWS_CODEX_MANIFEST, 'version': '0.166.0',
+            'execServer': 'bin/codex-exec-server.exe',
+        })
+
+    def test_profiles_reject_each_others_windows_inventory(self):
+        for source in (self, NativeCodexProvisionTests()):
+            _, _, payload = source.archive('win32')
+            archive = self.root / f'{source.profile}.zip'
+            archive.write_bytes(payload)
+            directory = self.root / source.profile
+            directory.mkdir()
+            target = 'relocation' if source.profile == 'team' else 'team'
+            with self.assertRaisesRegex(RuntimeError, 'inventory'):
+                ci.extract_windows_codex(archive, directory, profile=target)
+            self.assertEqual(list(directory.iterdir()), [])
+
+    def test_aggregate_boundaries_are_profile_specific_without_large_payloads(self):
+        self.assertEqual(ci.MAX_CODEX_BYTES, 512 * 1024 * 1024)
+        self.assertEqual(ci.MAX_TEAM_EXPANDED_CODEX_BYTES, 1024 * 1024 * 1024)
+        class ReachedManifest(Exception):
+            pass
+        for profile in ('relocation', 'team'):
+            inventory = ci.WINDOWS_CODEX_MEMBERS if profile == 'relocation' else self.windows_members
+            limit = ci.MAX_CODEX_BYTES if profile == 'relocation' else ci.MAX_TEAM_EXPANDED_CODEX_BYTES
+            for total in (ci.MAX_CODEX_BYTES, ci.MAX_CODEX_BYTES + 1,
+                          ci.MAX_TEAM_EXPANDED_CODEX_BYTES, ci.MAX_TEAM_EXPANDED_CODEX_BYTES + 1):
+                with self.subTest(profile=profile, total=total):
+                    items = [zipfile.ZipInfo(name) for name in inventory]
+                    for item in items:
+                        item.file_size = 0 if item.is_dir() else 1
+                    # Bounded members carry synthetic sizes; no data is allocated/read.
+                    remaining = total - sum(item.file_size for item in items)
+                    for item in (item for item in items if item.filename.endswith('.exe')):
+                        extra = min(remaining, ci.MAX_CODEX_BYTES - item.file_size)
+                        item.file_size += extra
+                        remaining -= extra
+                    self.assertEqual(remaining, 0)
+                    package = Mock()
+                    package.infolist.return_value = items
+                    package.getinfo.return_value.file_size = 1
+                    package.read.side_effect = ReachedManifest
+                    with patch.object(ci.zipfile, 'ZipFile') as opening:
+                        opening.return_value.__enter__.return_value = package
+                        if total <= limit:
+                            with self.assertRaises(ReachedManifest):
+                                ci.extract_windows_codex(self.root / 'synthetic.zip', self.root, profile=profile)
+                            package.read.assert_called_once_with('codex-package.json')
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, 'expanded Codex size'):
+                                ci.extract_windows_codex(self.root / 'synthetic.zip', self.root, profile=profile)
+                            package.read.assert_not_called()
+                        package.open.assert_not_called()
+
+    def test_current_aggregate_does_not_relax_member_metadata_or_manifest_bounds(self):
+        for attack in ('member-size', 'empty-file', 'directory-size', 'encrypted', 'manifest-size'):
+            with self.subTest(attack=attack):
+                items = [zipfile.ZipInfo(name) for name in self.windows_members]
+                for item in items:
+                    item.file_size = 0 if item.is_dir() else 1
+                entry = next(item for item in items if item.filename == 'bin/codex-exec-server.exe')
+                if attack == 'member-size': entry.file_size = ci.MAX_CODEX_BYTES + 1
+                if attack == 'empty-file': entry.file_size = 0
+                if attack == 'directory-size': items[0].file_size = 1
+                if attack == 'encrypted': entry.flag_bits |= 1
+                package = Mock()
+                package.infolist.return_value = items
+                package.getinfo.return_value.file_size = 4097 if attack == 'manifest-size' else 1
+                with patch.object(ci.zipfile, 'ZipFile') as opening:
+                    opening.return_value.__enter__.return_value = package
+                    with self.assertRaisesRegex(RuntimeError, 'Unsafe|manifest size'):
+                        ci.extract_windows_codex(self.root / 'synthetic.zip', self.root, profile='team')
+                package.read.assert_not_called()
+                package.open.assert_not_called()
+
+    def test_unknown_profile_fails_before_download_and_default_stays_historical(self):
+        with patch.object(ci, 'urlopen') as fetch:
+            with self.assertRaisesRegex(ValueError, 'profile'):
+                ci.provision_codex(self.destination, profile='typo')
+            fetch.assert_not_called()
+        with patch.object(ci.sys, 'platform', 'linux'), \
+                patch.object(ci.platform, 'machine', return_value='x86_64'), \
+                patch.object(ci, 'urlopen', side_effect=RuntimeError('stop before download')) as fetch:
+            with self.assertRaisesRegex(RuntimeError, 'stop before download'):
+                ci.provision_codex(self.destination)
+            fetch.assert_called_once_with(
+                'https://github.com/openai/codex/releases/download/rust-v0.161.0/'
+                'codex-x86_64-unknown-linux-musl.tar.gz', timeout=60)
 
 
 if __name__ == '__main__':

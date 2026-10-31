@@ -104,7 +104,7 @@ else:
             def checked(tools, executable):
                 events.append("checked")
                 self.assertEqual(Path(executable).resolve(), binary.resolve())
-                return "codex-cli 0.161.0"
+                return "codex-cli 0.166.0"
             def planned(tools, **kwargs):
                 events.append("planned")
                 self.assertEqual(kwargs["codex_binary"], str(binary.resolve()))
@@ -131,7 +131,7 @@ else:
                 def checked(tools, executable):
                     events.append("checked")
                     self.assertEqual(executable, str(binary.resolve()))
-                    return "codex-cli 0.161.0"
+                    return "codex-cli 0.166.0"
                 def planned(tools, **kwargs):
                     events.append("planned")
                     self.assertEqual(kwargs["codex_binary"], str(binary.resolve()))
@@ -535,8 +535,8 @@ class SetupPiraToolsTests(unittest.TestCase):
         def result(text: str, code: int = 0):
             return subprocess.CompletedProcess([], code, text, "")
         with patch.object(setup.shutil, "which", return_value="/test/codex"):
-            for version in ("codex-cli 0.159.0", "codex-cli 0.160.1"):
-                with patch.object(setup.subprocess, "run", side_effect=[
+            for version in ("codex-cli 0.166.0", "codex-cli 0.166.1", "codex-cli 0.166.0+build.1"):
+                with self.subTest(version=version), patch.object(setup.subprocess, "run", side_effect=[
                     result(version), result("--stdio\n--strict-config")]) as run, \
                      patch.object(setup, "check_team_protocol") as protocol:
                     self.assertEqual(setup.check_team_runtime(["pira_team"]), version)
@@ -544,13 +544,13 @@ class SetupPiraToolsTests(unittest.TestCase):
                     self.assertEqual([c.args[0][1:] for c in run.call_args_list],
                                      [["--version"], ["app-server", "--help"]])
                     self.assertTrue(all(c.kwargs["timeout"] == 10 for c in run.call_args_list))
-            for version in ("codex-cli 0.158.9", "codex-cli 0.159.0-beta.1", "unknown"):
-                with patch.object(setup.subprocess, "run", return_value=result(version)) as run:
-                    with self.assertRaises(RuntimeError):
+            for version in ("codex-cli 0.166.0-beta.1", "unknown"):
+                with self.subTest(version=version), patch.object(setup.subprocess, "run", return_value=result(version)) as run:
+                    with self.assertRaisesRegex(RuntimeError, "Cannot verify a stable Codex version"):
                         setup.check_team_runtime(["pira_team"])
                     self.assertEqual(run.call_count, 1)
             with patch.object(setup.subprocess, "run", side_effect=[
-                result("codex-cli 0.160.0"), result("--stdio-only --strict-config")]):
+                result("codex-cli 0.166.0"), result("--stdio-only --strict-config")]):
                 with self.assertRaisesRegex(RuntimeError, "lacks required options"):
                     setup.check_team_runtime(["pira_team"])
             for failure in (subprocess.TimeoutExpired("codex", 10), OSError("unavailable")):
@@ -561,14 +561,34 @@ class SetupPiraToolsTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "failed"):
                     setup.check_team_runtime(["pira_team"])
 
+    def test_team_preflight_rejects_older_versions_before_protocol(self):
+        for version in ("codex-cli 0.159.0", "codex-cli 0.165.9"):
+            with self.subTest(version=version), \
+                 patch.object(setup.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, version, "")) as run, \
+                 patch.object(setup, "check_team_protocol") as protocol:
+                with self.assertRaisesRegex(RuntimeError, r"requires Codex >= 0\.166\.0"):
+                    setup.check_team_runtime(["pira_team"], "/test/codex")
+                self.assertEqual(run.call_count, 1)
+                protocol.assert_not_called()
+
     def test_team_protocol_checks_native_inventory_before_direct_initialize(self):
         contract = json.loads((setup.REPO_ROOT / "tools/src/pira_team/backend_contract.json").read_text())
         fixture = runpy.run_path(str(setup.REPO_ROOT / "tools/crates/pira_team/tests/backend_fixture.py"))
-        for fault in ("", "method", "field"):
+        for fault in ("", "method", "field", "live_method", "live_response"):
             def run(command, **kwargs):
                 self.assertEqual(kwargs["timeout"], 10)
                 self.assertNotIn("--strict-config", command)
-                fixture["write_schemas"](command[command.index("--out") + 1], contract, fault)
+                self.assertEqual(command[:4], ["/fixture/codex", "app-server", "generate-json-schema", "--experimental"])
+                directory = Path(command[command.index("--out") + 1])
+                fixture["write_schemas"](directory, contract, fault)
+                if fault == "live_method":
+                    path = directory / "ClientRequest.json"
+                    schema = json.loads(path.read_text())
+                    schema["oneOf"] = [item for item in schema["oneOf"]
+                                       if item["properties"]["method"]["enum"] != ["turn/settings/update"]]
+                    path.write_text(json.dumps(schema))
+                elif fault == "live_response":
+                    (directory / "v2/TurnSettingsUpdateResponse.json").unlink()
                 return subprocess.CompletedProcess(command, 0, "", "")
             def initialize(command, env, *, project):
                 self.assertIn(".path with spaces", project)
@@ -590,7 +610,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                     probe.assert_called_once()
 
     def test_team_protocol_failures_are_actionable(self):
-        results = [subprocess.CompletedProcess([], 0, "codex-cli 0.160.1", ""),
+        results = [subprocess.CompletedProcess([], 0, "codex-cli 0.166.0", ""),
                    subprocess.CompletedProcess([], 0, "--stdio --strict-config", "")]
         for failure in (ValueError("missing method"), subprocess.TimeoutExpired("codex", 10)):
             with patch.object(setup.subprocess, "run", side_effect=results), \
@@ -618,7 +638,7 @@ class SetupPiraToolsTests(unittest.TestCase):
         index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
         with patch.dict(setup.os.environ, {"PIRA_TEAM_DIR": str(Path(setup.os.environ["HOME"]) / "custom-team")}), \
              patch.object(setup, "release_index", return_value=index), \
-             patch.object(setup, "prepare_team_runtime", return_value="codex-cli 0.159.3"), \
+             patch.object(setup, "prepare_team_runtime", return_value="codex-cli 0.166.0"), \
              patch.object(setup, "ensure_team_auth", side_effect=RuntimeError("login missing")) as auth, \
              patch.object(setup, "download_binary") as download:
             with self.assertRaisesRegex(RuntimeError, "login missing"):
@@ -632,7 +652,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             root = Path(tmp)
             with patch.object(setup.shutil, "which", return_value=None), \
                  patch.object(setup, "install_codex", return_value=root / "codex") as install, \
-                 patch.object(setup, "check_team_runtime", return_value="codex-cli 0.159.3") as check:
+                 patch.object(setup, "check_team_runtime", return_value="codex-cli 0.166.0") as check:
                 self.assertIsNone(setup.prepare_team_runtime(["pira_nav"], root, "linux-x64", verify=False, dry_run=False))
                 self.assertIsNone(setup.prepare_team_runtime(["pira_team"], root, "linux-x64", verify=False, dry_run=True))
                 install.assert_not_called()
@@ -661,7 +681,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             if extra is not None:
                 tar.addfile(extra, io.BytesIO(b"x" * extra.size))
         data = archive.getvalue()
-        metadata = {"tag_name": "rust-v0.159.3", "draft": False, "prerelease": False,
+        metadata = {"tag_name": "rust-v0.166.0", "draft": False, "prerelease": False,
                     "assets": [{"name": f"codex-package-{setup.CODEX_TARGETS[platform]}.tar.gz",
                                 "size": len(data), "digest": "sha256:" + hashlib.sha256(data).hexdigest()}]}
         return data, json.dumps(metadata).encode()
@@ -674,7 +694,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                 root = Path(tmp) / "bin"
                 with patch.object(setup, "request_bytes", return_value=metadata), \
                      patch.object(setup, "urlopen", return_value=response), \
-                     patch.object(setup, "check_team_runtime", return_value="codex-cli 0.159.3"):
+                     patch.object(setup, "check_team_runtime", return_value="codex-cli 0.166.0"):
                     installed = setup.install_codex(root, platform)
                     self.assertEqual(installed.read_bytes(), b"fixture")
                     self.assertTrue((root / setup.CODEX_PACKAGE_DIR / "codex-package.json").exists())
@@ -714,7 +734,7 @@ class SetupPiraToolsTests(unittest.TestCase):
     def test_codex_release_validation_and_failed_probe_do_not_publish(self) -> None:
         data, encoded = self.codex_package("linux-x64")
         original = json.loads(encoded)
-        for changed in ({"prerelease": True}, {"draft": True}, {"tag_name": "rust-v0.159.3-beta"},
+        for changed in ({"prerelease": True}, {"draft": True}, {"tag_name": "rust-v0.166.0-beta"},
                         {"assets": []}, {"assets": [{**original["assets"][0], "digest": "missing"}]}):
             with tempfile.TemporaryDirectory() as tmp, \
                  patch.object(setup, "request_bytes", return_value=json.dumps({**original, **changed}).encode()), \
