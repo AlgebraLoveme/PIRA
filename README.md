@@ -20,6 +20,10 @@ PIRA follows five principles:
 - **Transparent:** separate facts from interpretation and state uncertainty.
 - **Kind:** stay supportive, collaborative, and respectful.
 
+## Writing benchmark
+
+PIRA achieves better writing performance using fewer words on average. [View the writing benchmark](assets/bench/writing_bench.pdf).
+
 ## PIRA blogs
 
 - [Making Reliable Research Agents Accessible](https://algebraloveme.github.io/2026-07-23-pira-design-and-use/) — PIRA’s design, research workflow, and practical use.
