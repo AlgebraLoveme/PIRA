@@ -20,10 +20,6 @@ PIRA follows five principles:
 - **Transparent:** separate facts from interpretation and state uncertainty.
 - **Kind:** stay supportive, collaborative, and respectful.
 
-## Writing benchmark
-
-PIRA achieves better writing performance using fewer words on average. [View the writing benchmark](assets/bench/writing_bench.pdf).
-
 ## PIRA blogs
 
 - [Making Reliable Research Agents Accessible](https://algebraloveme.github.io/2026-07-23-pira-design-and-use/) — PIRA’s design, research workflow, and practical use.
@@ -299,6 +295,10 @@ Each generated implementation was then run inside its sandbox against the same 2
 The ctx agent used the wrapper for all 18 commands with no protocol violations. It read PIRA help once, adding 3,229 output bytes already included above, and used exact mode for the complete authoritative design. More commands did not imply more context: its median command response was 260 B versus 1,483 B for the baseline, while status-only checks and a failed test retained bounded reports. However, this is one development trial rather than a causal estimate. The agents chose different implementations: the baseline produced 1,348 source/test lines and 14 self-tests, versus 1,086 lines and six self-tests for the ctx agent, although both passed every hidden case. That behavioral variance may explain part of the token and time difference. The valid ctx run was executed first, so run order did not give the tool a later prompt-cache advantage.
 
 </details>
+
+### Writing benchmark
+
+PIRA achieves better writing performance using fewer words on average. [View the writing benchmark](assets/bench/writing_bench.pdf).
 
 ### `pira_ctx`: lightweight command context
 
