@@ -258,32 +258,42 @@ def checkpoints():
         # Native spool identity now follows the store, not the caller's TMPDIR.
         store = spool / f"checkpoint-{number}"
         watch_store = ROOT / f"separate-watch-{number}"
+        env["PIRA_CTX_STORE_DIR"] = str(store)
+        # CLI text is UTF-8-only; native store paths use the lossless environment.
+        # Same-store live IDs keep the owner's workspace; external paths use cwd.
+        def inspect(target, operation, *args, cwd=None):
+            return subprocess.run([BINARY, operation, *map(str, args)], cwd=cwd,
+                                  env={**env, "PIRA_CTX_STORE_DIR": str(target)},
+                                  capture_output=True, timeout=12)
         marker = ROOT / f"child-launched-{number}"
         code = f"import time;from pathlib import Path;Path({str(marker)!r}).write_text('yes');print('live-marker',flush=True);time.sleep(3)"
-        owner = subprocess.Popen([BINARY, "check", "--store-dir", str(store), "--intent", "finite native checkpoint", "--", sys.executable, "-c", code],
+        owner = subprocess.Popen([BINARY, "check", "--intent", "finite native checkpoint", "--", sys.executable, "-c", code],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            assert owner.stderr.readline().startswith(b"LIVE")
+            announcement = owner.stderr.readline()
+            assert announcement.startswith(b"LIVE"), announcement
             path = next((store / "live").glob("*.live.json"))
             checkpoint = json.loads(path.read_bytes())
             assert checkpoint["schema"] == schema, checkpoint
             assert ("stdout_path_native" in checkpoint) == (schema == 4)
             assert ("stderr_path_native" in checkpoint) == (schema == 4)
-            ok(run(store, "stats", path, env=env))
+            relative_live = Path("live") / path.name
+            result_id = checkpoint["metadata"]["result_id"]
+            ok(inspect(store, "stats", result_id))
             # Live watches must stay in the capture store; completed external reads are valid.
-            outside = run(watch_store, "watch", "--capture", path, "--deadline", "1s", env=env)
+            outside = inspect(watch_store, "watch", "--capture", relative_live, "--deadline", "1s", cwd=store)
             assert outside.returncode == 125 and b"outside its store" in outside.stderr
-            pending = run(store, "watch", "--capture", path, "--deadline", "1s", "--sample-every", "100ms", env=env)
+            pending = inspect(store, "watch", "--capture", result_id, "--deadline", "1s", "--sample-every", "100ms")
             assert pending.returncode == 21 and b"Job: Pending" in pending.stdout, (pending.returncode, pending.stdout, pending.stderr)
             assert b"render reliable: true" in pending.stdout
-            assert "files=0 " in ok(run(store, "prune", "--max-store-bytes", "0", env=env))
+            assert "files=0 " in ok(inspect(store, "prune", "--max-store-bytes", "0"))
             assert path.exists()
             out, err = owner.communicate(timeout=5)
             assert owner.returncode == 0 and marker.exists(), (owner.returncode, out, err)
             final = next(store.glob("*.piractx"))
             assert metadata(final)["compat_version"] == 4
-            assert run(store, "raw", final, "--stdout", env=env).stdout == b"live-marker\n"
-            completed = run(watch_store, "watch", "--capture", final, "--deadline", "1s", env=env)
+            assert inspect(store, "raw", final.name, "--stdout").stdout == b"live-marker\n"
+            completed = inspect(watch_store, "watch", "--capture", final.name, "--deadline", "1s", cwd=store)
             assert completed.returncode == 0 and b"Job: Succeeded" in completed.stdout, (completed.returncode, completed.stdout, completed.stderr)
             assert not list(spool.glob(".pira_ctx-spool-*"))
         finally:

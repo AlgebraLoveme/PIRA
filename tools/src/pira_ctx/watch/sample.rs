@@ -34,13 +34,22 @@ pub fn collect(
     }
 }
 
-fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, String> {
+fn capture_result_path(
+    state: &WatchState,
+    store: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = state.capture_path_native.as_ref() {
+        return path.to_path();
+    }
+    if let Some(path) = state.capture_path.as_ref() {
+        return Ok(path.clone());
+    }
     let target = state.source.first().ok_or("capture source missing")?;
-    let path = if let Some(path) = state.capture_path.as_ref() {
-        path.clone()
-    } else {
-        storage::resolve_result(store, target)?
-    };
+    storage::resolve_result(store, target)
+}
+
+fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, String> {
+    let path = capture_result_path(state, store)?;
     let stored = storage::read_result_path(&path)?;
     let (mut stored, mut growth) =
         stored.sample_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
@@ -258,6 +267,81 @@ mod tests {
         .unwrap();
         state.source = command;
         state
+    }
+
+    #[test]
+    fn external_capture_watch_preserves_native_path_and_schema() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/synthetic/native-\xff/result.piractx".to_vec(),
+        ));
+        let mut state = probe_state(vec!["result".into()]);
+        state.source_kind = SourceKind::Capture;
+        state.capture_path_native = Some(crate::native_path::NativePath::from_path(&path));
+        state.capture_path = Some(std::path::PathBuf::from("/wrong-legacy-alias"));
+        state.schema = 4;
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let mut restored: WatchState = serde_json::from_slice(&bytes).unwrap();
+        super::super::validate(&restored, &restored.id).unwrap();
+        assert_eq!(
+            capture_result_path(&restored, std::path::Path::new("/unused")).unwrap(),
+            path
+        );
+        restored.capture_path_native = None;
+        assert!(super::super::validate(&restored, &restored.id).is_err());
+        // Existing ordinary paths retain schemas 2/3 and their string field.
+        restored.capture_path = Some(std::path::PathBuf::from("/ordinary/result.piractx"));
+        for schema in [2, 3] {
+            restored.schema = schema;
+            restored.source_cwd_native =
+                (schema == 3).then(|| crate::native_path::NativePath::from_path(&path));
+            let bytes = serde_json::to_vec(&restored).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("capture_path_native"));
+            let legacy: WatchState = serde_json::from_slice(&bytes).unwrap();
+            super::super::validate(&legacy, &legacy.id).unwrap();
+            assert_eq!(
+                capture_result_path(&legacy, std::path::Path::new("/unused")).unwrap(),
+                std::path::PathBuf::from("/ordinary/result.piractx")
+            );
+        }
+    }
+
+    #[test]
+    fn external_capture_watch_rejects_unknown_native_encoding() {
+        let state = probe_state(vec!["result".into()]);
+        let mut value = serde_json::to_value(state).unwrap();
+        value["schema"] = serde_json::json!(4);
+        value["capture_path_native"] = serde_json::json!({"encoding":"unknown", "value":[]});
+        assert!(serde_json::from_value::<WatchState>(value).is_err());
+    }
+
+    #[test]
+    fn external_capture_watch_rejects_native_schema_mismatch() {
+        let mut state = probe_state(vec!["result".into()]);
+        state.source_kind = SourceKind::Capture;
+        state.capture_path_native = Some(crate::native_path::NativePath::UnixBytes(
+            b"/native-\xff".to_vec(),
+        ));
+        state.schema = 3;
+        assert!(
+            super::super::validate(&state, &state.id)
+                .unwrap_err()
+                .contains("schema mismatch")
+        );
+    }
+
+    #[test]
+    fn external_capture_watch_never_falls_back_from_foreign_native_encoding() {
+        let mut state = probe_state(vec!["result".into()]);
+        state.source_kind = SourceKind::Capture;
+        state.schema = 4;
+        state.capture_path = Some(std::path::PathBuf::from("/wrong-legacy-alias"));
+        state.capture_path_native = Some(crate::native_path::NativePath::WindowsWide(vec![0xd800]));
+        assert!(
+            capture_result_path(&state, std::path::Path::new("/unused"))
+                .unwrap_err()
+                .contains("another platform")
+        );
     }
 
     #[test]

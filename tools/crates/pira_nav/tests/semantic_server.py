@@ -77,7 +77,7 @@ while True:
         position = params["position"]
         key = f"{path.relative_to(root).as_posix()}:{position['line']}:{position['character']}"
         if config.get("log_requests", True):
-            with (root / ".requests").open("a") as log:
+            with (root / ".requests").open("a", newline="\n") as log:
                 log.write(key + "\n")
         targets = config.get("positions", {}).get(key, config.get("default", []))
         result = [location(target) for target in targets] if targets is not None else None

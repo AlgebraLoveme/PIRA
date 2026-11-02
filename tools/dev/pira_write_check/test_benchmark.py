@@ -50,10 +50,12 @@ class WorkDirectoryTests(unittest.TestCase):
             link.symlink_to(victim)
             missing = root / "missing-results-target"
             (work / "results.json").symlink_to(missing)
+            links = (link, work / "results.json")
+            targets_before = {path: os.readlink(path) for path in links}
             before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in (regular, victim)]
             self.assert_rejected(work, binary)
             self.assertEqual(before, [(p.read_bytes(), p.stat().st_mtime_ns) for p in (regular, victim)])
-            self.assertEqual(link.readlink(), victim)
+            self.assertEqual({path: os.readlink(path) for path in links}, targets_before)
             self.assertFalse(missing.exists())
 
     def test_work_directory_symlinks_including_dangling_are_rejected(self):
@@ -68,8 +70,9 @@ class WorkDirectoryTests(unittest.TestCase):
                         target.mkdir()
                     work = root / f"link-{existing}"
                     work.symlink_to(target, target_is_directory=True)
+                    target_before = os.readlink(work)
                     self.assert_rejected(work, binary)
-                    self.assertEqual(work.readlink(), target)
+                    self.assertEqual(os.readlink(work), target_before)
                     self.assertEqual(target.exists(), existing)
 
     def test_new_work_directory_is_private_and_retained(self):

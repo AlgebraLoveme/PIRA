@@ -1692,6 +1692,9 @@ mod tests {
             (dir.join("outside.py"), true),
             (root.join("../outside.py"), true),
         ] {
+            // Canonical Windows paths may have a local verbatim prefix, not a
+            // prefix that belongs in a file URI sent by a language server.
+            let path = crate::util::local_disk_path(&path);
             let uri = format!(
                 "file:///{}",
                 path.to_string_lossy()
@@ -1702,6 +1705,10 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("/")
             );
+            let decoded = file_path_from_uri(&uri)
+                .unwrap()
+                .expect("local fixture URI");
+            assert_eq!(crate::util::local_disk_path(&decoded), path);
             let mut output = Vec::new();
             render_location_fields(
                 &uri,

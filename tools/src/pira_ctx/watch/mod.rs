@@ -93,8 +93,16 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         config.watch_sample_every_ms,
     )?;
     let cwd_native = crate::native_path::NativePath::from_path(&cwd);
+    let capture_path_native = capture_path
+        .as_deref()
+        .map(crate::native_path::NativePath::from_path)
+        .filter(|path| path.requires_native());
+    // Keep ordinary states byte-compatible; never serialize a lossy native alias.
+    let capture_path = capture_path.filter(|_| capture_path_native.is_none());
     let watch = WatchState {
-        schema: if cwd_native.requires_native() {
+        schema: if capture_path_native.is_some() {
+            4
+        } else if cwd_native.requires_native() {
             3
         } else {
             SCHEMA
@@ -113,6 +121,7 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
         source_cwd: cwd.display().to_string(),
         source_cwd_native: Some(cwd_native),
         capture_path,
+        capture_path_native,
         intent: config.intent.clone(),
         sample_every_ms: config.watch_sample_every_ms,
         attempt_timeout_ms: config.watch_attempt_timeout_ms,
@@ -918,7 +927,9 @@ fn age(value: Option<u128>) -> String {
 }
 
 fn validate(w: &WatchState, id: &str) -> Result<(), String> {
-    let expected_schema = if w
+    let expected_schema = if w.capture_path_native.is_some() {
+        4
+    } else if w
         .source_cwd_native
         .as_ref()
         .is_some_and(|path| path.requires_native())

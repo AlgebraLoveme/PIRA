@@ -909,6 +909,7 @@ mod tests {
         for path in [
             "//host/share/x",
             "//?/C:/x",
+            "/?/C:/x",
             "/C:/NUL.txt",
             "/C:/COM¹",
             "/C:/file:stream",

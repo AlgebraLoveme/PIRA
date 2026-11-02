@@ -80,6 +80,8 @@ pub struct WatchState {
     pub source_cwd_native: Option<crate::native_path::NativePath>,
     #[serde(default)]
     pub capture_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_path_native: Option<crate::native_path::NativePath>,
     pub intent: Option<String>,
     pub sample_every_ms: u64,
     pub attempt_timeout_ms: u64,

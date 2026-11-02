@@ -1113,6 +1113,10 @@ pub(crate) fn open_live_spool(path: &Path) -> Result<File, String> {
         let mut prefix = PathBuf::new();
         for component in path.components() {
             prefix.push(component);
+            // A drive/UNC prefix is syntax, not a filesystem path until rooted.
+            if matches!(component, std::path::Component::Prefix(_)) {
+                continue;
+            }
             let meta =
                 fs::symlink_metadata(&prefix).map_err(|e| format!("inspect live spool: {e}"))?;
             if meta.file_type().is_symlink() {
@@ -1155,8 +1159,9 @@ fn read_live_result(path: &Path) -> Result<StoredResult, String> {
         let mut prefix = PathBuf::new();
         let safe = directory.components().all(|component| {
             prefix.push(component);
-            fs::symlink_metadata(&prefix)
-                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            matches!(component, std::path::Component::Prefix(_))
+                || fs::symlink_metadata(&prefix)
+                    .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
         });
         let store_owned = safe && directory.canonicalize().ok().as_deref() == stream.parent();
         if !store_owned && stream.parent() != Some(std::env::temp_dir().as_path()) {
@@ -2668,6 +2673,10 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), String> {
             ));
         }
         prefix.push(component);
+        // Inspect the rooted drive/share, never a drive-relative or verbatim prefix.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match fs::symlink_metadata(&prefix) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(format!(
@@ -2871,6 +2880,29 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn live_spools_accept_rooted_and_verbatim_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "ctx-rooted-spool-{}-{}",
+            std::process::id(),
+            RESULT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join(".pira_ctx-spool-test");
+        fs::write(&path, b"private snapshot").unwrap();
+        for path in [&path, &path.canonicalize().unwrap()] {
+            ensure_private_dir(path.parent().unwrap()).unwrap();
+            let mut bytes = Vec::new();
+            open_live_spool(path)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, b"private snapshot");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn live_checkpoint_paths_preserve_ordinary_schemas_and_native_units() {

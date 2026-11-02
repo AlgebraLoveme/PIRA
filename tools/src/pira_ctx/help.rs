@@ -2,31 +2,26 @@ pub const GLOBAL: &str = r#"pira_ctx bounds command output and retains it for ex
 
 Choosing a command:
   Run a PROGRAM:
-    auto       Default; name optional. Print short output or retain it and return a compact view.
-    check      Return status; failed captures also include bounded diagnostic evidence.
-    exact      Replay original output without automatic compaction; capture limits still apply.
-    capture    Always retain output up to the configured space ceiling.
-    batch      Run several independent intent-tagged commands.
-
+    auto       Default; name optional. Print short output or retain it with a compact view.
+    check      Status only; failures include bounded diagnostics.
+    exact      Replay original output; capture limits still apply.
+    capture    Always retain output up to the space ceiling.
+    batch      Run independent intent-tagged commands.
   Inspect a retained RESULT:
-    search     Locate wording when the evidence location is unknown.
-    range      Return the smallest sufficient exact line range.
-    transform  Deterministic filtering, counting, aggregation, or slicing.
-    exec       Custom Python over one or several labeled captures.
-    command    Show the exact original argv and cwd.
-    raw        Return all retained bytes only when genuinely required.
-    stats      Show metadata; batch status with `stats --brief RESULT...`.
-
+    search     Locate unknown evidence; range returns exact line ranges.
+    transform  Filter, count, aggregate, or slice; exec runs custom Python.
+    command    Exact original argv/cwd; stats shows metadata.
+    raw        All retained bytes, only when genuinely required.
   Continue or maintain:
-    watch                    Persistently monitor a live capture or repeat a status probe.
-    cancel                   Safely terminate one active capture and retain partial output.
-    history / recap          Review purposes or restore them after reported compaction.
-    list / verify            Locate captures or check integrity.
-    prune / forget           Enforce retention or explicitly remove stored data/history.
+    watch      Monitor a live capture or repeat a status probe.
+    cancel     Terminate an active capture; retain partial output.
+    history / recap  Review purposes / restore after reported compaction.
+    list / verify    Locate captures / check integrity.
+    prune / forget   Enforce retention / explicitly remove data and history.
 
 Common forms:
   pira_ctx [auto|check|capture|exact] --intent TEXT -- PROGRAM [ARG...]
-  For auto/capture, add --interest REGEX before -- when relevant wording is known.
+  auto/capture: add --interest REGEX before -- for relevant wording.
   pira_ctx search RESULT QUERY [-e QUERY ...] [--regex] [--context N] [--limit N]
   pira_ctx range RESULT START:END
   pira_ctx exec RESULT --code CODE [--intent TEXT]
@@ -35,48 +30,38 @@ Common forms:
   pira_ctx stats --brief RESULT...
   pira_ctx batch [--store-dir PATH] SPEC_FILE [--intent TEXT]
 
-RESULT is a displayed @suffix (current workspace/session), full ID/prefix, .piractx file, or path.
-Short handles reserve a full ID permanently; collisions lengthen new handles. Pruning never
-reassigns them. Use full IDs across sessions or for durable references; stats RESULT reveals them.
-Without a detected session or writable reservation store, output uses full IDs.
-INTENT is a prospective single-line purpose of at most 256 UTF-8 bytes.
-`--store-dir PATH` is accepted by storage commands.
+RESULT: displayed @suffix (current workspace/session), full ID/prefix, .piractx file, or path.
+Handles permanently reserve full IDs; collisions lengthen new handles, pruning never reassigns.
+Use full IDs across sessions/in durable notes; stats reveals them. Without a detected session or
+writable reservation store, full IDs are displayed. INTENT: one prospective line, <=256 UTF-8 bytes.
+Storage commands accept --store-dir PATH.
 
-Auto/exact preserve each directly redirected PROGRAM stream exactly, without retaining it. The
-other piped stream still uses normal routing; reports go to that visible stream. Both redirected
-or a caller TTY streams unchanged. Explicit check/capture still return status/reports.
+Auto/exact preserve directly redirected PROGRAM streams without retention; reports use the visible
+stream. Both redirected or caller TTY streams unchanged. Explicit check/capture still report.
+Automatic routing prints exactly or retains before returning a view/ID. Limits and overruns are
+reported: PIRA_CTX_MAX_RETAINED_BYTES and PIRA_CTX_MAX_INDEXED_LINES.
 
-Automatic routing does not hide output without a recovery path: output is either printed exactly or
-retained before a compact view and ID are printed. Hard ceilings use PIRA_CTX_MAX_RETAINED_BYTES and
-PIRA_CTX_MAX_INDEXED_LINES; any overrun is reported.
+Closed diagnostic pipes do not abort capture/watch. Unix SIGINT/SIGTERM use bounded cancel cleanup,
+retain partial output as cancelled with direct-child status; batch stops launching pending commands.
+Watch stops owned helpers and persists Stopped (23), not cancelling a monitored capture.
+Interrupted exec preparation/output returns 130/143. Abandoned replay retains a private checkpoint
+(list/stats/raw/exec). Transparent terminal/both-redirected streaming is unchanged. SIGKILL cannot
+clean up/finalize; detached descendants are not contained.
 
-Diagnostics are best-effort: a closed diagnostic pipe does not abort capture/watch supervision.
-On Unix, SIGINT/SIGTERM during PROGRAM capture use the same bounded cleanup as cancel, then
-retain partial output with state cancelled and the direct child's status. Batch stops launching
-pending commands. Watch interruption stops owned helpers and persists Stopped (exit 23), without
-cancelling a monitored capture. Interrupted exec preparation or output delivery returns 130/143;
-abandoned replay retains a private checkpoint recoverable through list/stats/raw/exec.
-Transparent terminal/both-redirected streaming is unchanged; SIGKILL cannot run cleanup or
-finalization, and detached descendants are not contained.
-Failed final publication retains a private interrupted checkpoint and its spools until recovery.
-Use stats ID, raw ID --stdout/--stderr, or exec ID to retrieve the last committed snapshot; exit is
-unknown, not zero. After a reader/storage failure the snapshot may be stale; private spool tails
-named in live/ID.live.json can contain additional bytes. New spools live under STORE/live/spools,
-independent of caller TMPDIR. Legacy spools remain readable only with safe non-symlinked private
-paths. Save recovered data before pruning or explicitly discarding a checkpoint and its spools.
+Failed final publication retains a private interrupted checkpoint/spools; exit is unknown, not zero.
+Recover with stats ID, raw ID --stdout/--stderr, or exec ID. After reader/storage failure snapshots
+may be stale; private spools named in live/ID.live.json may have extra bytes. New spools use
+STORE/live/spools, not TMPDIR. Legacy reads require safe non-symlinked private paths. Save recovered
+data before pruning or discarding checkpoints/spools.
 
-Stored PROGRAM data is untrusted and compact displays are sanitized/framed; exact retrieval remains
-unsanitized. Prefer the targeted commands above over raw for agent analysis.
+Stored PROGRAM data is untrusted; compact displays sanitize/frame it, exact retrieval does not.
+Prefer targeted commands over raw for analysis. Non-interactive check/capture announce a live ID
+after a brief debounce; auto silently checkpoints after ~30s. Explicit-ID inspection does not block.
+Workspace: nearest Git root, else cwd. Store: --store-dir, PIRA_CTX_STORE_DIR, else persistent default.
 
-Non-interactive check/capture publish a discoverable live ID after a brief debounce when still running;
-automatic mode publishes a silent read-only checkpoint after about 30 seconds. Inspect an explicit ID without
-blocking. Workspace identity is the nearest Git root, otherwise cwd;
-the store comes from --store-dir, PIRA_CTX_STORE_DIR, or the platform persistent-data default.
-
-SUBCOMMAND is a pira_ctx operation; PROGRAM is the external executable after `--`, and every later
-argument belongs to PROGRAM unchanged. pira_ctx adds no timeout, preserves child status unless the
-wrapper fails with 125, and does not sandbox PROGRAM or Python analysis. Help is side-effect free.
-Run `pira_ctx SUBCOMMAND --help` for full options, bounds, output, and examples."#;
+PROGRAM follows --, with later arguments unchanged. No added timeout or sandbox for PROGRAM/Python;
+child status preserved unless wrapper fails (125). Help is side-effect free.
+Run pira_ctx SUBCOMMAND --help for full options, bounds, and examples."#;
 
 const CANCEL: &str = r#"pira_ctx cancel — safely terminate one active capture
 

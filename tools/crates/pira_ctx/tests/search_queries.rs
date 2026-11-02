@@ -1196,6 +1196,7 @@ env = dict(os.environ, TMPDIR=str(root))
 regular = root / '.pira_ctx-spool-regular'
 fifo = root / '.pira_ctx-spool-fifo'
 regular.write_bytes(b'hello')
+regular.chmod(0o600)
 os.mkfifo(fifo)
 manifest = root / 'fixture.live.json'
 for out, err, size, expected in [(regular, regular, 0, b''), (regular, regular, 5, b'hello'),
@@ -1267,7 +1268,7 @@ fn batch_event_warnings_escape_controls_for_failed_and_completed_children() {
         );
         let text = String::from_utf8(output.stderr).unwrap();
         assert!(
-            text.contains("batch child completed but event recording failed"),
+            text.contains("warning: batch event recording failed:"),
             "{text}"
         );
         assert!(
