@@ -102,7 +102,17 @@ pub fn save_json(path: &Path, value: &Value) -> Result<(), String> {
     result
 }
 
-fn owner(run: &Path) -> Result<File, String> {
+pub(super) struct Owner {
+    run: PathBuf,
+    _lock: File,
+}
+impl Owner {
+    pub(super) fn owns(&self, run: &Path) -> bool {
+        self.run == run
+    }
+}
+
+pub(super) fn owner(run: &Path) -> Result<Owner, String> {
     private_path(run, true)?;
     private_path(run.parent().ok_or("missing store")?, true)?;
     #[cfg(unix)]
@@ -130,7 +140,10 @@ fn owner(run: &Path) -> Result<File, String> {
         .map_err(|e| e.to_string())?;
     file.try_lock()
         .map_err(|_| "run already has an active owner")?;
-    Ok(file)
+    Ok(Owner {
+        run: run.to_owned(),
+        _lock: file,
+    })
 }
 
 const FIX_TASK: &str = include_str!("fix_task.md");
@@ -164,8 +177,7 @@ pub(super) fn launch_at(mut options: Options, run: PathBuf) -> Result<(), String
         );
     }
     manifest["allow_subteam"] = json!(options.allow_subteam);
-    crate::subteam::admit(&run, &mut manifest, false)?;
-    revision(&mut options, &run, &mut manifest)
+    admitted_revision(&mut options, &run, &mut manifest, &_owner)
 }
 
 pub fn existing(args: &[String]) -> Result<(), String> {
@@ -425,8 +437,23 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .ok_or("invalid or exhausted revision number")?
         + 1;
     manifest["revision"] = json!(next);
-    crate::subteam::admit(&run, &mut manifest, true)?;
-    revision(&mut options, &run, &mut manifest)
+    admitted_revision(&mut options, &run, &mut manifest, &_owner)
+}
+
+fn admitted_revision(
+    options: &mut Options,
+    run: &Path,
+    manifest: &mut Value,
+    owner: &Owner,
+) -> Result<(), String> {
+    let resume = manifest["revision"] != 1;
+    let mut admission = crate::subteam::admit(run, manifest, resume, owner)?;
+    revision(options, run, manifest, &mut admission).map_err(|error| {
+        match admission.undo_unpublished() {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; admission retained: {cleanup}"),
+        }
+    })
 }
 
 fn usage_update(manifest: &mut Value, usage: Option<Value>, baseline: &Value) {
@@ -483,7 +510,12 @@ fn begin_revision(
     Ok(())
 }
 
-fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(), String> {
+fn revision(
+    options: &mut Options,
+    run: &Path,
+    manifest: &mut Value,
+    admission: &mut crate::subteam::Admission<'_>,
+) -> Result<(), String> {
     let _watcher = crate::subteam::Watcher::start(run, manifest)?;
     let number = manifest["revision"].as_u64().ok_or("missing revision")?;
     let revisions = run.join("revisions");
@@ -520,6 +552,7 @@ fn revision(options: &mut Options, run: &Path, manifest: &mut Value) -> Result<(
     begin_revision(&snapshot, || {
         save_json(&run.join("manifest.json"), manifest)
     })?;
+    admission.published();
     crate::notice(format_args!(
         "pira_team run_id: {}",
         manifest["run_id"].as_str().unwrap()
@@ -931,6 +964,7 @@ fn generate_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("admission_tests.rs");
 
     #[test]
     fn policy_bundle_composes_each_selection_without_changing_default_scope() {
@@ -1046,6 +1080,20 @@ mod tests {
             );
             assert_eq!(bundle.matches(crate::WRITING_POLICY).count(), 1);
         }
+    }
+
+    #[test]
+    fn previous_common_policy_refreshes_native_navigation_once() {
+        let options = crate::tests::options(&["task"]).unwrap();
+        let mut manifest = json!({"worker_policy_version":20});
+        let (bundle, selected) = policy_bundle(&options, &manifest, false);
+        let guidance = "Structural inventories are native by default";
+        let addition = policy_additions(&options, &manifest, &bundle, selected, true);
+        assert_eq!(addition, bundle);
+        assert_eq!(addition.matches(guidance).count(), 1);
+        assert!(!addition.contains("Let structural backends auto-select"));
+        manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+        assert!(policy_additions(&options, &manifest, &bundle, selected, true).is_empty());
     }
 
     #[test]

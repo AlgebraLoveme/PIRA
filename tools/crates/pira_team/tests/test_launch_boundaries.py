@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import select
 import shutil
-import signal
 import socket
 import subprocess
 import time
@@ -260,17 +259,25 @@ class LaunchBoundaryTests(unittest.TestCase):
 
     def test_detached_inherited_pipe_does_not_block_finalization_or_get_killed(self):
         rd, _, fds = self.gate("unused")
-        self.env["TEAM_DETACHED_PIPE"] = "1"
-        proc = self.start(pass_fds=fds)
-        run = self.ready(proc, rd)
-        pid = int((run / "codex-home/detached-fixture.pid").read_text())
-        try:
-            self.fixture.wait_stderr_notice(proc, "pira_team active:")
-            self.assertEqual(self.control(run, "interrupt").returncode, 0)
-            self.interrupted(proc, run)
-            os.kill(pid, 0)  # Excluded descendant survives; only owned transport was stopped.
-        finally:
-            os.kill(pid, signal.SIGKILL)  # Only this fixture's captured synthetic PID.
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(5)
+            self.env.update(TEAM_DETACHED_PIPE="1",
+                            TEAM_DETACHED_ENDPOINT=json.dumps(listener.getsockname()))
+            proc = self.start(pass_fds=fds)
+            control, _ = listener.accept()
+            with control:  # EOF releases the holder on every assertion/error path.
+                control.settimeout(3)
+                self.assertEqual(control.recv(1), b"R")
+                run = self.ready(proc, rd)
+                self.fixture.wait_stderr_notice(proc, "pira_team active:")
+                self.assertEqual(self.control(run, "interrupt").returncode, 0)
+                self.interrupted(proc, run)
+                control.sendall(b"P")
+                self.assertEqual(control.recv(1), b"P", "detached holder was terminated")
+                control.shutdown(socket.SHUT_WR)
+                self.assertEqual(control.recv(1), b"", "holder did not exit on control EOF")
 
     @unittest.skipUnless(os.environ.get("TEAM_TEST_SLOW_PREFLIGHT") == "1", "opt-in healthy >10s boundary")
     def test_healthy_preflight_can_finish_after_ten_seconds(self):

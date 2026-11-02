@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::Config;
 use crate::model::StreamKind;
+use crate::shutdown;
 use crate::storage::StoredResult;
 
 #[cfg(unix)]
@@ -86,6 +87,7 @@ pub fn prepare(
     config: &Config,
     sources: &[(String, StoredResult)],
 ) -> Result<PreparedExec, String> {
+    shutdown::check()?;
     if sources.is_empty() {
         return Err("exec requires at least one resolved capture".into());
     }
@@ -120,6 +122,7 @@ pub fn prepare(
     let code_path = workspace.path.join("analysis.py");
     let mut manifest = Vec::with_capacity(sources.len());
     for (index, (name, source)) in sources.iter().enumerate() {
+        shutdown::check()?;
         let merged_path = workspace.path.join(format!("input-{index:02}-merged.log"));
         let stdout_path = workspace.path.join(format!("input-{index:02}-stdout.log"));
         let stderr_path = workspace.path.join(format!("input-{index:02}-stderr.log"));
@@ -130,7 +133,7 @@ pub fn prepare(
             "stdout_path": exec_path(&stdout_path)?,
             "stderr_path": exec_path(&stderr_path)?,
             "id": source.metadata.result_id,
-            "exit": if source.is_running() { serde_json::Value::Null } else { serde_json::json!(source.metadata.exit_code) },
+            "exit": if source.has_snapshot() { serde_json::Value::Null } else { serde_json::json!(source.metadata.exit_code) },
             "state": source.state(),
             "generation": source.live_generation().unwrap_or_default(),
         }));
@@ -156,6 +159,7 @@ pub fn prepare(
         ));
     }
     write_private(&code_path, &code)?;
+    shutdown::check()?;
 
     command.extend([
         "-c".to_string(),
@@ -180,6 +184,17 @@ fn exec_path(path: &Path) -> Result<serde_json::Value, String> {
 }
 
 fn read_stdin_limited() -> Result<Vec<u8>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("ctx-stdin".into())
+        .spawn(move || {
+            let _ = sender.send(read_stdin());
+        })
+        .map_err(|e| format!("start analysis stdin reader: {e}"))?;
+    shutdown::wait(receiver)?
+}
+
+fn read_stdin() -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     io::stdin()
         .lock()
@@ -209,15 +224,24 @@ fn materialize(
     let mut reader = source.reader()?;
     let mut merged = create_private(merged_path)?;
     for line in &source.metadata.line_timeline {
+        shutdown::check()?;
         reader.copy_line(line, &mut merged)?;
     }
     Ok(())
 }
 
 fn resolve_python(config: &Config) -> Result<Vec<String>, String> {
+    shutdown::check()?;
     if let Some(program) = config.python.as_deref() {
         let candidate = vec![program.to_string()];
-        probe_python(&candidate).map_err(|error| format!("invalid --python PATH: {error}"))?;
+        probe_python(&candidate).map_err(|error| {
+            if error == shutdown::INTERRUPTED {
+                error
+            } else {
+                format!("invalid --python PATH: {error}")
+            }
+        })?;
+        shutdown::check()?;
         return Ok(candidate);
     }
     if let Some(program) = std::env::var_os("PIRA_CTX_PYTHON") {
@@ -226,7 +250,14 @@ fn resolve_python(config: &Config) -> Result<Vec<String>, String> {
                 .to_string()
         })?;
         let candidate = vec![program];
-        probe_python(&candidate).map_err(|error| format!("invalid PIRA_CTX_PYTHON: {error}"))?;
+        probe_python(&candidate).map_err(|error| {
+            if error == shutdown::INTERRUPTED {
+                error
+            } else {
+                format!("invalid PIRA_CTX_PYTHON: {error}")
+            }
+        })?;
+        shutdown::check()?;
         return Ok(candidate);
     }
 
@@ -235,15 +266,26 @@ fn resolve_python(config: &Config) -> Result<Vec<String>, String> {
     candidates.push(vec!["py".to_string(), "-3".to_string()]);
     candidates.push(vec!["python".to_string()]);
     for candidate in candidates {
-        if probe_python(&candidate).is_ok() {
-            return Ok(candidate);
+        shutdown::check()?;
+        match probe_python(&candidate) {
+            Ok(()) => {
+                shutdown::check()?;
+                return Ok(candidate);
+            }
+            // Do not turn an interrupted helper's cleanup failure into a retry
+            // or a successful interruption result.
+            Err(error) if shutdown::requested() => return Err(error),
+            Err(_) => {}
         }
     }
+    shutdown::check()?;
     Err("Python 3 was not found; install it, pass --python PATH, or set PIRA_CTX_PYTHON".into())
 }
 
 fn probe_python(candidate: &[String]) -> Result<(), String> {
-    let status = Command::new(&candidate[0])
+    shutdown::check()?;
+    let mut command = Command::new(&candidate[0]);
+    command
         .args(&candidate[1..])
         .args([
             "-c",
@@ -251,9 +293,21 @@ fn probe_python(candidate: &[String]) -> Result<(), String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("cannot run {}: {error}", candidate[0]))?;
+        .stderr(Stdio::null());
+    let mut tree = crate::watch::process::ProcessTree::spawn(&mut command, "Python preflight")?;
+    let status = loop {
+        if shutdown::requested() {
+            tree.terminate_and_wait()?;
+            return Err(shutdown::INTERRUPTED.into());
+        }
+        if let Some(status) = tree
+            .try_wait()
+            .map_err(|e| format!("wait Python preflight: {e}"))?
+        {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
     if status.success() {
         Ok(())
     } else {

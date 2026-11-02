@@ -6,6 +6,7 @@ mod model;
 mod native_path;
 mod python_exec;
 mod security;
+mod shutdown;
 mod storage;
 mod store_location;
 mod summarize;
@@ -14,7 +15,7 @@ mod util;
 mod watch;
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::process::Command;
 use std::time::{Instant, SystemTime};
 
@@ -34,6 +35,7 @@ const MAX_JSON_SYNOPSIS_LINES: usize = 16;
 pub fn run() -> i32 {
     match real_main() {
         Ok(code) => code,
+        Err(error) if error == shutdown::INTERRUPTED => shutdown::exit_code(),
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
             util::diagnostic_line(&format!("pira_ctx: {error}"));
@@ -61,6 +63,25 @@ fn real_main() -> Result<i32, String> {
     {
         return run_streaming_exact(&config);
     }
+    // Transparent terminal streaming has no capture containment or retained data.
+    // Keep its inherited signal behavior; capture/watch routes supervise shutdown.
+    let terminal_streaming = matches!(config.mode, Mode::Auto | Mode::Exact)
+        && (io::stdout().is_terminal() || io::stderr().is_terminal());
+    let _shutdown = if !terminal_streaming
+        && matches!(
+            config.mode,
+            Mode::Auto
+                | Mode::Exact
+                | Mode::Check
+                | Mode::Capture
+                | Mode::Batch
+                | Mode::Exec
+                | Mode::Watch
+        ) {
+        Some(shutdown::install()?)
+    } else {
+        None
+    };
     match config.mode {
         Mode::Help => {
             let text = config
@@ -126,6 +147,7 @@ fn run_python_exec(config: &Config) -> Result<i32, String> {
                 None,
             );
             replay_capture(&capture)?;
+            capture.retire_checkpoint.set(true);
             return Ok(capture.exit_code);
         }
     }
@@ -180,6 +202,9 @@ fn run_exact(config: &Config) -> Result<i32, String> {
             Some(&stored.metadata),
         );
         let mut notice = util::BoundedStdout::report(1024, capture.redirected_stream);
+        if shutdown::requested() {
+            return completed_capture_exit(&capture);
+        }
         if capture.cancelled {
             notice.line("Cancelled command: partial captured output retained.")?;
         } else if capture.drain_truncated {
@@ -200,6 +225,7 @@ fn run_exact(config: &Config) -> Result<i32, String> {
     } else {
         record_event(config, capture.exit_code, capture.duration_ms, None);
         replay_capture(&capture)?;
+        capture.retire_checkpoint.set(true);
     }
     Ok(capture.exit_code)
 }
@@ -327,6 +353,7 @@ fn run_auto(config: &Config) -> Result<i32, String> {
     if !normally_captured && replay_risk == security::ContentRisk::default() {
         record_event(config, capture.exit_code, capture.duration_ms, None);
         replay_capture(&capture)?;
+        capture.retire_checkpoint.set(true);
         return Ok(capture.exit_code);
     }
     score_capture(config, &mut capture, &ranking)?;
@@ -392,6 +419,9 @@ fn run_check(config: &Config) -> Result<i32, String> {
         Some(&stored.metadata),
     );
     let display_id = storage::display_result_id(&store_dir, &stored.metadata.result_id);
+    if shutdown::requested() {
+        return completed_capture_exit(&capture);
+    }
     util::stdout_line(&format!(
         "{} | exit={} | duration={}ms | result={}{}",
         if capture.cancelled {
@@ -417,7 +447,8 @@ fn check_label(exit_code: i32) -> &'static str {
 }
 
 fn should_retain_output(capture: &CaptureResult) -> Result<bool, String> {
-    if capture.live_id.is_some()
+    if capture.cancelled
+        || capture.live_id.is_some()
         || capture.timeline_truncated
         || capture.retention_truncated
         || capture.stdout.binary
@@ -473,15 +504,20 @@ fn run_cancel(config: &Config) -> Result<i32, String> {
 }
 
 fn replay_capture(capture: &CaptureResult) -> Result<(), String> {
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
+    shutdown::check()?;
+    let mut output = io::BufWriter::with_capacity(64 * 1024, shutdown::Output(false));
     let mut readers = capture.readers()?;
     for line in &capture.timeline {
-        match line.stream {
-            StreamKind::Stdout => readers.copy_line(line, &mut stdout)?,
-            StreamKind::Stderr => readers.copy_line(line, &mut stderr)?,
+        shutdown::check()?;
+        let stderr = line.stream == StreamKind::Stderr;
+        if output.get_ref().0 != stderr {
+            output.flush().map_err(util::io_error)?;
+            output.get_mut().0 = stderr;
         }
+        readers.copy_line(line, &mut output)?;
     }
+    output.flush().map_err(util::io_error)?;
+    shutdown::check()?;
     Ok(())
 }
 
@@ -499,11 +535,21 @@ fn store_and_summarize(
         Some(&stored.metadata),
     );
     let mut display = stored.metadata.clone();
+    if shutdown::requested() {
+        return completed_capture_exit(capture);
+    }
     display.result_id = storage::display_result_id(&store_dir, &display.result_id);
     if compact {
         print_compact_summary(&display, capture)?;
     } else {
         print_summary(&display, capture)?;
+    }
+    Ok(capture.exit_code)
+}
+
+fn completed_capture_exit(capture: &CaptureResult) -> Result<i32, String> {
+    if !capture.cancelled {
+        shutdown::check()?;
     }
     Ok(capture.exit_code)
 }
@@ -1266,7 +1312,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
                 let store = storage::read_result_path(&path)?;
                 let metadata = &store.metadata;
                 let state = store.state();
-                let exit = if store.is_running() {
+                let exit = if store.has_snapshot() {
                     "unknown".to_string()
                 } else {
                     metadata.exit_code.to_string()
@@ -1315,8 +1361,8 @@ fn run_stats(config: &Config) -> Result<i32, String> {
             "Scope: {stream} was redirected, not retained; sizes cover captured output only"
         ))?;
     }
-    if store.is_running() {
-        util::stdout_line("State: running (checkpoint snapshot)")?;
+    if store.has_snapshot() {
+        util::stdout_line(&format!("State: {} (checkpoint snapshot)", store.state()))?;
         util::stdout_line(&format!(
             "Generation: {}",
             store.live_generation().unwrap_or_default()
@@ -1332,7 +1378,7 @@ fn run_stats(config: &Config) -> Result<i32, String> {
         util::redacted_argv_display(&metadata.command_argv)
     ))?;
     util::stdout_line(&format!("Cwd: {}", metadata.cwd))?;
-    if store.is_running() {
+    if store.has_snapshot() {
         util::stdout_line("Exit: unknown")?;
     } else {
         util::stdout_line(&format!("Exit: {}", metadata.exit_code))?;
@@ -1449,7 +1495,7 @@ fn print_listed_entry(entry: &ListedEntry) -> Result<(), String> {
         entry.kind,
         entry.state,
         entry.timestamp,
-        if entry.running {
+        if entry.running || entry.state == "interrupted" {
             "-".to_string()
         } else {
             entry.exit.to_string()
@@ -1819,59 +1865,111 @@ fn run_batch(config: &Config) -> Result<i32, String> {
     let mut pending = validated.into_iter().enumerate();
     loop {
         let mut handles = Vec::new();
+        let mut failure = None;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::channel();
         for _ in 0..concurrency {
+            if shutdown::requested() {
+                break;
+            }
             let Some((index, (intent, argv))) = pending.next() else {
                 break;
             };
             let worker_dir = dir.clone();
-            handles.push(std::thread::spawn(move || {
-                let result = capture::capture_command(&argv, Some(&worker_dir), false, None);
-                (index, intent, argv, result)
-            }));
+            let sender = sender.clone();
+            let worker_cancel = cancel.clone();
+            match std::thread::Builder::new().spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    capture::capture_command_controlled(
+                        &argv,
+                        Some(&worker_dir),
+                        false,
+                        None,
+                        &worker_cancel,
+                    )
+                })
+                .unwrap_or_else(|_| Err("batch worker panicked".into()));
+                if result.is_err() {
+                    worker_cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let _ = sender.send((index, intent, argv, result));
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                    failure = Some(format!("start batch worker: {error}"));
+                    break;
+                }
+            }
         }
-        if handles.is_empty() {
+        drop(sender);
+        if handles.is_empty() && failure.is_none() {
             break;
         }
-        for handle in handles {
-            let (index, intent, argv, result) =
-                handle.join().map_err(|_| "batch worker panicked")?;
-            let mut capture = match result? {
-                Ok(capture) => capture,
-                Err(code) => {
-                    if let Err(error) = events::record(&dir, &intent, &argv, code, 0, None) {
-                        util::diagnostic_line(&format!(
-                            "pira_ctx: warning: batch child completed but event recording failed: {error}"
-                        ));
+        for (index, intent, argv, result) in receiver {
+            let processed = (|| -> Result<(), String> {
+                let mut capture = match result? {
+                    Ok(capture) => capture,
+                    Err(code) => {
+                        if let Err(error) = events::record(&dir, &intent, &argv, code, 0, None) {
+                            util::diagnostic_line(&format!(
+                                "pira_ctx: warning: batch event recording failed: {error}"
+                            ));
+                        }
+                        completed.push((index, code, 0, None, intent));
+                        return Ok(());
                     }
-                    completed.push((index, code, 0, None, intent));
-                    continue;
+                };
+                summarize::score_timeline(&mut capture, std::slice::from_ref(&intent), None)?;
+                let stored =
+                    storage::store_capture(&dir, &argv, std::slice::from_ref(&intent), &capture)?;
+                if let Err(error) = events::record(
+                    &dir,
+                    &intent,
+                    &argv,
+                    capture.exit_code,
+                    capture.duration_ms,
+                    Some(&stored.metadata),
+                ) {
+                    util::diagnostic_line(&format!(
+                        "pira_ctx: warning: batch event recording failed: {error}"
+                    ));
                 }
-            };
-            summarize::score_timeline(&mut capture, std::slice::from_ref(&intent), None)?;
-            let stored =
-                storage::store_capture(&dir, &argv, std::slice::from_ref(&intent), &capture)?;
-            if let Err(error) = events::record(
-                &dir,
-                &intent,
-                &argv,
-                capture.exit_code,
-                capture.duration_ms,
-                Some(&stored.metadata),
-            ) {
-                util::diagnostic_line(&format!(
-                    "pira_ctx: warning: batch child completed but event recording failed: {error}"
+                completed.push((
+                    index,
+                    capture.exit_code,
+                    capture.duration_ms,
+                    Some(storage::display_result_id(&dir, &stored.metadata.result_id)),
+                    intent,
                 ));
+                Ok(())
+            })();
+            if let Err(error) = processed {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                failure.get_or_insert(error);
             }
-            completed.push((
-                index,
-                capture.exit_code,
-                capture.duration_ms,
-                Some(storage::display_result_id(&dir, &stored.metadata.result_id)),
-                intent,
-            ));
+        }
+        // Join every started attempt even after capture, scoring or persistence fails.
+        for handle in handles {
+            if handle.join().is_err() {
+                failure.get_or_insert("batch worker panicked".into());
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if shutdown::requested() {
+            break;
         }
     }
     completed.sort_by_key(|r| r.0);
+    if shutdown::requested() {
+        return Ok(completed
+            .iter()
+            .rev()
+            .find(|r| r.1 != 0)
+            .map_or(shutdown::exit_code(), |r| r.1));
+    }
     util::stdout_line("index | exit | duration_ms | result | intent")?;
     let mut overall = 0;
     for (index, exit, duration, capture_id, intent) in completed {

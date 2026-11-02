@@ -70,6 +70,16 @@ pub struct LiveState {
 
 impl StoredResult {
     pub fn is_running(&self) -> bool {
+        self.live.as_ref().is_some_and(|_| {
+            self.path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|store| live_result_is_active(store, self))
+        })
+    }
+
+    /// Whether retained data is a checkpoint rather than a finalized capture.
+    pub fn has_snapshot(&self) -> bool {
         self.live.is_some()
     }
 
@@ -77,6 +87,8 @@ impl StoredResult {
     pub fn state(&self) -> &'static str {
         if self.is_running() {
             "running"
+        } else if self.has_snapshot() {
+            "interrupted"
         } else if self.metadata.cancelled {
             "cancelled"
         } else {
@@ -94,7 +106,7 @@ impl StoredResult {
 
     pub fn reader(&self) -> Result<StreamReaders, String> {
         if let Some(live) = &self.live {
-            return StreamReaders::from_paths(
+            return StreamReaders::from_live_paths(
                 &live.stdout_path,
                 0,
                 self.metadata.stdout_bytes,
@@ -189,7 +201,7 @@ impl StoredResult {
     ) -> Result<(Self, StreamGrowth), String> {
         match self.read_stream_growth(stdout_from, stderr_from, maximum_each) {
             Ok(growth) => Ok((self, growth)),
-            Err(error) if self.is_running() => {
+            Err(error) if self.has_snapshot() => {
                 // Publication retires the manifest and spools. Retry only this capture,
                 // from the unchanged cursors, never an unrelated/latest result.
                 let finalized = final_result_for_live_path(&self.path)?.ok_or(error)?;
@@ -205,8 +217,10 @@ impl StoredResult {
     }
 
     pub fn verify(&self) -> Result<(), String> {
-        if self.is_running() {
-            return Err("cannot verify a running capture; retry after PROGRAM exits".into());
+        if self.has_snapshot() {
+            return Err(
+                "cannot verify a checkpoint snapshot; a finalized capture is required".into(),
+            );
         }
         if self.stdout_blocks.is_some() {
             let mut readers = self.reader()?;
@@ -704,15 +718,16 @@ pub fn store_capture(
             .to_le_bytes(),
     );
     let base_id = format!("{}-{}", timestamp, short_hash(&seed, 12));
-    let (result_id, filename, path) = if let Some(id) = &capture.live_id {
-        (
-            id.clone(),
-            format!("{id}.piractx"),
-            store_dir.join(format!("{id}.piractx")),
-        )
-    } else {
-        available_result_path(store_dir, &base_id)
-    };
+    let (result_id, filename, path) =
+        if let Some(id) = capture.live_id.as_ref().or(capture.recovery_id.as_ref()) {
+            (
+                id.clone(),
+                format!("{id}.piractx"),
+                store_dir.join(format!("{id}.piractx")),
+            )
+        } else {
+            available_result_path(store_dir, &base_id)
+        };
     let detected_paths = summarize::detected_paths(capture)?;
     let suggested_keywords = summarize::suggested_keywords(capture, command, keywords)?;
     let metadata = Metadata {
@@ -778,10 +793,12 @@ pub fn store_capture(
             "pira_ctx: warning: stored result but could not update index: {error}"
         ));
     }
-    if capture.live_id.is_some() {
+    let stored = read_result_path(&path)?;
+    capture.retire_checkpoint.set(true);
+    if capture.live_id.is_some() || capture.recovery_id.is_some() {
         remove_live_checkpoint(store_dir, &result_id);
     }
-    read_result_path(&path)
+    Ok(stored)
 }
 
 fn available_result_path(store_dir: &Path, base_id: &str) -> (String, String, PathBuf) {
@@ -1035,24 +1052,123 @@ fn read_exact_final(store: &Path, id: &str) -> Result<Option<StoredResult>, Stri
     Ok(Some(stored))
 }
 
+// Legacy manifests may point outside the store. Validate the writer's private
+// file without trusting the reader's TMPDIR or following aliases.
+pub(crate) fn open_live_spool(path: &Path) -> Result<File, String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("live spool must have an absolute non-traversing path".into());
+    }
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".pira_ctx-spool-"));
+    if !valid_name {
+        return Err("invalid live checkpoint stream path".into());
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        // Pin each directory before opening its child: no ancestor or final
+        // symlink can be swapped in between validation and open.
+        let mut file = File::open("/").map_err(|e| e.to_string())?;
+        let mut parts = path
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .peekable();
+        while let Some(part) = parts.next() {
+            let name =
+                std::ffi::CString::new(part.as_bytes()).map_err(|_| "NUL in live spool path")?;
+            let flags = libc::O_RDONLY
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | libc::O_CLOEXEC
+                | if parts.peek().is_some() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            // SAFETY: parent descriptor and NUL-terminated component remain live;
+            // a successful descriptor is transferred exactly once to File.
+            let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(format!(
+                    "open non-symlinked private live spool: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            file = unsafe { File::from_raw_fd(fd) };
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            prefix.push(component);
+            let meta =
+                fs::symlink_metadata(&prefix).map_err(|e| format!("inspect live spool: {e}"))?;
+            if meta.file_type().is_symlink() {
+                return Err("refusing symlinked live spool path; recover from its original private location".into());
+            }
+        }
+        util::open_regular_file(path, "private live spool")?
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("live spool is not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 || meta.nlink() != 1
+        {
+            return Err(
+                "live spool must be privately owned, mode 0600, and not hard-linked".into(),
+            );
+        }
+    }
+    Ok(file)
+}
+
 fn read_live_result(path: &Path) -> Result<StoredResult, String> {
     let bytes = crate::util::read_file_limited(path, MAX_METADATA_BYTES, "live checkpoint")?;
     let manifest: LiveManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid live checkpoint: {error}"))?;
     let (stdout_path, stderr_path) = manifest.stream_paths()?;
-    for stream_path in [&stdout_path, &stderr_path] {
-        let valid_name = stream_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| value.starts_with(".pira_ctx-spool-"));
-        if !valid_name || stream_path.parent() != Some(std::env::temp_dir().as_path()) {
-            return Err("invalid live checkpoint stream path".into());
+    #[cfg(not(unix))]
+    for stream in [&stdout_path, &stderr_path] {
+        // Without Unix owner/mode checks, do not broaden legacy access beyond
+        // the original temporary root. New captures use the checked store root.
+        let directory = path
+            .parent()
+            .ok_or("live checkpoint has no directory")?
+            .join("spools");
+        let mut prefix = PathBuf::new();
+        let safe = directory.components().all(|component| {
+            prefix.push(component);
+            fs::symlink_metadata(&prefix)
+                .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        });
+        let store_owned = safe && directory.canonicalize().ok().as_deref() == stream.parent();
+        if !store_owned && stream.parent() != Some(std::env::temp_dir().as_path()) {
+            return Err("legacy live spool requires its original private temporary root on this platform; new captures use STORE/live/spools".into());
         }
     }
-    let stdout_length = fs::metadata(&stdout_path)
+    let stdout_length = open_live_spool(&stdout_path)?
+        .metadata()
         .map_err(|error| format!("open live stdout: {error}"))?
         .len();
-    let stderr_length = fs::metadata(&stderr_path)
+    let stderr_length = open_live_spool(&stderr_path)?
+        .metadata()
         .map_err(|error| format!("open live stderr: {error}"))?
         .len();
     if manifest.metadata.stdout_bytes > stdout_length
@@ -1889,9 +2005,8 @@ fn scan_live_headers(store_dir: &Path, workspace_filter: Option<&str>) -> Vec<Li
                 return None;
             }
             let mut entry = ListedEntry::from_metadata(&stored.metadata, path);
-            let active = live_result_is_active(store_dir, &stored);
-            entry.running = active;
-            entry.state = if active { "running" } else { "interrupted" }.into();
+            entry.state = stored.state().into();
+            entry.running = entry.state == "running";
             entry.exit = 0;
             Some(entry)
         })
@@ -2124,7 +2239,13 @@ fn short_id_dir(store_dir: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_short_binding(path: &Path) -> Result<String, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            "short result ID not found in this workspace/session; retry from the original workspace/session or use the full ID".into()
+        } else {
+            error.to_string()
+        }
+    })?;
     if !metadata.is_file() || metadata.len() > 128 {
         return Err("invalid short result ID reservation".into());
     }
@@ -2196,7 +2317,7 @@ pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String>
             directory.clone(),
         ] {
             let meta = fs::symlink_metadata(&directory).map_err(|_| {
-                "short result ID not found in this workspace/session; use the full ID".to_string()
+                "short result ID not found in this workspace/session; retry from the original workspace/session or use the full ID".to_string()
             })?;
             if !meta.is_dir() || meta.file_type().is_symlink() {
                 return Err("invalid short result ID directory".into());
@@ -2242,7 +2363,7 @@ pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String>
                 continue;
             }
             let stored = read_result_path(&entry.path)?;
-            if stored.is_running() || stored.metadata.scope_hash != scope.hash {
+            if stored.has_snapshot() || stored.metadata.scope_hash != scope.hash {
                 continue;
             }
             remaining -= 1;
@@ -2305,9 +2426,32 @@ pub fn resolve_result(store_dir: &Path, target: &str) -> Result<PathBuf, String>
         .collect();
     match matches.as_slice() {
         // A final capture can be published between the completed and live scans.
-        [] => read_exact_final(store_dir, target)?
-            .map(|stored| stored.path)
-            .ok_or_else(|| format!("no result matches {target}")),
+        [] => {
+            if let Some(stored) = read_exact_final(store_dir, target)? {
+                return Ok(stored.path);
+            }
+            if !target.is_empty()
+                && target
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                let live_path = live_manifest_path(store_dir, target);
+                if live_path
+                    .try_exists()
+                    .map_err(|e| format!("inspect live checkpoint: {e}"))?
+                {
+                    // Exact announced IDs must expose validation failures rather than
+                    // silently disappearing from the inventory's best-effort scan.
+                    let stored = read_result_path(&live_path)?;
+                    if stored.metadata.result_id == target
+                        && stored.metadata.workspace_hash == workspace
+                    {
+                        return Ok(live_path);
+                    }
+                }
+            }
+            Err(format!("no result matches {target}"))
+        }
         [entry] => Ok(entry.path.clone()),
         _ => Err(format!("ambiguous result id/name {target}")),
     }

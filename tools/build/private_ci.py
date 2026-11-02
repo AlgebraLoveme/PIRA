@@ -288,6 +288,8 @@ def selected(root: Path) -> list[Path]:
         "assets/scripts/retire_pira_audio.py", "assets/scripts/test_retire_pira_audio.py",
         "assets/scripts/setup_pira_tools.py", "assets/scripts/test_setup_pira_tools.py",
         "assets/scripts/setup_pira_stores.py", "assets/scripts/test_setup_pira_stores.py",
+        "assets/scripts/setup_pira_communication.py", "assets/scripts/test_setup_pira_communication.py",
+        "assets/COMMUNICATION_AGENTS_TEMPLATE.md", "assets/COMMUNICATION_WORKBOOK_TEMPLATE.md",
         "assets/scripts/setup_migration_choices.py", "assets/scripts/test_setup_migration_choices.py",
         "assets/scripts/migrate_pira_stores.py", "assets/scripts/test_migrate_pira_stores.py",
         "assets/LEGACY_LIST.md", "tools/select_tool_for_platform.py"))
@@ -295,6 +297,8 @@ def selected(root: Path) -> list[Path]:
         "tools/src/pira_write_check/help.md",
         "tools/src/pira_write_check/lexicon.json",
         "tools/crates/pira_write_check/tests/evaluation.json",
+        "tools/dev/pira_write_check/benchmark.py",
+        "tools/dev/pira_write_check/test_benchmark.py",
     ))
     # Optional retained development oracle; Rust lexical fixtures are self-contained.
     for name in ("tools/dev/pira_write_check/check.py", "tools/dev/pira_write_check/lexicon.json"):

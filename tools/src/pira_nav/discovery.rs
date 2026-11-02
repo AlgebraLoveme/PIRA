@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
-
 use crate::language::Language;
 use crate::util::{absolute_lexical, reject_symlink_components};
 
@@ -116,43 +114,20 @@ pub fn discover_filtered_files(
     let filters = filters
         .build()
         .map_err(|e| format!("invalid map globs: {e}"))?;
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .require_git(false)
-        .follow_links(false);
-    builder.max_depth(max_depth);
+    let walked = crate::safe_walk::files(root, max_depth);
     let mut files = Vec::new();
     let mut discovered = 0;
     let mut unsupported = 0;
     let mut ambiguous = 0;
     let mut all_files = Vec::new();
-    let mut walk_errors = Vec::new();
-    let mut walk_errors_total = 0usize;
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                walk_errors_total += 1;
-                if walk_errors.len() < 20 {
-                    walk_errors.push(error.to_string());
-                }
-                continue;
-            }
-        };
-        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
-        }
-        // Filtering after the normal walker cannot re-include ignored files.
-        if filters.matched(entry.path(), false).is_ignore() {
+    let walk_errors = walked.errors;
+    let walk_errors_total = walked.errors_total;
+    for path in walked.paths {
+        if filters.matched(&path, false).is_ignore() {
             continue;
         }
         discovered += 1;
-        let path = absolute_lexical(entry.path(), root);
+        let path = absolute_lexical(&path, root);
         all_files.push(path.clone());
         match classify(&path, selection) {
             DiscoveredLanguage::Eligible(language) => files.push((path, language)),
@@ -191,31 +166,21 @@ where
             }
             continue;
         }
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .hidden(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .parents(true)
-            .require_git(false)
-            .follow_links(false);
-        for entry in builder.build() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    walk_errors_total += 1;
-                    if walk_errors.len() < 20 {
-                        walk_errors.push(error.to_string());
-                    }
-                    continue;
-                }
-            };
-            if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                paths.insert(absolute_lexical(entry.path(), root));
+        let walked = crate::safe_walk::files(root, None);
+        walk_errors_total += walked.errors_total;
+        for error in walked.errors {
+            if walk_errors.len() < 20 {
+                walk_errors.push(error);
             }
         }
+        paths.extend(
+            walked
+                .paths
+                .into_iter()
+                .map(|path| absolute_lexical(&path, root)),
+        );
     }
+
     let mut files = Vec::new();
     let mut discovered = 0;
     let mut unsupported = 0;

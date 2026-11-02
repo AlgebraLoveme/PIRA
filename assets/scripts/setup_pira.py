@@ -29,23 +29,6 @@ import retire_pira_audio as audio_retirement
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
-USER_PLACEHOLDER_TEXT = """# USER
-
-## Knowledge Domains
-- fill manually
-
-## Technical Ability
-- fill manually
-
-## Strengths
-- fill manually
-
-## Learning Targets
-- fill manually
-
-## Working Preferences
-- fill manually
-"""
 PROJECT_AGENTS_GUARD = """# PIRA Repository Guard
 
 PIRA's global policy is already loaded from `AGENTS.md` through Codex `model_instructions_file`; do not load it again. If that policy is absent from the current context, read `AGENTS.md` before proceeding.
@@ -258,23 +241,6 @@ def ensure_agent_dir(state: SetupState, force_agent_link: bool) -> None:
     state.note_change(f"moved existing {display_path(agent_dir)} to {display_path(target)} and linked PIRA")
 
 
-def ensure_user_md(state: SetupState, user_mode: Literal["keep", "placeholder", "interactive"]) -> None:
-    user_path = state.agent_dir / "USER.md"
-    source_user_path = pira_source_root(state) / "USER.md"
-    if user_path.exists() or source_user_path.exists():
-        print(f"OK: USER.md exists ({display_path(source_user_path if source_user_path.exists() else user_path)})")
-        return
-    if user_mode == "keep":
-        state.warn("USER.md is missing; leaving it absent because --user-mode keep was selected")
-        return
-    if user_mode == "interactive" and not state.yes and sys.stdin.isatty():
-        print("USER.md is missing. PIRA works best with stable user preferences, but a placeholder is safe.")
-        if not prompt_yes_no("Create a private placeholder USER.md now?", default=True):
-            state.warn("USER.md placeholder was not created")
-            return
-    write_text(state, user_path, USER_PLACEHOLDER_TEXT, "private USER.md placeholder", backup=False)
-
-
 def parse_legacy_paths(source_root: Path, agent_dir: Path) -> list[Path]:
     legacy_file = source_root / "assets" / "LEGACY_LIST.md"
     if not legacy_file.exists():
@@ -285,7 +251,10 @@ def parse_legacy_paths(source_root: Path, agent_dir: Path) -> list[Path]:
         if not match:
             continue
         raw = match.group(1).replace("~/agent", str(agent_dir))
-        paths.append(expand_path(raw))
+        path = expand_path(raw)
+        # Private user profiles are never managed, even by a stale legacy list.
+        if path.name.casefold() != "user.md":
+            paths.append(path)
     return paths
 
 
@@ -595,7 +564,7 @@ def sh_quote(value: str) -> str:
 
 
 def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary: str | None = None,
-           *, user_mode: str = "placeholder", legacy_mode: str = "remove") -> None:
+           *, legacy_mode: str = "remove") -> None:
     def add(name: str, passed: bool, detail: str) -> None:
         state.verification.append((name, passed, detail))
         label = "PASS" if passed else "FAIL"
@@ -603,9 +572,6 @@ def verify(state: SetupState, config_path: Path, skip_codex: bool, codex_binary:
 
     agents = state.agent_dir / "AGENTS.md"
     add("AGENTS.md exists", agents.exists(), display_path(agents))
-    user = state.agent_dir / "USER.md"
-    if user_mode != "keep":
-        add("USER.md exists", user.exists(), display_path(user))
     token_ok = agents.exists() and VERIFY_TOKEN in agents.read_text(encoding="utf-8")
     add("verification token", token_ok, VERIFY_TOKEN)
     legacy_existing = [path for path in parse_legacy_paths(pira_source_root(state), state.agent_dir) if path.exists() or path.is_symlink()]
@@ -649,7 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--execution-mode", choices=["ask", "safe", "soft-safe", "keep"], default="ask")
     parser.add_argument("--replace-permissions", action="store_true", help="Remove top-level default_permissions when setting sandbox_mode.")
-    parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive")
+    parser.add_argument("--user-mode", choices=["interactive", "placeholder", "keep"], default="interactive",
+                        help="Deprecated compatibility option; ignored. Setup does not create, load or require USER.md.")
     parser.add_argument("--legacy", choices=["ask", "remove", "keep"], default="ask", help="How to handle paths listed in assets/LEGACY_LIST.md.")
     parser.add_argument("--force-agent-link", action="store_true", help="Move a conflicting --agent-dir aside and symlink this repo there.")
     parser.add_argument("--verify", action="store_true", help="Only verify the current setup; do not write.")
@@ -731,7 +698,6 @@ def main(argv: list[str] | None = None) -> int:
             if audio_plan is not None:
                 audio_retirement.apply_retirement(audio_plan, dry_run=state.dry_run)
             ensure_agent_dir(state, force_agent_link=args.force_agent_link)
-            ensure_user_md(state, args.user_mode)
             remove_legacy_files(state, args.legacy)
             if not args.skip_codex:
                 configure_codex(state, config_path, args.execution_mode, args.replace_permissions, plan=codex_plan)
@@ -747,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
             verify(state, config_path, skip_codex=args.skip_codex, codex_binary=codex_binary,
-                   user_mode=args.user_mode, legacy_mode=args.legacy)
+                   legacy_mode=args.legacy)
             if args.verify and not args.skip_tools:
                 configure_tools(
                     state,

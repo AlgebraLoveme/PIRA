@@ -557,50 +557,77 @@ fn cancelled_short_exact_retains_partial_output_and_live_id() {
 fn detached_pipe_holder_cannot_block_exit_or_cancellation() {
     let sandbox = Sandbox::new("detached-pipe");
     let script = r#"
-import json, os, pathlib, signal, subprocess, sys, time
+import json, pathlib, socket, subprocess, sys
 binary, root = sys.argv[1:]
+holder = r"""import json, socket, sys, time
+with socket.create_connection(tuple(json.loads(sys.argv[1])), timeout=3) as control:
+    deadline = time.monotonic() + 30
+    control.sendall(b'R')
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            control.settimeout(remaining)
+            command = control.recv(1)
+            if not command:
+                break
+            assert command == b'P', command
+            control.sendall(b'P')
+    except (ConnectionError, TimeoutError):
+        pass  # Bounded self-exit if the harness disappears or never releases us.
+"""
+code = r"""
+import subprocess, sys
+print('retained-before-exit', flush=True)
+subprocess.Popen([sys.executable, '-c', sys.argv[3], sys.argv[1]],
+                 stdin=subprocess.DEVNULL, start_new_session=True)
+if sys.argv[2] == 'True':
+    sys.stdin.buffer.read(1)
+"""
 for cancel in (False, True):
     store = pathlib.Path(root) / str(cancel)
     store.mkdir()
-    ready = store / 'detached.pid'
-    code = r"""
-import os, pathlib, sys, time
-r,w=os.pipe()
-pid=os.fork()
-if pid == 0:
-    os.close(r)
-    os.setsid()
-    os.write(w,b'ready');os.close(w)
-    time.sleep(8)
-    os._exit(0)
-os.close(w);os.read(r,5);os.close(r)
-print('retained-before-exit',flush=True)
-pathlib.Path(sys.argv[1]).write_text(str(pid))
-if sys.argv[2]=='True':time.sleep(8)
-"""
-    proc = subprocess.Popen([binary,'capture','--store-dir',str(store),'--intent','Bounded detached pipe fixture','--',sys.executable,'-c',code,str(ready),str(cancel)],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    try:
-        if cancel:
-            until=time.monotonic()+4
-            while not ready.exists():
-                assert time.monotonic()<until, 'detached fixture did not start'
-                time.sleep(.01)
-            manifest=next((store/'live').glob('*.live.json'))
-            result=json.loads(manifest.read_text())['metadata']['result_id']
-            subprocess.run([binary,'cancel','--store-dir',str(store),result],check=True,capture_output=True,timeout=3)
-        out,err=proc.communicate(timeout=4)
-        assert (proc.returncode != 0) == cancel, (proc.returncode,out,err)
-        assert b'drain expired' in err, err
-        raw=subprocess.run([binary,'raw','--store-dir',str(store),'--last','--stdout'],check=True,capture_output=True,timeout=3)
-        assert b'retained-before-exit' in raw.stdout, raw
-        stats=subprocess.run([binary,'stats','--store-dir',str(store),'--last'],check=True,capture_output=True,timeout=3)
-        assert b'truncat' in stats.stdout.lower(), stats.stdout
-    finally:
-        if proc.poll() is None:proc.kill()
-        proc.communicate(timeout=3)
-        if ready.exists():
-            try:os.kill(int(ready.read_text()),signal.SIGKILL)
-            except ProcessLookupError:pass
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        listener.settimeout(5)
+        endpoint = json.dumps(listener.getsockname())
+        proc = subprocess.Popen([binary, 'capture', '--store-dir', str(store),
+                                 '--intent', 'Bounded detached pipe fixture', '--',
+                                 sys.executable, '-c', code, endpoint, str(cancel), holder],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            control, _ = listener.accept()
+            with control:
+                control.settimeout(3)
+                assert control.recv(1) == b'R'
+                if cancel:
+                    # Capture publishes the initial checkpoint before spawning PROGRAM.
+                    manifest, = (store / 'live').glob('*.live.json')
+                    result = json.loads(manifest.read_text())['metadata']['result_id']
+                    subprocess.run([binary, 'cancel', '--store-dir', str(store), result],
+                                   check=True, capture_output=True, timeout=3)
+                # Do not let communicate() close PROGRAM stdin before cancellation settles.
+                proc.wait(timeout=4)
+                out, err = proc.communicate(timeout=3)
+                assert (proc.returncode != 0) == cancel, (proc.returncode, out, err)
+                assert b'drain expired' in err, err
+                raw = subprocess.run([binary, 'raw', '--store-dir', str(store), '--last', '--stdout'],
+                                     check=True, capture_output=True, timeout=3)
+                assert b'retained-before-exit' in raw.stdout, raw
+                stats = subprocess.run([binary, 'stats', '--store-dir', str(store), '--last'],
+                                       check=True, capture_output=True, timeout=3)
+                assert b'truncat' in stats.stdout.lower(), stats.stdout
+                control.sendall(b'P')
+                assert control.recv(1) == b'P', 'owner cleanup killed detached pipe holder'
+                control.shutdown(socket.SHUT_WR)
+                assert control.recv(1) == b'', 'holder did not exit on control EOF'
+            # Closing control on every error also releases the detached holder.
+        finally:
+            if proc.poll() is None:
+                proc.kill()  # Only the fresh, unreaped wrapper handle.
+            proc.communicate(timeout=3)
 "#;
     let output = Command::new(python())
         .args(["-c", script, binary(), sandbox.path().to_str().unwrap()])

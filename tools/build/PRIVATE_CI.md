@@ -91,6 +91,23 @@ when the retained oracle is available; otherwise its tests explicitly skip while
 Rust lexical fixtures still run. The snapshot always requires the checker's runtime
 `help.md`, `lexicon.json` and `tests/evaluation.json`; it optionally selects only
 `tools/dev/pira_write_check/check.py` and its `lexicon.json`, not the development tree.
+Two additional exact required dependencies are
+`tools/dev/pira_write_check/benchmark.py` and
+`tools/dev/pira_write_check/test_benchmark.py`; missing either fails staging.
+Each checker host (macOS, Linux, Windows) runs the three safe work-directory tests
+once, outside the debug/release parity loop:
+
+```bash
+python -B tools/dev/pira_write_check/test_benchmark.py -v
+```
+
+These tests mock the platform check and reject or stop before benchmark fixture
+generation; no measured binary, performance benchmark, or timeout signals run.
+Symlink creation must be permitted (including on Windows); only POSIX hosts check
+the new directory's private permission bits. The actual benchmark remains limited
+to macOS/Linux `/usr/bin/time` and POSIX process-group timeout handling; these safe
+tests do not validate performance or make the benchmark Windows-compatible.
+No other development-directory files are selected recursively.
 Before staging, the source owner must supply the checker manifest, Rust sources,
 tests and lexical fixtures, and update workspace membership and `Cargo.lock` together.
 This helper does not change them or any writing policy.
@@ -117,8 +134,19 @@ offline test suite.
 The setup snapshot explicitly selects `setup_pira.py`, `setup_pira_tools.py`,
 `setup_pira_stores.py`, `migrate_pira_stores.py`, their four test modules,
 `assets/LEGACY_LIST.md`, and the platform selector, alongside existing Team
-fixture/policy dependencies. The setup job discovers `test_*.py` only from this
-reviewed snapshot. Maintain these exact inputs as dependencies change; never replace
+fixture/policy dependencies. Communication setup additionally requires these exact
+four paths (missing any one fails staging):
+
+- `assets/scripts/setup_pira_communication.py`
+- `assets/scripts/test_setup_pira_communication.py`
+- `assets/COMMUNICATION_AGENTS_TEMPLATE.md`
+- `assets/COMMUNICATION_WORKBOOK_TEMPLATE.md`
+
+The existing Linux/Windows setup job discovers the communication module's tests
+through `test_*.py` in this reviewed snapshot; no workflow change is needed. Both
+templates retain their `assets/` location for runtime lookup. Offline helper
+regressions check byte preservation and missing-dependency rejection, not native
+Linux/Windows execution. Maintain these exact inputs as dependencies change; never replace
 them with recursive script-directory copying. Migration verification precedes
 configuration publication in both entry points, including unified setup's
 `--skip-tools` route. Retained Team histories remain subject to the migration

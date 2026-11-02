@@ -55,6 +55,9 @@ jobs:
           PY
       - name: Locked crate tests
         run: cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }} -- --test-threads=1
+      - name: Safe writing benchmark work-directory regressions
+        if: matrix.crate == 'pira_write_check'
+        run: python -B tools/dev/pira_write_check/test_benchmark.py -v
       - name: Native writing checker parity and release tests
         if: matrix.crate == 'pira_write_check'
         shell: bash

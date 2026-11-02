@@ -44,10 +44,10 @@ fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, St
     let stored = storage::read_result_path(&path)?;
     let (mut stored, mut growth) =
         stored.sample_growth(state.stdout_offset, state.stderr_offset, MAX_TAIL as u64)?;
-    if stored.is_running() && !storage::live_result_is_active(store, &stored) {
+    if stored.has_snapshot() && !storage::live_result_is_active(store, &stored) {
         // Owner release follows final publication. Recheck this exact result first.
         let latest = storage::read_result_path(&path)?;
-        if latest.is_running() {
+        if latest.has_snapshot() {
             return Err(
                 "capture owner lost; interrupted checkpoint cannot establish child outcome".into(),
             );
@@ -59,7 +59,7 @@ fn capture(state: &mut WatchState, store: &std::path::Path) -> Result<Sample, St
         growth.stdout_total > state.stdout_offset || growth.stderr_total > state.stderr_offset;
     state.stdout_offset = growth.stdout_total;
     state.stderr_offset = growth.stderr_total;
-    let job = if stored.is_running() {
+    let job = if stored.has_snapshot() {
         JobStatus::Pending
     } else if stored.metadata.exit_code == 0 {
         JobStatus::Succeeded
@@ -105,30 +105,30 @@ fn probe(
     let started = Instant::now();
     let status = loop {
         if stop() {
-            tree.terminate_tree();
-            let s = tree.child.wait().map_err(|e| e.to_string())?;
+            let s = tree.terminate_and_wait()?;
             break (s, true, false);
         }
         if started.elapsed() >= Duration::from_millis(attempt_timeout_ms) {
-            tree.terminate_tree();
-            let s = tree.child.wait().map_err(|e| e.to_string())?;
+            let s = tree.terminate_and_wait()?;
             break (s, false, true);
         }
-        if let Some(s) = tree.child.try_wait().map_err(|e| e.to_string())? {
+        if let Some(s) = tree.try_wait().map_err(|e| e.to_string())? {
             tree.terminate_tree();
             break (s, false, false);
         }
         thread::sleep(Duration::from_millis(50));
     };
     let drain_deadline = Instant::now() + Duration::from_secs(1);
-    let (stdout, stdout_complete) = receive_reader(out, drain_deadline, "probe stdout")?;
-    let (stderr, stderr_complete) = receive_reader(err, drain_deadline, "probe stderr")?;
-    if status.1 {
+    let stdout_result = receive_reader(out, drain_deadline, "probe stdout");
+    let stderr_result = receive_reader(err, drain_deadline, "probe stderr");
+    if status.1 || stop() {
         return Err("watch stop requested".into());
     }
     if status.2 {
         return Err("probe attempt timed out".into());
     }
+    let (stdout, stdout_complete) = stdout_result?;
+    let (stderr, stderr_complete) = stderr_result?;
     let code = util::status_code(status.0);
     let job = if code == 0 {
         JobStatus::Succeeded

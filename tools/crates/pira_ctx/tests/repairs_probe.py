@@ -255,7 +255,8 @@ def checkpoints():
         directories.append((Path(os.fsdecode(native)), 4))
     for number, (spool, schema) in enumerate(directories):
         env = {**ENV, "TMPDIR": str(spool), "PIRA_CTX_LIVE_CHECKPOINT_MS": "100"}
-        store = ROOT / f"checkpoint-{number}"
+        # Native spool identity now follows the store, not the caller's TMPDIR.
+        store = spool / f"checkpoint-{number}"
         watch_store = ROOT / f"separate-watch-{number}"
         marker = ROOT / f"child-launched-{number}"
         code = f"import time;from pathlib import Path;Path({str(marker)!r}).write_text('yes');print('live-marker',flush=True);time.sleep(3)"

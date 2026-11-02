@@ -146,30 +146,12 @@ pub fn run(
     let started = Instant::now();
     let (status, stopped, timed_out) = loop {
         if stop() {
-            tree.terminate_tree();
-            break (
-                tree.child
-                    .wait()
-                    .map_err(|e| format!("wait analyzer: {e}"))?,
-                true,
-                false,
-            );
+            break (tree.terminate_and_wait()?, true, false);
         }
         if started.elapsed() >= Duration::from_millis(timeout_ms) {
-            tree.terminate_tree();
-            break (
-                tree.child
-                    .wait()
-                    .map_err(|e| format!("wait analyzer: {e}"))?,
-                false,
-                true,
-            );
+            break (tree.terminate_and_wait()?, false, true);
         }
-        if let Some(status) = tree
-            .child
-            .try_wait()
-            .map_err(|e| format!("wait analyzer: {e}"))?
-        {
+        if let Some(status) = tree.try_wait().map_err(|e| format!("wait analyzer: {e}"))? {
             tree.terminate_tree();
             break (status, false, false);
         }
@@ -177,15 +159,19 @@ pub fn run(
     };
 
     let drain_deadline = Instant::now() + Duration::from_secs(1);
-    receive_io(writer, drain_deadline, "analyzer stdin")?;
-    let (stdout, stdout_overflow) = receive_io(stdout_reader, drain_deadline, "analyzer stdout")?;
-    let (stderr, _) = receive_io(stderr_reader, drain_deadline, "analyzer stderr")?;
-    if stopped {
+    let written = receive_io(writer, drain_deadline, "analyzer stdin");
+    let stdout_result = receive_io(stdout_reader, drain_deadline, "analyzer stdout");
+    let stderr_result = receive_io(stderr_reader, drain_deadline, "analyzer stderr");
+    // Drain all started I/O before applying accepted stop precedence.
+    if stopped || stop() {
         return Err("watch stop requested".into());
     }
     if timed_out {
         return Err("analyzer attempt timed out".into());
     }
+    written?;
+    let (stdout, stdout_overflow) = stdout_result?;
+    let (stderr, _) = stderr_result?;
     if stdout_overflow {
         return Err("analyzer output exceeds 16 KiB".into());
     }

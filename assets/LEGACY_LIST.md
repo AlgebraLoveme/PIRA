@@ -24,3 +24,7 @@ Legacy files removed from the active scheme. During setup or migration, if any o
 - `~/agent/assets/AUDIO_CUSTOMIZATION_GUIDE.md` — retired audio customization support.
 
 Tracked default audio assets were removed from the repository. Local/custom media are not cleanup targets; do not delete `PIRA_Voice` directories or external hook/configuration paths based on this list.
+
+- `~/agent/assets/USER_TEMPLATE.md` — global user-profile setup retired.
+
+Existing private USER.md files are not cleanup targets. Preserve them; communicator personalization belongs in local instructions and memory.

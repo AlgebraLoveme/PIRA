@@ -544,7 +544,7 @@ fn hover_escapes_lone_cr_but_preserves_crlf() {
 }
 
 #[test]
-fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
+fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let f = Fixture::new();
     let external = Fixture::new();
@@ -581,10 +581,10 @@ fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
         let out = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
             .current_dir(&f.0)
             .env("PATH", path)
-            .args(["outline", "broken.c"])
+            .args(["hover", "broken.c:1:5"])
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
         assert!(!f.0.join("started").exists());
     }
     let explicit = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
@@ -600,7 +600,7 @@ fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
     let allowed = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
         .current_dir(&f.0)
         .env("PATH", &external.0)
-        .args(["outline", "broken.c"])
+        .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
     assert!(allowed.status.success(), "{allowed:?}");
@@ -611,28 +611,28 @@ fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
     let linked = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
         .current_dir(&f.0)
         .env("PATH", &external.0)
-        .args(["outline", "broken.c"])
+        .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
-    assert_eq!(linked.status.code(), Some(3), "{linked:?}");
+    assert_eq!(linked.status.code(), Some(2), "{linked:?}");
     assert!(!f.0.join("started").exists());
     let ancestor = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
         .current_dir(f.0.join("sub"))
         .env("PATH", &f.0)
-        .args(["outline", "broken.c"])
+        .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
-    assert_eq!(ancestor.status.code(), Some(3), "{ancestor:?}");
+    assert_eq!(ancestor.status.code(), Some(2), "{ancestor:?}");
     assert!(!f.0.join("started").exists());
     fs::remove_file(f.0.join("clangd")).unwrap();
     symlink(external.0.join("outside-peer"), f.0.join("clangd")).unwrap();
     let launcher = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
         .current_dir(&f.0)
         .env("PATH", ".")
-        .args(["outline", "broken.c"])
+        .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
-    assert_eq!(launcher.status.code(), Some(3), "{launcher:?}");
+    assert_eq!(launcher.status.code(), Some(2), "{launcher:?}");
     assert!(!f.0.join("started").exists());
     symlink(&f.0, external.0.join("alias")).unwrap();
     fs::create_dir(f.0.join("child")).unwrap();
@@ -640,10 +640,10 @@ fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
         let hidden = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
             .current_dir(&f.0)
             .env("PATH", path)
-            .args(["outline", "broken.c"])
+            .args(["hover", "broken.c:1:5"])
             .output()
             .unwrap();
-        assert_eq!(hidden.status.code(), Some(3), "{hidden:?}");
+        assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
         assert!(!f.0.join("started").exists());
     }
     let explicit_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
@@ -663,7 +663,7 @@ fn automatic_servers_exclude_repository_launchers_and_resolved_targets() {
     let external_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
         .current_dir(&f.0)
         .env("PATH", third.0.join("external-alias"))
-        .args(["outline", "broken.c"])
+        .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
     assert!(external_alias.status.success(), "{external_alias:?}");

@@ -17,6 +17,9 @@ pub use protocol::{
     normalize_range,
 };
 
+#[cfg(test)]
+pub(crate) use protocol::LspPosition;
+
 #[derive(Clone, Debug)]
 pub struct LspConfig {
     executable: PathBuf,

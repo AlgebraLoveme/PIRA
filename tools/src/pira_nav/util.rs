@@ -54,6 +54,9 @@ pub fn open_regular_file(path: &Path) -> Result<File, String> {
 }
 
 pub fn read_source(path: &Path) -> Result<String, String> {
+    if crate::cancellation::requested() {
+        return Err("Nav operation cancelled".into());
+    }
     let file = open_regular_file(path)?;
     let metadata = file
         .metadata()
@@ -96,6 +99,25 @@ pub(crate) fn decode_source(mut bytes: Vec<u8>) -> Result<String, std::string::F
         bytes.drain(..3);
     }
     String::from_utf8(bytes)
+}
+
+/// Compare/encode canonical local drive paths without exposing Windows device URI forms.
+pub(crate) fn local_disk_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(local) = path.to_str().and_then(strip_local_verbatim_disk) {
+        return Cow::Owned(PathBuf::from(local));
+    }
+    Cow::Borrowed(path)
+}
+
+#[cfg(any(windows, test))]
+fn strip_local_verbatim_disk(path: &str) -> Option<&str> {
+    let local = path.strip_prefix(r"\\?\")?;
+    let bytes = local.as_bytes();
+    (bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && bytes.get(2) == Some(&b'\\'))
+    .then_some(local)
 }
 
 pub fn identity_path(path: &Path, cwd: &Path) -> String {
@@ -420,6 +442,34 @@ mod tests {
     use super::{percent_decode, percent_encode, repository_path_penalty};
 
     #[test]
+    fn windows_local_verbatim_disk_normalization_never_accepts_unc_or_device_prefixes() {
+        assert_eq!(
+            super::strip_local_verbatim_disk(r"\\?\C:\local\file.rs"),
+            Some(r"C:\local\file.rs")
+        );
+        for path in [
+            r"\\?\UNC\host\share\x",
+            r"\\.\pipe\x",
+            r"\\?\C:relative",
+            r"//?/C:/x",
+        ] {
+            assert!(super::strip_local_verbatim_disk(path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn pool_failure_falls_back_sequentially_in_input_order() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .spawn_handler(|_| Err(std::io::Error::other("injected pool failure")))
+            .build();
+        assert!(pool.is_err());
+        assert_eq!(
+            super::map_with_pool(&[3, 1, 2], |v| v * 2, pool.as_ref().ok()),
+            vec![6, 2, 4]
+        );
+    }
+
+    #[test]
     fn percent_encoding_round_trips_unicode_and_reserved_bytes() {
         let input = "src/naïve file.rs::Thing";
         let encoded = percent_encode(input);
@@ -444,5 +494,31 @@ mod tests {
             repository_path_penalty(Path::new("internal/parser_test/case.go"))
                 > repository_path_penalty(Path::new("internal/parser/case.go"))
         );
+    }
+}
+
+/// Map in input order; thread exhaustion must not turn a read-only command into a panic.
+pub(crate) fn map_ordered<T: Sync, U: Send>(
+    items: &[T],
+    map: impl Fn(&T) -> U + Sync + Send,
+) -> Vec<U> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    map_with_pool(
+        items,
+        map,
+        POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().build().ok())
+            .as_ref(),
+    )
+}
+
+fn map_with_pool<T: Sync, U: Send>(
+    items: &[T],
+    map: impl Fn(&T) -> U + Sync + Send,
+    pool: Option<&rayon::ThreadPool>,
+) -> Vec<U> {
+    use rayon::prelude::*;
+    match pool {
+        Some(pool) => pool.install(|| items.par_iter().map(map).collect()),
+        None => items.iter().map(map).collect(),
     }
 }

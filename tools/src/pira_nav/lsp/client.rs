@@ -86,29 +86,26 @@ struct DocumentPosition<'a> {
 }
 
 pub(super) struct LspClient {
-    child: Child,
+    process: ServerProcess,
     input: Option<mpsc::Sender<WriteRequest>>,
     output: mpsc::Receiver<InboundMessage>,
     inbound: Arc<InboundBudget>,
-    input_thread: Option<JoinHandle<()>>,
-    output_thread: Option<JoinHandle<()>>,
     stderr: Arc<Mutex<Vec<u8>>>,
-    stderr_thread: Option<JoinHandle<()>>,
     next_id: u64,
     encoding: PositionEncoding,
     capabilities: ServerCapabilities,
     settings: Option<Value>,
     retain_documents: bool,
     open_documents: BTreeMap<String, Vec<usize>>,
-    #[cfg(windows)]
-    job: windows_sys::Win32::Foundation::HANDLE,
     unusable: bool,
-    tree_terminated: bool,
     request_timeout: Duration,
 }
 
 impl LspClient {
     pub(super) fn start(config: &LspConfig, retain_documents: bool) -> Result<Self, String> {
+        if crate::cancellation::requested() {
+            return Err("LSP operation cancelled".into());
+        }
         let mut command = Command::new(&config.executable);
         command
             .args(&config.arguments)
@@ -117,33 +114,40 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_process_group(&mut command);
-        let mut child = command.spawn().map_err(|error| {
+        let child = command.spawn().map_err(|error| {
             format!(
                 "cannot start LSP server {}: {error}",
                 config.executable.display()
             )
         })?;
+        // Install ownership before any fallible pipe/thread/job setup.
+        let mut process = ServerProcess::new(child);
         #[cfg(windows)]
-        let job = create_kill_job(&child).map_err(|error| {
-            let _ = child.kill();
-            let _ = child.wait();
-            format!("cannot isolate LSP server process tree: {error}")
-        })?;
-        let input = child
+        {
+            process.job = create_kill_job(&process.child)
+                .map_err(|e| format!("cannot isolate LSP server process tree: {e}"))?;
+        }
+        let input = process
+            .child
             .stdin
             .take()
             .ok_or_else(|| "LSP server stdin was not available".to_string())?;
-        let output = child
+        let output = process
+            .child
             .stdout
             .take()
             .ok_or_else(|| "LSP server stdout was not available".to_string())?;
-        let stderr = child
+        let stderr = process
+            .child
             .stderr
             .take()
             .ok_or_else(|| "LSP server stderr was not available".to_string())?;
+        let input = InterruptiblePipe::new(input, Arc::clone(&process.stop))?;
+        let output = InterruptiblePipe::new(output, Arc::clone(&process.stop))?;
+        let stderr = InterruptiblePipe::new(stderr, Arc::clone(&process.stop))?;
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_thread = Arc::clone(&captured);
-        let stderr_thread = thread::spawn(move || {
+        process.spawn("stderr", move || {
             let mut stderr = stderr;
             let mut chunk = [0u8; 8 * 1024];
             while let Ok(count) = stderr.read(&mut chunk) {
@@ -155,9 +159,9 @@ impl LspClient {
                     bytes.extend_from_slice(&chunk[..count.min(remaining)]);
                 }
             }
-        });
+        })?;
         let (input_sender, input_receiver) = mpsc::channel::<WriteRequest>();
-        let input_thread = thread::spawn(move || {
+        process.spawn("stdin", move || {
             let mut input = BufWriter::new(input);
             for (bytes, reply) in input_receiver {
                 let result = input
@@ -170,11 +174,11 @@ impl LspClient {
                     break;
                 }
             }
-        });
+        })?;
         let (output_sender, output_receiver) = mpsc::sync_channel(MAX_PENDING_MESSAGES);
         let inbound = Arc::new(InboundBudget::default());
         let reader_budget = Arc::clone(&inbound);
-        let output_thread = thread::spawn(move || {
+        process.spawn("stdout", move || {
             let mut output = BufReader::new(output);
             loop {
                 let (message, size) = match read_message(&mut output) {
@@ -187,26 +191,20 @@ impl LspClient {
                     break;
                 }
             }
-        });
+        })?;
         let mut client = Self {
-            child,
+            process,
             input: Some(input_sender),
             output: output_receiver,
             inbound,
-            input_thread: Some(input_thread),
-            output_thread: Some(output_thread),
             stderr: captured,
-            stderr_thread: Some(stderr_thread),
             next_id: 1,
             encoding: PositionEncoding::Utf16,
             capabilities: ServerCapabilities::default(),
             settings: config.settings.clone(),
             retain_documents,
             open_documents: BTreeMap::new(),
-            #[cfg(windows)]
-            job,
             unusable: false,
-            tree_terminated: false,
             request_timeout: LSP_REQUEST_TIMEOUT,
         };
         let root_uri = file_uri(&config.root)?;
@@ -651,39 +649,24 @@ impl LspClient {
     }
 
     fn respond_to_server_request(&mut self, message: &Value) -> Result<(), String> {
-        let id = message
-            .get("id")
-            .cloned()
-            .ok_or_else(|| "LSP server request omitted id".to_string())?;
         let method = message
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if method == "workspace/configuration" {
+            let payload = configuration_response(message, self.settings.as_ref())?;
+            return self.send_payload(payload);
+        }
+        let id = message
+            .get("id")
+            .cloned()
+            .ok_or("LSP server request omitted id")?;
         let response = match method {
             "workspace/applyEdit" => json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {"applied": false, "failureReason": "pira_nav is read-only"}
             }),
-            "workspace/configuration" => {
-                let items = message
-                    .pointer("/params/items")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let values = items
-                    .iter()
-                    .map(|item| match item.get("section") {
-                        None | Some(Value::Null) => self.settings.clone().unwrap_or(Value::Null),
-                        Some(Value::String(section)) => {
-                            configuration_section(self.settings.as_ref(), section)
-                                .unwrap_or(Value::Null)
-                        }
-                        Some(_) => Value::Null,
-                    })
-                    .collect::<Vec<_>>();
-                json!({"jsonrpc": "2.0", "id": id, "result": values})
-            }
             "client/registerCapability"
             | "client/unregisterCapability"
             | "window/workDoneProgress/create" => {
@@ -703,8 +686,17 @@ impl LspClient {
         if self.unusable {
             return Err("LSP client is unavailable after a previous I/O failure".into());
         }
-        let payload = serde_json::to_vec(message)
+        let mut output = CappedBytes::default();
+        serde_json::to_writer(&mut output, message)
             .map_err(|error| format!("cannot encode LSP message: {error}"))?;
+        self.send_payload(output.0)
+    }
+
+    fn send_payload(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        self.check_inbound_budget()?;
+        if self.unusable {
+            return Err("LSP client is unavailable after a previous I/O failure".into());
+        }
         if payload.len() > MAX_MESSAGE_BYTES {
             return Err(format!(
                 "LSP message exceeds the {} MiB safety limit",
@@ -719,7 +711,11 @@ impl LspClient {
             .ok_or_else(|| "LSP writer is closed".to_string())?
             .send((framed, reply))
             .map_err(|_| "LSP writer stopped unexpectedly".to_string())?;
-        let written = result.recv_timeout(LSP_WRITE_TIMEOUT);
+        let written = receive(
+            &result,
+            Instant::now() + LSP_WRITE_TIMEOUT,
+            &self.process.stop,
+        );
         self.check_inbound_budget()?;
         match written {
             Ok(Ok(())) => Ok(()),
@@ -738,8 +734,7 @@ impl LspClient {
 
     fn read(&mut self, deadline: Instant) -> Result<Value, String> {
         self.check_inbound_budget()?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let received = self.output.recv_timeout(remaining);
+        let received = receive(&self.output, deadline, &self.process.stop);
         if let Ok((_, size)) = &received {
             self.inbound.bytes.fetch_sub(*size, Ordering::AcqRel);
         }
@@ -763,6 +758,11 @@ impl LspClient {
     }
 
     fn check_inbound_budget(&mut self) -> Result<(), String> {
+        if crate::cancellation::requested() || self.process.stop.load(Ordering::Acquire) {
+            self.unusable = true;
+            self.terminate_tree();
+            return Err("LSP operation cancelled".into());
+        }
         if self.inbound.overflow.load(Ordering::Acquire) {
             self.unusable = true;
             self.terminate_tree();
@@ -772,37 +772,14 @@ impl LspClient {
     }
 
     fn terminate_tree(&mut self) {
-        if self.tree_terminated {
-            return;
-        }
-        // Terminate before reaping the leader so its PID/process-group ID cannot be reused.
-        self.tree_terminated = true;
-        #[cfg(unix)]
-        {
-            let group = self.child.id().min(i32::MAX as u32) as i32;
-            // SAFETY: the LSP server is made leader of its own process group before spawn.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
-            }
-        }
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-            // SAFETY: `job` is a live handle owned by this client.
-            unsafe {
-                TerminateJobObject(self.job, 1);
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = self.child.kill();
-        }
+        self.process.terminate();
     }
 
     fn io_error(&mut self, operation: &str, error: io::Error) -> String {
         self.unusable = true;
         self.terminate_tree();
         let status = self
+            .process
             .child
             .try_wait()
             .ok()
@@ -811,6 +788,23 @@ impl LspClient {
             .unwrap_or_default();
         let stderr = self.stderr_excerpt();
         format!("cannot {operation} LSP message: {error}{status}{stderr}")
+    }
+}
+
+fn receive<T>(
+    receiver: &mpsc::Receiver<T>,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    loop {
+        if stop.load(Ordering::Acquire) || crate::cancellation::requested() {
+            return Err(mpsc::RecvTimeoutError::Disconnected);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(25))) {
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+            result => return result,
+        }
     }
 }
 
@@ -885,45 +879,255 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        if !self.unusable {
-            for (uri, _) in std::mem::take(&mut self.open_documents) {
-                let _ = self.notify(
-                    "textDocument/didClose",
-                    json!({"textDocument": {"uri": uri}}),
-                );
+        // Best-effort shutdown shares one short deadline, not one timeout per
+        // document. Never wait for a peer to acknowledge shutdown during Drop.
+        if !self.unusable && !crate::cancellation::requested() {
+            if let Some(input) = self.input.as_ref() {
+                if let Ok(payload) = serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0", "id":self.next_id, "method":"shutdown", "params":null
+                })) {
+                    let mut frame =
+                        format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
+                    frame.extend(payload);
+                    let exit = b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}";
+                    frame.extend(format!("Content-Length: {}\r\n\r\n", exit.len()).bytes());
+                    frame.extend(exit);
+                    let (reply, result) = mpsc::sync_channel(1);
+                    let _ = input.send((frame, reply));
+                    let _ = result.recv_timeout(Duration::from_millis(50));
+                }
             }
-            let id = self.next_id;
-            let _ = self.send(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "shutdown",
-                "params": null
-            }));
-            let _ = self.notify("exit", Value::Null);
         }
         self.input.take();
-        // Pipes may still be held by descendants after the leader has exited.
-        self.terminate_tree();
-        let _ = self.child.wait();
-        if let Some(thread) = self.input_thread.take() {
-            let _ = thread.join();
+        // ServerProcess owns termination, reaping, and interruptible pipe joins.
+    }
+}
+
+struct ServerProcess {
+    child: Child,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    terminated: bool,
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+impl ServerProcess {
+    fn new(child: Child) -> Self {
+        #[cfg(test)]
+        STARTED_CHILD.with(|pid| pid.set(Some(child.id())));
+        Self {
+            child,
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Vec::new(),
+            terminated: false,
+            #[cfg(windows)]
+            job: std::ptr::null_mut(),
         }
-        let (_replacement, disconnected) = mpsc::channel();
-        self.output = disconnected;
-        if let Some(thread) = self.output_thread.take() {
-            let _ = thread.join();
+    }
+    fn spawn(&mut self, name: &str, work: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        #[cfg(test)]
+        if SPAWN_FAILURE.with(|at| match at.get() {
+            Some(0) => true,
+            Some(n) => {
+                at.set(Some(n - 1));
+                false
+            }
+            None => false,
+        }) {
+            return Err("injected LSP thread creation failure".into());
         }
-        if let Some(thread) = self.stderr_thread.take() {
-            let _ = thread.join();
+        let handle = thread::Builder::new()
+            .name(format!("nav-lsp-{name}"))
+            .spawn(work)
+            .map_err(|e| format!("cannot start LSP {name} thread: {e}"))?;
+        self.threads.push(handle);
+        Ok(())
+    }
+    fn terminate(&mut self) {
+        if self.terminated {
+            return;
+        }
+        self.terminated = true;
+        self.stop.store(true, Ordering::Release);
+        // The leader is never reaped until its owned group has been terminated,
+        // so the PID/group number cannot be reused by an unrelated process.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
         #[cfg(windows)]
-        {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            // SAFETY: `job` is owned by this client and closed exactly once.
-            unsafe {
-                CloseHandle(self.job);
+        unsafe {
+            if !self.job.is_null() {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
+            } else {
+                let _ = self.child.kill();
             }
         }
+        // Also target the still-owned child handle if a peer moved its group or
+        // a platform group/job termination failed. This never targets a reaped PID.
+        let _ = self.child.kill();
+    }
+}
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        self.terminate();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        // A stuck kernel/foreign pipe holder must not turn cleanup into an
+        // unbounded wait. Never send a second signal after reaping the leader.
+        while Instant::now() < deadline {
+            #[cfg(windows)]
+            for handle in &self.threads {
+                use std::os::windows::io::AsRawHandle;
+                // SAFETY: handle is owned and live; only this thread's pending
+                // synchronous I/O is cancelled, never another process's I/O.
+                unsafe {
+                    CancelSynchronousIo(handle.as_raw_handle());
+                }
+            }
+            let reaped = self.child.try_wait().is_ok_and(|s| s.is_some());
+            if reaped && self.threads.iter().all(JoinHandle::is_finished) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        for handle in self.threads.drain(..) {
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+            // PIRA: a platform I/O operation stuck beyond 500 ms is detached;
+            // the CLI exits without chasing/killing an unowned pipe holder.
+        }
+        #[cfg(windows)]
+        if !self.job.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(test)]
+thread_local! {
+    static SPAWN_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static STARTED_CHILD: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+struct InterruptiblePipe<T> {
+    pipe: T,
+    stop: Arc<AtomicBool>,
+}
+impl<T> InterruptiblePipe<T> {
+    #[cfg(unix)]
+    fn new(pipe: T, stop: Arc<AtomicBool>) -> Result<Self, String>
+    where
+        T: std::os::fd::AsRawFd,
+    {
+        let fd = pipe.as_raw_fd();
+        // SAFETY: fd is a live owned pipe; preserve existing status flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(format!(
+                "cannot make LSP pipe interruptible: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { pipe, stop })
+    }
+    #[cfg(not(unix))]
+    fn new(pipe: T, stop: Arc<AtomicBool>) -> Result<Self, String> {
+        Ok(Self { pipe, stop })
+    }
+    fn check(&self) -> io::Result<()> {
+        if self.stop.load(Ordering::Acquire) || crate::cancellation::requested() {
+            Err(io::Error::other("LSP operation cancelled"))
+        } else {
+            Ok(())
+        }
+    }
+}
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> InterruptiblePipe<T> {
+    fn ready(&self, events: i16) -> io::Result<()> {
+        self.check()?;
+        let mut fd = libc::pollfd {
+            fd: self.pipe.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: poll borrows one initialized descriptor for at most 25 ms.
+        if unsafe { libc::poll(&mut fd, 1, 25) } < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        self.check()
+    }
+}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsRawFd> Read for InterruptiblePipe<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.pipe.read(bytes) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    self.ready(libc::POLLIN)?
+                }
+                result => return result,
+            }
+        }
+    }
+}
+#[cfg(unix)]
+impl<T: Write + std::os::fd::AsRawFd> Write for InterruptiblePipe<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            self.check()?;
+            match self.pipe.write(bytes) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    self.ready(libc::POLLOUT)?
+                }
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        self.pipe.flush()
+    }
+}
+#[cfg(not(unix))]
+impl<T: Read> Read for InterruptiblePipe<T> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.check()?;
+        self.pipe.read(bytes)
+    }
+}
+#[cfg(not(unix))]
+impl<T: Write> Write for InterruptiblePipe<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.check()?;
+        self.pipe.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.check()?;
+        self.pipe.flush()
     }
 }
 
@@ -975,15 +1179,84 @@ fn create_kill_job(child: &Child) -> Result<windows_sys::Win32::Foundation::HAND
     }
 }
 
-fn configuration_section(settings: Option<&Value>, section: &str) -> Option<Value> {
+fn configuration_section<'a>(settings: Option<&'a Value>, section: &str) -> Option<&'a Value> {
     let mut value = settings?;
     if section.is_empty() {
-        return Some(value.clone());
+        return Some(value);
     }
     for component in section.split('.') {
         value = value.get(component)?;
     }
-    Some(value.clone())
+    Some(value)
+}
+
+const MAX_CONFIGURATION_ITEMS: usize = 256;
+
+#[derive(Default)]
+struct CappedBytes(Vec<u8>);
+impl Write for CappedBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_MESSAGE_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::other(
+                "LSP message exceeds the 16 MiB safety limit",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct SizeBudget(usize);
+impl Write for SizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("LSP configuration exceeds the 16 MiB safety limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn configuration_response(message: &Value, settings: Option<&Value>) -> Result<Vec<u8>, String> {
+    let items = message.pointer("/params/items").and_then(Value::as_array);
+    let items = items.map(Vec::as_slice).unwrap_or(&[]);
+    if items.len() > MAX_CONFIGURATION_ITEMS {
+        return Err(format!(
+            "LSP configuration exceeds {MAX_CONFIGURATION_ITEMS} items"
+        ));
+    }
+    let id = message.get("id").ok_or("LSP server request omitted id")?;
+    let values = items
+        .iter()
+        .map(|item| match item.get("section") {
+            None | Some(Value::Null) => settings.unwrap_or(&Value::Null),
+            Some(Value::String(section)) => {
+                configuration_section(settings, section).unwrap_or(&Value::Null)
+            }
+            Some(_) => &Value::Null,
+        })
+        .collect::<Vec<_>>();
+    // Compute the aggregate serialized budget using borrowed values and no reply
+    // allocation, then encode. No repeated settings clones, even on rejection.
+    let mut budget = SizeBudget(MAX_MESSAGE_BYTES);
+    let encode = |out: &mut dyn Write| -> Result<(), String> {
+        out.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":")
+            .map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut *out, id).map_err(|e| e.to_string())?;
+        out.write_all(b",\"result\":").map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut *out, &values).map_err(|e| e.to_string())?;
+        out.write_all(b"}").map_err(|e| e.to_string())
+    };
+    encode(&mut budget)?;
+    let mut output = CappedBytes::default();
+    encode(&mut output)?;
+    Ok(output.0)
 }
 
 fn provider_enabled(value: Option<&Value>) -> bool {
@@ -1005,6 +1278,80 @@ mod tests {
     };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn configuration_item_limit_rejects_before_selecting_settings() {
+        let message =
+            json!({"id":1, "params":{"items":vec![json!({}); super::MAX_CONFIGURATION_ITEMS + 1]}});
+        assert!(
+            super::configuration_response(&message, None)
+                .unwrap_err()
+                .contains("items")
+        );
+    }
+
+    #[test]
+    fn configuration_aggregate_limit_precedes_response_allocation() {
+        let message = json!({"id":1, "params":{"items":vec![json!({}); 256]}});
+        let settings = json!({"value":"x".repeat(70_000)});
+        assert!(
+            super::configuration_response(&message, Some(&settings))
+                .unwrap_err()
+                .contains("16 MiB")
+        );
+        let message = json!({"id":"a", "params":{"items":[{}, {"section":"value"}, {"section":"missing"}, {"section":42}]}});
+        let payload = super::configuration_response(&message, Some(&json!({"value":"é"}))).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&payload).unwrap(),
+            json!({"jsonrpc":"2.0", "id":"a", "result":[{"value":"é"}, "é", null, null]})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_thread_creation_failure_reaps_the_immediately_guarded_child() {
+        for index in 0..3 {
+            let config = LspConfig::new(
+                PathBuf::from("/usr/bin/env"),
+                vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import time; time.sleep(1)".into(),
+                ],
+                std::env::temp_dir().canonicalize().unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            super::SPAWN_FAILURE.with(|at| at.set(Some(index)));
+            let start = Instant::now();
+            let result = LspClient::start(&config, false);
+            super::SPAWN_FAILURE.with(|at| at.set(None));
+            assert!(result.err().unwrap().contains("injected LSP thread"));
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let pid = super::STARTED_CHILD.with(|pid| pid.get().unwrap());
+            // Query only this test's already reaped child; no signals or PID scans.
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+    }
+
+    #[test]
+    fn injected_cancellation_interrupts_pending_channel_waits() {
+        let (_sender, receiver) = mpsc::channel::<()>();
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let started = Instant::now();
+        assert!(
+            super::receive(&receiver, Instant::now() + Duration::from_secs(120), &stop).is_err()
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
 
     #[test]
     fn header_limits_apply_before_reading_past_the_sentinel() {
@@ -1062,13 +1409,10 @@ mod tests {
     #[test]
     fn configuration_sections_support_whole_and_dotted_settings() {
         let settings = json!({"python": {"analysis": {"level": "strict"}}});
-        assert_eq!(
-            configuration_section(Some(&settings), ""),
-            Some(settings.clone())
-        );
+        assert_eq!(configuration_section(Some(&settings), ""), Some(&settings));
         assert_eq!(
             configuration_section(Some(&settings), "python.analysis"),
-            Some(json!({"level": "strict"}))
+            Some(&json!({"level": "strict"}))
         );
         assert_eq!(
             configuration_section(Some(&settings), "python.missing"),
@@ -1077,8 +1421,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn stalled_lsp_request_is_time_bounded() {
+    fn stalled_client() -> (PathBuf, LspClient) {
         let directory = std::env::temp_dir().join(format!(
             "pira-nav-lsp-timeout-{}-{}",
             std::process::id(),
@@ -1089,7 +1432,8 @@ mod tests {
         fs::write(
             &server,
             r#"#!/usr/bin/env python3
-import json, sys, time
+import json, sys, time, signal
+signal.alarm(5)
 def read():
     n = 0
     while True:
@@ -1105,7 +1449,7 @@ m = read()
 send({'jsonrpc':'2.0','id':m['id'],'result':{'capabilities':{}}})
 read()
 m = read()
-time.sleep(10)
+time.sleep(2)
 "#,
         )
         .unwrap();
@@ -1119,7 +1463,39 @@ time.sleep(10)
             None,
         )
         .unwrap();
-        let mut client = LspClient::start(&config, false).unwrap();
+        (directory, LspClient::start(&config, false).unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_cancellation_reaps_a_started_server_without_a_signal_fixture() {
+        let (directory, mut client) = stalled_client();
+        let pid = client.process.child.id();
+        let start = Instant::now();
+        client.process.stop.store(true, Ordering::Release);
+        assert!(
+            client
+                .request("test/stall", json!({}))
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        drop(client);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_lsp_request_is_time_bounded() {
+        let (directory, mut client) = stalled_client();
         client.request_timeout = Duration::from_millis(100);
         let started = Instant::now();
         let error = client.request("test/stall", json!({})).unwrap_err();

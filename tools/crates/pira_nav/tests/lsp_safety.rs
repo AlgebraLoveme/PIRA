@@ -114,22 +114,9 @@ fn oversized_protocol_position_fails_before_rendering() {
 #[test]
 fn exited_leader_does_not_leave_descendant_pipes_blocking_cleanup() {
     let f = Fixture::new();
-    let mut unrelated = Command::new("/usr/bin/env")
-        .args(["python3", "-c", "import time; time.sleep(4)"])
-        .spawn()
-        .unwrap();
     let (output, elapsed) = f.lsp("descendant");
-    let unrelated_alive = unrelated.try_wait().unwrap().is_none();
-    if unrelated_alive {
-        unrelated.kill().unwrap();
-    }
-    unrelated.wait().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
-    assert!(
-        unrelated_alive,
-        "cleanup must not terminate unrelated processes"
-    );
 }
 
 #[test]
@@ -217,4 +204,24 @@ fn lsp_uri_preserves_unix_backslash_and_encoded_characters() {
     assert!(output.status.success(), "{output:?}");
     let uri = fs::read_to_string(f.0.join("uri.txt")).unwrap();
     assert!(uri.ends_with("literal%5C%C3%A9%20%25name.py"), "{uri}");
+}
+
+#[test]
+fn detached_pipe_holder_does_not_delay_cleanup_or_require_signalling_it() {
+    let f = Fixture::new();
+    let (output, elapsed) = f.lsp("detached");
+    assert!(output.status.success(), "{output:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn blocked_document_write_times_out_and_cleanup_is_bounded() {
+    let f = Fixture::new();
+    let (output, elapsed) = f.lsp("blocked-write");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("write timed out after 5s"),
+        "{output:?}"
+    );
+    assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
 }

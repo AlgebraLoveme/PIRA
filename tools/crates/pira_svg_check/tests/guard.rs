@@ -1016,3 +1016,26 @@ fn regression_plain_diagnostics_escape_controls_without_changing_json_values() {
         );
     }
 }
+
+#[test]
+fn regression_internal_keys_cannot_change_author_css_or_text_identity() {
+    let template = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='80'><style>RULE</style><text id='label' x='10' y='50' font-family='sans-serif' font-size='26' fill='#eee'>A &amp; B</text></svg>";
+    let expected = analyze_svg(&template.replace("RULE", ""));
+    assert!(expected.warnings.iter().any(|w| w.code == "low-contrast"));
+    for rule in [
+        "[data-pira-svg-check-key] {fill:black}",
+        "[data-pira-svg-check-key] {display:none!important}",
+        "text:not([data-pira-svg-check-key]) {fill:#eee}",
+        "[style] {fill:black}",
+    ] {
+        let report = analyze_svg(&template.replace("RULE", rule));
+        assert_eq!(report.warnings, expected.warnings, "{rule}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.text.as_deref() == Some("A & B")
+                    && w.text_element.as_deref() == Some("<text#label>"))
+        );
+    }
+}

@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 
 use crate::command::{
@@ -1405,35 +1404,49 @@ fn command_map(
     let mut summaries = Vec::with_capacity(discovery.files.len());
     let mut resolver = structural_resolver(lsp, &root)?;
     for batch in parse_batches(&discovery.files) {
-        let parsed = batch
-            .par_iter()
-            .map(|(path, language)| {
-                (!is_broad_map_fixture(path, &root, language.is_document()))
-                    .then(|| parse_structural_input(path, *language, lsp))
-            })
-            .collect::<Vec<_>>();
-        for ((path, _), result) in batch.iter().zip(parsed) {
+        let parsed = crate::util::map_ordered(batch, |(path, language)| {
+            (!is_broad_map_fixture(path, &root, language.is_document()))
+                .then(|| parse_structural_input(path, *language, lsp))
+        });
+        for ((path, language), result) in batch.iter().zip(parsed) {
             let Some(result) = result else {
                 continue;
             };
-            match result {
-                Ok(parsed) => match resolver.resolve_parsed(parsed) {
-                    Ok(parsed) => summaries.push(FileSummary {
-                        path: parsed.path,
-                        language: parsed.language,
-                        backend: parsed.backend,
-                        names: top_level_map_names(&parsed.symbols),
-                        symbols_truncated: parsed.symbols_truncated,
-                    }),
-                    Err((code, message)) => {
-                        failures.record(display_path(path, &root), code, message)
+            match result
+                .map_err(input_error)
+                .and_then(|parsed| resolver.resolve_parsed(parsed))
+            {
+                Ok(parsed) => summaries.push(FileSummary {
+                    path: parsed.path,
+                    language: parsed.language,
+                    backend: parsed.backend,
+                    names: top_level_map_names(&parsed.symbols),
+                    symbols_truncated: parsed.symbols_truncated,
+                    landmarks_unavailable: false,
+                }),
+                Err((code, message)) => {
+                    if !lsp.forces_language(*language) {
+                        // Topology does not depend on optional parser landmarks.
+                        summaries.push(FileSummary {
+                            path: path.clone(),
+                            language: *language,
+                            backend: ParseBackend::Native,
+                            names: Vec::new(),
+                            symbols_truncated: false,
+                            landmarks_unavailable: true,
+                        });
                     }
-                },
-                Err(message) => failures.record(display_path(path, &root), 2, message),
+                    failures.record(display_path(path, &root), code, message);
+                }
             }
         }
     }
-    let parsed_count = summaries.len();
+    let summary_count = summaries.len();
+    let native_unavailable = summaries
+        .iter()
+        .filter(|file| file.landmarks_unavailable)
+        .count();
+    let parsed_count = summary_count - native_unavailable;
     let source_files = discovery
         .files
         .iter()
@@ -1513,7 +1526,7 @@ fn command_map(
     if discovery.ambiguous > 0 {
         write!(output, " ambiguous={}", discovery.ambiguous).map_err(output_error)?;
     }
-    let omitted = parsed_count.saturating_sub(shown);
+    let omitted = summary_count.saturating_sub(shown);
     if omitted > 0 {
         write!(output, " omitted={omitted}").map_err(output_error)?;
     }
@@ -1571,6 +1584,9 @@ fn command_map(
         if file.symbols_truncated {
             write!(output, " truncated=1").map_err(output_error)?;
         }
+        if file.landmarks_unavailable {
+            write!(output, " landmarks_unavailable=1").map_err(output_error)?;
+        }
         let label = match file.language {
             Language::Markdown => "headings",
             language if language.is_document() => "keys",
@@ -1580,7 +1596,7 @@ fn command_map(
     }
     finish_partial_result(
         discovery.files.len().saturating_sub(fixture_skipped),
-        parsed_count,
+        parsed_count + native_unavailable,
         &failures,
         "all eligible map files failed; inspect the reported file errors",
         output,
@@ -1906,10 +1922,9 @@ fn command_symbols(
         .map(|_| SymbolBucket::new(options.max_items))
         .collect::<Vec<_>>();
     for batch in parse_batches(&discovery.files) {
-        let parsed = batch
-            .par_iter()
-            .map(|(path, language)| parse_structural_input(path, *language, lsp))
-            .collect::<Vec<_>>();
+        let parsed = crate::util::map_ordered(batch, |(path, language)| {
+            parse_structural_input(path, *language, lsp)
+        });
         for ((path, _), result) in batch.iter().zip(parsed) {
             let parsed = match result {
                 Ok(parsed) => match resolver.resolve_parsed(parsed) {
@@ -2425,6 +2440,7 @@ struct FileSummary {
     backend: ParseBackend,
     names: Vec<String>,
     symbols_truncated: bool,
+    landmarks_unavailable: bool,
 }
 
 fn parse_batches(files: &[(PathBuf, Language)]) -> Vec<&[(PathBuf, Language)]> {
@@ -4194,16 +4210,66 @@ fn finish_output(result: CommandResult, output: &mut dyn Write) -> i32 {
 }
 
 fn fail<T: AsRef<str>>(code: i32, message: T) -> i32 {
-    if let Some(message) = message.as_ref().strip_prefix("warning: ") {
-        eprintln!("warning: {message}");
+    diagnostic(&mut std::io::stderr().lock(), code, message.as_ref())
+}
+
+fn diagnostic(output: &mut dyn Write, code: i32, message: &str) -> i32 {
+    let message = sanitize_metadata(message);
+    if let Some(message) = message.strip_prefix("warning: ") {
+        let _ = writeln!(output, "warning: {message}");
     } else {
-        eprintln!("error: {}", message.as_ref());
+        let _ = writeln!(output, "error: {message}");
     }
     code
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_external_snapshot_never_reuses_another_symbols_source_range() {
+        let source = "def alpha(): pass\n# outside\n";
+        let path = std::path::PathBuf::from("source.py");
+        let language = crate::language::Language::Python;
+        let (symbols, _) = crate::parse::parse_source_symbols(&path, language, source).unwrap();
+        let row = super::SymbolRow {
+            path,
+            language,
+            backend: crate::model::ParseBackend::Lsp,
+            symbol: symbols[0].clone(),
+            selector: None,
+            source_hash: super::hash16(source.as_bytes()),
+        };
+        assert!(
+            super::unchanged_symbol_source(&row, source)
+                .unwrap()
+                .starts_with("def alpha")
+        );
+        assert!(super::unchanged_symbol_source(&row, "def other(): pass\n# outside\n").is_none());
+    }
+
+    #[test]
+    fn final_diagnostic_escapes_controls_and_preserves_exit_on_sink_failure() {
+        let mut output = Vec::new();
+        assert_eq!(
+            super::diagnostic(&mut output, 2, "warning: bad\x1b[31m\nforged"),
+            2
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "warning: bad\\u{1b}[31m\\u{a}forged\n"
+        );
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected stderr failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(super::diagnostic(&mut Broken, 3, "failure"), 3);
+    }
+
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

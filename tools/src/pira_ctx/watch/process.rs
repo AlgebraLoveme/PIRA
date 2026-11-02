@@ -1,5 +1,6 @@
 use std::io;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// A child isolated so its descendants can be terminated as one attempt.
 pub struct ProcessTree {
@@ -7,10 +8,13 @@ pub struct ProcessTree {
     #[cfg(windows)]
     job: windows_sys::Win32::Foundation::HANDLE,
     cleaned: bool,
+    #[cfg(unix)]
+    group_pending: bool,
 }
 
 impl ProcessTree {
     pub fn spawn(command: &mut Command, label: &str) -> Result<Self, String> {
+        crate::shutdown::check()?;
         configure(command);
         let child = command
             .spawn()
@@ -22,6 +26,7 @@ impl ProcessTree {
         cmd: &[String],
         redirected: Option<crate::model::StreamKind>,
     ) -> Result<Self, String> {
+        crate::shutdown::check()?;
         let mut command = Command::new(&cmd[0]);
         command
             .args(&cmd[1..])
@@ -56,7 +61,11 @@ impl ProcessTree {
             Err(error) => {
                 let mut child = child;
                 let _ = child.kill();
-                let _ = child.wait();
+                if let Err(cleanup) = wait_owned_child(&mut child) {
+                    crate::util::diagnostic_line(&format!(
+                        "pira_ctx: cleanup isolation failure: {cleanup}"
+                    ));
+                }
                 return Err(format!("isolate {_label} process tree: {error}"));
             }
         };
@@ -65,14 +74,18 @@ impl ProcessTree {
             #[cfg(windows)]
             job,
             cleaned: false,
+            #[cfg(unix)]
+            group_pending: true,
         };
         #[cfg(windows)]
         {
             let mut tree = tree;
             if let Err(error) = resume_primary(&tree.child) {
-                tree.terminate_tree();
-                let _ = tree.child.kill();
-                let _ = tree.child.wait();
+                if let Err(cleanup) = tree.terminate_and_wait() {
+                    crate::util::diagnostic_line(&format!(
+                        "pira_ctx: cleanup resume failure: {cleanup}"
+                    ));
+                }
                 return Err(format!("resume isolated {_label}: {error}"));
             }
             return Ok(tree);
@@ -81,38 +94,172 @@ impl ProcessTree {
         Ok(tree)
     }
 
-    /// Ends any descendants that retained stdio after the direct child exited.
+    /// Observe completion without releasing the Unix PID before group cleanup.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        #[cfg(unix)]
+        if self.group_pending {
+            // SAFETY: waitid observes only our direct child and WNOWAIT pins its
+            // PID even after exit. No other code may reap it before group cleanup.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    // An external reaper invalidates group ownership; never signal it.
+                    self.group_pending = false;
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            self.terminate_tree();
+        }
+        self.child.try_wait()
+    }
+
+    /// Ends descendants before reaping the direct child and releasing its PID.
     pub fn terminate_tree(&mut self) {
         if self.cleaned {
             return;
         }
+        #[allow(unused_mut)]
+        let mut group_cleaned = true;
         #[cfg(unix)]
-        {
+        if std::mem::take(&mut self.group_pending) {
             let group = self.child.id().min(i32::MAX as u32) as i32;
-            // SAFETY: every attempt is made leader of a new process group before spawn.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
+            // SAFETY: spawn made this child a group leader. Its unreaped PID pins
+            // the original group ID, even if the child moved to another group.
+            // Never retry the group signal after a subsequent try_wait reaps it.
+            let result = unsafe { libc::kill(-group, libc::SIGKILL) };
+            if result != 0 {
+                let error = io::Error::last_os_error();
+                if !group_already_exited(group, &error) {
+                    group_cleaned = false;
+                    crate::util::diagnostic_line(&format!(
+                        "pira_ctx: terminate original process group: {error}"
+                    ));
+                }
             }
         }
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
             // SAFETY: `job` is a live handle owned by this value.
-            unsafe {
-                TerminateJobObject(self.job, 1);
+            if unsafe { TerminateJobObject(self.job, 1) } == 0 {
+                group_cleaned = false;
+                crate::util::diagnostic_line(&format!(
+                    "pira_ctx: terminate owned job: {}",
+                    io::Error::last_os_error()
+                ));
             }
         }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = self.child.kill();
+        // A direct child may have left its original group. Kill only that owned
+        // child, never its new group (which can contain unrelated processes).
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    crate::util::diagnostic_line(&format!(
+                        "pira_ctx: terminate owned child: {error}"
+                    ));
+                    return;
+                }
+            }
+            Err(error) => {
+                crate::util::diagnostic_line(&format!("pira_ctx: inspect owned child: {error}"));
+                return;
+            }
         }
-        self.cleaned = true;
+        self.cleaned = group_cleaned;
+    }
+
+    /// Kill containment and the owned child, bounding the reap wait to two seconds.
+    pub fn terminate_and_wait(&mut self) -> Result<ExitStatus, String> {
+        self.terminate_tree();
+        wait_owned_child(&mut self.child)
+    }
+}
+
+#[cfg(unix)]
+fn group_already_exited(group: i32, error: &io::Error) -> bool {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return zombie_only_group(group);
+    }
+    let _ = group;
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn zombie_only_group(group: i32) -> bool {
+    // Darwin includes zombies in the group list, but kill may return EPERM when
+    // no live member remains. Inspect only; never signal an enumerated PID.
+    // Unknown/incomplete observations retain the original failure diagnostic.
+    // SAFETY: null/zero queries size; subsequent buffers have the supplied size.
+    let count = unsafe { libc::proc_listpgrppids(group, std::ptr::null_mut(), 0) };
+    if count <= 0 || count > 262_144 {
+        return false;
+    }
+    let mut pids = vec![0_i32; count as usize + 32];
+    let capacity = size_of_val(pids.as_slice()) as i32;
+    // proc_listpgrppids returns a PID count, although its buffer size is in bytes.
+    let count = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), capacity) };
+    if count <= 0 || count as usize >= pids.len() {
+        return false;
+    }
+    pids[..count as usize].iter().all(|&pid| {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: initialized native struct with its exact size; arg=1 explicitly
+        // includes zombies in PROC_PIDTBSDINFO. The PID is observed, not signalled.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        bytes == size && info.pbi_pgid == group as u32 && info.pbi_status == libc::SZOMB
+    })
+}
+
+fn wait_owned_child(child: &mut Child) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("reap owned child: {e}"))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            return Err("owned child did not exit within 2s of termination".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 impl Drop for ProcessTree {
     fn drop(&mut self) {
-        self.terminate_tree();
+        if let Err(error) = self.terminate_and_wait() {
+            crate::util::diagnostic_line(&format!("pira_ctx: cleanup: {error}"));
+        }
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::CloseHandle;
@@ -244,6 +391,28 @@ fn resume_primary(child: &Child) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn live_group_permission_errors_are_not_silenced() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("1").current_dir(std::env::temp_dir());
+        let tree = ProcessTree::spawn(&mut command, "permission classification fixture").unwrap();
+        let group = tree.child.id() as i32;
+        assert!(!group_already_exited(
+            group,
+            &io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(!group_already_exited(
+            group,
+            &io::Error::from_raw_os_error(libc::EACCES)
+        ));
+        // Drop terminates only this unreaped owned group and waits within the bound.
+    }
 }
 
 #[cfg(all(test, windows))]

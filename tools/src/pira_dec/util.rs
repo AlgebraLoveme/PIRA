@@ -220,6 +220,15 @@ pub fn stdout_line(value: &str) -> Result<(), String> {
     writeln!(lock, "{value}").map_err(output_error)
 }
 
+// Diagnostic failures must not interrupt publication, cleanup, or exit handling.
+pub fn stderr_line(message: std::fmt::Arguments<'_>) {
+    stderr_line_to(&mut io::stderr().lock(), message);
+}
+
+pub(crate) fn stderr_line_to(writer: &mut impl Write, message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{message}");
+}
+
 pub fn stdout_text(value: &str) -> Result<(), String> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
@@ -370,6 +379,55 @@ fn output_error(error: io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_diagnostics_preserve_line_format() {
+        let mut output = Vec::new();
+        stderr_line_to(&mut output, format_args!("pira_dec: skipped={}", 9));
+        assert_eq!(output, b"pira_dec: skipped=9\n");
+    }
+
+    #[test]
+    fn stderr_write_failures_are_best_effort() {
+        struct FailingWriter {
+            remaining: usize,
+            error: io::ErrorKind,
+            attempts: usize,
+        }
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.attempts += 1;
+                if self.remaining == 0 {
+                    return Err(self.error.into());
+                }
+                let written = bytes.len().min(self.remaining);
+                self.remaining -= written;
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for error in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            for remaining in [0, 5] {
+                let mut writer = FailingWriter {
+                    remaining,
+                    error,
+                    attempts: 0,
+                };
+                stderr_line_to(&mut writer, format_args!("pira_dec: warning {}", 1));
+                assert_eq!(writer.remaining, 0);
+                assert!(writer.attempts > 0);
+            }
+        }
+        // A writer that makes no progress produces WriteZero, not a panic.
+        stderr_line_to(&mut &mut [0u8; 0][..], format_args!("warning"));
+    }
 
     #[test]
     fn formats_fixed_utc_timestamps() {

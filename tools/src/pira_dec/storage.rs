@@ -390,11 +390,28 @@ pub fn delete_exact(layout: &Layout, id: &str) -> Result<Option<DecisionRecord>,
 }
 
 fn publish_no_clobber(temporary: &Path, final_path: &Path) -> Result<(), String> {
+    publish_with_cleanup(
+        temporary,
+        final_path,
+        |path| fs::remove_file(path),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn publish_with_cleanup(
+    temporary: &Path,
+    final_path: &Path,
+    remove_temporary: impl FnOnce(&Path) -> std::io::Result<()>,
+    diagnostics: &mut impl std::io::Write,
+) -> Result<(), String> {
     match fs::hard_link(temporary, final_path) {
         Ok(()) => {
-            if fs::remove_file(temporary).is_err() {
-                eprintln!(
-                    "pira_dec: warning: decision was published but its temporary link remains"
+            if remove_temporary(temporary).is_err() {
+                util::stderr_line_to(
+                    diagnostics,
+                    format_args!(
+                        "pira_dec: warning: decision was published but its temporary link remains"
+                    ),
                 );
             }
             Ok(())
@@ -1009,6 +1026,46 @@ mod tests {
         assert!(publish_no_clobber(&staged, &destination).is_err());
         assert_eq!(fs::read(&destination).unwrap(), b"original");
         assert_eq!(fs::read(&staged).unwrap(), b"new");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn cleanup_and_diagnostic_failures_allow_publication_finalization() {
+        struct BrokenDiagnostics(usize);
+        impl std::io::Write for BrokenDiagnostics {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sandbox = Sandbox::new();
+        let staged = sandbox.0.join("staged");
+        let destination = sandbox.0.join("record");
+        util::write_private_new(&staged, b"complete bytes").unwrap();
+        let mut diagnostics = BrokenDiagnostics(0);
+        publish_with_cleanup(
+            &staged,
+            &destination,
+            |path| {
+                assert_eq!(path, staged);
+                Err(ErrorKind::PermissionDenied.into())
+            },
+            &mut diagnostics,
+        )
+        .unwrap();
+        // The warning must return normally so the caller can reach its sync barrier.
+        #[cfg(unix)]
+        sync_directory(&sandbox.0).unwrap();
+        assert!(diagnostics.0 > 0);
+        assert_eq!(fs::read(&destination).unwrap(), b"complete bytes");
+        assert_eq!(fs::read(&staged).unwrap(), b"complete bytes");
+        util::check_private_file(&File::open(&destination).unwrap()).unwrap();
+        assert!(publish_no_clobber(&staged, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"complete bytes");
     }
 
     #[test]

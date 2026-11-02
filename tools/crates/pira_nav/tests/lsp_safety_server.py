@@ -40,6 +40,10 @@ while True:
             time.sleep(4)
             sys.exit(0)
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {"definitionProvider": True, "documentSymbolProvider": True}}})
+    elif method == "initialized" and mode == "blocked-write":
+        # Finite peer; stop draining stdin while Nav writes its 1 MiB document.
+        time.sleep(6)
+        sys.exit(0)
     elif method == "initialized" and mode in ("duplex", "overflow"):
         # Do not read didOpen until the burst is completely written. Its 1 MiB
         # source also exceeds a pipe buffer: blocking reader backpressure deadlocks.
@@ -61,10 +65,12 @@ while True:
         }]})
     elif method == "textDocument/definition":
         position = {"line": 2147483648 if mode == "integer" else 1, "character": 0}
-        if mode == "descendant":
+        if mode in ("descendant", "detached"):
             ready_read, ready_write = os.pipe()
             if os.fork() == 0:
                 os.close(ready_read)
+                if mode == "detached":
+                    os.setsid()
                 os.write(ready_write, b"ready")
                 os.close(ready_write)
                 # Retain stdin/stdout/stderr but do no I/O. Finite even on regressions.
@@ -77,7 +83,7 @@ while True:
             "uri": message["params"]["textDocument"]["uri"],
             "range": {"start": position, "end": position},
         }]})
-        if mode == "descendant":
+        if mode in ("descendant", "detached"):
             os._exit(0)
     elif method == "shutdown":
         send({"jsonrpc": "2.0", "id": message["id"], "result": None})

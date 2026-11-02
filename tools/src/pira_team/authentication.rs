@@ -345,6 +345,9 @@ impl Server {
             return Err("coordinator backend selection is not retained".into());
         }
         let payload = Backend::capture(program)?.encode()?;
+        Self::listen(run, revision, payload)
+    }
+    fn listen(run: &Path, revision: &Value, payload: Secret) -> Result<Self, String> {
         let run = run.to_owned();
         let revision = revision.clone();
         let stopped = Arc::new(AtomicBool::new(false));
@@ -364,14 +367,17 @@ impl Server {
                 return;
             }
             while !stop.load(Ordering::SeqCst) {
-                let mut connection = match listener.accept(Instant::now() + BUDGET) {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
-                    Err(_) => break,
-                };
+                let mut connection =
+                    match listener.accept(Instant::now() + Duration::from_millis(100)) {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+                        Err(_) => break,
+                    };
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
+                #[cfg(unix)]
+                connection.stop_on(stop.clone());
                 let accepted = (|| -> Result<(), String> {
                     let peer = connection.peer().map_err(|_| "unverified launcher peer")?;
                     let bytes = read_frame(&mut connection, 4096)
@@ -409,7 +415,6 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::SeqCst);
-        let _ = local::connect(&self.endpoint, Instant::now() + BUDGET);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -459,38 +464,56 @@ mod local {
     pub struct Connection {
         stream: UnixStream,
         deadline: Instant,
+        stopped: Option<Arc<AtomicBool>>,
+    }
+    #[cfg(unix)]
+    fn ready(
+        fd: std::os::fd::RawFd,
+        events: i16,
+        deadline: Instant,
+        stopped: Option<&AtomicBool>,
+    ) -> io::Result<()> {
+        loop {
+            if stopped.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local handoff deadline exceeded",
+                ));
+            }
+            let mut poll = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            let milliseconds = remaining.as_millis().saturating_add(1).min(100) as i32;
+            let result = unsafe { libc::poll(&mut poll, 1, milliseconds) };
+            if result > 0 {
+                return Ok(());
+            }
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
     }
     #[cfg(unix)]
     impl Connection {
+        pub(super) fn stop_on(&mut self, stopped: Arc<AtomicBool>) {
+            self.stopped = Some(stopped);
+        }
         fn ready(&self, events: i16) -> io::Result<()> {
-            loop {
-                let remaining = self.deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "local handoff deadline exceeded",
-                    ));
-                }
-                let mut fd = libc::pollfd {
-                    fd: self.stream.as_raw_fd(),
-                    events,
-                    revents: 0,
-                };
-                let milliseconds = remaining
-                    .as_millis()
-                    .saturating_add(1)
-                    .min(i32::MAX as u128) as i32;
-                let result = unsafe { libc::poll(&mut fd, 1, milliseconds) };
-                if result > 0 {
-                    return Ok(());
-                }
-                if result < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-            }
+            ready(
+                self.stream.as_raw_fd(),
+                events,
+                self.deadline,
+                self.stopped.as_deref(),
+            )
         }
         pub fn peer(&self) -> io::Result<u32> {
             let fd = self.stream.as_raw_fd();
@@ -580,7 +603,7 @@ mod local {
     pub struct Listener {
         listener: UnixListener,
         endpoint: Value,
-        cleanup: Option<PathBuf>,
+        cleanup: Option<(PathBuf, u64, u64)>,
     }
     #[cfg(unix)]
     impl Listener {
@@ -615,6 +638,15 @@ mod local {
                     Some(path),
                 )
             };
+            listener.set_nonblocking(true)?;
+            use std::os::unix::fs::MetadataExt;
+            let cleanup: Option<PathBuf> = cleanup;
+            let cleanup = cleanup
+                .map(|path| {
+                    let metadata = std::fs::symlink_metadata(&path)?;
+                    Ok::<_, io::Error>((path, metadata.dev(), metadata.ino()))
+                })
+                .transpose()?;
             Ok(Self {
                 listener,
                 endpoint,
@@ -624,20 +656,114 @@ mod local {
         pub fn endpoint(&self) -> Value {
             self.endpoint.clone()
         }
-        pub fn accept(&self, _deadline: Instant) -> io::Result<Connection> {
-            let (stream, _) = self.listener.accept()?;
-            stream.set_nonblocking(true)?;
-            Ok(Connection {
-                stream,
-                deadline: Instant::now() + BUDGET,
-            })
+        pub fn accept(&self, deadline: Instant) -> io::Result<Connection> {
+            loop {
+                ready(self.listener.as_raw_fd(), libc::POLLIN, deadline, None)?;
+                match self.listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true)?;
+                        return Ok(Connection {
+                            stream,
+                            deadline: Instant::now() + BUDGET,
+                            stopped: None,
+                        });
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
     #[cfg(unix)]
     impl Drop for Listener {
         fn drop(&mut self) {
-            if let Some(path) = &self.cleanup {
-                let _ = std::fs::remove_file(path);
+            if let Some((path, dev, ino)) = &self.cleanup {
+                use std::os::unix::fs::MetadataExt;
+                if std::fs::symlink_metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino)
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    fn connect_name(name: &[u8], deadline: Instant) -> io::Result<UnixStream> {
+        use std::os::fd::FromRawFd;
+        if deadline <= Instant::now() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if name.len() > address.sun_path.len() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (target, byte) in address.sun_path.iter_mut().zip(name) {
+            *target = *byte as libc::c_char;
+        }
+        let length = std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len();
+        #[cfg(target_os = "macos")]
+        {
+            address.sun_len = length as u8;
+        }
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        stream.set_nonblocking(true)?;
+        loop {
+            if deadline <= Instant::now() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if unsafe {
+                libc::connect(
+                    fd,
+                    (&address as *const libc::sockaddr_un).cast(),
+                    length as libc::socklen_t,
+                )
+            } == 0
+            {
+                return Ok(stream);
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EISCONN) => return Ok(stream),
+                Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
+                    ready(fd, libc::POLLOUT, deadline, None)?;
+                    let mut code = 0_i32;
+                    let mut size = std::mem::size_of_val(&code) as libc::socklen_t;
+                    if unsafe {
+                        libc::getsockopt(
+                            fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            (&mut code as *mut i32).cast(),
+                            &mut size,
+                        )
+                    } != 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if code == 0 {
+                        return Ok(stream);
+                    }
+                    return Err(io::Error::from_raw_os_error(code));
+                }
+                Some(libc::EINTR) => {}
+                _ if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                _ => return Err(error),
             }
         }
     }
@@ -651,9 +777,9 @@ mod local {
             let name = endpoint["name"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("invalid local endpoint"))?;
-            UnixStream::connect_addr(&std::os::unix::net::SocketAddr::from_abstract_name(
-                name.as_bytes(),
-            )?)?
+            let mut bytes = vec![0];
+            bytes.extend_from_slice(name.as_bytes());
+            connect_name(&bytes, deadline)?
         };
         #[cfg(target_os = "macos")]
         let stream = {
@@ -663,10 +789,16 @@ mod local {
             let root = endpoint["root"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("invalid local endpoint"))?;
-            in_directory(Path::new(root), || UnixStream::connect("credential.sock"))?
+            in_directory(Path::new(root), || {
+                connect_name(b"credential.sock\0", deadline)
+            })?
         };
         stream.set_nonblocking(true)?;
-        Ok(Connection { stream, deadline })
+        Ok(Connection {
+            stream,
+            deadline,
+            stopped: None,
+        })
     }
     #[cfg(windows)]
     pub type Connection = native::windows::Pipe;
@@ -712,6 +844,7 @@ mod local {
     #[cfg(test)]
     mod tests {
         use super::*;
+        include!("authentication_deadline_tests.rs");
         #[test]
         fn native_local_transport_verifies_peer_and_delivers_before_close() {
             let root = std::env::temp_dir().join(format!(
@@ -783,6 +916,7 @@ mod local {
             let mut connection = Connection {
                 stream: reader,
                 deadline: Instant::now() + Duration::from_millis(20),
+                stopped: None,
             };
             let start = Instant::now();
             let error = connection.read(&mut [0]).unwrap_err();
@@ -799,6 +933,7 @@ mod local {
             let mut connection = Connection {
                 stream: reader,
                 deadline: Instant::now() + BUDGET,
+                stopped: None,
             };
             assert!(read_frame(&mut connection, 128).unwrap() == b"synthetic frame");
         }

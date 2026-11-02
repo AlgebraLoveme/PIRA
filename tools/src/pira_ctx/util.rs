@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +28,7 @@ impl BoundedStdout {
 
     fn emit(&self, text: &str) -> Result<(), String> {
         if self.stderr {
-            writeln!(io::stderr().lock(), "{text}").map_err(io_error)
+            crate::shutdown::write_output(true, format!("{text}\n").as_bytes()).map_err(io_error)
         } else {
             stdout_line(text)
         }
@@ -111,8 +111,8 @@ pub fn read_file_limited(path: &Path, maximum: u64, label: &str) -> Result<Vec<u
 }
 
 pub fn stdout_line(text: &str) -> Result<(), String> {
-    let mut output = io::stdout().lock();
-    writeln!(output, "{}", sanitize_terminal(text)).map_err(io_error)
+    crate::shutdown::write_output(false, format!("{}\n", sanitize_terminal(text)).as_bytes())
+        .map_err(io_error)
 }
 
 pub fn millis(time: SystemTime) -> u128 {
@@ -515,11 +515,15 @@ fn escape_diagnostic(text: &str) -> String {
 
 /// Do not append wrapper diagnostics to a caller's redirected data stream.
 pub fn diagnostic_line(text: &str) {
+    // Never block shutdown trying to report an interrupted output operation.
+    if crate::shutdown::requested() {
+        return;
+    }
     let text = escape_diagnostic(text);
     if !stderr_is_data_destination() {
-        let _ = writeln!(io::stderr().lock(), "{text}");
+        let _ = crate::shutdown::write_output(true, format!("{text}\n").as_bytes());
     } else if !stdout_is_data_destination() {
-        let _ = writeln!(io::stdout().lock(), "{text}");
+        let _ = crate::shutdown::write_output(false, format!("{text}\n").as_bytes());
     }
 }
 

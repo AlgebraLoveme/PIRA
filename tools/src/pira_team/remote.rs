@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(super) mod routing;
+mod transport;
 
 const VERSION: u64 = 2;
 const NAMESPACE: &str = "pira-team-remote-v2";
@@ -1012,29 +1013,13 @@ impl Client {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+        let mut request = serde_json::to_vec(envelope).map_err(|e| e.to_string())?;
+        request.push(b'\n');
         let mut child = ssh.spawn().map_err(|e| format!("start SSH: {e}"))?;
-        let sent = (|| {
-            let mut input = child.stdin.take().ok_or("SSH stdin unavailable")?;
-            serde_json::to_writer(&mut input, envelope).map_err(|e| e.to_string())?;
-            input.write_all(b"\n").map_err(|e| e.to_string())
-        })();
-        let mut bytes = Vec::new();
-        child
-            .stdout
-            .take()
-            .ok_or("SSH stdout unavailable")?
-            .take(LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("read SSH: {e}"))?;
-        if bytes.len() as u64 > LIMIT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("remote reply exceeds protocol limit".into());
-        }
-        let status = child.wait().map_err(|e| e.to_string())?;
-        if sent.is_err() || !status.success() {
-            return Err("SSH delivery/connectivity unknown; reconcile SAME request/operation ID, never replay with a new ID; worker was not stopped".into());
-        }
+        let bytes = transport::exchange(&mut child, &request, || {
+            crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .map_err(|error| self.delivery_error(&error))?;
         let reply: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid remote response/protocol mismatch; delivery unknown")?;
         if reply["version"] != VERSION {
@@ -1047,6 +1032,13 @@ impl Client {
                 .to_owned());
         }
         Ok(reply["result"].clone())
+    }
+    fn delivery_error(&self, error: &str) -> String {
+        format!(
+            "{error}; SSH delivery/connectivity unknown; reconcile SAME request ID {} / operation ID {}; never replay with a new ID; remote worker was not interrupted",
+            self.id,
+            self.operation.as_deref().unwrap_or("none")
+        )
     }
     fn capability_request(&self, issuer: &str) -> Result<Value, String> {
         let mut grant = self.grant("read", issuer, None)?;

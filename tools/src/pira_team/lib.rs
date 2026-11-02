@@ -30,7 +30,7 @@ extern "C" fn cancel_worker(_: libc::c_int) {
     CANCELLED.store(true, Ordering::SeqCst);
 }
 
-const WORKER_POLICY_VERSION: u64 = 20;
+const WORKER_POLICY_VERSION: u64 = 21;
 const COORDINATOR_POLICY_VERSION: u64 = 22;
 
 pub const POLICY: &str = include_str!("main.md");
@@ -68,8 +68,11 @@ struct Options {
 // Children may intentionally outlive their coordinator. A closed diagnostic pipe
 // must not panic before managed lifecycle state is finalized.
 fn notice(message: std::fmt::Arguments<'_>) {
-    use std::io::Write;
-    let _ = writeln!(std::io::stderr().lock(), "{message}");
+    write_notice(&mut std::io::stderr().lock(), message);
+}
+
+fn write_notice(output: &mut impl std::io::Write, message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(output, "{message}");
 }
 
 fn completion_gate(value: Option<String>) -> Result<String, String> {
@@ -411,16 +414,21 @@ impl IsolatedHome {
         }
         Ok(home)
     }
-}
-
-impl Drop for IsolatedHome {
-    fn drop(&mut self) {
+    fn detach(&self, warn: impl FnOnce(std::fmt::Arguments<'_>)) {
         // Retain only the worker's session; detach authentication after every revision.
         if let Err(error) = fs::remove_file(self.0.join("auth.json"))
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!("pira_team: detach worker authentication: {error}");
+            warn(format_args!(
+                "pira_team: detach worker authentication: {error}"
+            ));
         }
+    }
+}
+
+impl Drop for IsolatedHome {
+    fn drop(&mut self) {
+        self.detach(notice);
     }
 }
 
@@ -651,6 +659,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authentication_detach_survives_injected_diagnostic_write_failure() {
+        struct BrokenOutput(usize);
+        impl std::io::Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "team-detach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        private_dir(&root).unwrap();
+        // A directory makes unlink fail deterministically, without credentials or chmod.
+        private_dir(&root.join("auth.json")).unwrap();
+        let home = IsolatedHome(root.clone());
+        let mut output = BrokenOutput(0);
+        home.detach(|message| write_notice(&mut output, message));
+        assert!(output.0 > 0);
+        assert!(root.join("auth.json").is_dir());
+        fs::remove_dir(root.join("auth.json")).unwrap();
+        let mut warnings = 0;
+        home.detach(|_| warnings += 1);
+        assert_eq!(warnings, 0, "missing authentication is not a warning");
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn worker_path_prefers_parent_launcher_and_preserves_ambient_order() {
         let launcher = Path::new("/staged team/bin/pira_team");
         let inherited = std::env::join_paths([
@@ -872,7 +915,7 @@ mod tests {
         ] {
             assert!(safety.contains(expected), "{expected}");
         }
-        assert_eq!(WORKER_POLICY_VERSION, 20);
+        assert_eq!(WORKER_POLICY_VERSION, 21);
         assert!(!IMPLEMENTATION_POLICY.contains("exact prefix `Safety:`"));
     }
 

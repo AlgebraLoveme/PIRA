@@ -17,7 +17,10 @@ pub fn run() -> i32 {
         Ok(code) => code,
         Err(error) if error == util::BROKEN_PIPE => 0,
         Err(error) => {
-            eprintln!("pira_dec: {}", util::escape_diagnostic(&error));
+            util::stderr_line(format_args!(
+                "pira_dec: {}",
+                util::escape_diagnostic(&error)
+            ));
             2
         }
     }
@@ -85,12 +88,7 @@ fn run_export(
     limit: Option<usize>,
 ) -> Result<i32, String> {
     let (since_ms, until_ms) = parse_time_window("export", since, until)?;
-    let (records, skipped) = load_records(store)?;
-    let records: Vec<_> = records
-        .into_iter()
-        .filter(|record| time_matches(record, since_ms, until_ms))
-        .take(limit.unwrap_or(usize::MAX))
-        .collect();
+    let (records, skipped) = load_export_records(store, since_ms, until_ms, limit)?;
     let html = export::render(&records, skipped.len())?;
     util::write_private_new(output, html.as_bytes())?;
     util::stdout_line(&format!(
@@ -120,13 +118,13 @@ fn run_show(store: Option<&Path>, id: &str, json: bool) -> Result<i32, String> {
     let layout = storage::Layout::current(store)?;
     let path = match storage::resolve(&layout, id, false)? {
         storage::Resolution::Missing => {
-            eprintln!("pira_dec: no decision matches {id:?}");
+            util::stderr_line(format_args!("pira_dec: no decision matches {id:?}"));
             return Ok(1);
         }
         storage::Resolution::Ambiguous => {
-            eprintln!(
+            util::stderr_line(format_args!(
                 "pira_dec: decision prefix is ambiguous: {id:?}; use a complete ID from pira_dec list --limit 20"
-            );
+            ));
             return Ok(1);
         }
         storage::Resolution::Found(path) => path,
@@ -134,7 +132,9 @@ fn run_show(store: Option<&Path>, id: &str, json: bool) -> Result<i32, String> {
     let record = match storage::read_record(&path) {
         Ok(record) => record,
         Err(storage::ReadFailure::Vanished) => {
-            eprintln!("pira_dec: decision vanished before it could be read");
+            util::stderr_line(format_args!(
+                "pira_dec: decision vanished before it could be read"
+            ));
             return Ok(1);
         }
         Err(storage::ReadFailure::Invalid(error)) => return Err(error),
@@ -418,10 +418,7 @@ fn load_bounded_records(
     let skipped = visit_records(store, |record| {
         if matches(&record)? {
             total += 1;
-            heap.push(std::cmp::Reverse(RankedRecord(record)));
-            if heap.len() > limit {
-                heap.pop();
-            }
+            retain_newest(&mut heap, record, limit);
         }
         Ok(())
     })?;
@@ -430,10 +427,34 @@ fn load_bounded_records(
     Ok((records, skipped, total > limit))
 }
 
-fn load_records(store: Option<&Path>) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>), String> {
+fn retain_newest(
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<RankedRecord>>,
+    record: DecisionRecord,
+    limit: usize,
+) {
+    heap.push(std::cmp::Reverse(RankedRecord(record)));
+    if heap.len() > limit {
+        heap.pop();
+    }
+}
+
+fn load_export_records(
+    store: Option<&Path>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+    limit: Option<usize>,
+) -> Result<(Vec<DecisionRecord>, Vec<SkippedRecord>), String> {
+    if let Some(limit) = limit {
+        let (records, skipped, _) = load_bounded_records(store, limit, |record| {
+            Ok(time_matches(record, since_ms, until_ms))
+        })?;
+        return Ok((records, skipped));
+    }
     let mut records = Vec::new();
     let skipped = visit_records(store, |record| {
-        records.push(record);
+        if time_matches(&record, since_ms, until_ms) {
+            records.push(record);
+        }
         Ok(())
     })?;
     sort_records_newest_first(&mut records);
@@ -453,11 +474,11 @@ fn visit_records(
             Err(storage::ReadFailure::Invalid(error)) => {
                 let filename = filename_only(&path);
                 if skipped.len() < 8 {
-                    eprintln!(
+                    util::stderr_line(format_args!(
                         "pira_dec: skipped {}: {}",
                         filename,
                         util::single_line_clip(&error, 300)
-                    );
+                    ));
                 }
                 skipped.push(SkippedRecord {
                     filename,
@@ -467,11 +488,11 @@ fn visit_records(
         }
     }
     if skipped.len() > 8 {
-        eprintln!(
+        util::stderr_line(format_args!(
             "pira_dec: skipped={} warnings_omitted={}; use search --json for record details",
             skipped.len(),
             skipped.len() - 8
-        );
+        ));
     }
     Ok(skipped)
 }
@@ -506,7 +527,7 @@ fn run_forget(store: Option<&Path>, id: &str, confirmed: bool) -> Result<i32, St
             Ok(0)
         }
         None => {
-            eprintln!("pira_dec: no exact decision {id:?}");
+            util::stderr_line(format_args!("pira_dec: no exact decision {id:?}"));
             Ok(1)
         }
     }
@@ -593,7 +614,10 @@ mod tests {
 
     fn record(timestamp_ms: u64) -> DecisionRecord {
         DecisionRecord {
-            id: format!("D-19700101T000000000Z-{timestamp_ms:016x}"),
+            id: format!(
+                "D-{}-{timestamp_ms:016x}",
+                util::format_id_timestamp(timestamp_ms).unwrap()
+            ),
             timestamp_ms,
             context: "Choose cache format".into(),
             choices: vec!["SQLite".into(), "JSON".into()],
@@ -601,6 +625,107 @@ mod tests {
             maker: Maker::Agent,
             supersedes: None,
             related: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bounded_selection_retains_only_limit_payloads() {
+        for limit in [1, 3] {
+            let mut heap = std::collections::BinaryHeap::new();
+            // Generate payloads lazily: this fixture itself never holds the history.
+            for index in 0..128 {
+                let mut record = record((index * 13) % 128);
+                record.context = "x".repeat(4_096);
+                retain_newest(&mut heap, record, limit);
+                assert!(heap.len() <= limit);
+                assert!(heap.iter().map(|r| r.0.0.context.len()).sum::<usize>() <= limit * 4_096);
+            }
+            assert_eq!(heap.len(), limit);
+            assert_eq!(heap.peek().unwrap().0.0.timestamp_ms, 128 - limit as u64);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn export_filters_limits_orders_and_reports_corruption() {
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!("pira-dec-export-{}", util::nonce_hex()));
+        std::fs::create_dir(&path).unwrap();
+        let sandbox = Sandbox(path.canonicalize().unwrap());
+        let layout = storage::Layout::current(Some(&sandbox.0)).unwrap();
+        layout.prepare_for_write().unwrap();
+        let mut reference = Vec::new();
+        for index in 0..32 {
+            let timestamp_ms = ((index * 13) % 32) / 2 * 1_000;
+            let mut record = record(timestamp_ms);
+            record.id = format!(
+                "D-{}-{index:016x}",
+                util::format_id_timestamp(timestamp_ms).unwrap()
+            );
+            record.context = format!("record-{index:02} {}", "x".repeat(4_096));
+            util::write_private_new(
+                &layout.records_dir.join(format!("{}.piradec", record.id)),
+                &model::encode(&record).unwrap(),
+            )
+            .unwrap();
+            reference.push(record);
+        }
+        // More than eight corrupt records also exercise the warning-summary path.
+        for index in 0..9 {
+            util::write_private_new(
+                &layout.records_dir.join(format!("bad-{index}.piradec")),
+                b"invalid",
+            )
+            .unwrap();
+        }
+        // Independent full-sort reference; do not reuse the selection comparator.
+        reference.sort_by_key(|record| std::cmp::Reverse((record.timestamp_ms, record.id.clone())));
+        for (index, (since, until, limit, expected_count)) in [
+            (None, None, None, 32),
+            (None, None, Some(1), 1),
+            (Some(3_000), Some(7_000), None, 8),
+            (Some(3_000), Some(7_000), Some(3), 3),
+            (Some(3_000), Some(7_000), Some(8), 8),
+            (Some(100_000), None, None, 0),
+            (Some(100_000), None, Some(1), 0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let expected: Vec<_> = reference
+                .iter()
+                .filter(|record| {
+                    since.is_none_or(|since| record.timestamp_ms >= since)
+                        && until.is_none_or(|until| record.timestamp_ms < until)
+                })
+                .take(limit.unwrap_or(usize::MAX))
+                .cloned()
+                .collect();
+            assert_eq!(expected.len(), expected_count);
+            let since = since.map(|time| util::format_rfc3339(time).unwrap());
+            let until = until.map(|time| util::format_rfc3339(time).unwrap());
+            let output = sandbox.0.join(format!("export-{index}.html"));
+            assert_eq!(
+                run_export(
+                    Some(&sandbox.0),
+                    &output,
+                    since.as_deref(),
+                    until.as_deref(),
+                    limit
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                std::fs::read_to_string(&output).unwrap(),
+                export::render(&expected, 9).unwrap()
+            );
+            util::check_private_file(&std::fs::File::open(&output).unwrap()).unwrap();
         }
     }
 

@@ -1,4 +1,5 @@
 mod css;
+mod limits;
 mod style;
 mod xml;
 
@@ -9,7 +10,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -144,7 +145,7 @@ impl Renderer {
     }
 
     fn parse(&self, source: &[u8]) -> Result<usvg::Tree, GuardError> {
-        let depth = xml::render_depth(source, 0)?;
+        let depth = xml::render_depth(source, 0)?.max(xml::reference_depth(source, 0)?);
         let resource_state = Mutex::new((depth, 0_usize, None));
         let data_resolver = usvg::ImageHrefResolver::default_data_resolver();
         let issues = Mutex::new(Vec::new());
@@ -208,6 +209,10 @@ impl Renderer {
                         || data.starts_with(b"GIF89a")
                         || (data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP"));
                     if mime != "image/svg+xml" && (mime != "text/plain" || raster) {
+                        if let Err(error) = limits::raster(&data) {
+                            resource_state.lock().unwrap().2 = Some(error);
+                            return None;
+                        }
                         return data_resolver(mime, data, options);
                     }
                     let (parent_depth, layers) = {
@@ -221,6 +226,7 @@ impl Renderer {
                     } else {
                         xml::render_depth(&data, parent_depth).and_then(|depth| {
                             xml::validate_resources(&data)?;
+                            let depth = depth.max(xml::reference_depth(&data, parent_depth)?);
                             Ok((depth, xml::renderer_source(&data)?))
                         })
                     };
@@ -285,6 +291,7 @@ impl Renderer {
                 "rendered SVG exceeds the pixel limit".to_string(),
             ));
         }
+        limits::tree(tree, self.scale, (width, height))?;
         let mut pixmap = Pixmap::new(width, height)
             .ok_or_else(|| GuardError("cannot allocate SVG render buffer".to_string()))?;
         resvg::render(
@@ -363,11 +370,17 @@ fn analyze_with_mask_budget(
         .map_err(|error| GuardError(format!("cannot read {}: {error}", path.display())))?;
     let source = read_svg(file, config.max_svg_bytes)
         .map_err(|error| GuardError(format!("cannot read {}: {error}", path.display())))?;
-    let mut annotated = xml::annotate(&source)?;
+    xml::validate_resources(&source)?;
+    // Match author selectors before introducing any bookkeeping or overrides.
     let renderer = Renderer::new(config);
-    let tree = renderer.parse(&annotated.source)?;
+    let tree = renderer.parse(&source)?;
     let final_image = renderer.render_tree(&tree, None)?;
     let canvas = Some((final_image.width(), final_image.height()));
+    let normalized = style::normalize(&source)?;
+    if renderer.render(&normalized, canvas)?.data() != final_image.data() {
+        return Err(GuardError("unsupported scene analysis: style normalization changes pixels; simplify author styles".into()));
+    }
+    let mut annotated = xml::annotate(&normalized)?;
     if has_scene_effects(tree.root()) || xml::has_local_references(&annotated.source)? {
         // Resolve instance inheritance, dependencies and original effect bounds
         // before any analysis rewrite, even when no href appears in the source.
@@ -382,7 +395,7 @@ fn analyze_with_mask_budget(
         annotated = xml::annotate(resolved.as_bytes())?;
     }
     drop(tree);
-    let variant_source = style::normalize(&annotated.source)?;
+    let variant_source = &annotated.source;
     let mut warnings = Vec::new();
     let mut regions = Vec::new();
     let mut retained_mask_bytes = 0;
@@ -402,7 +415,7 @@ fn analyze_with_mask_budget(
         // a possible upgrade if this conservative allocation ceiling is too low.
         let next_mask_bytes =
             checked_mask_bytes(retained_mask_bytes, final_image.data().len(), mask_budget)?;
-        let isolated = xml::rewrite(&variant_source, &meta.key, Variant::IsolateText)?;
+        let isolated = xml::rewrite(variant_source, &meta.key, Variant::IsolateText)?;
         // Sequential probes preserve the retained-plus-next-mask resource envelope.
         let unclipped = xml::rewrite(&isolated, "", Variant::Unclip)?;
         let unclipped_alpha = alpha_sum(&renderer.render(&unclipped, canvas)?);
@@ -472,7 +485,7 @@ fn analyze_with_mask_budget(
             ));
         }
 
-        let removed_source = xml::rewrite(&variant_source, &meta.key, Variant::Remove)?;
+        let removed_source = xml::rewrite(variant_source, &meta.key, Variant::Remove)?;
         let without_text = renderer.render(
             &removed_source,
             Some((final_image.width(), final_image.height())),
@@ -512,7 +525,7 @@ fn analyze_with_mask_budget(
     warnings.extend(text_overlap_warnings(&regions));
     warnings.extend(stroke_intrusion_warnings(
         &annotated,
-        &variant_source,
+        variant_source,
         &regions,
         &final_image,
         &renderer,
@@ -879,19 +892,40 @@ fn deduplicate(warnings: &mut Vec<GuardWarning>) {
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>) -> i32 {
-    match real_run(args) {
+    run_with_writers(
+        args,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn run_with_writers(
+    args: impl IntoIterator<Item = OsString>,
+    output: &mut dyn Write,
+    diagnostic: &mut dyn Write,
+) -> i32 {
+    match real_run(args, output) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!(
+            let _ = writeln!(
+                diagnostic,
                 "pira_svg_check: error: {}",
                 display_text(&error.to_string())
             );
+            let _ = diagnostic.flush();
             2
         }
     }
 }
 
-fn real_run(args: impl IntoIterator<Item = OsString>) -> Result<i32, GuardError> {
+fn output_error(error: std::io::Error) -> GuardError {
+    GuardError(format!("cannot write output: {error}"))
+}
+
+fn real_run(
+    args: impl IntoIterator<Item = OsString>,
+    output: &mut dyn Write,
+) -> Result<i32, GuardError> {
     let mut args = args.into_iter();
     let _program = args.next();
     let mut config = Config::default();
@@ -925,11 +959,12 @@ fn real_run(args: impl IntoIterator<Item = OsString>) -> Result<i32, GuardError>
         };
         match value {
             "--help" | "-h" => {
-                print_help();
+                print_help(output)?;
                 return Ok(0);
             }
             "--version" | "-V" => {
-                println!("pira_svg_check {VERSION}");
+                writeln!(output, "pira_svg_check {VERSION}").map_err(output_error)?;
+                output.flush().map_err(output_error)?;
                 return Ok(0);
             }
             "--json" => json = true,
@@ -951,15 +986,22 @@ fn real_run(args: impl IntoIterator<Item = OsString>) -> Result<i32, GuardError>
         source.ok_or_else(|| GuardError("missing SVG input; use --help for usage".to_string()))?;
     let report = analyze_file(&source, &config)?;
     if json {
-        println!(
+        writeln!(
+            output,
             "{}",
             serde_json::to_string_pretty(&report)
                 .map_err(|error| GuardError(format!("cannot serialize report: {error}")))?
-        );
+        )
+        .map_err(output_error)?;
     } else if report.warnings.is_empty() {
-        println!("pira_svg_check: clear (no warnings)");
+        writeln!(output, "pira_svg_check: clear (no warnings)").map_err(output_error)?;
     } else {
-        println!("pira_svg_check: {} warning(s)", report.warnings.len());
+        writeln!(
+            output,
+            "pira_svg_check: {} warning(s)",
+            report.warnings.len()
+        )
+        .map_err(output_error)?;
         for item in report.warnings {
             let subject = item
                 .text_element
@@ -969,15 +1011,18 @@ fn real_run(args: impl IntoIterator<Item = OsString>) -> Result<i32, GuardError>
                 .interfering_element
                 .map(|value| format!("; interfering element {}", display_text(&value)))
                 .unwrap_or_default();
-            println!(
+            writeln!(
+                output,
                 "- [{}]{}: {}{}",
                 item.code,
                 subject,
                 display_text(&item.message),
                 interference
-            );
+            )
+            .map_err(output_error)?;
         }
     }
+    output.flush().map_err(output_error)?;
     Ok(0)
 }
 
@@ -1003,20 +1048,183 @@ where
         .map_err(|_| GuardError(format!("invalid numeric value for {option}: {value}")))
 }
 
-fn print_help() {
-    println!(
+fn print_help(output: &mut dyn Write) -> Result<(), GuardError> {
+    writeln!(output,
         "pira_svg_check {VERSION} — conservative warning-only PIRA SVG check\n\n\
 USAGE\n  pira_svg_check [OPTIONS] SVG\n\n\
 OPTIONS\n  --json                 Emit a machine-readable report\n  --scale NUMBER         Fixed rasterization scale [default: 2]\n  --min-contrast NUMBER  Minimum text/background contrast [default: 4.5]\n  --crossing-ratio N     Fraction of a text block a stroke must traverse [default: 0.45]\n  --font-dir DIR         Add a font directory; repeatable\n  --isolated-fonts       Use only supplied font directories; missing fonts fail\n  -h, --help             Show this help\n  -V, --version          Show the version\n\n\
 Warnings are advisory and return exit code 0. Analysis errors return exit code 2.\n\
 System fonts are loaded by default. Unsupported scene analysis and missing isolated fonts are errors."
-    );
+    ).map_err(output_error)?;
+    output.flush().map_err(output_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn renderer_preflights_outer_and_embedded_reference_graphs_and_raster_dimensions() {
+        let renderer = Renderer::new(&Config {
+            scale: 1.0,
+            isolated_fonts: true,
+            ..Config::default()
+        });
+        let cycle = "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><defs><clipPath id='a' clip-path='url(#b)'><rect width='10' height='10'/></clipPath><clipPath id='b' clip-path='url(#c)'><rect width='10' height='10'/></clipPath><clipPath id='c' clip-path='url(#a)'><rect width='10' height='10'/></clipPath></defs><rect width='10' height='10' clip-path='url(#a)'/></svg>";
+        // Establish rejection before exercising the wired parser entry point.
+        assert!(xml::reference_depth(cycle.as_bytes(), 0).is_err());
+        assert!(
+            renderer
+                .parse(cycle.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("reference cycle")
+        );
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(100_000_u32.to_be_bytes());
+        png.extend(100_000_u32.to_be_bytes());
+        assert!(limits::raster(&png).is_err());
+        let encode =
+            |data: &[u8]| -> String { data.iter().map(|byte| format!("%{byte:02X}")).collect() };
+        for tag in ["image", "feImage"] {
+            for (mime, data, expected) in [
+                ("image/svg+xml", cycle.as_bytes(), "reference cycle"),
+                ("text/plain", cycle.as_bytes(), "reference cycle"),
+                ("image/png", png.as_slice(), "embedded raster"),
+                ("text/plain", png.as_slice(), "embedded raster"),
+            ] {
+                let image = format!(
+                    "<{tag} width='10' height='10' href='data:{mime},{}'/>",
+                    encode(data)
+                );
+                let body = if tag == "feImage" {
+                    format!(
+                        "<defs><filter id='f'>{image}</filter></defs><rect width='10' height='10' filter='url(#f)'/>"
+                    )
+                } else {
+                    image
+                };
+                let source = format!(
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'>{body}</svg>"
+                );
+                assert!(
+                    renderer
+                        .parse(source.as_bytes())
+                        .unwrap_err()
+                        .to_string()
+                        .contains(expected),
+                    "{tag} {mime}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_cli_output_and_last_resort_diagnostics_are_fallible() {
+        struct FailedWriter {
+            kind: std::io::ErrorKind,
+            flush_only: bool,
+        }
+        impl Write for FailedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.flush_only {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::from(self.kind))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(self.kind))
+            }
+        }
+        let path = std::env::temp_dir().join(format!("svg-output-{}.svg", std::process::id()));
+        fs::write(
+            &path,
+            "<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>",
+        )
+        .unwrap();
+        let path = path.into_os_string();
+        for args in [
+            vec!["--help".into()],
+            vec!["--version".into()],
+            vec![path.clone()],
+            vec!["--json".into(), path.clone()],
+        ] {
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                for flush_only in [false, true] {
+                    let mut output = FailedWriter { kind, flush_only };
+                    let mut diagnostic = Vec::new();
+                    let args =
+                        std::iter::once(OsString::from("pira_svg_check")).chain(args.clone());
+                    assert_eq!(run_with_writers(args, &mut output, &mut diagnostic), 2);
+                    assert!(
+                        String::from_utf8(diagnostic)
+                            .unwrap()
+                            .contains("cannot write output")
+                    );
+                }
+            }
+        }
+        let mut failed = FailedWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+            flush_only: false,
+        };
+        assert_eq!(
+            run_with_writers(
+                ["pira_svg_check".into(), "--unknown".into()],
+                &mut Vec::new(),
+                &mut failed
+            ),
+            2
+        );
+        assert_eq!(
+            run_with_writers(
+                ["pira_svg_check".into(), "--help".into()],
+                &mut failed,
+                &mut std::io::sink()
+            ),
+            2
+        );
+        fs::remove_file(PathBuf::from(path)).unwrap();
+    }
+
+    #[test]
+    fn bookkeeping_is_invisible_to_author_selectors_and_baseline_pixels() {
+        let renderer = Renderer::new(&Config {
+            scale: 1.0,
+            ..Config::default()
+        });
+        let source = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='80'><style>RULE</style><text id='label' x='10' y='50' font-size='26' fill='#eee'>A &amp; B</text></svg>";
+        let source = with_available_font(source, &renderer).unwrap();
+        let original = renderer
+            .render(source.replace("RULE", "").as_bytes(), None)
+            .unwrap();
+        for rule in [
+            "[data-pira-svg-check-key] {fill:black}",
+            "text:not([data-pira-svg-check-key]) {fill:#eee}",
+            "[data-pira-svg-check-key^=n] {display:none!important}",
+            "[style] {fill:black}",
+        ] {
+            let source = source.replace("RULE", rule);
+            assert_eq!(
+                renderer.render(source.as_bytes(), None).unwrap().data(),
+                original.data()
+            );
+            let normalized = style::normalize(source.as_bytes()).unwrap();
+            let annotated = xml::annotate(&normalized).unwrap();
+            assert_eq!(annotated.texts[0].text, "A & B");
+            assert_eq!(annotated.texts[0].label(), "<text#label>");
+            assert_eq!(
+                renderer.render(&annotated.source, None).unwrap().data(),
+                original.data(),
+                "{rule}"
+            );
+        }
+    }
 
     #[test]
     fn accepted_render_depth_keeps_pixels_and_unsupported_encodings_fail() {

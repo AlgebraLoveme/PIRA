@@ -1268,7 +1268,7 @@ class TeamTests(unittest.TestCase):
         run = Path(first["run_root"])
         manifest = run / "manifest.json"
         state = json.loads(manifest.read_text())
-        state["worker_policy_version"] = 16
+        state["worker_policy_version"] = 20
         manifest.write_text(json.dumps(state))
         prefix = (run / "policy.md").read_bytes()
         for migrated in (True, False):
@@ -1277,7 +1277,8 @@ class TeamTests(unittest.TestCase):
             latest = Path(json.loads(result.stdout)["handoff_path"]).parent.parent
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual("# Technical artifact worker" in (latest / "phase.md").read_text(), migrated)
-            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
+            self.assertEqual((latest / "phase.md").read_text().count("Structural inventories are native by default"), 1 if migrated else 0)
+            self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 21)
 
     def test_version_six_policy_gets_new_rules_once_without_adding_phases(self):
         first = json.loads(self.launch("review").stdout)
@@ -1325,7 +1326,7 @@ class TeamTests(unittest.TestCase):
             self.assertEqual((latest / "policy.md").read_bytes(), prefix)
             self.assertEqual(policy.read_bytes(), prefix)
             updated = json.loads(manifest.read_text())
-            self.assertEqual(updated["worker_policy_version"], 20)
+            self.assertEqual(updated["worker_policy_version"], 21)
             self.assertIsNone(updated.get("dec_workspace"))
 
     def test_task_guidance_updates_migrate_once_without_replacing_prefix(self):
@@ -1351,14 +1352,14 @@ class TeamTests(unittest.TestCase):
                         phase = (latest / "phase.md").read_text()
                         self.assertEqual(rule in phase, migrated)
                         self.assertEqual("Configured build/cache roots granted by Team" in phase, migrated)
-                        self.assertEqual("explicit `--lsp` selects the authoritative server inventory" in phase, migrated)
+                        self.assertEqual("Structural inventories are native by default" in phase, migrated)
                         if flag == "--inject-implement":
                             self.assertEqual("Preserve compatibility when it is straightforward and low-cost" in phase, migrated)
                         self.assertNotIn(absent, phase)
                         self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                         self.assertEqual((run / "policy.md").read_bytes(), prefix)
                         self.assertEqual(Path(first["handoff_path"]).read_bytes(), original_handoff)
-                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 20)
+                        self.assertEqual(json.loads(manifest.read_text())["worker_policy_version"], 21)
 
     def test_deprecated_navigation_does_not_remove_tools(self):
         result = self.launch("review", "--navigation", "shell")

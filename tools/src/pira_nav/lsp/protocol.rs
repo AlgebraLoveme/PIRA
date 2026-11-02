@@ -112,10 +112,49 @@ pub fn file_path_from_uri(uri: &str) -> Result<Option<PathBuf>, String> {
     if decoded.contains('\0') {
         return Err("file URI contains a null byte".into());
     }
+    // Do not hand remote/device forms to metadata, canonicalize, or open. Keep
+    // them as URI locations, including encoded separator/authority variants.
+    if !local_uri_path(&decoded, cfg!(windows)) {
+        return Ok(None);
+    }
     if cfg!(windows) && decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':') {
         decoded.remove(0);
     }
     Ok(Some(PathBuf::from(decoded)))
+}
+
+fn local_uri_path(path: &str, windows: bool) -> bool {
+    if path.starts_with("//") || path.starts_with("/\\") {
+        return false;
+    }
+    if !windows {
+        return true;
+    }
+    if path.contains('\\') {
+        return false;
+    }
+    !path.split('/').enumerate().any(|(index, part)| {
+        let base = part
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        (part.contains(':')
+            && !(index == 1 && part.len() == 2 && part.as_bytes()[0].is_ascii_alphabetic()))
+            || matches!(
+                base.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || (["COM", "LPT"].iter().any(|prefix| {
+                base.strip_prefix(prefix).is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                    )
+                })
+            }))
+    })
 }
 
 pub fn normalize_range(
@@ -835,6 +874,7 @@ pub(super) fn language_id(language: Language) -> &'static str {
 }
 
 pub(super) fn file_uri(path: &Path) -> Result<String, String> {
+    let path = crate::util::local_disk_path(path);
     let mut path = path
         .to_str()
         .ok_or_else(|| format!("LSP path is not valid UTF-8: {}", path.display()))?
@@ -863,6 +903,41 @@ pub(super) fn file_uri(path: &Path) -> Result<String, String> {
 mod tests {
     use super::{PositionEncoding, SourcePositions, file_uri, parse_document_symbols};
     use crate::language::Language;
+
+    #[test]
+    fn windows_uri_validation_rejects_unc_devices_streams_and_drive_relative_forms() {
+        for path in [
+            "//host/share/x",
+            "//?/C:/x",
+            "/C:/NUL.txt",
+            "/C:/COM¹",
+            "/C:/file:stream",
+            "/C:relative",
+            "/C:/back\\slash",
+        ] {
+            assert!(!super::local_uri_path(path, true), "{path}");
+        }
+        assert!(super::local_uri_path("/C:/local/file.rs", true));
+        assert!(super::local_uri_path("/tmp/literal\\name.rs", false));
+    }
+
+    #[test]
+    fn remote_and_device_uri_forms_remain_unopened_uri_locations() {
+        for uri in [
+            "file://host/share/x",
+            "file:////host/share/x",
+            "file:///%2fhost/share/x",
+            "file:///%5chost/share/x",
+            "file:////?/C:/x",
+            "file:////./pipe/x",
+        ] {
+            assert_eq!(super::file_path_from_uri(uri).unwrap(), None, "{uri}");
+        }
+        assert_eq!(
+            super::file_path_from_uri("file:///tmp/local.rs").unwrap(),
+            Some(std::path::PathBuf::from("/tmp/local.rs"))
+        );
+    }
 
     #[test]
     fn protocol_positions_reject_out_of_domain_integers() {

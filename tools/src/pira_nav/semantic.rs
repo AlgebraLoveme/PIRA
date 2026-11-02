@@ -31,6 +31,7 @@ const MAX_SEMANTIC_ITEMS_PER_REQUEST: usize = 10_000;
 const MAX_SEMANTIC_HOVER_BYTES: usize = 64 * 1024;
 
 struct SemanticTarget {
+    read_root: PathBuf,
     path: PathBuf,
     language: Language,
     source: Arc<str>,
@@ -64,6 +65,8 @@ fn parse_semantic_target(
         reject_document_semantics(language)?;
         let source = cached_source(&path, sources)?;
         return Ok(SemanticTarget {
+            read_root: std::fs::canonicalize(lsp.root(cwd))
+                .map_err(|e| input_error(e.to_string()))?,
             path,
             language,
             source,
@@ -127,7 +130,7 @@ fn parse_semantic_target(
     let parsed = dirty_resolver
         .as_mut()
         .expect("resolver initialized")
-        .resolve_source(&path, language, source.to_string())?;
+        .resolve_semantic_source(&path, language, source.to_string())?;
     if parsed.symbols_truncated {
         return Err((
             2,
@@ -195,6 +198,7 @@ fn parse_semantic_target(
         )
     })?;
     Ok(SemanticTarget {
+        read_root: std::fs::canonicalize(lsp.root(cwd)).map_err(|e| input_error(e.to_string()))?,
         path,
         language,
         source,
@@ -1287,6 +1291,20 @@ fn render_type_relations(
     Ok(())
 }
 
+// The lexical check precedes *all* filesystem operations on a server-supplied path.
+// read_source then rejects symlink components (including before `..`).
+fn result_source(path: &Path, target: &SemanticTarget) -> Option<String> {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || !crate::util::local_disk_path(path)
+            .starts_with(crate::util::local_disk_path(&target.read_root).as_ref())
+    {
+        return None;
+    }
+    read_source(path).ok()
+}
+
 fn render_selection_range(
     relation: &LspTypeItem,
     target: &SemanticTarget,
@@ -1294,7 +1312,7 @@ fn render_selection_range(
     output: &mut dyn Write,
 ) -> CommandResult {
     let normalized = if let Some(path) = file_path_from_uri(&relation.uri).map_err(lsp_error)? {
-        if path == target.path {
+        if crate::util::local_disk_path(&path) == crate::util::local_disk_path(&target.path) {
             Some(
                 normalize_range(&target.source, relation.selection_range, relation.encoding)
                     .map_err(lsp_error)?,
@@ -1304,7 +1322,7 @@ fn render_selection_range(
                 .as_ref()
                 .is_none_or(|(cached, _)| cached != &path)
             {
-                *last_source = Some((path.clone(), read_source(&path).ok()));
+                *last_source = Some((path.clone(), result_source(&path, target)));
             }
             last_source
                 .as_ref()
@@ -1471,22 +1489,23 @@ fn render_site_range(
             encoding.as_str()
         ));
     };
-    let normalized = if path == target.path {
-        Some(normalize_range(&target.source, range, encoding).map_err(lsp_error)?)
-    } else {
-        if last_source
-            .as_ref()
-            .is_none_or(|(cached, _)| cached != &path)
-        {
-            *last_source = Some((path.clone(), read_source(&path).ok()));
-        }
-        last_source
-            .as_ref()
-            .and_then(|(_, source)| source.as_deref())
-            .map(|source| normalize_range(source, range, encoding))
-            .transpose()
-            .map_err(lsp_error)?
-    };
+    let normalized =
+        if crate::util::local_disk_path(&path) == crate::util::local_disk_path(&target.path) {
+            Some(normalize_range(&target.source, range, encoding).map_err(lsp_error)?)
+        } else {
+            if last_source
+                .as_ref()
+                .is_none_or(|(cached, _)| cached != &path)
+            {
+                *last_source = Some((path.clone(), result_source(&path, target)));
+            }
+            last_source
+                .as_ref()
+                .and_then(|(_, source)| source.as_deref())
+                .map(|source| normalize_range(source, range, encoding))
+                .transpose()
+                .map_err(lsp_error)?
+        };
     Ok(match normalized {
         Some(range) => format!("{}:{}", display_path(&path, cwd), format_lsp_range(range)),
         None => format!(
@@ -1547,14 +1566,16 @@ fn render_location_fields(
     output: &mut dyn Write,
 ) -> CommandResult {
     if let Some(path) = file_path_from_uri(uri).map_err(lsp_error)? {
-        let normalized = if path == target.path {
+        let normalized = if crate::util::local_disk_path(&path)
+            == crate::util::local_disk_path(&target.path)
+        {
             Some(normalize_range(&target.source, range, encoding).map_err(lsp_error)?)
         } else {
             if last_source
                 .as_ref()
                 .is_none_or(|(cached, _)| cached != &path)
             {
-                *last_source = Some((path.clone(), read_source(&path).ok()));
+                *last_source = Some((path.clone(), result_source(&path, target)));
             }
             match last_source
                 .as_ref()
@@ -1631,6 +1652,115 @@ mod tests {
         RequestDefaults, SemanticCommand, ensure_target_root, parse_semantic_target,
         prepare_requests,
     };
+
+    #[test]
+    fn coordinate_renderers_read_only_the_selected_root_and_keep_external_locations() {
+        use super::*;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nav-coordinate-scope-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("scope")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let root = dir.join("scope");
+        fs::write(root.join("local.py"), "éx").unwrap();
+        fs::write(dir.join("outside.py"), "éx").unwrap();
+        let target = SemanticTarget {
+            read_root: root.clone(),
+            path: root.join("target.py"),
+            language: crate::language::Language::Python,
+            source: Arc::from("éx"),
+            row: 0,
+            byte_column: 0,
+        };
+        let range = LspRange {
+            start: crate::lsp::LspPosition {
+                line: 0,
+                character: 1,
+            },
+            end: crate::lsp::LspPosition {
+                line: 0,
+                character: 2,
+            },
+        };
+        for (path, external) in [
+            (root.join("local.py"), false),
+            (dir.join("outside.py"), true),
+            (root.join("../outside.py"), true),
+        ] {
+            let uri = format!(
+                "file:///{}",
+                path.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches('/')
+                    .split('/')
+                    .map(crate::util::percent_encode)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+            let mut output = Vec::new();
+            render_location_fields(
+                &uri,
+                range,
+                PositionEncoding::Utf16,
+                &target,
+                &dir,
+                &mut None,
+                &mut output,
+            )
+            .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(
+                text.contains(if external {
+                    "lsp_range=L1:2-1:3 encoding=utf-16"
+                } else {
+                    "range=L1:3-1:4"
+                }),
+                "{text}"
+            );
+            let site = render_site_range(
+                &uri,
+                range,
+                PositionEncoding::Utf16,
+                &target,
+                &dir,
+                &mut None,
+            )
+            .unwrap();
+            assert!(
+                site.contains(if external {
+                    "L1:2-1:3:utf-16"
+                } else {
+                    "L1:3-1:4"
+                }),
+                "{site}"
+            );
+            let relation = LspTypeItem {
+                uri,
+                range,
+                selection_range: range,
+                encoding: PositionEncoding::Utf16,
+                name: "x".into(),
+                kind: "class",
+            };
+            let mut output = Vec::new();
+            render_selection_range(&relation, &target, &mut None, &mut output).unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(
+                text.contains(if external {
+                    "lsp_selection_range=L1:2-1:3 encoding=utf-16"
+                } else {
+                    " selection_range=L1:3-1:4"
+                }),
+                "{text}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn named_targets_use_declaration_coordinates() {

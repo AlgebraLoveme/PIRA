@@ -161,10 +161,7 @@ pub fn identity(pid: u32) -> io::Result<Identity> {
     if alive && count <= 0 {
         // A removed executable does not mean this PID exited. Keep identity
         // failure distinct from missing-process evidence used by settlement.
-        return Err(io::Error::other(format!(
-            "cannot identify executable for live process {pid}: {}",
-            io::Error::last_os_error()
-        )));
+        return Err(unavailable_executable(pid, io::Error::last_os_error()));
     }
     let bytes = &buffer[..buffer
         .iter()
@@ -182,6 +179,14 @@ pub fn identity(pid: u32) -> io::Result<Identity> {
         executable: std::ffi::OsStr::from_bytes(bytes).into(),
         alive,
     })
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn unavailable_executable(pid: u32, error: io::Error) -> io::Error {
+    // Executable inspection failure is not evidence that the live PID exited.
+    io::Error::other(format!(
+        "cannot identify executable for live process {pid}: {error}"
+    ))
 }
 
 #[cfg(windows)]

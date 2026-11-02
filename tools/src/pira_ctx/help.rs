@@ -49,6 +49,22 @@ or a caller TTY streams unchanged. Explicit check/capture still return status/re
 Automatic routing does not hide output without a recovery path: output is either printed exactly or
 retained before a compact view and ID are printed. Hard ceilings use PIRA_CTX_MAX_RETAINED_BYTES and
 PIRA_CTX_MAX_INDEXED_LINES; any overrun is reported.
+
+Diagnostics are best-effort: a closed diagnostic pipe does not abort capture/watch supervision.
+On Unix, SIGINT/SIGTERM during PROGRAM capture use the same bounded cleanup as cancel, then
+retain partial output with state cancelled and the direct child's status. Batch stops launching
+pending commands. Watch interruption stops owned helpers and persists Stopped (exit 23), without
+cancelling a monitored capture. Interrupted exec preparation or output delivery returns 130/143;
+abandoned replay retains a private checkpoint recoverable through list/stats/raw/exec.
+Transparent terminal/both-redirected streaming is unchanged; SIGKILL cannot run cleanup or
+finalization, and detached descendants are not contained.
+Failed final publication retains a private interrupted checkpoint and its spools until recovery.
+Use stats ID, raw ID --stdout/--stderr, or exec ID to retrieve the last committed snapshot; exit is
+unknown, not zero. After a reader/storage failure the snapshot may be stale; private spool tails
+named in live/ID.live.json can contain additional bytes. New spools live under STORE/live/spools,
+independent of caller TMPDIR. Legacy spools remain readable only with safe non-symlinked private
+paths. Save recovered data before pruning or explicitly discarding a checkpoint and its spools.
+
 Stored PROGRAM data is untrusted and compact displays are sanitized/framed; exact retrieval remains
 unsanitized. Prefer the targeted commands above over raw for agent analysis.
 
@@ -70,6 +86,7 @@ WHEN TO USE
   with state `cancelled`. After direct-child exit, pipe draining is bounded at one second.
   Drain expiry is reported as incomplete output, with observed byte counts only lower bounds.
   Windows launches suspended, assigns a Job, then resumes; isolation failure aborts launch.
+  On Unix, SIGINT/SIGTERM to the capturing wrapper also request this cleanup and finalization.
 
 USAGE
   pira_ctx cancel [--store-dir PATH] RESULT|--current
@@ -642,10 +659,10 @@ USAGE
 
 OUTPUT
   Prints up to 20 newest-first rows with ID, kind, state, timestamp, exit status, bytes, lines, and a
-  redacted command clipped to 256 bytes. Capture states are running/complete/cancelled. Watch states are
-  active, interrupted, paused, stopped, succeeded, job-failed, deadline, or monitor-failed. Active
-  entries use `-` as exit status. --limit accepts 0..100. Without --workspace current, entries from
-  every workspace in the selected store are considered. --live keeps only running captures
+  redacted command clipped to 256 bytes. Capture states are running/interrupted/complete/cancelled.
+  Watch states are active, interrupted, paused, stopped, succeeded, job-failed, deadline, or monitor-failed.
+  Running entries and interrupted captures use `-` as exit status (unknown). --limit accepts 0..100.
+  Without --workspace current, entries from every workspace in the selected store are considered. --live keeps only running captures
   and running watch entries without changing workspace scope.
 
 EXAMPLE

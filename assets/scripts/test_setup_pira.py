@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import sys
 import tempfile
 import tomllib
@@ -98,7 +100,78 @@ class AutoRecapTests(unittest.TestCase):
             state = setup.SetupState(root, root, True, True)
             setup.verify(state, root / "config.toml", True)
             self.assertEqual([name for name, passed, _ in state.verification if not passed],
-                             ["USER.md exists", "legacy files absent"])
+                             ["legacy files absent"])
+
+    def test_missing_user_profile_is_valid_for_default_and_former_modes(self):
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        args = ["--agent-dir", str(root), "--skip-codex", "--skip-tools", "--legacy", "remove"]
+        with patch.object(setup, "ensure_agent_dir"), \
+             patch.object(setup.sys.stdin, "isatty", return_value=True), \
+             patch.object(setup, "prompt_yes_no", side_effect=AssertionError("no profile prompt")):
+            for selection in ([], ["--user-mode", "interactive"],
+                              ["--user-mode", "placeholder"], ["--user-mode", "keep"]):
+                for mode in ([], ["--dry-run"], ["--verify"], []):
+                    with self.subTest(selection=selection, mode=mode):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                            self.assertEqual(setup.main([*args, *selection, *mode]), 0)
+                        self.assertNotIn("USER.md", output.getvalue())
+                        self.assertNotIn("WARNING:", output.getvalue())
+                        self.assertFalse((root / "USER.md").exists())
+
+    def test_existing_user_profile_is_never_opened_or_changed(self):
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        profile = root / "USER.md"
+        profile.write_bytes(b"Synthetic fixture preferences only.\n")
+        before = profile.read_bytes(), profile.stat().st_mtime_ns
+        args = ["--agent-dir", str(root), "--skip-codex", "--skip-tools", "--legacy", "remove"]
+        original_open = Path.open
+        def reject_profile_open(path, *args, **kwargs):
+            if path == profile:
+                raise AssertionError("setup must not open a private user profile")
+            return original_open(path, *args, **kwargs)
+        with patch.object(setup, "ensure_agent_dir"), \
+             patch.object(Path, "open", reject_profile_open), \
+             patch.object(setup, "prompt_yes_no", side_effect=AssertionError("no profile prompt")):
+            for selection in ([], ["--user-mode", "interactive"],
+                              ["--user-mode", "placeholder"], ["--user-mode", "keep"]):
+                for mode in (["--dry-run"], ["--verify"], [], []):
+                    with self.subTest(selection=selection, mode=mode):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(setup.main([*args, *selection, *mode]), 0)
+                        self.assertEqual(profile.stat().st_mtime_ns, before[1])
+        self.assertEqual((profile.read_bytes(), profile.stat().st_mtime_ns), before)
+        self.assertFalse(list(root.rglob("USER.md.bak.*")))
+        self.assertFalse((root / ".backup").exists())
+
+    def test_stale_legacy_list_cannot_target_user_profiles(self):
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        assets = root / "assets"
+        assets.mkdir()
+        (assets / "LEGACY_LIST.md").write_text(
+            "- `~/agent/USER.md`\n- `~/agent/user.MD`\n- `~/agent/legacy`\n")
+        profile = root / "USER.md"
+        profile.write_bytes(b"Synthetic profile stays outside legacy cleanup.\n")
+        before = profile.read_bytes(), profile.stat().st_mtime_ns
+        legacy = root / "legacy"
+        legacy.write_text("ordinary legacy fixture")
+        self.assertEqual(setup.parse_legacy_paths(root, root), [legacy])
+        state = setup.SetupState(root, root, False, True)
+        setup.remove_legacy_files(state, "remove")
+        self.assertFalse(legacy.exists())
+        self.assertEqual((profile.read_bytes(), profile.stat().st_mtime_ns), before)
+        self.assertEqual([p.read_text() for p in (root / ".backup").rglob("*") if p.is_file()],
+                         ["ordinary legacy fixture"])
+        setup.verify(state, root / "config.toml", True)
+        self.assertTrue(all(passed for _, passed, _ in state.verification))
+
+    def test_user_mode_help_describes_ignored_compatibility(self):
+        help_text = " ".join(setup.build_parser().format_help().split())
+        self.assertIn("Deprecated compatibility option; ignored.", help_text)
+        self.assertIn("does not create, load or require USER.md", help_text)
 
     def test_guard_conflicts_precede_configuration_and_migration(self):
         root = Path(setup.os.environ["HOME"])
@@ -185,7 +258,7 @@ class AutoRecapTests(unittest.TestCase):
                      patch.object(setup.tool_setup, "check_team_runtime", return_value="codex-cli 0.166.0") as check, \
                      patch.object(setup.stores.migration, "team_backend", return_value=helper), \
                      patch.object(setup.stores, "historical_store_paths", side_effect=lambda tool: [source.parent] if tool == "pira_team" else []), \
-                     patch.object(setup, "ensure_agent_dir"), patch.object(setup, "ensure_user_md"), \
+                     patch.object(setup, "ensure_agent_dir"), \
                      patch.object(setup, "remove_legacy_files"), \
                      patch.object(setup, "verify"), \
                      patch.object(setup, "configure_codex", wraps=setup.configure_codex) as publish, \
@@ -272,7 +345,6 @@ class AutoRecapTests(unittest.TestCase):
     def test_unified_migration_copies_before_config_switch_and_is_repeatable(self) -> None:
         root = Path(setup.os.environ["HOME"])
         (root / "AGENTS.md").write_text("# Fixture\n" + setup.VERIFY_TOKEN)
-        (root / "USER.md").write_text("fixture")
         source = setup.stores.historical_store_paths("pira_ctx")[0]
         destination = Path(setup.stores.selected_store_paths(["pira_ctx"])["PIRA_CTX_STORE_DIR"])
         (source / "records").mkdir(parents=True)
@@ -349,7 +421,6 @@ class AutoRecapTests(unittest.TestCase):
     def test_empty_team_setup_publishes_all_selected_stores(self) -> None:
         root = Path(setup.os.environ["HOME"])
         (root / "AGENTS.md").write_text("# Fixture\n" + setup.VERIFY_TOKEN)
-        (root / "USER.md").write_text("fixture")
         config = root / "config.toml"
         args = ["--agent-dir", str(root), "--codex-config", str(config), "--skip-tools",
                 "--execution-mode", "keep", "--user-mode", "keep", "--legacy", "keep"]
@@ -363,7 +434,6 @@ class AutoRecapTests(unittest.TestCase):
         import os
         root = Path(os.environ["HOME"])
         (root / "AGENTS.md").write_text("# Fixture\n" + setup.VERIFY_TOKEN)
-        (root / "USER.md").write_text("fixture")
         physical = root / "stores"
         physical.mkdir()
         alias = root / "alias"
@@ -399,12 +469,10 @@ class AutoRecapTests(unittest.TestCase):
             with self.subTest(original=original):
                 config.write_text(original)
                 with patch.object(setup, "ensure_agent_dir") as agent, \
-                     patch.object(setup, "ensure_user_md") as user, \
                      patch.object(setup, "configure_tools") as tools:
                     self.assertEqual(setup.main(["--agent-dir", str(root / "agent"), "--codex-config", str(config),
                                                 "--execution-mode", "keep"]), 1)
                     agent.assert_not_called()
-                    user.assert_not_called()
                     tools.assert_not_called()
                 self.assertEqual(config.read_text(), original)
                 self.assertEqual(list(root.iterdir()), [config])

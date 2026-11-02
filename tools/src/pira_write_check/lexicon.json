@@ -103,5 +103,24 @@
     "partially",
     "a little",
     "more or less"
+  ],
+  "stock/ai-wording": [
+    "delve into",
+    "delves into",
+    "delved into",
+    "delving into",
+    "deep dive into",
+    "intricate interplay",
+    "intricate web",
+    "in the realm of",
+    "this paper showcases"
+  ],
+  "filler/plain-language": [
+    "going forward",
+    "moving forward",
+    "in order to"
+  ],
+  "user-requested": [
+    "snapshot"
   ]
 }

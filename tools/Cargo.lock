@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "pira_team"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "csv",
  "getrandom",
@@ -1056,8 +1056,9 @@ dependencies = [
 
 [[package]]
 name = "pira_write_check"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "libc",
  "regex",
  "serde",
  "serde_json",

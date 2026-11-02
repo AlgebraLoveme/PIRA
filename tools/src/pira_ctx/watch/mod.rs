@@ -46,7 +46,7 @@ pub fn run(config: &Config) -> Result<i32, String> {
         return own(config, &store, &id);
     }
     let id = create(config, &store)?;
-    eprintln!("PIRA watch live | result={id}");
+    util::diagnostic_line(&format!("PIRA watch live | result={id}"));
     own(config, &store, &id)
 }
 
@@ -74,7 +74,7 @@ fn create(config: &Config, store: &Path) -> Result<String, String> {
             .canonicalize()
             .map_err(|error| format!("resolve capture path: {error}"))?;
         let canonical_store = store.canonicalize().unwrap_or_else(|_| store.to_path_buf());
-        if stored.is_running() && !canonical.starts_with(&canonical_store) {
+        if stored.has_snapshot() && !canonical.starts_with(&canonical_store) {
             return Err("watch cannot persist a live capture outside its store; use that store with --store-dir".into());
         }
         let persisted_path = (!canonical.starts_with(&canonical_store)).then_some(canonical);
@@ -267,14 +267,17 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
             watch.attempt_timeout_ms,
         );
         let sample = sample::collect(&mut watch, store, attempt_limit_ms, || {
-            state::read::<ControlState>(&control_path, "watch control")
-                .is_ok_and(|c| c.stop_requested)
+            crate::shutdown::requested()
+                || state::read::<ControlState>(&control_path, "watch control")
+                    .is_ok_and(|c| c.stop_requested)
         });
         watch.attempt = AttemptStatus::Idle;
         watch.attempts = watch.attempts.saturating_add(1);
         let sample = match sample {
             Ok(sample) => sample,
-            Err(error) if error == "watch stop requested" => {
+            Err(error)
+                if error == "watch stop requested" || error == crate::shutdown::INTERRUPTED =>
+            {
                 watch.monitor = MonitorStatus::Stopped;
                 watch.detail = error;
                 persist(&path, &mut watch)?;
@@ -312,7 +315,9 @@ fn own(config: &Config, store: &Path, id: &str) -> Result<i32, String> {
         let analyzer_attention =
             match incorporate_sample(&mut watch, sample, store, run_analyzer, analyzer_limit_ms) {
                 Ok(attention) => attention,
-                Err(error) if error == "watch stop requested" => {
+                Err(error)
+                    if error == "watch stop requested" || error == crate::shutdown::INTERRUPTED =>
+                {
                     watch.monitor = MonitorStatus::Stopped;
                     watch.detail = error;
                     persist(&path, &mut watch)?;
@@ -427,8 +432,9 @@ fn incorporate_sample(
             store,
             &crate::native_path::resolve(watch.source_cwd_native.as_ref(), &watch.source_cwd)?,
             || {
-                state::read::<ControlState>(&control_path, "watch control")
-                    .is_ok_and(|control| control.stop_requested)
+                crate::shutdown::requested()
+                    || state::read::<ControlState>(&control_path, "watch control")
+                        .is_ok_and(|control| control.stop_requested)
             },
         ) {
             Ok(output) => {
@@ -526,8 +532,9 @@ fn update_attention(watch: &mut WatchState, reason: Option<String>) -> bool {
 fn apply_control(store: &Path, watch: &mut WatchState) -> Result<(), String> {
     let path = state::control_path(store, &watch.id);
     let control: ControlState = state::read(&path, "watch control")?;
-    if control.stop_requested {
+    if control.stop_requested || crate::shutdown::requested() {
         watch.monitor = MonitorStatus::Stopped;
+        watch.attempt = AttemptStatus::Idle;
         watch.detail = "stop requested".into()
     }
     if control.clear_analyzer {
@@ -653,8 +660,20 @@ fn stop(store: &Path, id: &str) -> Result<i32, String> {
                 latest.detail = "stop applied while watch had no owner".into();
                 persist(&path, &mut latest)?;
             }
-            util::stdout_line(&format!("watch {id} stopped; monitored job is unchanged"))?;
-            return Ok(0);
+            if latest.monitor == MonitorStatus::Stopped {
+                util::stdout_line(&format!("watch {id} stopped; monitored job is unchanged"))?;
+                return Ok(0);
+            }
+            return Err(format!(
+                "watch {id} reached {:?}; stop was not applied",
+                latest.monitor
+            ));
+        }
+        if terminal(&watch) {
+            return Err(format!(
+                "watch {id} reached {:?}; stop was not applied",
+                watch.monitor
+            ));
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
@@ -807,6 +826,9 @@ fn configuration_update_requested(config: &Config) -> bool {
 }
 
 fn report(w: &WatchState, code: i32) -> Result<i32, String> {
+    if crate::shutdown::requested() {
+        return Ok(code);
+    }
     let mut out = util::BoundedStdout::new(MAX_REPORT_BYTES);
     let risk = crate::security::inspect_combined([
         w.visible_stdout.as_str(),

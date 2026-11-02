@@ -469,8 +469,26 @@ while True:
         refuse_request()
     if method == "turn/start" and os.environ.get("TEAM_DETACHED_PIPE"):
         import subprocess
-        child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"], start_new_session=True)
-        (home / "detached-fixture.pid").write_text(str(child.pid))
+        holder = r"""import json, socket, sys, time
+with socket.create_connection(tuple(json.loads(sys.argv[1])), timeout=3) as control:
+    deadline = time.monotonic() + 30
+    control.sendall(b'R')
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            control.settimeout(remaining)
+            command = control.recv(1)
+            if not command:
+                break
+            assert command == b'P', command
+            control.sendall(b'P')
+    except (ConnectionError, TimeoutError):
+        pass  # Bounded self-exit if the harness disappears or never releases us.
+"""
+        subprocess.Popen([sys.executable, "-c", holder, os.environ["TEAM_DETACHED_ENDPOINT"]],
+                         stdin=subprocess.DEVNULL, start_new_session=True)
         os.write(int(os.environ["TEAM_BOUNDARY_READY_FD"]), b"1")
     if method == "turn/start" and task == "partial-crash":
         notify("thread/tokenUsage/updated", {"tokenUsage": {"total": {"inputTokens": 11, "cachedInputTokens": 3, "outputTokens": 2}}})

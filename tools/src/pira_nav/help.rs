@@ -22,9 +22,12 @@ COMMANDS
   languages                       Formats and discovered language servers.
 
 BACKENDS
-  Bundled parsers handle clean source plus JSON/JSONC/YAML/TOML/Markdown. Dirty code uses a server
-  discovered on PATH or selected by --lsp. --native requires a clean bundled parse. Semantic
-  commands apply only to code and always require an LSP. Imports/dependents/deps also require
+  Structural inventory uses bundled parsers by default; only explicit --lsp selects server
+  inventory. Dirty native syntax reports unavailable structure, never automatic LSP fallback.
+  Map retains file/topology rows with landmarks_unavailable=1 and complete=0 when optional
+  native summaries fail. --native remains a compatible native-only structural selection.
+  Semantic commands discover servers on PATH or use --lsp, and always require an LSP.
+  Imports/dependents/deps also require
   a server advertising definitionProvider; no filename guesses establish dependency identity.
 
 COMMON OPTIONS
@@ -34,11 +37,24 @@ COMMON OPTIONS
   --lsp-root DIR            Set the exact server workspace boundary.
   --                        End options; later arguments are positional where supported.
 
-Read-only: never edits, builds, or executes repository code. Untrusted source/hover is framed; bounded
+Read-only query client: Navigator rejects LSP workspace edits and guards source identities.
+Source roots, CWD and file URIs remain in place. Language servers may run normal setup/build
+helpers; no OS sandbox or arbitrary-helper write confinement is provided.
+Only semantic commands or explicit --lsp inventories start providers; they may refresh caches.
+No OS sandbox or strict cache-immutability guarantee is provided.
+Untrusted source/hover is framed; bounded
 partial results identify omissions. Structural operands reject symlink components (not a guarantee
 against concurrent directory replacement). LSP input queues fail nonblockingly above 256 pending
 messages or 32 MiB of queued JSON payloads, plus at most one frame being decoded; this is not an RSS
-limit. Owned LSP process groups/jobs are terminated during cleanup, including remaining descendants.
+limit. Ignore/config reads reject symlinks and non-regular files; ignore inputs are capped at 16 MiB,
+100,000 lines and 64 KiB per line. Invalid/unreadable rules mark discovery coverage partial.
+External LSP locations remain visible in LSP coordinates; coordinate conversion reads only within the
+selected LSP root. Remote/device URI forms remain URI locations without filesystem access.
+Configuration replies allow at most 256 items and 16 MiB aggregate encoded data.
+Owned LSP groups/jobs are terminated before reaping; pipe cleanup has a 500 ms deadline. Detached
+pipe holders are not chased or killed. The Unix CLI handles SIGINT/SIGTERM during LSP work; SIGKILL
+cannot run cleanup. Embedders using run retain their own signal handlers. Windows uses kill-on-close
+jobs. These ownership boundaries do not promise termination of escaped descendants.
 Detailed syntax: `pira_nav COMMAND --help`; several topics:
 `pira_nav help COMMAND...`."#;
 

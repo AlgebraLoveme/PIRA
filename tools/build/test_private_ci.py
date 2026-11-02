@@ -111,6 +111,10 @@ class PrivateCITests(unittest.TestCase):
             'assets/scripts/setup_pira.py': b'import setup_pira_stores',
             'assets/scripts/test_setup_pira.py': b'# unified fixture',
             'assets/scripts/test_setup_pira_stores.py': b'# store fixture',
+            'assets/scripts/setup_pira_communication.py': b'# communication setup\r\n',
+            'assets/scripts/test_setup_pira_communication.py': b'# communication tests\r\n',
+            'assets/COMMUNICATION_AGENTS_TEMPLATE.md': b'# communication agents\r\n',
+            'assets/COMMUNICATION_WORKBOOK_TEMPLATE.md': b'# communication workbook\r\n',
             'assets/scripts/team_store_relocation.py': b'# helper fixture',
             'assets/scripts/test_team_store_relocation.py': b'# helper tests',
             'assets/scripts/team_relocation_fixture.py': b'# native fixture',
@@ -123,6 +127,8 @@ class PrivateCITests(unittest.TestCase):
             'tools/crates/pira_write_check/tests/test_cli_parity.py': b'# optional oracle parity',
             'tools/dev/pira_write_check/check.py': b'# retained oracle',
             'tools/dev/pira_write_check/lexicon.json': b'{"scope": ["only"]}\r\n',
+            'tools/dev/pira_write_check/benchmark.py': b'# benchmark helper\r\n',
+            'tools/dev/pira_write_check/test_benchmark.py': b'# safe benchmark tests\r\n',
             'assets/LEGACY_LIST.md': b'# fixture legacy list',
             'tools/select_tool_for_platform.py': b'# fixture',
             'tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf': b'<fontconfig/>',
@@ -195,6 +201,31 @@ class PrivateCITests(unittest.TestCase):
         # Independent baseline gates must not become conditional on checker selection.
         for job in ('setup', 'native_relocation'):
             self.assertIn(f'  {job}:\n    if: github.event.repository.private == true\n', workflow)
+
+    def test_checker_benchmark_dependencies_and_safe_test_step(self):
+        names = ('tools/dev/pira_write_check/benchmark.py',
+                 'tools/dev/pira_write_check/test_benchmark.py')
+        neighbor = 'tools/dev/pira_write_check/benchmark_private.py'
+        self.write(neighbor, b'not selected')
+        data = ci.verify(self.stage(('pira_write_check',)))
+        for name in names:
+            self.assertEqual(data[name], self.files[name])
+        self.assertNotIn(neighbor, data)
+        workflow = data['.github/workflows/private-pira-tests.yml'].decode()
+        command = 'python -B tools/dev/pira_write_check/test_benchmark.py -v'
+        self.assertEqual(workflow.count(command), 1)
+        step = workflow.split('- name: Safe writing benchmark work-directory regressions', 1)[1].split('\n      - name:', 1)[0]
+        self.assertEqual(step.strip(), "if: matrix.crate == 'pira_write_check'\n        run: " + command)
+        for name in names:
+            with self.subTest(missing=name):
+                path = self.root / name
+                path.unlink()
+                try:
+                    with self.assertRaises(FileNotFoundError) as failure:
+                        ci.stage(self.root)
+                    self.assertEqual(Path(failure.exception.filename), path)
+                finally:
+                    path.write_bytes(self.files[name])
 
     def test_checker_subset_without_oracle_retains_lexical_fixtures(self):
         for name in ('tools/dev/pira_write_check/check.py', 'tools/dev/pira_write_check/lexicon.json'):
@@ -466,6 +497,27 @@ class PrivateCITests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('FileNotFoundError', result.stderr)
+
+    def test_communication_snapshot_bytes_and_required_dependencies(self):
+        names = ('assets/scripts/setup_pira_communication.py',
+                 'assets/scripts/test_setup_pira_communication.py',
+                 'assets/COMMUNICATION_AGENTS_TEMPLATE.md',
+                 'assets/COMMUNICATION_WORKBOOK_TEMPLATE.md')
+        self.write('assets/COMMUNICATION_PRIVATE.md', b'not selected')
+        data = ci.verify(self.stage(('pira_ctx',)))
+        for name in names:
+            self.assertEqual(data[name], self.files[name])
+        self.assertNotIn('assets/COMMUNICATION_PRIVATE.md', data)
+        for name in names:
+            with self.subTest(missing=name):
+                path = self.root / name
+                path.unlink()
+                try:
+                    with self.assertRaises(FileNotFoundError) as failure:
+                        ci.stage(self.root)
+                    self.assertEqual(Path(failure.exception.filename), path)
+                finally:
+                    path.write_bytes(self.files[name])
 
     def test_missing_setup_dependency_fails_staging(self):
         for name in ('retire_pira_audio.py', 'test_retire_pira_audio.py',

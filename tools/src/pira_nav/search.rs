@@ -2,8 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
-use rayon::prelude::*;
+use ignore::overrides::OverrideBuilder;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 
 use crate::command::{CommandResult, input_error, output_error, positive_usize};
@@ -161,22 +160,19 @@ pub fn run(
         }
     }
     let paths = path_set.into_iter().collect::<Vec<_>>();
-    let results = paths
-        .par_iter()
-        .map(|path| match read_text(path) {
-            Ok(text) => Ok(scan(
-                path,
-                Language::infer(path).ok(),
-                &text,
-                &engine,
-                options.mode,
-            )),
-            Err(kind) => Err(Skip {
-                kind,
-                path: path.clone(),
-            }),
-        })
-        .collect::<Vec<_>>();
+    let results = crate::util::map_ordered(&paths, |path| match read_text(path) {
+        Ok(text) => Ok(scan(
+            path,
+            Language::infer(path).ok(),
+            &text,
+            &engine,
+            options.mode,
+        )),
+        Err(kind) => Err(Skip {
+            kind,
+            path: path.clone(),
+        }),
+    });
 
     let mut scans = Vec::new();
     let mut skips = Vec::new();
@@ -706,52 +702,26 @@ fn discover_text_files(
             errors_total: 0,
         });
     }
-    let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .require_git(false)
-        .parents(true)
-        .ignore(true)
-        .follow_links(false);
-    let mut paths = Vec::new();
-    let mut errors = Vec::new();
-    let mut errors_total = 0usize;
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                errors_total += 1;
-                if errors.len() < 20 {
-                    errors.push(error.to_string());
-                }
-                continue;
-            }
-        };
-        if !entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
-        {
-            continue;
-        }
-        let path = entry.into_path();
-        if !overrides.matched(&path, false).is_ignore()
-            && language.is_none_or(|item| item.matches_path(&path))
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort();
+    let walked = crate::safe_walk::files(root, None);
+    let paths = walked
+        .paths
+        .into_iter()
+        .filter(|path| {
+            !overrides.matched(path, false).is_ignore()
+                && language.is_none_or(|item| item.matches_path(path))
+        })
+        .collect();
     Ok(TextDiscovery {
         paths,
-        errors,
-        errors_total,
+        errors: walked.errors,
+        errors_total: walked.errors_total,
     })
 }
 
 fn read_text(path: &Path) -> Result<TextFile, SkipKind> {
+    if crate::cancellation::requested() {
+        return Err(SkipKind::Unreadable);
+    }
     let file = crate::util::open_regular_file(path).map_err(|_| SkipKind::Unreadable)?;
     let metadata = file.metadata().map_err(|_| SkipKind::Unreadable)?;
     if !metadata.is_file() {

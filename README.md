@@ -42,12 +42,12 @@ Install or update PIRA, including its tools, following https://github.com/Algebr
 <details>
 <summary>Technical installation and update instructions</summary>
 
-Setup is safe to rerun: it preserves an existing `USER.md`, backs up user-level Codex files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
+Setup is safe to rerun: it leaves global `USER.md` unmanaged, backs up user-level Codex files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
 
 ### Complete update procedure
 
 1. **Sync the checkout.** Locate the existing installation, check its remote and local changes, and fast-forward from the public `master` branch when safe. Preserve local work; stop for conflicts rather than resetting or discarding changes.
-2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Preserve existing choices with `--execution-mode keep`, `--user-mode keep` and `--legacy keep`; retain custom configuration/install paths and version pins. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
+2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Preserve existing choices with `--execution-mode keep` and `--legacy keep`; retain custom configuration/install paths and version pins. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
 3. **Verify and restart.** Run the same setup with `--verify` and the selected options, check the installed tool versions, and restart shells or agents when configuration or environment changes require it. Report any incomplete step.
 
 Pulling Git alone does not refresh executables. Setup installs the latest **published tool releases**, which may lag source changes on `master`; an update report should distinguish the checkout revision from installed tool versions. The commands below explicitly select the recommended configuration rather than preserve every existing preference.
@@ -59,22 +59,21 @@ The recommended command installs or updates PIRA, then connects it to Codex. It:
 - enables **soft-safe** mode;
 - configures Codex to load PIRA's canonical `AGENTS.md` once;
 - installs or refreshes bundled PIRA tools in the user's `PATH`;
-- moves old PIRA-managed legacy files into backup;
-- creates a private `USER.md` placeholder only if `USER.md` is missing.
+- moves old PIRA-managed legacy files into backup.
 
 macOS/Linux:
 
 ```bash
-if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent && cd ~/agent; fi && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --user-mode placeholder --legacy remove
+if [ -d ~/agent/.git ]; then cd ~/agent && git pull --ff-only; else git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent && cd ~/agent; fi && assets/scripts/setup_pira.sh --yes --execution-mode soft-safe --legacy remove
 ```
 
 Windows PowerShell:
 
 ```powershell
-if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --user-mode placeholder --legacy remove
+if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } else { git clone https://github.com/AlgebraLoveme/PIRA.git "$HOME/agent"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location "$HOME/agent" }; powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --yes --execution-mode soft-safe --legacy remove
 ```
 
-To preserve an existing installation’s preferences, use `--execution-mode keep --user-mode keep --legacy keep` instead of the corresponding flags above.
+To preserve an existing installation’s preferences, use `--execution-mode keep --legacy keep` instead of the corresponding flags above.
 
 `git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
 
@@ -99,6 +98,39 @@ powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1
 ```
 
 The macOS/Linux and Windows wrappers support the same options. If Python is missing, setup can offer to install it with Homebrew on macOS or winget on Windows.
+
+</details>
+
+## One assistant across projects
+
+After installing PIRA, ask your agent:
+
+```text
+If ~/pira is missing, set up my PIRA communication workspace there. Leave an existing directory unchanged. After creating it, tell me how to start a new session there and use it across all my projects.
+```
+
+Your communicator lives at `~/pira`. Its local instructions and workbook keep track of your preferences, projects and unfinished work, so you can manage them through one conversation. Project details stay in their own project workbooks.
+
+<details>
+<summary>Communication-workspace setup instructions for agents</summary>
+
+Check whether `~/pira` exists. Run the creation commands only if it is missing; do not populate, repair or overwrite an existing directory. The script also checks this deterministically. The location is fixed and cannot be customized.
+
+Run directly from the PIRA repository with Python 3.11 or newer:
+
+```bash
+python3 assets/scripts/setup_pira_communication.py --dry-run
+python3 assets/scripts/setup_pira_communication.py
+python3 assets/scripts/setup_pira_communication.py --verify
+```
+
+On Windows, use `py -3` in place of `python3` when it selects a suitable interpreter. The workspace is the `pira` directory under the current user’s home directory.
+
+Fresh setup installs the separate [coordination instructions](assets/COMMUNICATION_AGENTS_TEMPLATE.md) and [initial workbook](assets/COMMUNICATION_WORKBOOK_TEMPLATE.md). Existing directories remain unchanged. Conflicting path types or symlinks are reported rather than replaced. `--verify` checks file presence and types without changing contents or comparing personalized rules with templates.
+
+After successful fresh setup, tell the user: “Open a new agent session in YOUR_ABSOLUTE_HOME/pira and use it as your single point of contact across all your projects. Tell PIRA what you are working on and where those projects live. You can assign tasks, share ideas and ask for progress updates in that one conversation.” Replace the placeholder with the actual absolute path.
+
+This entrypoint leaves global PIRA configuration, tools and authentication unchanged. Install PIRA first using the instructions above.
 
 </details>
 
@@ -153,13 +185,9 @@ Setup does not execute shell profiles or interpret sourced files. For dynamic, s
 | `--execution-mode soft-safe` | `approval_policy = "never"`, `sandbox_mode = "danger-full-access"` | You want convenience and accept full-permission risk. |
 | `--execution-mode keep` | Leaves existing approval/sandbox settings unchanged. | You already manage Codex permissions yourself. |
 
-### `USER.md` mode
+### Personalization
 
-| Option | Behavior |
-| --- | --- |
-| `--user-mode placeholder` | Creates a private placeholder `USER.md` when it is missing. Existing `USER.md` is preserved. |
-| `--user-mode keep` | Leaves `USER.md` exactly as-is; if it is missing, setup leaves it missing. |
-| `--user-mode interactive` | Asks what to do when `USER.md` is missing. |
+Keep personalization in communicator-local instructions and memory. Setup does not create, load or require a global `USER.md`; missing files are valid, and existing files are not read, changed or cleaned up. Deprecated `--user-mode` values remain accepted as ignored compatibility options.
 
 ### Other useful flags
 
@@ -218,7 +246,7 @@ PIRA has one source/install branch: `master`. Change tool source there and bump 
 In plain language, setup connects PIRA to Codex, installs its tools, and checks the result. More precisely, it:
 
 1. Detects the repository directory and ensures it is available as `~/agent`, unless another `--agent-dir` is given.
-2. Initializes a private `USER.md` placeholder when needed.
+2. Leaves global `USER.md` unmanaged; it is neither required nor created.
 3. Moves legacy files listed in `assets/LEGACY_LIST.md` into `.backup/setup_pira_legacy/` when approved.
 4. Updates or creates Codex `config.toml` so the selected agent directory's `AGENTS.md` is loaded, with `project_doc_max_bytes = 65536` and `tui.auto_recap = false` (Codex 0.153.0+; manual `/recap` remains available).
 5. Creates a local repository guard that prevents the same `AGENTS.md` from being rediscovered while working inside the PIRA checkout, and removes an older `~/.codex/AGENTS.md` symlink only when it duplicates PIRA.
@@ -468,12 +496,12 @@ Reading an entire repository is slow and context-heavy. `pira_nav` provides port
 #### Command surface
 
 - `search` scans ordinary unignored UTF-8 repository text. Literals are the default and may be stated with `-F`; bounded Rust regular expressions, case-insensitive and Unicode half-word matching, multiple patterns, snippets, matching-file rows, and exact matching-line counts are available. Repeated patterns and up to 64 deduplicated file or directory scopes share one traversal. Missing peers in a multi-scope search are reported as incomplete while valid peers continue; a lone missing target remains an error. Every pattern is ranked independently so declaration-like production matches precede test/generated peers, while snippets remain query-balanced, capped at eight ranked lines per pattern and 8 KiB of rendered source blocks by default, and report exact shown/omitted counts. `--max-per-query` and `--max-bytes` expand deliberately, while `--owners` optionally adds enclosing clean declarations. `--max-results` aliases `--max-items`. Binary, oversized, non-UTF-8, and unreadable files are reported as aggregate completeness counts without routine per-file noise.
-- `map`, `symbols` (`declaration`/`declarations` aliases), `outline`, and `show` narrow repository shape, code declarations, structured-document paths, Markdown sections, and exact source. Canonical qualified names use `::` between hierarchy segments in every code and document format, `[N]` for indices, and JSON-style bracket quoting for arbitrary segments. Legacy language-native, dot-key, and `Parent > Child` selectors remain accepted aliases. A default map shows at most 20 balanced root-relative code/document rows and 16 landmarks balanced by kind, ranks production paths first, and counts but skips recognizable fixture/corpus subtrees; `--max-depth`/`--depth` bounds traversal. Outline output defaults to 64 items across the invocation, while `--depth 0` limits it to top-level items. Markdown outlines render local heading titles beneath indented ancestors instead of repeating the full heading path on every row; matching and `show` continue to use qualified paths. `show FILE` reads full UTF-8 files and accepts mixed bare/range/item batches; a trailing `--head N` or `--tail N` limits only the preceding bare file, including within a batch. Exact line ranges and windows require no language inference. For orientation across ultra-long lines, `show --glance` adds line numbers and shows at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata. Clean code uses bundled parsers; syntax-dirty code uses a conventional language server discovered on `PATH` or selected with `--lsp`. Native documents expose JSON/JSONC/YAML/TOML keys, indices, references, and tables or hierarchical Markdown headings rather than code semantics.
+- `map`, `symbols` (`declaration`/`declarations` aliases), `outline`, and `show` narrow repository shape, code declarations, structured-document paths, Markdown sections, and exact source. Canonical qualified names use `::` between hierarchy segments in every code and document format, `[N]` for indices, and JSON-style bracket quoting for arbitrary segments. Legacy language-native, dot-key, and `Parent > Child` selectors remain accepted aliases. A default map shows at most 20 balanced root-relative code/document rows and 16 landmarks balanced by kind, ranks production paths first, and counts but skips recognizable fixture/corpus subtrees; `--max-depth`/`--depth` bounds traversal. Outline output defaults to 64 items across the invocation, while `--depth 0` limits it to top-level items. Markdown outlines render local heading titles beneath indented ancestors instead of repeating the full heading path on every row; matching and `show` continue to use qualified paths. `show FILE` reads full UTF-8 files and accepts mixed bare/range/item batches; a trailing `--head N` or `--tail N` limits only the preceding bare file, including within a batch. Exact line ranges and windows require no language inference. For orientation across ultra-long lines, `show --glance` adds line numbers and shows at most the first 160 UTF-8-safe source bytes per physical line with explicit clipping metadata. Structural inventory uses bundled parsers by default; only explicit `--lsp` selects a server inventory. Dirty native syntax reports unavailable structure without automatic server startup. Map retains bounded filenames/topology with `landmarks_unavailable=1` and `complete=0` when optional native summaries fail; other native structural requests report parser errors. `--native` remains compatible. Native documents expose JSON/JSONC/YAML/TOML keys, indices, references, and tables or hierarchical Markdown headings rather than code semantics.
 - `imports`, `dependents`, and `deps` extract source references with bundled parsers and require a definition-capable language server to resolve file identities. They do not infer edges from filesystem naming heuristics. Output distinguishes resolved relationships from unresolved, unsupported, ambiguous and blocked references, with failures and omissions disclosed. Reverse/traversal results cover inspected source references, not an exhaustive runtime or build graph; zero results with unresolved references do not establish absence of dependencies. Use command help for bounds and server options.
 - `definition`, `implementation`, `type-definition`, `references`, `callers`, `callees`, `supertypes`, `subtypes`, and `hover` use a caller-installed language server. Targets may be one-based `FILE:LINE:COLUMN`, unique `FILE::QUALIFIED-NAME`, or freshness-checked selectors. Valid peers continue when another target fails preparation or execution. `query` batches ordered mixed semantic requests and shares invocation-local server and document state.
 - `languages` lists 24 compiled code languages with the discovered conventional server name or `missing`, plus five native document formats.
 
-Language is normally inferred from the file suffix or supported shebang; `--language` handles ambiguous paths or restricts a scan, and `--` ends option parsing before positional paths beginning with `-`. Bundled code support covers Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, Julia, and Lean 4; bundled document support covers JSON, JSONC, YAML, TOML, and Markdown. Lean's dynamically extended syntax falls back to its official `lake serve`/`lean --server` LSP for structural and semantic navigation, while module-header extraction is native and dependency resolution requires a capable server. Ordinary readable UTF-8 text remains searchable and exactly range-readable without a parser. No language runtime, daemon, persistent index, project initialization, or network access is required for native work. Dependency and semantic accuracy and startup cost depend on the caller's language server and project configuration. Explicit `--lsp` uses the server's symbol inventory; consume those selectors with the same server configuration.
+Language is normally inferred from the file suffix or supported shebang; `--language` handles ambiguous paths or restricts a scan, and `--` ends option parsing before positional paths beginning with `-`. Bundled code support covers Python, Rust, Java, C, C++, CUDA, Bash, Go, JavaScript, TypeScript/TSX, C#, PowerShell, PHP, Kotlin, Lua, HCL/Terraform, R, Ruby, Swift, Scala, Dart, Elixir, Julia, and Lean 4; bundled document support covers JSON, JSONC, YAML, TOML, and Markdown. Lean's dynamically extended syntax can use an explicitly selected official `lake serve`/`lean --server` for structural inventory. Actual semantic navigation still discovers or explicitly selects a capable server; module-header extraction is native and dependency resolution requires a capable server. Ordinary readable UTF-8 text remains searchable and exactly range-readable without a parser. No language runtime, daemon, persistent index, project initialization, or network access is required for native work. Dependency and semantic accuracy and startup cost depend on the caller's language server and project configuration. Explicit `--lsp` uses the server's symbol inventory; consume those selectors with the same server configuration.
 
 #### Relationship to existing tools
 
@@ -481,13 +509,13 @@ ast-outline demonstrates compact declarations and name-based retrieval; Grove de
 
 #### Read-only and security boundary
 
-Repository code is read and parsed but never edited, built, imported, or executed. Directory discovery honors ignore and hidden rules and does not follow symlinked directories; explicit search operands reject symlink components, and local dependency targets cannot escape the selected root. Source files, syntax, patterns, protocol messages, server output, results, and rendered bytes are bounded.
+Native operations read and parse repository code without editing, building, importing, or executing it. Directory discovery honors ignore and hidden rules and does not follow symlinked directories; explicit search operands reject symlink components, and local dependency targets cannot escape the selected root. Source files, syntax, patterns, protocol messages, server output, results, and rendered bytes are bounded.
 
-Source and hover text is framed as untrusted data, and unsafe terminal controls are escaped. A conservative English-keyword heuristic adds one short warning when rendered content resembles prompt injection; it never redacts, reorders, or expands source and is not a general multilingual classifier. The LSP client rejects `workspace/applyEdit`. A selected or `PATH`-discovered language server is still an external executable and may create its own caches, so its executable configuration remains part of the caller's trust boundary. Each LSP request is bounded to two minutes and timed-out server process trees are terminated; callers may still cancel earlier.
+Source and hover text is framed as untrusted data, and unsafe terminal controls are escaped. A conservative English-keyword heuristic adds one short warning when rendered content resembles prompt injection; it never redacts, reorders, or expands source and is not a general multilingual classifier. The LSP client rejects `workspace/applyEdit`. A selected or `PATH`-discovered language server is an external executable whose setup/build helpers may execute project code and create or rebuild caches, so its executable and output configuration remain part of the caller's trust boundary. Navigator does not provide OS-level confinement of those processes. Each LSP request is bounded to two minutes and timed-out server process trees are terminated; callers may still cancel earlier.
 
 #### Validation
 
-The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files are rejected by `--native` and routed to an LSP when available. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips, 967/967 unique canonical-name round trips, and 74/74 curated essential target checks. Current validation also includes 38 functional black-box tests, 12 inert security tests, 51 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 29 code/document formats. These are implementation tests, not an agentic evaluation.
+The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files have unavailable native structure and need explicit `--lsp` for server inventories; default topology maps mark unavailable native landmarks as partial coverage. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips, 967/967 unique canonical-name round trips, and 74/74 curated essential target checks. Current validation also includes 38 functional black-box tests, 12 inert security tests, 51 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 29 code/document formats. These are implementation tests, not an agentic evaluation.
 
 #### Performance
 
@@ -518,10 +546,10 @@ Validation used pinned real fixtures with retained upstream provenance, hashes, 
 ### `pira_write_check`: native English lexical review markers
 
 The Rust checker scans explicit UTF-8 files for configured literal English words
-and phrases, retaining exact locations, source context and every overlapping
-occurrence. Findings prompt review of necessity in context; they are not semantic
+and phrases, including defensive wording, stock phrasing and filler. It retains
+exact locations, source context and every overlapping occurrence. Findings prompt review of necessity in context; they are not semantic
 verdicts and never trigger automatic rewriting. Warnings exit `0`; input errors
-exit `2`. The default JSON lexicon is embedded in the executable. Use `pira_write_check --help`
+exit `2`, and output failures exit `1`. The default JSON lexicon is embedded in the executable. Use `pira_write_check --help`
 for options, examples, marker interpretation and exit statuses. See
 [`tools/crates/pira_write_check/README.md`](tools/crates/pira_write_check/README.md)
 for usage, Unicode semantics and limitations. Release availability follows the
@@ -705,7 +733,6 @@ other agent platforms has not been equally tested.
 <summary>Source, policy, setup, and bundled-tool files</summary>
 
 - `AGENTS.md` — canonical always-on identity, behavior, tool, safety, memory, and module-routing policy
-- `USER.md` — user-specific knowledge and working preferences; keep this private
 - `modules/` — optional task-specific modules for research, coding, writing, learning, guidance, and maintenance
 - `assets/scripts/` — setup and helper scripts
 - `tools/crates/` and `tools/Cargo.toml` — isolated Rust packages in the shared PIRA tools workspace
@@ -731,7 +758,7 @@ PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: fil
 
 The public repository contains the shared policy framework plus tool source, reproducible build inputs, and verified release bundles. Local-only material should stay private:
 
-- keep `USER.md` private;
+- keep personalization in communicator-local instructions and memory; never publish private profile contents;
 - keep workspace-specific memory in local `AGENT_WORKBOOK.md` files;
 - keep tool tests, benchmarks, fixtures, downloaded toolchains, and build work local;
 - do not commit secrets or sensitive personal information.

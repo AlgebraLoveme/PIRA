@@ -539,10 +539,127 @@ fn id(run: &Path) -> &str {
     run.file_name().unwrap().to_str().unwrap()
 }
 
+// Borrowing the native owner keeps run.lock held until publication or guarded undo.
+enum Publication {
+    New,
+    Retained(Value),
+    Published,
+}
+pub(super) struct Admission<'a> {
+    owner: &'a crate::lifecycle::Owner,
+    run: PathBuf,
+    root: PathBuf,
+    epoch: Value,
+    member: Value,
+    previous: Value,
+    publication: Publication,
+}
+impl Admission<'_> {
+    pub(super) fn published(&mut self) {
+        self.publication = Publication::Published;
+    }
+
+    pub(super) fn undo_unpublished(self) -> Result<(), String> {
+        if matches!(self.publication, Publication::Published) {
+            return Ok(());
+        }
+        let _lock = lock(&self.root)?;
+        // Any changed/unreadable manifest may represent publication. Never undo it.
+        let retained = match self.publication {
+            Publication::Retained(retained) => {
+                if read_json(&self.run.join("manifest.json"))? != retained {
+                    return Ok(());
+                }
+                Some(retained)
+            }
+            Publication::New => {
+                match std::fs::symlink_metadata(self.run.join("manifest.json")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        return Err(format!("cannot prove initial manifest absence: {error}"));
+                    }
+                }
+                None
+            }
+            Publication::Published => unreachable!(),
+        };
+        let launcher = crate::native::current()?;
+        let mut tree = read_tree(&self.root)?;
+        let current = &tree["members"][id(&self.run)];
+        let blocked = current["blocked"]
+            .as_bool()
+            .ok_or("invalid admission gate")?;
+        let mut expected = self.member;
+        expected["blocked"] = json!(blocked);
+        if !self.owner.owns(&self.run)
+            || tree["epoch"] != self.epoch
+            || *current != expected
+            || expected["launcher_pid"] != launcher.pid
+            || expected["launcher_birth"] != launcher.birth
+        {
+            return Err(
+                "unpublished admission ownership/epoch changed or prior member is unknown".into(),
+            );
+        }
+        if let Some(retained) = retained {
+            if retained["run_id"] != id(&self.run)
+                || !terminal(&retained["status"])
+                || retained["revision"].as_u64().and_then(|n| n.checked_add(1))
+                    != expected["revision"].as_u64()
+                || tree_root(&self.run, &retained)? != self.root
+                || self.previous["active"] != false
+                || self.previous["revision"] != retained["revision"]
+            {
+                return Err("prior admission member is unknown; no rollback".into());
+            }
+            let mut previous = self.previous;
+            if blocked {
+                previous["blocked"] = json!(true);
+            }
+            tree["members"][id(&self.run)] = previous;
+        } else {
+            if expected["revision"] != 1
+                || !self.previous.is_null()
+                || (blocked && self.root == self.run)
+            {
+                return Err(
+                    "initial admission has prior state or a root-member gate; no rollback".into(),
+                );
+            }
+            // A never-published identity cannot resume. Its own blocked bit belongs
+            // to this failed admission; root and unrelated gates remain untouched.
+            tree["members"]
+                .as_object_mut()
+                .ok_or("invalid tree members")?
+                .remove(id(&self.run));
+        }
+        // Undo only our admission, never root gates or other members.
+        save_json(&self.root.join("tree.json"), &tree)
+    }
+}
+
 /// Admit before publishing running state. The same lock seals completion and interruption.
-pub fn admit(run: &Path, manifest: &mut Value, resume: bool) -> Result<(), String> {
+pub(super) fn admit<'a>(
+    run: &Path,
+    manifest: &mut Value,
+    resume: bool,
+    owner: &'a crate::lifecycle::Owner,
+) -> Result<Admission<'a>, String> {
+    if !owner.owns(run) {
+        return Err("admission requires this run's native owner lock".into());
+    }
     let root = tree_root(run, manifest)?;
     let _lock = lock(&root)?;
+    let publication = if resume {
+        Publication::Retained(read_json(&run.join("manifest.json"))?)
+    } else {
+        match std::fs::symlink_metadata(run.join("manifest.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Publication::New,
+            Ok(_) => return Err("initial admission already has a manifest; no overwrite".into()),
+            Err(error) => return Err(format!("cannot verify initial manifest absence: {error}")),
+        }
+    };
     let path = root.join("tree.json");
     let mut tree = if path.exists() {
         read_tree(&root)?
@@ -601,9 +718,26 @@ pub fn admit(run: &Path, manifest: &mut Value, resume: bool) -> Result<(), Strin
     }
     manifest["subtree_epoch"] = tree["epoch"].clone();
     let launcher = crate::native::current()?;
+    let previous = tree["members"][id(run)].clone();
     tree["members"][id(run)] = json!({"active":true,"revision":manifest["revision"],"blocked":false,
         "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"credential_claimed":false});
-    save_json(&path, &tree)
+    let admission = Admission {
+        owner,
+        run: run.to_owned(),
+        root: root.clone(),
+        epoch: tree["epoch"].clone(),
+        member: tree["members"][id(run)].clone(),
+        previous,
+        publication,
+    };
+    if let Err(error) = save_json(&path, &tree) {
+        drop(_lock);
+        return Err(match admission.undo_unpublished() {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; admission cleanup refused: {cleanup}"),
+        });
+    }
+    Ok(admission)
 }
 
 pub struct Watcher {
@@ -1094,6 +1228,224 @@ pub const POLICY: &str = include_str!("coordinator.md");
 mod tests {
     use super::*;
     include!("native_boundary_tests.rs");
+
+    #[test]
+    fn child_admission_undo_preserves_coordinator_and_child_interruption_gate() {
+        let store = std::env::temp_dir().join(format!(
+            "team-child-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::private_dir(&store).unwrap();
+        let root = store.join("root");
+        let run = store.join("child");
+        crate::private_dir(&root).unwrap();
+        crate::private_dir(&run).unwrap();
+        let owner = crate::lifecycle::owner(&run).unwrap();
+        let retained = json!({"run_id":"child","parent_run_id":"root",
+            "revision":1,"status":"completed"});
+        save_json(&run.join("manifest.json"), &retained).unwrap();
+        let previous = json!({"active":false,"revision":1,"blocked":false});
+        let coordinator = json!({"active":true,"revision":5,"blocked":false});
+        let launcher = crate::native::current().unwrap();
+        let member = json!({"active":true,"revision":2,"blocked":false,
+            "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"credential_claimed":false});
+        // Test the undo primitive after admission, without bypassing ancestry to launch a child.
+        let admission = Admission {
+            owner: &owner,
+            run: run.clone(),
+            root: root.clone(),
+            epoch: json!(9),
+            member: member.clone(),
+            previous: previous.clone(),
+            publication: Publication::Retained(retained),
+        };
+        let mut tree = json!({"version":1,"epoch":9,"blocked":false,
+            "members":{"root":coordinator,"child":member}});
+        tree["members"]["child"]["blocked"] = json!(true);
+        save_json(&root.join("tree.json"), &tree).unwrap();
+        admission.undo_unpublished().unwrap();
+        let actual = read_json(&root.join("tree.json")).unwrap();
+        let mut expected = previous;
+        expected["blocked"] = json!(true);
+        assert_eq!(actual["members"]["child"], expected);
+        assert_eq!(actual["members"]["root"], coordinator);
+        assert_eq!(actual["blocked"], false);
+        assert_eq!(actual["epoch"], 9);
+        drop(owner);
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
+    #[test]
+    fn unpublished_child_undo_allows_parent_completion_and_guarded_stop() {
+        for (root_blocked, child_blocked) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let store = std::env::temp_dir().join(format!(
+                "team-new-child-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&store).unwrap();
+            let root = store.join("root");
+            let run = store.join("child");
+            crate::private_dir(&root).unwrap();
+            crate::private_dir(&run).unwrap();
+            std::fs::write(run.join("keep"), b"child payload").unwrap();
+            let root_owner = crate::lifecycle::owner(&root).unwrap();
+            let child_owner = crate::lifecycle::owner(&run).unwrap();
+            let launcher = crate::native::current().unwrap();
+            let member = json!({"active":true,"revision":1,"blocked":false,
+                "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"credential_claimed":false});
+            let admission = Admission {
+                owner: &child_owner,
+                run: run.clone(),
+                root: root.clone(),
+                epoch: json!(9),
+                member: member.clone(),
+                previous: Value::Null,
+                publication: Publication::New,
+            };
+            let mut tree = json!({"version":1,"epoch":9,"blocked":root_blocked,
+                "members":{"root":{"active":true,"revision":5,"blocked":false},"child":member}});
+            tree["members"]["child"]["blocked"] = json!(child_blocked);
+            save_json(&root.join("tree.json"), &tree).unwrap();
+            admission.undo_unpublished().unwrap();
+            drop(child_owner);
+            let tree = read_tree(&root).unwrap();
+            assert!(tree["members"].get("child").is_none());
+            assert_eq!(tree["blocked"], root_blocked);
+            assert_eq!(std::fs::read(run.join("keep")).unwrap(), b"child payload");
+            let mut parent =
+                json!({"run_id":"root","parent_run_id":null,"revision":5,"status":"completed"});
+            assert_eq!(finish(&root, &mut parent).is_ok(), !root_blocked);
+            drop(root_owner);
+            assert_eq!(interrupt(&root, true).unwrap()["status"], "stopped");
+            std::fs::remove_dir_all(store).unwrap();
+        }
+    }
+
+    #[test]
+    fn unpublished_child_undo_rechecks_locked_state_and_preserves_unrelated_gates() {
+        for change in ["gate", "epoch", "claim", "manifest"] {
+            let store = std::env::temp_dir().join(format!(
+                "team-new-child-race-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&store).unwrap();
+            let root = store.join("root");
+            let run = store.join("child");
+            crate::private_dir(&root).unwrap();
+            crate::private_dir(&run).unwrap();
+            std::fs::write(run.join("keep"), b"unrelated payload").unwrap();
+            let owner = crate::lifecycle::owner(&run).unwrap();
+            let launcher = crate::native::current().unwrap();
+            let member = json!({"active":true,"revision":1,"blocked":false,
+                "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"credential_claimed":false});
+            let parent = json!({"active":true,"revision":5,"blocked":false});
+            save_json(
+                &root.join("tree.json"),
+                &json!({"version":1,"epoch":9,"blocked":false,
+                "members":{"root":parent,"child":member}}),
+            )
+            .unwrap();
+            let admission = Admission {
+                owner: &owner,
+                run: run.clone(),
+                root: root.clone(),
+                epoch: json!(9),
+                member,
+                previous: Value::Null,
+                publication: Publication::New,
+            };
+            let (ready, acquired) = std::sync::mpsc::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let other_root = root.clone();
+            let other_run = run.clone();
+            let writer = std::thread::spawn(move || {
+                let _lock = lock(&other_root).unwrap();
+                ready.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                let mut tree = read_tree(&other_root).unwrap();
+                tree["blocked"] = json!(true);
+                tree["members"]["child"]["blocked"] = json!(true);
+                tree["members"]["other"] =
+                    json!({"active":false,"revision":3,"blocked":true,"note":"unrelated"});
+                match change {
+                    "epoch" => tree["epoch"] = json!(10),
+                    "claim" => tree["members"]["child"]["credential_claimed"] = json!(true),
+                    "manifest" => save_json(
+                        &other_run.join("manifest.json"),
+                        &json!({"run_id":"child","revision":1,"status":"running"}),
+                    )
+                    .unwrap(),
+                    _ => {}
+                }
+                save_json(&other_root.join("tree.json"), &tree).unwrap();
+                tree
+            });
+            acquired.recv_timeout(Duration::from_secs(3)).unwrap();
+            on_lock_contention(move || release.send(()).unwrap());
+            let result = admission.undo_unpublished();
+            let mut expected = writer.join().unwrap();
+            if change == "gate" {
+                result.unwrap();
+                expected["members"].as_object_mut().unwrap().remove("child");
+            } else if change == "manifest" {
+                result.unwrap(); // possible publication: keep the complete admitted state
+                assert_eq!(
+                    read_json(&run.join("manifest.json")).unwrap()["status"],
+                    "running"
+                );
+            } else {
+                assert!(result.is_err(), "{change}");
+            }
+            assert_eq!(read_tree(&root).unwrap(), expected, "{change}");
+            assert_eq!(
+                std::fs::read(run.join("keep")).unwrap(),
+                b"unrelated payload"
+            );
+            drop(owner);
+            std::fs::remove_dir_all(store).unwrap();
+        }
+    }
+
+    #[test]
+    fn initial_undo_preserves_unexpected_root_member_gate() {
+        let store = std::env::temp_dir().join(format!(
+            "team-root-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        crate::private_dir(&store).unwrap();
+        let run = store.join("root");
+        crate::private_dir(&run).unwrap();
+        let owner = crate::lifecycle::owner(&run).unwrap();
+        let mut manifest = json!({"run_id":"root","parent_run_id":null,"revision":1});
+        let admission = admit(&run, &mut manifest, false, &owner).unwrap();
+        let mut tree = read_tree(&run).unwrap();
+        tree["blocked"] = json!(true);
+        tree["members"]["root"]["blocked"] = json!(true);
+        save_json(&run.join("tree.json"), &tree).unwrap();
+        assert!(admission.undo_unpublished().is_err());
+        assert_eq!(read_tree(&run).unwrap(), tree);
+        drop(owner);
+        std::fs::remove_dir_all(store).unwrap();
+    }
+
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -1455,45 +1807,22 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn unlinked_live_executable_never_becomes_missing_worker_or_exited_backend() {
-        struct Probe {
-            child: std::process::Child,
-            dir: PathBuf,
-        }
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                let _ = std::fs::remove_dir_all(&self.dir);
-            }
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "team-unlinked-executable-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let executable = dir.join("codex-fixture");
-        std::fs::copy("/bin/sleep", &executable).unwrap();
-        let probe = Probe {
-            child: std::process::Command::new(&executable)
-                .arg("30")
-                .spawn()
-                .unwrap(),
-            dir,
-        };
-        let pid = probe.child.id();
-        let original = crate::native::identity(pid).unwrap();
-        assert!(original.alive);
-        std::fs::remove_file(executable).unwrap();
-        let error = crate::native::identity(pid).unwrap_err();
-        assert!(!crate::native::missing(&error), "{error}");
-        assert!(inspect(pid).is_err());
-        assert!(bound_backend_alive(pid, original.birth, crate::native::identity).is_err());
+    fn live_executable_inspection_failure_never_means_absent_worker_or_backend() {
+        let fixture = DiscoveryFixture::new(12);
+        let failure =
+            || crate::native::unavailable_executable(12, std::io::ErrorKind::NotFound.into());
+        assert!(!crate::native::missing(&failure()));
+        assert!(
+            discover_using(32, |pid| {
+                if pid == 12 {
+                    Err(failure().to_string())
+                } else {
+                    fixture.inspect(pid)
+                }
+            })
+            .is_err()
+        );
+        assert!(bound_backend_alive(12, 20, |_| Err(failure())).is_err());
     }
 }

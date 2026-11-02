@@ -57,7 +57,8 @@ impl StructuralResolver {
         self.resolve_parsed(parsed)
     }
 
-    pub fn resolve_source(
+    /// Semantic target preparation retains discovery for dirty source identity.
+    pub fn resolve_semantic_source(
         &mut self,
         path: &Path,
         language: Language,
@@ -76,14 +77,21 @@ impl StructuralResolver {
         } else {
             parse_file_source(path, language, source).map_err(input_error)?
         };
+        if !self.native_only && parsed.syntax_defects > 0 {
+            return self.resolve_lsp(parsed);
+        }
         self.resolve_parsed(parsed)
     }
 
     pub fn resolve_parsed(&mut self, parsed: ParsedFile) -> Result<ParsedFile, CommandError> {
         let force_lsp = self.force_all_lsp || self.forced_languages.contains(&parsed.language);
-        if self.native_only || (!force_lsp && parsed.syntax_defects == 0) {
+        if self.native_only || !force_lsp {
             return self.resolve_native(parsed);
         }
+        self.resolve_lsp(parsed)
+    }
+
+    fn resolve_lsp(&mut self, parsed: ParsedFile) -> Result<ParsedFile, CommandError> {
         let path = parsed.path.clone();
         let language = parsed.language;
         if !self.service.is_configured(language) {
@@ -120,18 +128,10 @@ impl StructuralResolver {
 
     pub fn resolve_native(&self, parsed: ParsedFile) -> Result<ParsedFile, CommandError> {
         if parsed.syntax_defects > 0 {
-            let recovery = if parsed.language.is_document() {
-                format!(
-                    "pass --lsp {}=ABSOLUTE_SERVER_PATH, or use search or an exact show line range",
-                    parsed.language.name()
-                )
-            } else {
-                format!(
-                    "rerun without --native with a conventional {} LSP on PATH or pass --lsp {}=ABSOLUTE_SERVER_PATH",
-                    parsed.language.name(),
-                    parsed.language.name()
-                )
-            };
+            let recovery = format!(
+                "use search or an exact show line range, or explicitly select --lsp {}=ABSOLUTE_SERVER_PATH for a server inventory",
+                parsed.language.name()
+            );
             return Err(lsp_error(format!(
                 "native parser found {} syntax defect(s); {recovery}",
                 parsed.syntax_defects

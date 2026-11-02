@@ -217,9 +217,26 @@ pub fn capture_command(
     announce_live: bool,
     redirected_stream: Option<StreamKind>,
 ) -> Result<Result<CaptureResult, i32>, String> {
+    capture_command_controlled(
+        cmd,
+        live_store_dir,
+        announce_live,
+        redirected_stream,
+        &AtomicBool::new(false),
+    )
+}
+
+pub(crate) fn capture_command_controlled(
+    cmd: &[String],
+    live_store_dir: Option<&Path>,
+    announce_live: bool,
+    redirected_stream: Option<StreamKind>,
+    cancel: &AtomicBool,
+) -> Result<Result<CaptureResult, i32>, String> {
     if cmd.is_empty() {
         return Err(crate::cli::USAGE.to_string());
     }
+    crate::shutdown::check()?;
     let cwd_path = std::env::current_dir().map_err(|error| error.to_string())?;
     let cwd_path = cwd_path.canonicalize().unwrap_or(cwd_path);
     let cwd = cwd_path.display().to_string();
@@ -242,8 +259,15 @@ pub fn capture_command(
         maximum: retained_limit,
         used: AtomicU64::new(0),
     });
-    let stdout_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stdout", start_ms)));
-    let stderr_spool = Arc::new(Mutex::new(AdaptiveSpool::new("stderr", start_ms)));
+    let spool_dir = live_store_dir.map(|store| store.join("live/spools"));
+    let stdout_spool = Arc::new(Mutex::new(AdaptiveSpool::new_in(
+        "stdout",
+        start_ms,
+        spool_dir.clone(),
+    )));
+    let stderr_spool = Arc::new(Mutex::new(AdaptiveSpool::new_in(
+        "stderr", start_ms, spool_dir,
+    )));
     let (initial_live_id, live_owner) = if announce_live {
         let store_dir = live_store_dir.ok_or("live announcement requires capture storage")?;
         let (stdout_path, stderr_path) = live_spool_paths(&stdout_spool, &stderr_spool)?;
@@ -321,28 +345,38 @@ pub fn capture_command(
     let stdout_collected = Arc::clone(&collected);
     let stdout_budget = Arc::clone(&budget);
     let stdout_writer = Arc::clone(&stdout_spool);
+    let (reader_failure, reader_failed) = mpsc::channel();
+    let stdout_failure = reader_failure.clone();
     let stdout_handle = thread::spawn(move || {
-        read_stream(
+        let result = read_stream(
             child_stdout,
             &stdout_writer,
             StreamKind::Stdout,
             &stdout_collected,
             indexed_line_limit,
             &stdout_budget,
-        )
+        );
+        if result.is_err() {
+            let _ = stdout_failure.send(());
+        }
+        result
     });
     let stderr_collected = Arc::clone(&collected);
     let stderr_budget = Arc::clone(&budget);
     let stderr_writer = Arc::clone(&stderr_spool);
     let stderr_handle = thread::spawn(move || {
-        read_stream(
+        let result = read_stream(
             child_stderr,
             &stderr_writer,
             StreamKind::Stderr,
             &stderr_collected,
             indexed_line_limit,
             &stderr_budget,
-        )
+        );
+        if result.is_err() {
+            let _ = reader_failure.send(());
+        }
+        result
     });
     let checkpoint_interval = Duration::from_millis(configured_u64(
         "PIRA_CTX_LIVE_CHECKPOINT_MS",
@@ -473,23 +507,33 @@ pub fn capture_command(
                     }
                 }
             }
-            (live_id, live_owner)
+            (live_id, live_owner, generation)
         })
     });
     let mut live_announced = false;
     let mut cancelled = false;
     let status = loop {
         let active_live_id = shared_live_id.lock().ok().and_then(|id| id.clone());
-        if let (Some(store_dir), Some(result_id)) = (live_store_dir, active_live_id.as_deref())
-            && crate::storage::cancellation_requested(store_dir, result_id)
-        {
+        let requested = match (live_store_dir, active_live_id.as_deref()) {
+            (Some(store), Some(id)) => crate::storage::cancellation_requested(store, id),
+            _ => false,
+        };
+        if cancel.load(Ordering::Acquire) || requested || crate::shutdown::requested() {
             cancelled = true;
-            tree.terminate_tree();
-            break tree.child.wait().map_err(|error| error.to_string())?;
+            break tree.terminate_and_wait();
+        }
+        if reader_failed.try_recv().is_ok() {
+            break tree.terminate_and_wait();
         }
         // Observe completion before announcing; setup/scheduling may consume the delay
         // even when the child has already exited. Cancellation retains priority.
-        let child_status = tree.child.try_wait().map_err(|error| error.to_string())?;
+        let child_status = match tree.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                tree.terminate_tree();
+                break Err(error.to_string());
+            }
+        };
         if announce_live
             && !live_announced
             && live_announcement_due(elapsed.elapsed().as_millis(), child_status.is_none())
@@ -498,33 +542,99 @@ pub fn capture_command(
             let display_id = live_store_dir
                 .map(|dir| crate::storage::display_result_id(dir, result_id))
                 .unwrap_or_else(|| result_id.to_string());
-            eprintln!("LIVE | result={display_id}");
+            // Diagnostics are best-effort; a closed diagnostic pipe must not
+            // abort an owned attempt or prevent durable output publication.
+            util::diagnostic_line(&format!("LIVE | result={display_id}"));
             live_announced = true;
         }
         if let Some(status) = child_status {
             tree.terminate_tree();
-            break status;
+            break Ok(status);
         }
         thread::sleep(Duration::from_millis(CAPTURE_CONTROL_POLL_MS));
     };
     *drain.deadline.lock().map_err(|_| "drain state poisoned")? =
         Some(Instant::now() + POST_EXIT_DRAIN);
     let _ = checkpoint_stop.send(());
-    let (live_id, live_owner) = checkpoint_handle
+    let checkpoint_result = checkpoint_handle
         .map(|handle| {
             handle
                 .join()
                 .map_err(|_| "live checkpoint worker panicked".to_string())
         })
-        .transpose()?
-        .unwrap_or((None, None));
+        .transpose();
     let end_ms = util::millis(SystemTime::now());
-    let stdout_analysis = join_reader(stdout_handle, "stdout")?;
-    let stderr_analysis = join_reader(stderr_handle, "stderr")?;
+    // Never short-circuit a join: both readers belong to this attempt.
+    let stdout_analysis = join_reader(stdout_handle, "stdout");
+    let stderr_analysis = join_reader(stderr_handle, "stderr");
+    let (live_id, mut live_owner, generation) = checkpoint_result?.unwrap_or((None, None, 0));
     let collected = collected
         .lock()
         .map_err(|_| "capture state lock poisoned".to_string())?
         .clone();
+    let mut recovery_id = None;
+    if let Some(store) = live_store_dir {
+        let snapshot = (|| {
+            let (stdout_path, stderr_path) = live_spool_paths(&stdout_spool, &stderr_spool)?;
+            let checkpoint = crate::storage::LiveCheckpoint {
+                redirected_stream,
+                command: cmd,
+                cwd: &cwd,
+                cwd_native: &cwd_native,
+                start_ms,
+                duration_ms: elapsed.elapsed().as_millis(),
+                stdout_path: &stdout_path,
+                stderr_path: &stderr_path,
+                stdout_bytes: collected.stdout_bytes,
+                stderr_bytes: collected.stderr_bytes,
+                observed_stdout_bytes: collected.observed_stdout_bytes,
+                observed_stderr_bytes: collected.observed_stderr_bytes,
+                stdout_lines: collected.stdout,
+                stderr_lines: collected.stderr,
+                total_lines: collected.total,
+                timeline: &collected.timeline,
+                timeline_truncated: collected.truncated
+                    || stdout_analysis.is_err()
+                    || stderr_analysis.is_err(),
+            };
+            if live_id.is_some() {
+                crate::storage::write_live_checkpoint(
+                    store,
+                    live_id.as_deref(),
+                    generation.saturating_add(1),
+                    true,
+                    &checkpoint,
+                )
+                .map(|id| (id, None))
+            } else {
+                crate::storage::begin_live_capture(store, &checkpoint)
+                    .map(|(id, owner)| (id, Some(owner)))
+            }
+        })();
+        match snapshot {
+            Ok((id, owner)) => {
+                recovery_id = Some(id);
+                if owner.is_some() {
+                    live_owner = owner;
+                }
+            }
+            Err(error) => util::diagnostic_line(&format!(
+                "pira_ctx: final recovery checkpoint failed; last snapshot may be stale: {error}"
+            )),
+        }
+    }
+    if stdout_analysis.is_err() || stderr_analysis.is_err() || status.is_err() {
+        if let Some(id) = recovery_id.as_ref().or(live_id.as_ref()) {
+            preserve_spool(&stdout_spool);
+            preserve_spool(&stderr_spool);
+            util::diagnostic_line(&format!(
+                "pira_ctx: interrupted snapshot retained: {id}; use stats/raw/exec for recovery"
+            ));
+        }
+    }
+    let stdout_analysis = stdout_analysis?;
+    let stderr_analysis = stderr_analysis?;
+    let status = status?;
     let drain_truncated = drain.truncated.load(Ordering::Acquire);
     if drain_truncated {
         crate::util::diagnostic_line(
@@ -557,6 +667,8 @@ pub fn capture_command(
         live_id,
         live_store_dir: live_store_dir.map(Path::to_path_buf),
         _live_owner: live_owner,
+        recovery_id,
+        retire_checkpoint: std::cell::Cell::new(false),
     };
     Ok(Ok(capture))
 }
@@ -606,7 +718,16 @@ fn finish_spool(
     spool.finish(analysis)
 }
 
+fn preserve_spool(spool: &Mutex<AdaptiveSpool>) {
+    if let Ok(mut spool) = spool.lock()
+        && let Some(guard) = &mut spool.guard
+    {
+        guard.disarm();
+    }
+}
+
 struct AdaptiveSpool {
+    directory: Option<PathBuf>,
     stream: &'static str,
     start_ms: u128,
     memory: Vec<u8>,
@@ -615,8 +736,14 @@ struct AdaptiveSpool {
 }
 
 impl AdaptiveSpool {
+    #[cfg(test)]
     fn new(stream: &'static str, start_ms: u128) -> Self {
+        Self::new_in(stream, start_ms, None)
+    }
+
+    fn new_in(stream: &'static str, start_ms: u128, directory: Option<PathBuf>) -> Self {
         Self {
+            directory,
             stream,
             start_ms,
             memory: Vec::new(),
@@ -642,7 +769,8 @@ impl AdaptiveSpool {
 
     fn ensure_file(&mut self) -> Result<&Path, String> {
         if self.file.is_none() {
-            let (guard, mut file) = create_spool(self.stream, self.start_ms)?;
+            let (guard, mut file) =
+                create_spool(self.stream, self.start_ms, self.directory.as_deref())?;
             file.write_all(&self.memory)
                 .map_err(|error| format!("initialize temporary capture: {error}"))?;
             self.memory.clear();
@@ -683,8 +811,19 @@ impl AdaptiveSpool {
     }
 }
 
-fn create_spool(stream: &str, start_ms: u128) -> Result<(SpoolGuard, File), String> {
-    let directory = std::env::temp_dir();
+fn create_spool(
+    stream: &str,
+    start_ms: u128,
+    directory: Option<&Path>,
+) -> Result<(SpoolGuard, File), String> {
+    let directory = match directory {
+        Some(path) => {
+            crate::storage::ensure_private_dir(path)?;
+            path.canonicalize()
+                .map_err(|e| format!("resolve private spool directory: {e}"))?
+        }
+        None => std::env::temp_dir(),
+    };
     for nonce in 0..100_u32 {
         let filename = format!(
             ".pira_ctx-spool-{}-{start_ms}-{stream}-{nonce}",

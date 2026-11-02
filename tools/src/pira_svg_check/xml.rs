@@ -97,6 +97,219 @@ pub(crate) fn render_depth(source: &[u8], parent_depth: usize) -> Result<usize, 
     Ok(maximum)
 }
 
+// Include containment as well as references: a referenced subtree can itself
+// reference another definition. Definitions are entered by reference, not by
+// ordinary painting. Inheritable paints must also be checked in their consumers.
+pub(crate) fn reference_depth(source: &[u8], parent_depth: usize) -> Result<usize, GuardError> {
+    use std::collections::HashMap;
+    const PROPERTIES: &[&str] = &[
+        "fill",
+        "stroke",
+        "clip-path",
+        "mask",
+        "filter",
+        "marker-start",
+        "marker-mid",
+        "marker-end",
+    ];
+    let normalized = crate::style::normalize(source)?;
+    let mut reader = quick_xml::Reader::from_reader(normalized.as_slice());
+    let mut stack: Vec<usize> = Vec::new();
+    let mut edges: Vec<Vec<usize>> = Vec::new();
+    let mut links: Vec<Vec<String>> = Vec::new();
+    let mut properties: Vec<HashMap<String, String>> = Vec::new();
+    let mut ids = HashMap::new();
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| GuardError(format!("invalid SVG XML: {e}")))?;
+        match event {
+            Event::Start(ref element) | Event::Empty(ref element) => {
+                let index = edges.len();
+                check_node_limit(index + 1)?;
+                edges.push(Vec::new());
+                links.push(Vec::new());
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if let Some(&parent) = stack.last()
+                    && !matches!(
+                        name.as_str(),
+                        "defs"
+                            | "symbol"
+                            | "pattern"
+                            | "mask"
+                            | "clipPath"
+                            | "marker"
+                            | "filter"
+                            | "linearGradient"
+                            | "radialGradient"
+                    )
+                {
+                    edges[parent].push(index);
+                }
+                let mut attrs = HashMap::new();
+                for attr in element.attributes() {
+                    let attr =
+                        attr.map_err(|e| GuardError(format!("invalid SVG attribute: {e}")))?;
+                    // Normalize literal XML whitespace before entity expansion,
+                    // exactly as the renderer does for IDs and references.
+                    let raw = reader
+                        .decoder()
+                        .decode(attr.value.as_ref())
+                        .map_err(|e| GuardError(e.to_string()))?;
+                    let raw = raw.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+                    attrs.insert(
+                        String::from_utf8_lossy(attr.key.as_ref()).into_owned(),
+                        quick_xml::escape::unescape(&raw)
+                            .map_err(|e| GuardError(e.to_string()))?
+                            .into_owned(),
+                    );
+                }
+                if let Some(id) = attrs.get("id") {
+                    // usvg keeps the first duplicate ID.
+                    ids.entry(id.clone()).or_insert(index);
+                }
+                if let Some(href) = attrs.get("href").or_else(|| {
+                    attrs
+                        .iter()
+                        .find_map(|(k, v)| (k.ends_with(":href")).then_some(v))
+                }) {
+                    if matches!(
+                        name.as_str(),
+                        "use"
+                            | "linearGradient"
+                            | "radialGradient"
+                            | "pattern"
+                            | "filter"
+                            | "image"
+                            | "feImage"
+                            | "textPath"
+                            | "tref"
+                    ) {
+                        links[index].push(href.trim().to_string());
+                    }
+                }
+                let mut effective: HashMap<String, (String, bool)> = PROPERTIES
+                    .iter()
+                    .filter_map(|&k| attrs.get(k).map(|v| (k.to_string(), (v.clone(), false))))
+                    .collect();
+                if let Some(style) = attrs.get("style") {
+                    for declaration in simplecss::DeclarationTokenizer::from(style.as_str()) {
+                        let names: &[&str] = if declaration.name == "marker" {
+                            &["marker-start", "marker-mid", "marker-end"]
+                        } else if PROPERTIES.contains(&declaration.name) {
+                            std::slice::from_ref(&declaration.name)
+                        } else {
+                            continue;
+                        };
+                        for &name in names {
+                            if !effective.get(name).is_some_and(|(_, important)| *important) {
+                                effective.insert(
+                                    name.to_string(),
+                                    (declaration.value.to_string(), declaration.important),
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut values = HashMap::new();
+                for &property in PROPERTIES {
+                    let inherited = stack.last().and_then(|&p| properties[p].get(property));
+                    let value = match effective.get(property).map(|(v, _)| v.as_str()) {
+                        Some("inherit") => inherited.cloned(),
+                        Some(value) => Some(value.to_string()),
+                        None if matches!(
+                            property,
+                            "fill" | "stroke" | "marker-start" | "marker-mid" | "marker-end"
+                        ) =>
+                        {
+                            inherited.cloned()
+                        }
+                        None => None,
+                    };
+                    if let Some(value) = value {
+                        let paint = matches!(
+                            property,
+                            "fill" | "stroke" | "marker-start" | "marker-mid" | "marker-end"
+                        );
+                        if !paint || is_paintable(&name) || name == "tspan" {
+                            links[index].extend(css::references(&value)?);
+                        }
+                        values.insert(property.to_string(), value);
+                    }
+                }
+                properties.push(values);
+                if matches!(event, Event::Start(_)) {
+                    stack.push(index);
+                }
+            }
+            Event::End(_) => {
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    for (index, references) in links.iter().enumerate() {
+        for reference in references {
+            if let Some(target) = reference.strip_prefix('#').and_then(|id| ids.get(id)) {
+                edges[index].push(*target);
+            }
+        }
+    }
+    // Iterative DFS with memoized longest paths. No hostile input can recurse
+    // in this guard, and shared DAGs do not cause exponential traversal here.
+    let mut state = vec![0_u8; edges.len()];
+    let mut depths = vec![1_usize; edges.len()];
+    let mut maximum = 0;
+    for start in 0..edges.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut pending = vec![(start, 0)];
+        state[start] = 1;
+        while let Some((node, next)) = pending.last_mut() {
+            if *next < edges[*node].len() {
+                let child = edges[*node][*next];
+                *next += 1;
+                match state[child] {
+                    1 => {
+                        return Err(GuardError(
+                            "SVG reference cycle is unsupported for bounded scene analysis".into(),
+                        ));
+                    }
+                    0 => {
+                        state[child] = 1;
+                        pending.push((child, 0));
+                        if pending.len() + parent_depth > MAX_RENDER_DEPTH {
+                            return Err(reference_depth_error());
+                        }
+                    }
+                    _ => {
+                        depths[*node] = depths[*node].max(1 + depths[child]);
+                    }
+                }
+            } else {
+                let (node, _) = pending.pop().unwrap();
+                state[node] = 2;
+                maximum = maximum.max(depths[node]);
+                if let Some((parent, _)) = pending.last() {
+                    depths[*parent] = depths[*parent].max(1 + depths[node]);
+                }
+                if maximum + parent_depth > MAX_RENDER_DEPTH {
+                    return Err(reference_depth_error());
+                }
+            }
+        }
+    }
+    Ok(maximum + parent_depth)
+}
+
+fn reference_depth_error() -> GuardError {
+    GuardError(format!(
+        "SVG exceeds the effective reference traversal limit ({MAX_RENDER_DEPTH}); simplify referenced artwork"
+    ))
+}
+
 // Resource policy applies to every parsed document, independently of outer-only
 // annotation keys and text discovery beneath foreign ancestors.
 pub(crate) fn validate_resources(source: &[u8]) -> Result<(), GuardError> {
@@ -815,6 +1028,83 @@ pub(crate) fn has_local_references(source: &[u8]) -> Result<bool, GuardError> {
 #[cfg(test)]
 mod tests {
     use super::{Variant, annotate, rewrite};
+
+    #[test]
+    fn reference_cycles_are_rejected_without_entering_usvg() {
+        for (tag, property) in [
+            ("clipPath", "clip-path"),
+            ("mask", "mask"),
+            ("pattern", "fill"),
+        ] {
+            let source = format!(
+                "<svg xmlns='http://www.w3.org/2000/svg'><defs><{tag} id='a'><rect {property}='url(#b)'/></{tag}><{tag} id='b'><rect {property}='url(#c)'/></{tag}><{tag} id='c'><rect {property}='url(#a)'/></{tag}></defs></svg>"
+            );
+            assert!(
+                super::reference_depth(source.as_bytes(), 0)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reference cycle"),
+                "{tag}"
+            );
+        }
+        for body in [
+            "<linearGradient id='a' href='#b'/><linearGradient id='b' href='#c'/><linearGradient id='c' href='#a'/>",
+            "<g id='a'><use href='#b'/></g><g id='b'><use href='#c'/></g><g id='c'><use href='#a'/></g>",
+            "<filter id='f'><feImage href='#a'/></filter><rect id='a' filter='url(#f)'/>",
+            "<style>#a {clip-path:url('#b')} #b {mask:url(#c)} #c {clip-path:url(#a)}</style><g id='a'/><g id='b'/><g id='c'/>",
+            "<pattern id='p'><g fill='inherit'><rect/></g></pattern><g fill='url(#p)'/>",
+        ] {
+            let body = if body.starts_with("<pattern") {
+                format!("<g fill='url(#p)'>{body}</g>")
+            } else {
+                body.to_string()
+            };
+            let source = format!("<svg xmlns='http://www.w3.org/2000/svg'>{body}</svg>");
+            let result = super::reference_depth(source.as_bytes(), 0);
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("reference cycle")),
+                "{body}: {result:?}; normalized={}",
+                String::from_utf8_lossy(&crate::style::normalize(source.as_bytes()).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn effective_reference_depth_counts_subtrees_shared_dags_and_embedded_parents() {
+        let chain = |count| {
+            let mut nodes = String::from("<g id='n0'><rect/></g>");
+            for n in 1..count {
+                nodes.push_str(&format!(
+                    "<g id='n{n}'><g><use href='#n{}'/></g></g>",
+                    n - 1
+                ));
+            }
+            format!(
+                "<svg xmlns='http://www.w3.org/2000/svg'><defs>{nodes}</defs><use href='#n{}'/><use href='#n{}'/></svg>",
+                count - 1,
+                count - 1
+            )
+        };
+        assert!(super::reference_depth(chain(12).as_bytes(), 0).is_ok());
+        assert!(
+            super::reference_depth(chain(24).as_bytes(), 0)
+                .unwrap_err()
+                .to_string()
+                .contains("reference traversal limit")
+        );
+        assert!(
+            super::reference_depth(chain(12).as_bytes(), 40)
+                .unwrap_err()
+                .to_string()
+                .contains("reference traversal limit")
+        );
+        let ordinary = b"<svg xmlns='http://www.w3.org/2000/svg' fill='url(#p)'><defs><pattern id='p'><rect fill='red'/></pattern></defs><rect/><a id='a' href='#a'><text>Link</text></a></svg>";
+        assert!(super::reference_depth(ordinary, 0).is_ok());
+        let overridden = b"<svg xmlns='http://www.w3.org/2000/svg'><style>#a {fill:url(#a);fill:black}</style><rect id='a'/></svg>";
+        assert!(super::reference_depth(overridden, 0).is_ok());
+    }
 
     #[test]
     fn foreign_ancestors_do_not_exempt_genuine_svg_resources() {

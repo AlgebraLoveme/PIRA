@@ -126,14 +126,14 @@ pira_dec show ID
 
 #### Rules
 
-- Choose by need: text → `search`; declaration/key/heading name → `symbols`; file structure → `outline`; known source target → `show`. Use `map` only for topology. Search/symbols/map default to cwd.
+- Choose by need: text → `search`; declaration/key/heading name → `symbols`; file structure → `outline`; known source target → `show`. Use `map` only for topology; optional native summaries never implicitly start or require an LSP. Search/symbols/map default to cwd.
 - Start with default bounds. `symbols` includes bounded source for unique matches; do not automatically follow with `show`. Reuse verified paths, targets, and evidence; stop once all answer parts are supported. Increase only omission-reported bounds; broaden/repeat only for a named unresolved gap.
 - Batch related same-scope search/symbols queries with `-e` (independent ranking/accounting); one regex per conceptual query. Batch independent targets in one same-operation command; mix show/semantic operations with `query`, in request order. Query is not search; use standalone show for source-only batches.
 - Targets: `FILE`, `FILE:START-END`, `FILE::ITEM`, or freshness-checked `outline --selectors` output. Hierarchy uses `::`, indices `[N]`, arbitrary segments JSON-style brackets (`["a.b"]`); shell-quote metacharacters. Exact paths precede unique suffixes; ambiguity errors, canonical paths never fall back to legacy aliases. Build Markdown targets from the outline's ancestor/local-title hierarchy.
 - Ranges are inclusive: positive indices are 1-based; negatives count from the content's end (`-1` last). Content means the file for inline ranges, the preceding resolved target for postfix ranges. Zero, invalid starts, and reversed ranges error; oversized ends clip.
 - Show is exact by default; `--glance` is clipped, line-numbered orientation. Do not use it for exact source; preserve requested expression punctuation.
 - Lexical matches do not establish semantic identity: use LSP semantic commands when identity matters; report missing LSP instead of substituting text matches. Semantic targets: qualified names, selectors, or one-based UTF-8-byte `FILE:LINE:COLUMN`; show also accepts positions.
-- Let structural backends auto-select. Use `--native` only to require clean bundled parsing; explicit `--lsp` selects the authoritative server inventory. Reuse that server configuration with its selectors. Dependency commands (`imports`, `dependents`, `deps`) require a definition-capable LSP; report missing/unsupported capabilities, and do not treat zero results with unresolved references as proof of no dependencies.
+- Structural inventories are native by default; dirty native syntax must not start an LSP implicitly. `--native` remains a native-only selection. Use explicit `--lsp` when a server inventory is needed, and reuse that server configuration with its selectors. Dependency commands (`imports`, `dependents`, `deps`) require a definition-capable LSP; report missing/unsupported capabilities, and do not treat zero results with unresolved references as proof of no dependencies.
 - Before dash-prefixed positional paths/targets, use `--`; query instead pairs each operation option with its target.
 - Do not use nav for binary/non-UTF-8 data, multiline/PCRE-only matching, archives, broad ignored-tree overrides, or symlink traversal.
 

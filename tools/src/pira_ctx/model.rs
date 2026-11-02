@@ -92,6 +92,7 @@ impl LineMeta {
 #[derive(Debug)]
 pub struct CapturedStream {
     data: CapturedStreamData,
+    preserve_file: bool,
     pub length: u64,
     pub observed_length: u64,
     pub sha256: [u8; 32],
@@ -116,6 +117,7 @@ impl CapturedStream {
         let length = bytes.len() as u64;
         Self {
             data: CapturedStreamData::Memory(bytes.into()),
+            preserve_file: false,
             length,
             observed_length,
             sha256,
@@ -134,6 +136,7 @@ impl CapturedStream {
     ) -> Self {
         Self {
             data: CapturedStreamData::File(path),
+            preserve_file: false,
             length,
             observed_length,
             sha256,
@@ -160,7 +163,9 @@ impl CapturedStream {
 
 impl Drop for CapturedStream {
     fn drop(&mut self) {
-        if let CapturedStreamData::File(path) = &self.data {
+        if !self.preserve_file
+            && let CapturedStreamData::File(path) = &self.data
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -188,12 +193,32 @@ pub struct CaptureResult {
     pub live_id: Option<String>,
     pub live_store_dir: Option<PathBuf>,
     pub(crate) _live_owner: Option<crate::storage::LiveOwnerLease>,
+    pub(crate) recovery_id: Option<String>,
+    // Durable publication or successful exact delivery permits retirement.
+    pub(crate) retire_checkpoint: std::cell::Cell<bool>,
 }
 
 impl Drop for CaptureResult {
     fn drop(&mut self) {
-        if let (Some(store), Some(id)) = (&self.live_store_dir, &self.live_id) {
-            crate::storage::remove_live_checkpoint(store, id);
+        if let Some(store) = &self.live_store_dir {
+            let id = self.live_id.as_ref().or(self.recovery_id.as_ref());
+            if self.retire_checkpoint.get() {
+                if let Some(id) = id {
+                    crate::storage::remove_live_checkpoint(store, id);
+                }
+            } else {
+                self.stdout.preserve_file = true;
+                self.stderr.preserve_file = true;
+                if let Some(id) = id {
+                    crate::util::diagnostic_line(&format!(
+                        "pira_ctx: capture not published; retained private snapshot {id}; use stats/raw/exec for recovery (snapshot may be stale)"
+                    ));
+                } else {
+                    crate::util::diagnostic_line(
+                        "pira_ctx: capture not published and no recovery checkpoint could be written; any file-backed spools remain in STORE/live/spools",
+                    );
+                }
+            }
         }
     }
 }
@@ -436,6 +461,32 @@ impl StreamReaders {
                 reader: stderr.reader()?,
                 base: 0,
                 length: stderr.length,
+            },
+        })
+    }
+
+    pub(crate) fn from_live_paths(
+        stdout_path: &std::path::Path,
+        stdout_base: u64,
+        stdout_length: u64,
+        stderr_path: &std::path::Path,
+        stderr_base: u64,
+        stderr_length: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            stdout: SectionReader::Raw {
+                reader: RawReader::File(BufReader::new(crate::storage::open_live_spool(
+                    stdout_path,
+                )?)),
+                base: stdout_base,
+                length: stdout_length,
+            },
+            stderr: SectionReader::Raw {
+                reader: RawReader::File(BufReader::new(crate::storage::open_live_spool(
+                    stderr_path,
+                )?)),
+                base: stderr_base,
+                length: stderr_length,
             },
         })
     }

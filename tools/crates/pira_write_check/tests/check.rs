@@ -77,6 +77,101 @@ fn every_configured_marker_case_repetition_and_boundaries() {
     }
 }
 #[test]
+fn stock_filler_and_user_requested_candidates_have_distinct_categories() {
+    for (category, markers) in [
+        (
+            "stock/ai-wording",
+            vec![
+                "delve into",
+                "delves into",
+                "delved into",
+                "delving into",
+                "deep dive into",
+                "intricate interplay",
+                "intricate web",
+                "in the realm of",
+                "this paper showcases",
+            ],
+        ),
+        (
+            "filler/plain-language",
+            vec!["going forward", "moving forward", "in order to"],
+        ),
+        ("user-requested", vec!["snapshot"]),
+    ] {
+        for marker in markers {
+            let groups = scan(marker, DEFAULT_LEXICON);
+            assert_eq!(
+                located(&groups),
+                vec![json!({"line":1,"column":1,"span":marker,"category":category})],
+                "{marker}"
+            );
+            assert_eq!(groups[0]["matches"][0]["marker"], marker);
+            assert_eq!(groups[0]["prompt"], PROMPT);
+        }
+    }
+}
+#[test]
+fn common_corpus_words_and_technical_terms_are_not_blanket_warnings() {
+    let text = "Potential findings within a comprehensive review across disciplines.\n\
+                A crucial value, intricate geometry, and a Unicode underscore.\n\
+                The realm uses robust regression and financial leverage.\n\
+                snapshots snapshot_id xsnapshot snapshot² πsnapshot";
+    assert!(scan(text, DEFAULT_LEXICON).as_array().unwrap().is_empty());
+}
+#[test]
+fn technical_uses_remain_read_only_review_flags_alongside_defensive_markers() {
+    let tmp = Fixture::new();
+    let text = "Create a filesystem snapshot before migration.\n\
+                The robot is moving forward at 2 m/s.\n\
+                The divers take a deep dive into the trench.\n\
+                The proof is not complete.\n";
+    let path = tmp.file("technical.md", text.as_bytes());
+    let before = (
+        fs::read(&path).unwrap(),
+        fs::metadata(&path).unwrap().modified().unwrap(),
+    );
+    let out = cli(&["--json", arg(&path)]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let data = report(&out);
+    assert_eq!(data["errors"], json!([]));
+    assert_eq!(data["advisory"], ADVISORY);
+    assert_eq!(
+        located(&data["warnings"]),
+        vec![
+            json!({"line":1,"column":21,"span":"snapshot","category":"user-requested"}),
+            json!({"line":2,"column":14,"span":"moving forward","category":"filler/plain-language"}),
+            json!({"line":3,"column":19,"span":"deep dive into","category":"stock/ai-wording"}),
+            json!({"line":4,"column":14,"span":"not","category":"negation"}),
+        ]
+    );
+    for group in data["warnings"].as_array().unwrap() {
+        assert_eq!(group["prompt"], PROMPT);
+        let line = group["line"].as_u64().unwrap() as usize;
+        assert_eq!(group["context"], text.lines().nth(line - 1).unwrap());
+    }
+    let out = cli(&[arg(&path)]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let output = String::from_utf8(out.stdout).unwrap();
+    for category in [
+        "user-requested",
+        "filler/plain-language",
+        "stock/ai-wording",
+        "negation",
+    ] {
+        assert!(output.contains(&format!("[{category}]")));
+    }
+    assert_eq!(
+        before,
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().modified().unwrap()
+        )
+    );
+}
+#[test]
 fn literal_phrases_self_overlap_transitivity_and_adjacent_groups() {
     let groups = scan(
         "A.B acb go\tgo go go x-y",
@@ -93,6 +188,45 @@ fn literal_phrases_self_overlap_transitivity_and_adjacent_groups() {
     let adjacent = scan("a-b", r#"{"x":["a","b"]}"#);
     assert_eq!(adjacent.as_array().unwrap().len(), 2);
 }
+#[test]
+fn overlapping_unicode_nested_phrases_preserve_exact_union_and_hits() {
+    let text = "é\té é é";
+    let groups = scan(text, r#"{"x":["é","é é","é é é"]}"#);
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["span"], text);
+    assert_eq!(groups[0]["context"], text);
+    let hits = groups[0]["matches"].as_array().unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|h| h["column"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 3, 3, 3, 5, 5, 7]
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|h| h["span"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["é", "é\té", "é\té é", "é", "é é", "é é é", "é", "é é", "é"]
+    );
+}
+
+#[test]
+fn dense_self_overlap_retains_one_complete_group() {
+    let words = 4096;
+    let text = "go ".repeat(words);
+    let groups = Lexicon::parse(r#"{"x":["go go"]}"#)
+        .unwrap()
+        .check_text(&text, "fixture");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].span, text.trim_end());
+    assert_eq!(groups[0].matches.len(), words - 1);
+    assert_eq!(groups[0].matches[0].column, 1);
+    assert_eq!(
+        groups[0].matches.last().unwrap().column,
+        (words - 2) * 3 + 1
+    );
+}
+
 #[test]
 fn unicode_scalar_columns_exact_context_and_python_line_breaks() {
     let text = "\u{feff}😀e\u{301}\tNOT necessarily valid; but useful.";
@@ -282,6 +416,18 @@ fn direct_help_is_structured_and_embeds_separate_guidance() {
             "No stdin",
             "rewriting",
             ADVISORY,
+            "stock/ai-wording",
+            "filler/plain-language",
+            "user-requested",
+            "snapshot",
+            "not AI authorship detection",
+            "zero warnings",
+            "technical uses",
+            "Output write, serialization or flush error",
+            "broken pipe",
+            "best-effort",
+            "same opened",
+            "nonblocking",
         ] {
             assert!(text.contains(required), "missing help contract: {required}");
         }
@@ -320,6 +466,26 @@ fn usage_errors_keep_stderr_and_exit_two() {
         assert!(error.contains("Usage:"));
     }
 }
+#[test]
+fn unknown_option_diagnostics_escape_controls_and_preserve_the_argument() {
+    let argument = "--odd\x1b[31m\nFORGED\r\t\"\\😀\u{7f}\u{85}\u{9b}";
+    let out = cli(&[argument]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let error = String::from_utf8(out.stderr).unwrap();
+    assert!(!error.chars().any(|c| c.is_control() && c != '\n'));
+    assert_eq!(error.lines().count(), 2);
+    let escaped = error
+        .strip_prefix("pira_write_check: unknown option: ")
+        .unwrap()
+        .split_once('\n')
+        .unwrap()
+        .0;
+    assert!(escaped.contains(r"\u001b[31m\nFORGED\r\t"));
+    let recovered: String = serde_json::from_str(&format!("\"{escaped}\"")).unwrap();
+    assert_eq!(recovered, argument);
+}
+
 #[test]
 fn help_version_short_circuit_in_encounter_order() {
     let help = cli(&["--help"]).stdout;
@@ -480,6 +646,37 @@ fn cli_json_exact_expectations_determinism_and_unchanged_files() {
     );
 }
 #[test]
+fn cli_long_line_and_final_tail_match_complete_owned_api_report() {
+    let tmp = Fixture::new();
+    let text = format!(
+        "{}\r\n{}\u{2028}snapshot",
+        "😀 not ".repeat(256),
+        "x".repeat(32768)
+    );
+    let path = tmp.file("long.md", text.as_bytes());
+    let warnings = Lexicon::parse(DEFAULT_LEXICON)
+        .unwrap()
+        .check_text(&text, arg(&path));
+    assert_eq!(warnings.len(), 257);
+    assert_eq!(warnings[255].column, 1533);
+    assert_eq!(warnings[256].line, 3);
+    assert_eq!(warnings[256].span, "snapshot");
+    let expected = pira_write_check::Report {
+        advisory: ADVISORY,
+        warnings,
+        errors: Vec::new(),
+    };
+    let out = cli(&["--json", arg(&path)]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
+    );
+    assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+}
+
+#[test]
 fn cli_text_escapes_context_and_reports_every_occurrence() {
     let tmp = Fixture::new();
     let path = tmp.file("source.txt", b"no no no\t\"safe\"");
@@ -570,6 +767,45 @@ fn explicit_symlinks_read_regular_targets_without_rewriting() {
     assert_eq!(report(&out)["warnings"][0]["path"], arg(&link));
     assert_eq!(fs::read(&good).unwrap(), b"without");
 }
+#[cfg(unix)]
+#[test]
+fn symlinked_document_and_custom_lexicon_preserve_regular_targets() {
+    let tmp = Fixture::new();
+    let source = tmp.file("source.txt", b"sensor");
+    let lexicon = tmp.file("custom.json", br#"{"custom":["sensor"]}"#);
+    let source_link = tmp.0.join("source-link");
+    let lexicon_link = tmp.0.join("lexicon-link");
+    std::os::unix::fs::symlink(&source, &source_link).unwrap();
+    std::os::unix::fs::symlink(&lexicon, &lexicon_link).unwrap();
+    let before: Vec<_> = [&source, &lexicon]
+        .iter()
+        .map(|p| {
+            (
+                fs::read(p).unwrap(),
+                fs::metadata(p).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let out = cli(&["--json", "--lexicon", arg(&lexicon_link), arg(&source_link)]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let data = report(&out);
+    assert_eq!(data["errors"], json!([]));
+    assert_eq!(data["warnings"].as_array().unwrap().len(), 1);
+    assert_eq!(data["warnings"][0]["path"], arg(&source_link));
+    assert_eq!(data["warnings"][0]["matches"][0]["category"], "custom");
+    let after: Vec<_> = [&source, &lexicon]
+        .iter()
+        .map(|p| {
+            (
+                fs::read(p).unwrap(),
+                fs::metadata(p).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(before, after);
+}
+
 #[cfg(unix)]
 #[test]
 fn malformed_unicode_arguments_are_usage_errors() {

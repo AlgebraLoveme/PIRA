@@ -22,6 +22,11 @@ pub(super) fn validate_reference(value: &str) -> Result<(), GuardError> {
 // Scan CSS tokens, not arbitrary XML strings. Strings and comments outside url()
 // are inert; escapes must be decoded in both function names and URL arguments.
 pub(super) fn validate_urls(value: &str) -> Result<(), GuardError> {
+    references(value).map(|_| ())
+}
+
+pub(super) fn references(value: &str) -> Result<Vec<String>, GuardError> {
+    let mut references = Vec::new();
     let mut chars = value.chars().peekable();
     while chars.peek().is_some() {
         skip_space_and_comments(&mut chars);
@@ -51,14 +56,16 @@ pub(super) fn validate_urls(value: &str) -> Result<(), GuardError> {
                 if identifier.eq_ignore_ascii_case("url") {
                     skip_space_and_comments(&mut chars);
                     if chars.next_if_eq(&'(').is_some() {
-                        validate_reference(&url(&mut chars)?)?;
+                        let reference = url(&mut chars)?;
+                        validate_reference(&reference)?;
+                        references.push(reference);
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(references)
 }
 
 fn is_name_char(ch: char) -> bool {

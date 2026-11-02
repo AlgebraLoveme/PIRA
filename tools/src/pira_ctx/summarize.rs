@@ -1278,6 +1278,8 @@ mod tests {
                 live_id: None,
                 live_store_dir: None,
                 _live_owner: None,
+                recovery_id: None,
+                retire_checkpoint: std::cell::Cell::new(false),
             };
             assert!(
                 !capture
