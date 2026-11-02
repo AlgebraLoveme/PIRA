@@ -126,6 +126,11 @@ class AutoRecapTests(unittest.TestCase):
         profile = root / "USER.md"
         profile.write_bytes(b"Synthetic fixture preferences only.\n")
         before = profile.read_bytes(), profile.stat().st_mtime_ns
+        # Verification now also requires an already prepared communicator workspace.
+        workspace = root / "pira"
+        workspace.mkdir()
+        for name in setup.communication.TEMPLATES:
+            (workspace / name).write_bytes(b"synthetic communicator fixture")
         args = ["--agent-dir", str(root), "--skip-codex", "--skip-tools", "--legacy", "remove"]
         original_open = Path.open
         def reject_profile_open(path, *args, **kwargs):
@@ -691,6 +696,174 @@ class AutoRecapTests(unittest.TestCase):
                 result = setup.disable_auto_recap(original)
                 self.assertEqual(tomllib.loads(result), expected)
                 self.assertEqual(setup.disable_auto_recap(result), result)
+
+
+class AutomaticCommunicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        AutoRecapTests.setUp(self)
+        self.home = Path(os.environ["HOME"])
+        self.agent = self.home / "agent"
+        self.agent.mkdir()
+        (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        self.workspace = self.home / "pira"
+        # Exercise the shared full setup path, but never install tools or select
+        # a host backend. All other setup/configuration I/O stays synthetic.
+        source = patch.object(setup, "__file__", str(self.agent / "assets/scripts/setup_pira.py"))
+        source.start()
+        self.addCleanup(source.stop)
+        backend = patch.object(setup, "migration_codex_binary", return_value=None)
+        backend.start()
+        self.addCleanup(backend.stop)
+        tools = patch.object(setup, "configure_tools")
+        self.tools = tools.start()
+        self.addCleanup(tools.stop)
+
+    def run_setup(self, *args: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = setup.main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def snapshot(self, directory: Path) -> dict:
+        return {str(p.relative_to(directory)): (p.lstat().st_mode, p.lstat().st_mtime_ns,
+                p.read_bytes() if p.is_file() else None)
+                for p in [directory, *sorted(directory.rglob("*"))]}
+
+    def assert_no_handoff(self, output: str) -> None:
+        for text in ("Open a NEW", "ONE conversation", "Highly recommended reading"):
+            self.assertNotIn(text, output)
+
+    def assert_handoff(self, output: str) -> None:
+        self.assertIn(f"Open a NEW Codex or supported agent session in {self.workspace}.", output)
+        self.assertIn("ONE conversation across all projects", output)
+        self.assertIn("neither handled nor launched by the user's communicator", output)
+        self.assertIn("delegated setup to a worker running from another directory", output)
+        self.assertIn("existing communicator session can continue without restarting", output)
+        self.assertIn("Highly recommended reading:", output)
+        self.assertIn("https://algebraloveme.github.io/everything-everywhere-with-one-pira/", output)
+
+    def test_default_full_setup_creates_then_preserves_customized_update(self) -> None:
+        code, out, err = self.run_setup()
+        self.assertEqual((code, err), (0, ""))
+        self.tools.assert_called_once()
+        for name, template in setup.communication.TEMPLATES.items():
+            self.assertEqual((self.workspace / name).read_bytes(),
+                             (setup.communication.TEMPLATE_DIR / template).read_bytes())
+        self.assert_handoff(out)
+        self.assertLess(out.index("Verification passed."), out.index("Open a NEW"))
+        (self.workspace / "AGENTS.md").write_bytes(b"synthetic customized instructions\r\n")
+        (self.workspace / "AGENT_WORKBOOK.md").write_bytes(b"synthetic notes\x00\xff")
+        (self.workspace / "nested").mkdir()
+        (self.workspace / "nested/other.txt").write_bytes(b"unrelated fixture")
+        before = self.snapshot(self.workspace)
+        for flags in ((), (), ("--dry-run",), ("--verify",)):
+            with self.subTest(flags=flags):
+                code, out, err = self.run_setup(*flags)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(self.snapshot(self.workspace), before)
+                self.assertNotIn("CREATED:", out)
+                if flags:
+                    self.assert_no_handoff(out)
+                else:
+                    self.assertIn("SKIPPED: existing directory preserved unchanged", out)
+                    self.assert_handoff(out)
+
+    def check_incomplete_workspace(self, existing: str | None) -> None:
+        self.workspace.mkdir()
+        if existing:
+            (self.workspace / existing).write_bytes(b"synthetic custom file")
+        before = self.snapshot(self.workspace)
+        for flags in ((), (), ("--dry-run",), ("--verify",)):
+            with self.subTest(existing=existing, flags=flags):
+                code, out, err = self.run_setup(*flags)
+                self.assertEqual(code, 1 if flags == ("--verify",) else 0)
+                self.assertEqual(self.snapshot(self.workspace), before)
+                self.assertNotIn("CREATED:", out)
+                if flags:
+                    self.assert_no_handoff(out)
+                else:
+                    self.assertIn("SKIPPED: existing directory preserved unchanged", out)
+                    self.assert_handoff(out)
+                if flags == ("--verify",):
+                    self.assertIn("Missing required file", err)
+
+    def test_existing_empty_directory_is_not_filled(self) -> None:
+        self.check_incomplete_workspace(None)
+
+    def test_existing_incomplete_directory_is_not_filled(self) -> None:
+        self.check_incomplete_workspace("AGENTS.md")
+
+    def test_missing_workspace_dry_run_does_not_write(self) -> None:
+        before = self.snapshot(self.home)
+        code, out, err = self.run_setup("--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"DRY-RUN: would create directory {self.workspace}", out)
+        self.assertEqual(self.snapshot(self.home), before)
+        self.assert_no_handoff(out)
+
+    def test_missing_workspace_verify_fails_without_writes(self) -> None:
+        self.assertEqual(self.run_setup()[0], 0)
+        for name in setup.communication.TEMPLATES:
+            (self.workspace / name).unlink()
+        self.workspace.rmdir()
+        before = self.snapshot(self.home)
+        code, out, err = self.run_setup("--verify")
+        self.assertEqual(code, 1)
+        self.assertIn("Missing required file", err)
+        self.assertEqual(self.snapshot(self.home), before)
+        self.assert_no_handoff(out)
+
+    def test_workspace_file_conflict_propagates_without_modification(self) -> None:
+        self.workspace.write_bytes(b"synthetic conflicting file")
+        before = self.workspace.read_bytes(), self.workspace.stat().st_mtime_ns
+        for flags in ((), ("--dry-run",), ("--verify",)):
+            code, out, err = self.run_setup(*flags)
+            self.assertEqual(code, 1)
+            self.assertIn("Conflicting file", err)
+            self.assertEqual((self.workspace.read_bytes(), self.workspace.stat().st_mtime_ns), before)
+            self.assert_no_handoff(out)
+
+    def test_workspace_alias_is_never_followed(self) -> None:
+        target = self.home / "untouched-target"
+        target.mkdir()
+        (target / "sentinel").write_bytes(b"synthetic sentinel")
+        try:
+            self.workspace.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"Symlink creation unavailable: {exc}")
+        before = self.snapshot(target), self.workspace.lstat().st_mtime_ns
+        for flags in ((), ("--dry-run",), ("--verify",)):
+            code, out, err = self.run_setup(*flags)
+            self.assertEqual(code, 1)
+            self.assertIn("Conflicting symlink/reparse point", err)
+            self.assertTrue(self.workspace.is_symlink())
+            self.assertEqual((self.snapshot(target), self.workspace.lstat().st_mtime_ns), before)
+            self.assert_no_handoff(out)
+
+    def test_tools_failure_never_creates_workspace_or_prints_handoff(self) -> None:
+        self.tools.side_effect = RuntimeError("injected tools failure")
+        code, out, err = self.run_setup()
+        self.assertEqual(code, 1)
+        self.assertIn("injected tools failure", err)
+        self.assertFalse(self.workspace.exists())
+        self.assert_no_handoff(out)
+
+    def test_core_verification_failure_never_prints_handoff(self) -> None:
+        (self.agent / "AGENTS.md").write_text("synthetic missing verification token")
+        code, out, _ = self.run_setup()
+        self.assertEqual(code, 1)
+        self.assertIn("Verification failed", out)
+        self.assertFalse(self.workspace.exists())
+        self.assert_no_handoff(out)
+
+    def test_communicator_failure_propagates_without_handoff(self) -> None:
+        with patch.object(setup.communication, "create_missing", side_effect=PermissionError("injected communicator write failure")):
+            code, out, err = self.run_setup()
+        self.assertEqual(code, 1)
+        self.assertIn("injected communicator write failure", err)
+        self.assertTrue(self.workspace.is_dir())
+        self.assertEqual(list(self.workspace.iterdir()), [])
+        self.assert_no_handoff(out)
 
 
 if __name__ == "__main__":

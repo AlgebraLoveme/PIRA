@@ -56,6 +56,21 @@ class CommunicationSetupTests(unittest.TestCase):
         for text in ("Open a NEW", "ONE conversation", "Provide your current projects"):
             self.assertNotIn(text, output)
 
+    def assert_handoff(self, output: str, workspace: Path | None = None) -> None:
+        self.assertIn(f"Open a NEW Codex or supported agent session in {workspace or self.workspace}.", output)
+        for text in ("neither handled nor launched by the user's communicator",
+                     "ONE conversation across all projects", "shared context and coordination",
+                     "current projects and their paths", "where those projects live",
+                     "Make a deliberate effort to bring new tasks to this communicator",
+                     "even while it is working", "rather than opening separate sessions out of habit",
+                     "Highly recommended reading:",
+                     "https://algebraloveme.github.io/everything-everywhere-with-one-pira/",
+                     "Otherwise omit this onboarding handoff",
+                     "delegated setup to a worker running from another directory",
+                     "existing communicator session can continue without restarting",
+                     "Use the assignment context, not the setup process's working directory"):
+            self.assertIn(text, output)
+
     def test_fresh_default_copies_shipped_templates_only(self) -> None:
         code, out, err = self.run_setup()
         self.assertEqual((code, err), (0, ""))
@@ -65,6 +80,7 @@ class CommunicationSetupTests(unittest.TestCase):
             self.assertEqual((self.workspace / name).read_bytes(),
                              (setup.TEMPLATE_DIR / template).read_bytes())
         self.assertIn("Summary: created=2 preserved=0 errors=0", out)
+        self.assert_handoff(out)
         self.assertIn(f"Open a NEW Codex or supported agent session in {self.workspace}.", out)
         self.assertIn("ONE conversation across all projects", out)
         self.assertIn("shared context and coordination", out)
@@ -114,7 +130,10 @@ class CommunicationSetupTests(unittest.TestCase):
             self.assertEqual((code, err), (0, ""))
             self.assertIn("SKIPPED: existing directory preserved unchanged", out)
             self.assertNotIn("would create", out)
-            self.assert_no_onboarding(out)
+            if flags:
+                self.assert_no_onboarding(out)
+            else:
+                self.assert_handoff(out)
             self.assertEqual(self.snapshot(self.workspace), before)
 
     def test_empty_and_incomplete_directories_are_skipped_without_filling(self) -> None:
@@ -132,8 +151,19 @@ class CommunicationSetupTests(unittest.TestCase):
                         self.assertEqual((code, err), (0, ""))
                         self.assertIn(f"SKIPPED: existing directory preserved unchanged: {workspace}", out)
                         self.assertNotIn("would create", out)
-                        self.assert_no_onboarding(out)
+                        if flags:
+                            self.assert_no_onboarding(out)
+                        else:
+                            self.assert_handoff(out, workspace)
                         self.assertEqual(self.snapshot(workspace), before)
+
+    def test_handoff_exempts_communicator_origin_without_cwd_guessing(self) -> None:
+        with patch.object(setup.Path, "cwd", side_effect=AssertionError("cwd is not assignment origin")):
+            for _ in range(2):
+                code, out, err = self.run_setup()
+                self.assertEqual((code, err), (0, ""))
+                self.assert_handoff(out)
+                self.assertIn("neither handled nor launched", out)
 
     def test_dry_run_does_not_create_missing_parents(self) -> None:
         home = self.root / "missing parent/nested home"
@@ -353,7 +383,7 @@ class CommunicationSetupTests(unittest.TestCase):
         self.assertIn("SKIPPED: existing directory preserved unchanged", out)
         self.assertEqual(self.snapshot(self.workspace), before)
         self.assertFalse((self.workspace / "AGENT_WORKBOOK.md").exists())
-        self.assert_no_onboarding(out)
+        self.assert_handoff(out)
 
     def test_concurrent_conflicting_workspace_is_not_followed_or_overwritten(self) -> None:
         original_mkdir = Path.mkdir
@@ -500,7 +530,7 @@ class CommunicationSetupTests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""))
         self.assertIn("SKIPPED", out)
         self.assertEqual(self.snapshot(self.workspace), before)
-        self.assert_no_onboarding(out)
+        self.assert_handoff(out)
 
     def test_read_only_modes_are_mutually_exclusive(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:

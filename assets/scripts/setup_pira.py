@@ -26,6 +26,7 @@ from typing import Iterable, Literal
 import setup_pira_stores as stores
 import setup_pira_tools as tool_setup
 import retire_pira_audio as audio_retirement
+import setup_pira_communication as communication
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
@@ -746,7 +747,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Verification passed.")
     else:
         print("Verification skipped.")
-    return 0
+    # Last setup step: never offer a successful handoff after an earlier failure.
+    mode = ["--verify"] if args.verify else ["--dry-run"] if state.dry_run else []
+    return communication.main(mode)
 
 
 if __name__ == "__main__":

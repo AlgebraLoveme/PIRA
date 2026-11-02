@@ -24,6 +24,7 @@ PIRA follows five principles:
 
 - [Making Reliable Research Agents Accessible](https://algebraloveme.github.io/2026-07-23-pira-design-and-use/) — PIRA’s design, research workflow, and practical use.
 - [Working with PIRA Team](https://algebraloveme.github.io/2026-10-10-working-with-pira-team/) — Parallel collaboration, worker configuration, and getting started.
+- [Everything Everywhere with One PIRA](https://algebraloveme.github.io/everything-everywhere-with-one-pira/) — One communicator for your work across projects and machines.
 
 ## Tested compatibility
 
@@ -59,6 +60,7 @@ The recommended command installs or updates PIRA, then connects it to Codex. It:
 - enables **soft-safe** mode;
 - configures Codex to load PIRA's canonical `AGENTS.md` once;
 - installs or refreshes bundled PIRA tools in the user's `PATH`;
+- creates the communicator workspace at `~/pira` if it is missing, preserving an existing directory;
 - moves old PIRA-managed legacy files into backup.
 
 macOS/Linux:
@@ -103,36 +105,22 @@ The macOS/Linux and Windows wrappers support the same options. If Python is miss
 
 ## One assistant across projects
 
-Read [Everything Everywhere with One PIRA](https://algebraloveme.github.io/everything-everywhere-with-one-pira/) to see how one communicator can manage your work across projects and machines.
+Standard PIRA setup also creates your communication workspace at `~/pira` when it is missing. An existing directory stays unchanged. After setup, open a new agent session there and use it across all your projects.
 
-After installing PIRA, ask your agent:
-
-```text
-If ~/pira is missing, set up my PIRA communication workspace there. Leave an existing directory unchanged. After creating it, tell me how to start a new session there and use it across all my projects.
-```
-
-Your communicator lives at `~/pira`. Its local instructions and workbook keep track of your preferences, projects and unfinished work, so you can manage them through one conversation. Project details stay in their own project workbooks.
+Your communicator’s local instructions and workbook keep track of your preferences, projects and unfinished work, so you can manage them through one conversation. Project details stay in their own project workbooks.
 
 <details>
-<summary>Communication-workspace setup instructions for agents</summary>
+<summary>Communication-workspace guidance for agents</summary>
 
-Check whether `~/pira` exists. Run the creation commands only if it is missing; do not populate, repair or overwrite an existing directory. The script also checks this deterministically. The location is fixed and cannot be customized.
+Use the standard setup flow above; no separate communicator installation is needed. The workspace location is fixed to the `pira` directory under the current user’s home directory. Create it only when missing; do not populate, repair or overwrite an existing directory. Report conflicting path types or symlinks rather than replacing them.
 
-Run directly from the PIRA repository with Python 3.11 or newer:
+Fresh setup installs the [coordination instructions](assets/COMMUNICATION_AGENTS_TEMPLATE.md) and [initial workbook](assets/COMMUNICATION_WORKBOOK_TEMPLATE.md).
 
-```bash
-python3 assets/scripts/setup_pira_communication.py --dry-run
-python3 assets/scripts/setup_pira_communication.py
-python3 assets/scripts/setup_pira_communication.py --verify
-```
+After successful installation or update, give the following handoff only when the work was neither handled nor launched by the user’s communicator in their home `pira` workspace. This includes updates where the directory already existed:
 
-On Windows, use `py -3` in place of `python3` when it selects a suitable interpreter. The workspace is the `pira` directory under the current user’s home directory.
+> Open a new agent session in YOUR_ABSOLUTE_HOME/pira and use it across all your projects. Tell PIRA what you are working on and where those projects live. Make a deliberate effort to bring new tasks to this communicator, even while it is working, rather than opening separate sessions out of habit. Let it manage progress across projects for you.
 
-Fresh setup installs the separate [coordination instructions](assets/COMMUNICATION_AGENTS_TEMPLATE.md) and [initial workbook](assets/COMMUNICATION_WORKBOOK_TEMPLATE.md). Existing directories remain unchanged. Conflicting path types or symlinks are reported rather than replaced. `--verify` checks file presence and types without changing contents or comparing personalized rules with templates.
-
-After successful fresh setup, tell the user: “Open a new agent session in YOUR_ABSOLUTE_HOME/pira and use it as your single point of contact across all your projects. Tell PIRA what you are working on and where those projects live. You can assign tasks, share ideas and ask for progress updates in that one conversation.” Replace the placeholder with the actual absolute path.
-
-This entrypoint leaves global PIRA configuration, tools and authentication unchanged. Install PIRA first using the instructions above.
+Append the collaborator article from **PIRA blogs** to the handoff, with its link and the label **Highly recommended reading**. Replace the path placeholder with the actual absolute path. Omit this onboarding handoff when the communicator handles setup directly or delegates it to a worker, even if that worker runs from another directory. Use the assignment context rather than the setup process’s working directory to determine this.
 
 </details>
 

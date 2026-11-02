@@ -165,13 +165,21 @@ def main(argv: list[str] | None = None) -> int:
                         raise RuntimeError("; ".join(conflicts))
                     if any(kind != "file" for kind in kinds.values()):
                         raise RuntimeError(f"Workspace changed during creation: {workspace}; inspect it manually.")
-                    print(f"Open a NEW Codex or supported agent session in {workspace}.")
-                    print("Keep that ONE conversation across all projects for shared context and coordination.")
-                    print("Provide your current projects in that conversation.")
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         errors += 1
     print(f"Summary: created={created} preserved={preserved} errors={errors}")
+    if not errors and not (args.dry_run or args.verify):
+        print(f"If this setup was neither handled nor launched by the user's communicator in {workspace}, give this handoff:")
+        print(f"Open a NEW Codex or supported agent session in {workspace}.")
+        print("Keep that ONE conversation across all projects for shared context and coordination.")
+        print("Provide your current projects and their paths: tell PIRA what you are working on and where those projects live.")
+        print("Make a deliberate effort to bring new tasks to this communicator, even while it is working, rather than opening separate sessions out of habit.")
+        print("Let it manage progress across projects for you.")
+        print("Highly recommended reading: Everything Everywhere with One PIRA — https://algebraloveme.github.io/everything-everywhere-with-one-pira/")
+        print("Otherwise omit this onboarding handoff, including when the communicator delegated setup to a worker running from another directory.")
+        print("An existing communicator session can continue without restarting.")
+        print("Use the assignment context, not the setup process's working directory, to determine this.")
     return 1 if errors else 0
 
 
