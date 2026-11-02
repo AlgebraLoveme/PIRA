@@ -103,6 +103,8 @@ The macOS/Linux and Windows wrappers support the same options. If Python is miss
 
 ## One assistant across projects
 
+Read [Everything Everywhere with One PIRA](https://algebraloveme.github.io/everything-everywhere-with-one-pira/) to see how one communicator can manage your work across projects and machines.
+
 After installing PIRA, ask your agent:
 
 ```text
