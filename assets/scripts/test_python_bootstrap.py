@@ -178,6 +178,26 @@ foreach ($flag in '--dry-run', '--verify') {{
     try {{ Bootstrap-PiraPython3 -Args @('--yes', $flag); throw 'unexpected success' }}
     catch {{ if ($_.Exception.Message -notlike '*read-only setup*') {{ throw }} }}
 }}
+# -Command otherwise retains failure status from the expected caught exception.
+exit 0
+"""
+        result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", code],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "native PowerShell unavailable")
+    def test_explicit_yes_survives_helper_parameter_binding(self):
+        path = str(LIB / "pira_python_bootstrap.ps1").replace("'", "''")
+        code = f"""
+$ErrorActionPreference = 'Stop'
+. '{path}'
+$env:PIRA_SETUP_ASSUME_YES = '0'
+if (-not (Test-PiraAssumeYes -Args @('--yes'))) {{ throw 'Explicit yes lost' }}
+if (Test-PiraAssumeYes -Args @('--verify')) {{ throw 'Unexpected yes' }}
+function Read-Host {{ throw 'UNEXPECTED_PROMPT' }}
+function winget {{ $script:installed = $true; $global:LASTEXITCODE = 0 }}
+Install-PiraPythonHint -Args @('--yes')
+if (-not $script:installed) {{ throw 'Mocked installer was not called' }}
 """
         result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", code],
                                 capture_output=True, text=True, timeout=10)

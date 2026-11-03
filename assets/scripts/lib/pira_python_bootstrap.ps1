@@ -38,13 +38,13 @@ function Find-PiraPython3 {
 }
 
 function Test-PiraAssumeYes {
-    param([string[]]$Args = @())
+    param([Alias("Args")][string[]]$SetupArgs = @())
     if ($env:PIRA_SETUP_ASSUME_YES -eq "1") { return $true }
-    return @($Args) -contains "--yes"
+    return @($SetupArgs) -contains "--yes"
 }
 
 function Install-PiraPythonHint {
-    param([string[]]$Args = @())
+    param([Alias("Args")][string[]]$SetupArgs = @())
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
         Write-Error "Python 3.11+ was not found and winget is unavailable. Install Python 3.11+ from https://www.python.org/downloads/ or Microsoft Store, then rerun this setup wrapper."
@@ -53,7 +53,7 @@ function Install-PiraPythonHint {
     Write-Host "Python 3.11+ was not found. It can be installed with winget:"
     Write-Host "  winget install --id Python.Python.3.14 --source winget"
     $install = $false
-    if (Test-PiraAssumeYes -Args $Args) {
+    if (Test-PiraAssumeYes -Args $SetupArgs) {
         $install = $true
     } else {
         $answer = Read-Host "Install Python 3.11+ now with winget? [y/N]"
@@ -78,13 +78,13 @@ function Require-PiraPython3 {
 }
 
 function Bootstrap-PiraPython3 {
-    param([string[]]$Args = @())
+    param([Alias("Args")][string[]]$SetupArgs = @())
     $python = Find-PiraPython3 -MinimumMinor 11
     if (-not $python) {
-        if (@($Args) -contains "--dry-run" -or @($Args) -contains "--verify") {
+        if (@($SetupArgs) -contains "--dry-run" -or @($SetupArgs) -contains "--verify") {
             throw "Python 3.11+ is required; read-only setup will not install it. Install Python separately and retry."
         }
-        Install-PiraPythonHint -Args $Args
+        Install-PiraPythonHint -Args $SetupArgs
         $python = Find-PiraPython3 -MinimumMinor 11
     }
     if (-not $python) {
