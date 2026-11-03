@@ -1,4 +1,5 @@
 """Isolated prerequisite checks: never invoke a real package manager."""
+import json
 import os
 from pathlib import Path
 import re
@@ -104,8 +105,28 @@ class ShellBootstrapTests(unittest.TestCase):
         result = subprocess.run(["/bin/sh", "-n", str(LIB / "pira_python_bootstrap.sh")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_setup_wrapper_forwards_include_arguments_unchanged(self):
+        wrapper = LIB.parent / "setup_pira.sh"
+        self.executable("dirname", '#!/bin/sh\nprintf "%s\\n" "${2%/*}"\n')
+        self.executable("python3", f"#!{sys.executable}\nimport json, sys\n"
+                        "if sys.argv[1] != '-c': print(json.dumps(sys.argv[1:]))\n")
+        for selection in (["Codex"], ["ClaudeCode"], ["Codex", "ClaudeCode"]):
+            with self.subTest(selection=selection):
+                args = ["--include", *selection, "--agent-dir", "path with spaces", "--dry-run"]
+                result = subprocess.run(["/bin/sh", str(wrapper), *args], env=self.env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), [str(wrapper.with_suffix(".py")), *args])
+
 
 class PowerShellBootstrapTests(unittest.TestCase):
+    def test_setup_wrapper_forwarding_contract(self):
+        # Source contract only when native PowerShell is unavailable.
+        source = (LIB.parent / "setup_pira.ps1").read_text()
+        self.assertIn("[Parameter(ValueFromRemainingArguments = $true)]", source)
+        self.assertIn("$pythonArgs = @($python.PrefixArgs + @($SetupPy) + $SetupArgs)", source)
+        self.assertIn("& $pythonFile @pythonArgs", source)
+
     def test_installer_command_contract(self):
         # Literal command contract only: this does not emulate PowerShell execution.
         source = (LIB / "pira_python_bootstrap.ps1").read_text()

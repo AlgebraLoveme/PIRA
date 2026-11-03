@@ -2,7 +2,7 @@
 
 PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
 
-It adds a small, inspectable set of instructions and tools to Codex. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
+It adds a small, inspectable set of instructions and tools to Codex or Claude Code. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
 
 ## What PIRA helps with
 
@@ -30,25 +30,27 @@ PIRA follows five principles:
 
 PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Other models or agent platforms may work, but have not received the same level of testing.
 
-> **Using Claude Code?** Open the dedicated [`claude` branch](https://github.com/AlgebraLoveme/PIRA/tree/claude) and ask your agent to "Install PIRA for Claude." Its README covers Claude-only and combined Codex and Claude installations. Claude branch features may lag behind. The instructions below install PIRA for Codex from `master`.
+> **Using Claude Code?** Use this same `master` checkout with setup's `--include ClaudeCode`, or `--include Codex ClaudeCode` for both. No separate branch is needed. Setup defaults to Codex; see the Claude setup options below.
 
-## Install or update with Codex
+## Install or update
 
-PIRA installs to `~/agent` by default. Before updating, close active PIRA sessions. Start a fresh Codex session and send:
+PIRA installs to `~/agent` by default. Before updating, close active PIRA sessions. Start a fresh Codex or Claude Code session and send:
 
 ```text
 Install or update PIRA, including its tools, following https://github.com/AlgebraLoveme/PIRA. Preserve my existing preferences and local changes.
 ```
 
+For Claude Code, also specify whether you want Claude-only setup or both harnesses.
+
 <details>
 <summary>Technical installation and update instructions</summary>
 
-Setup is safe to rerun: it leaves global `USER.md` unmanaged, backs up user-level Codex files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
+Setup is safe to rerun: it leaves global `USER.md` unmanaged, backs up user-level configuration files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
 
 ### Complete update procedure
 
 1. **Sync the checkout.** Locate the existing installation, check its remote and local changes, and fast-forward from the public `master` branch when safe. Preserve local work; stop for conflicts rather than resetting or discarding changes.
-2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Preserve existing choices with `--execution-mode keep` and `--legacy keep`; retain custom configuration/install paths and version pins. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
+2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Retain your selection (`--include Codex`, `--include ClaudeCode`, or `--include Codex ClaudeCode`; default `Codex`), custom configuration/install paths and version pins. Preserve existing choices with `--execution-mode keep` and `--legacy keep`. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
 3. **Verify and restart.** Run the same setup with `--verify` and the selected options, check the installed tool versions, and restart shells or agents when configuration or environment changes require it. Report any incomplete step.
 
 Pulling Git alone does not refresh executables. Setup installs the latest **published tool releases**, which may lag source changes on `master`; an update report should distinguish the checkout revision from installed tool versions. The commands below explicitly select the recommended configuration rather than preserve every existing preference.
@@ -79,7 +81,57 @@ To preserve an existing installation’s preferences, use `--execution-mode keep
 
 `git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
 
-> **Soft-safe is not a sandbox.** It sets Codex to no-approval/full-permission mode and relies on PIRA's explicit safety rules before state-changing commands.
+> **Soft-safe is not a sandbox.** It sets Codex to no-approval/full-permission mode, or Claude to `bypassPermissions` with its shell sandbox disabled, for each selected harness. It relies on PIRA's explicit safety rules before state-changing commands.
+
+### Claude setup options
+
+From the same checkout, select Claude-only setup on macOS/Linux:
+
+```bash
+assets/scripts/setup_pira.sh --include ClaudeCode --yes --execution-mode soft-safe --legacy remove
+```
+
+On Windows:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --include ClaudeCode --yes --execution-mode soft-safe --legacy remove
+```
+
+Use `--include Codex ClaudeCode` instead to configure both CLIs, or `--include Codex`
+for Codex alone (also the default). The same selection works with the tools-only
+entrypoint, for example `python3 assets/scripts/setup_pira_tools.py --include Codex ClaudeCode`.
+Values are case-sensitive and at least one is required after `--include`.
+Legacy `--harness codex|claude|both` remains supported, but cannot be combined with
+`--include`. Claude-only setup preserves
+Codex configuration and does not install or authenticate Codex. Install and
+authenticate Claude Code yourself. Selected Claude setup requires **2.1.311 or newer**
+(the native AGENTS integration was tested on Linux with 2.1.311); newer versions
+are accepted unchanged, not pinned. Full setup (including `--skip-tools`) and tools-only
+setup check `claude --version`. Normal setup runs `claude update` once for an older
+native CLI, then rechecks; recognized npm installations and JS/Windows script launchers instead
+require manual upgrade, avoiding global npm mutations. `--verify` and `--dry-run` never update and fail if
+the CLI is missing, too old, or unrecognizable. Native CLI failure diagnostics remain visible.
+Missing CLI installation is manual: follow the [official native setup instructions](https://code.claude.com/docs/en/setup).
+Setup does not initiate Claude login, inspect Claude credentials, switch release channels,
+or run package-manager upgrades. If `claude update` leaves a package-manager/custom
+launcher or stable-channel installation below the floor, setup fails with manual
+upgrade/channel guidance instead of silently replacing it.
+
+Claude setup preserves custom settings, adds physical PIRA store paths to
+`settings.json`, and links global `CLAUDE.md` to the same canonical `AGENTS.md`
+used by Codex. Windows uses a one-line `@` import if symlinks are unavailable.
+Existing custom global instructions are preserved with a canonical import;
+conflicting symlinks and customized managed blocks require manual resolution.
+Known generated import blocks migrate with a backup. Only `AGENTS.md` needs
+policy maintenance: setup also configures the native built-in AGENTS plugin's
+`instructionFiles` option as `claude-md-and-agents-md`, so project `AGENTS.md`
+loads alongside project `CLAUDE.md` (validated with Claude Code 2.1.311).
+The configuration directory defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`;
+override it with `--claude-dir DIR`. `--execution-mode keep` leaves
+existing Claude permissions and sandbox settings unchanged. Claude Team requires
+a current `bypassPermissions` turn and an unsandboxed shell; `safe` mode is not
+supported. Preview with `--dry-run`, then verify with the same options plus
+`--verify`.
 
 ### Inspect-first install
 
@@ -292,7 +344,7 @@ PIRA includes six native tools for agent continuity, repository work, figure val
 | `pira_nav` | Provides portable lexical/structural navigation and language-server-backed dependency/semantic navigation. |
 | `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
 | `pira_write_check` | Flags English negation, contrast, hedging and minimization markers for contextual review. |
-| `pira_team` | Delegates technical artifact review or implementation to fresh Codex workers, returning tool-managed handoffs to the main agent. |
+| `pira_team` | Delegates technical artifact review or implementation to Codex or Claude Code workers, returning tool-managed handoffs to the main agent. |
 
 ### Agent-level evaluation
 
@@ -557,7 +609,7 @@ For reproducible font selection, use `--isolated-fonts --font-dir DIR` with expl
 for focused syntax, `pira_team help remote` for remote interfaces, and
 `pira_team help manual` for the full safety, recovery, session and transport reference.
 
-`pira_team` delegates substantial reviews and implementation tasks to Codex workers, keeping your main agent focused on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
+`pira_team` delegates substantial reviews and implementation tasks to Codex or Claude Code workers, keeping your main agent focused on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
 
 <details>
 <summary>When to use Team, design differences, requirements, and benchmark results</summary>
@@ -587,7 +639,16 @@ Keep small or closely coupled tasks with the main agent, where delegation overhe
 
 #### Requirements and limits
 
-- **Setup:** Team needs stable Codex CLI **0.166.0 or newer** on the agent's execution host, network access, and file-backed Codex login or an API key. Setup also checks the required native protocol, exporting schemas with `--experimental` as Team does; a passing version alone is insufficient. PIRA setup installs the CLI if missing and guides login when needed; an existing incompatible CLI fails without replacement. App/extension users can keep their usual interface, but a ChatGPT app login or keyring-only credentials are not sufficient for Team authentication.
+`--model claude-*` selects Claude Code; other model identifiers retain the Codex
+launcher. Either native CLI can be the main, and one main can launch workers from
+both families. Use canonical Claude model names, not aliases. Team launches assume
+the selected CLI is already installed and authenticated; they never install or
+log in. Claude requires a verified full-access
+caller; its native sessions support resume, steer, interrupt, and same-host
+subteams. Claude currently supports standard service tier and efforts
+`low|medium|high|xhigh|max`. A retained session cannot change backend families.
+
+- **Codex setup:** Codex workers need stable Codex CLI **0.166.0 or newer** on the agent's execution host, network access, and file-backed Codex login or an API key. Setup also checks the required native protocol, exporting schemas with `--experimental` as Team does; a passing version alone is insufficient. PIRA setup installs the CLI if missing and guides login when needed; an existing incompatible CLI fails without replacement. App/extension users can keep their usual interface, but a ChatGPT app login or keyring-only credentials are not sufficient for Team authentication.
 - **Included:** Team is installed with PIRA. Setup sets `features.multi_agent_v2.multi_agent_mode_hint_text = ""` so Codex's additional explicit-request-only instruction does not interfere with PIRA's delegation policy; native-tool availability is unchanged.
 - **Model:** Shipped defaults map Astra mains to Sol 6.1/high workers, regardless of main effort. Other recognized models inherit the main model and effort; unrecognized mains fall back to Sol 6.1/high. Saved per-main-model settings override these defaults; explicit launch flags take precedence. Resumed runs retain their selected model and effort unless explicitly overridden.
 - **Session isolation:** Runs and bookmarks belong to the creating main-agent session, not the workspace. Verified caller identity is required for all run/bookmark access and controls, including literal IDs and explicit stores; resume preserves ownership. The same label can exist independently in different sessions. Legacy global tags remain preserved but hidden; ambiguous legacy runs are retained but inaccessible unless original creator evidence is available. This isolates the Team interface only, not OS/filesystem/process access. Use updated Team and setup tooling together for the session-scoped bookmark format.

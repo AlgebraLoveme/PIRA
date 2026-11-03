@@ -56,8 +56,10 @@ fn resolve_using(
         (Some(profile), _) => (profile, "config"),
         (None, Some(profile)) => (profile, "mapping"),
         (None, None)
-            if caller_model
-                .is_some_and(|model| inherit.iter().any(|entry| entry.as_str() == Some(model))) =>
+            if caller_model.is_some_and(|model| {
+                crate::harness::Harness::for_model(model).inherits_native_profile()
+                    || inherit.iter().any(|entry| entry.as_str() == Some(model))
+            }) =>
         {
             (&parent, "parent")
         }
@@ -84,6 +86,7 @@ fn resolve_using(
     let sources = json!({"model": model_source, "effort": effort_source});
     validate_model(&model)?;
     validate_effort(&effort)?;
+    crate::harness::Harness::for_model(&model).validate_effort(&effort)?;
     Ok((model, effort, sources, execution))
 }
 
@@ -131,10 +134,32 @@ pub(crate) fn caller_session() -> Result<String, String> {
     Ok(id.to_owned())
 }
 
+pub(crate) fn native_caller_identity(manifest: &Value) -> Option<String> {
+    let session = manifest["thread_id"].as_str().filter(|id| !id.is_empty())?;
+    // Missing transport is a legacy Codex manifest; unknown explicit transports
+    // never acquire Codex identity by default.
+    let harness = match manifest.get("transport") {
+        None | Some(Value::Null) => crate::harness::Harness::Codex,
+        Some(value) => crate::harness::Harness::from_transport(value.as_str()?)?,
+    };
+    Some(harness.caller_identity(session))
+}
+
+pub(crate) fn matches_native_session(manifest: &Value, context: &Value) -> bool {
+    native_caller_identity(manifest)
+        .as_deref()
+        .zip(context["caller_thread_id"].as_str())
+        .is_some_and(|(native, caller)| native == caller)
+}
+
 pub fn load() -> Result<Value, String> {
     if let Some(context) = crate::remote::delegated_context() {
         return Ok(context);
     }
+    crate::harness::Harness::caller_context()
+}
+
+pub(crate) fn codex_context() -> Result<Value, String> {
     let thread = std::env::var("CODEX_THREAD_ID").map_err(|_| "CODEX_THREAD_ID is unavailable")?;
     if thread.is_empty()
         || thread.len() > 200
@@ -923,7 +948,14 @@ mod tests {
 
     #[test]
     fn recognized_models_inherit_without_alias_matching() {
-        for model in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol"] {
+        for model in [
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "claude-haiku-5-5",
+            "claude-future-100",
+        ] {
             let (actual_model, effort, sources, _) =
                 resolve(None, None, caller(model, "medium")).unwrap();
             assert_eq!((actual_model.as_str(), effort.as_str()), (model, "medium"));
@@ -938,7 +970,6 @@ mod tests {
     #[test]
     fn unknown_or_missing_model_identity_uses_fallback_not_caller_effort() {
         for model in [
-            json!("claude-sonnet"),
             json!("other"),
             json!("gpt-6-astra-preview"),
             json!("GPT-6-ASTRA"),

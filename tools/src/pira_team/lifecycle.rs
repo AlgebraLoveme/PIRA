@@ -1,5 +1,5 @@
 //! Durable run ownership and immutable revision outputs.
-use crate::{IsolatedHome, Options, app_server, artifact, create, private_dir, profile, storage};
+use crate::{Options, app_server, artifact, create, private_dir, profile, storage};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -164,7 +164,7 @@ pub fn launch(options: Options) -> Result<(), String> {
 // Remote requests allocate and durably bind the run before acknowledging submission.
 pub(super) fn launch_at(mut options: Options, run: PathBuf) -> Result<(), String> {
     let _owner = owner(&run)?;
-    let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":"app-server","run_id":run.file_name().unwrap().to_string_lossy(),
+    let mut manifest = json!({"schema_version":4,"worker_policy_version":crate::WORKER_POLICY_VERSION,"transport":crate::harness::Harness::for_model(&options.model).transport(),"run_id":run.file_name().unwrap().to_string_lossy(),
         "creator_main_session_id":options.execution.caller_thread_id,"parent_run_id":null,"revision":1,"thread_id":null,"usage":{},"usage_complete":true,"revisions":[],
         "sandbox":options.execution.mode,"pira_instructions":false});
     if let Some(parent) = crate::subteam::caller_run()? {
@@ -339,7 +339,10 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut manifest = read_json(&run.join("manifest.json"))?;
     // Backfill only after original creator evidence passed the ownership gate.
     manifest["creator_main_session_id"] = json!(session);
-    if manifest["transport"] != "app-server" || manifest["thread_id"].as_str().is_none() {
+    if crate::harness::Harness::from_transport(manifest["transport"].as_str().unwrap_or(""))
+        .is_none()
+        || manifest["thread_id"].as_str().is_none()
+    {
         return Err(
             "run has no retained native conversation; legacy ephemeral runs cannot resume".into(),
         );
@@ -359,7 +362,9 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     {
         return Err("run is not in a resumable terminal state".into());
     }
-    private_path(&run.join("codex-home"), true)?;
+    if manifest["transport"] == "app-server" {
+        private_path(&run.join("codex-home"), true)?;
+    }
     let text = |key: &str| {
         manifest[key]
             .as_str()
@@ -373,6 +378,12 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         Some(effort.unwrap_or(text("effort")?)),
         parent,
     )?;
+    if manifest["transport"] != crate::harness::Harness::for_model(&model).transport() {
+        return Err(
+            "cannot resume a native conversation with a different backend family; start a new run"
+                .into(),
+        );
+    }
     let output = output.unwrap_or(text("output")?);
     if !["artifact", "answer"].contains(&output.as_str()) {
         return Err("invalid output".into());
@@ -768,7 +779,8 @@ fn generate_stage(
     baseline: &Value,
     review_stage: bool,
 ) -> Result<String, String> {
-    let _home = IsolatedHome::new(run, &options.authentication)?;
+    let harness = crate::harness::Harness::for_model(&options.model);
+    let _home = harness.isolated_home(run, &options.authentication)?;
     let artifacts = dir.join("artifacts");
     private_dir(&artifacts).map_err(|e| e.to_string())?;
     let final_handoff = artifacts.join(options.contract.handoff_name());
@@ -810,18 +822,26 @@ fn generate_stage(
         }
         // Preserve the prefix for retained conversations; migration is injected once below.
         let initial_policy = run.join("policy.md");
-        let policy = if initial_policy.exists() {
+        let replace_policy =
+            harness.policy_delivery() == crate::harness::PolicyDelivery::ReplaceEachTurn;
+        let policy = if replace_policy {
+            bundle.clone()
+        } else if initial_policy.exists() {
             fs::read_to_string(&initial_policy).map_err(|e| e.to_string())?
         } else {
             bundle.clone()
         };
-        let migration = policy_additions(
-            options,
-            manifest,
-            &bundle,
-            guidance,
-            initial_policy.exists(),
-        );
+        let migration = if replace_policy {
+            String::new()
+        } else {
+            policy_additions(
+                options,
+                manifest,
+                &bundle,
+                guidance,
+                initial_policy.exists(),
+            )
+        };
         let phase = format!(
             include_str!("assignment_contract.md"),
             migration,
@@ -854,7 +874,7 @@ fn generate_stage(
         let record = json!({"logs":attempt_dir,"status":"running","stage":manifest["stage"]});
         manifest["attempts"].as_array_mut().unwrap().push(record);
         save_json(&run.join("manifest.json"), manifest)?;
-        let turn = match app_server::turn(
+        let turn = match harness.turn(
             options,
             run,
             &attempt_dir,

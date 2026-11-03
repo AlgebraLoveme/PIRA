@@ -101,6 +101,13 @@ class PrivateCITests(unittest.TestCase):
                 b'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n',
             'assets/scripts/setup_pira_tools.py': b'import setup_pira_stores',
             'assets/scripts/test_setup_pira_tools.py': b'# fixture',
+            'assets/scripts/setup_pira_claude.py': b'# Claude setup fixture',
+            'assets/scripts/test_setup_pira_claude.py': b'# Claude setup tests',
+            'assets/scripts/test_python_bootstrap.py': b'# wrapper tests',
+            'assets/scripts/setup_pira.sh': b'# shell wrapper',
+            'assets/scripts/setup_pira.ps1': b'# PowerShell wrapper',
+            'assets/scripts/lib/pira_python_bootstrap.sh': b'# shell bootstrap',
+            'assets/scripts/lib/pira_python_bootstrap.ps1': b'# PowerShell bootstrap',
             'assets/scripts/retire_pira_audio.py': b'# retirement helper fixture',
             'assets/scripts/test_retire_pira_audio.py': b'# retirement test fixture',
             'assets/scripts/setup_pira_stores.py': b'import migrate_pira_stores\nimport setup_migration_choices',
@@ -445,6 +452,9 @@ class PrivateCITests(unittest.TestCase):
         self.assertNotIn("if: matrix.crate == 'pira_team'\n        run: python -m unittest", workflow)
         for name in ('setup_pira.py', 'test_setup_pira.py', 'setup_pira_tools.py',
                      'test_setup_pira_tools.py', 'setup_pira_stores.py', 'test_setup_pira_stores.py',
+                     'setup_pira_claude.py', 'test_setup_pira_claude.py', 'test_python_bootstrap.py',
+                     'setup_pira.sh', 'setup_pira.ps1',
+                     'lib/pira_python_bootstrap.sh', 'lib/pira_python_bootstrap.ps1',
                      'migrate_pira_stores.py', 'test_migrate_pira_stores.py',
                      'setup_migration_choices.py', 'test_setup_migration_choices.py',
                      'retire_pira_audio.py', 'test_retire_pira_audio.py',
@@ -522,6 +532,9 @@ class PrivateCITests(unittest.TestCase):
     def test_missing_setup_dependency_fails_staging(self):
         for name in ('retire_pira_audio.py', 'test_retire_pira_audio.py',
                      'setup_pira_stores.py', 'setup_migration_choices.py',
+                     'setup_pira_claude.py', 'test_setup_pira_claude.py', 'test_python_bootstrap.py',
+                     'setup_pira.sh', 'setup_pira.ps1',
+                     'lib/pira_python_bootstrap.sh', 'lib/pira_python_bootstrap.ps1',
                      'test_setup_migration_choices.py'):
             with self.subTest(name=name):
                 path = self.root / 'assets/scripts' / name

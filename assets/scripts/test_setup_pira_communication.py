@@ -57,7 +57,7 @@ class CommunicationSetupTests(unittest.TestCase):
             self.assertNotIn(text, output)
 
     def assert_handoff(self, output: str, workspace: Path | None = None) -> None:
-        self.assertIn(f"Open a NEW Codex or supported agent session in {workspace or self.workspace}.", output)
+        self.assertIn(f"Open a NEW Codex or Claude Code session in {workspace or self.workspace}.", output)
         for text in ("neither handled nor launched by the user's communicator",
                      "ONE conversation across all projects", "shared context and coordination",
                      "current projects and their paths", "where those projects live",
@@ -81,7 +81,7 @@ class CommunicationSetupTests(unittest.TestCase):
                              (setup.TEMPLATE_DIR / template).read_bytes())
         self.assertIn("Summary: created=2 preserved=0 errors=0", out)
         self.assert_handoff(out)
-        self.assertIn(f"Open a NEW Codex or supported agent session in {self.workspace}.", out)
+        self.assertIn(f"Open a NEW Codex or Claude Code session in {self.workspace}.", out)
         self.assertIn("ONE conversation across all projects", out)
         self.assertIn("shared context and coordination", out)
         self.assertIn("Provide your current projects", out)

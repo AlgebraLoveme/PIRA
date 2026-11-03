@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Summary: created={created} preserved={preserved} errors={errors}")
     if not errors and not (args.dry_run or args.verify):
         print(f"If this setup was neither handled nor launched by the user's communicator in {workspace}, give this handoff:")
-        print(f"Open a NEW Codex or supported agent session in {workspace}.")
+        print(f"Open a NEW Codex or Claude Code session in {workspace}.")
         print("Keep that ONE conversation across all projects for shared context and coordination.")
         print("Provide your current projects and their paths: tell PIRA what you are working on and where those projects live.")
         print("Make a deliberate effort to bring new tasks to this communicator, even while it is working, rather than opening separate sessions out of habit.")

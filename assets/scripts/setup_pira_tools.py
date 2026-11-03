@@ -29,6 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 RETIRED_TOOLS = {"pira_codenav"}
 TEAM_CODEX_MIN_VERSION = (0, 166, 0)
+TEAM_CLAUDE_MIN_VERSION = (2, 1, 311)
+CLAUDE_INSTALL_GUIDE = "https://code.claude.com/docs/en/setup"
 CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
 MAX_CODEX_BYTES = 512 * 1024 * 1024
 CODEX_PACKAGE_DIR = ".pira-codex"
@@ -513,12 +515,33 @@ def direct_version(binary: Path) -> str:
     return result.stdout.strip()
 
 
+class _IncludeHarness(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: list[str], option_string: str | None = None) -> None:
+        if len(set(values)) == 2:
+            harness = "both"
+        else:
+            harness = "codex" if "Codex" in values else "claude"
+        setattr(namespace, self.dest, harness)
+
+
+def add_harness_arguments(parser: argparse.ArgumentParser) -> None:
+    """Share setup selection while retaining the internal legacy harness names."""
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--include", nargs="+", choices=["Codex", "ClaudeCode"],
+                           dest="harness", action=_IncludeHarness, default="codex",
+                           help="CLIs to set up (default: Codex). Claude installation/login is caller-owned; old native CLIs are updated.")
+    selection.add_argument("--harness", choices=["codex", "claude", "both"], default=argparse.SUPPRESS,
+                           help="Compatibility selection; cannot be combined with --include.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Install or refresh cloud-built PIRA tools for this user."
     )
     stores.add_migration_arguments(parser)
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
+    add_harness_arguments(parser)
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
     parser.add_argument(
         "--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
@@ -998,6 +1021,70 @@ def selected_codex_binary(install_dir: Path) -> str | None:
     return str(managed.resolve()) if managed.is_file() else None
 
 
+def prepare_claude_runtime(*, verify: bool, dry_run: bool, config_dir: Path | None = None) -> str:
+    """Require the Claude minimum, updating an older CLI only during normal setup."""
+    minimum = ".".join(map(str, TEAM_CLAUDE_MIN_VERSION))
+    guidance = (
+        f"Install/update Claude Code using the supported native instructions: {CLAUDE_INSTALL_GUIDE}; "
+        "make claude available in PATH, then rerun setup. Package-manager/custom-launcher installs "
+        "may need a manual upgrade. Setup does not change release channels; if your channel is "
+        "below the required floor, choose a suitable channel explicitly."
+    )
+    executable = shutil.which("claude")
+    if executable is None:
+        raise RuntimeError(f"Selected Claude setup requires Claude Code >= {minimum}. {guidance}")
+    # Disable background/opt-in package-manager updates, not the explicit native update.
+    environment = dict(os.environ, DISABLE_AUTOUPDATER="1", CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE="0")
+    if config_dir is not None:
+        environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
+
+    def invoke(argument: str, timeout: int) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run([executable, argument], stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=timeout,
+                                    check=False, env=environment)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            outputs = (getattr(error, "stdout", None), getattr(error, "stderr", None))
+            detail = "\n".join(part.decode(errors="replace") if isinstance(part, bytes) else part
+                               for part in outputs if part)
+            raise RuntimeError(f"Cannot run Claude Code {argument}: {error}\n{detail}\n{guidance}") from error
+        if result.returncode:
+            raise RuntimeError(f"Claude Code {argument} failed (exit {result.returncode}).\n"
+                               f"{result.stdout}\n{result.stderr}\n{guidance}")
+        return result
+
+    def version() -> tuple[str, tuple[int, ...]]:
+        result = invoke("--version", 10)
+        text = result.stdout.strip()
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?: \(Claude Code\))?", text)
+        if match is None:
+            raise RuntimeError(f"Cannot parse Claude Code version: {text!r}.\n{result.stderr}\n{guidance}")
+        return text, tuple(map(int, match.groups()))
+
+    text, found = version()
+    if found < TEAM_CLAUDE_MIN_VERSION:
+        if verify or dry_run:
+            raise RuntimeError(f"Claude Code >= {minimum} required; found {text}. "
+                               f"Verify/dry-run will not update; upgrade manually or rerun normal setup for a native update attempt. {guidance}")
+        # npm's native binary can invoke global npm during self-update. Do not
+        # update npm installations or script launchers on the user's behalf.
+        resolved = Path(executable).resolve()
+        if ("node_modules" in (part.casefold() for part in resolved.parts)
+                or resolved.suffix.lower() in (".js", ".cjs", ".mjs", ".cmd", ".bat", ".ps1")):
+            raise RuntimeError(f"Claude Code >= {minimum} required; found {text}. "
+                               f"Refusing automatic update of an npm/script launcher: {executable}. {guidance}")
+        print(f"Updating Claude Code: found {text}, require >= {minimum}; release channel unchanged")
+        result = invoke("update", 300)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        text, found = version()
+        if found < TEAM_CLAUDE_MIN_VERSION:
+            raise RuntimeError(f"Claude Code still below required >= {minimum} after claude update: {text}. {guidance}")
+    return text
+
+
 def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
                          *, verify: bool, dry_run: bool) -> str | None:
     if "pira_team" not in tools:
@@ -1096,6 +1183,10 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    use_codex = args.harness != "claude"
+    if args.harness in ("claude", "both"):
+        runtime = prepare_claude_runtime(verify=args.verify, dry_run=args.dry_run)
+        print(f"OK: Claude Code runtime {runtime}")
     if not args.no_path:
         stores.configuration_toml()
     selector = load_selector()
@@ -1110,19 +1201,19 @@ def main(argv: list[str] | None = None) -> int:
             "version specified for tool excluded by --tool: "
             + ", ".join(unselected_versions)
         )
-    if "pira_team" in tools:
+    if "pira_team" in tools and use_codex:
         runtime = prepare_team_runtime(tools, install_dir, platform_key,
                                        verify=args.verify, dry_run=args.dry_run)
         if runtime:
             print(f"OK: Team backend {runtime}; native API inventory and isolated strict-config stdio initialize verified (not shared daemon/model access)")
     # Preparation can install a managed backend outside PATH. Pass that exact
     # selection to retained-history preflight before publishing any store paths.
-    codex_binary = selected_codex_binary(install_dir) if "pira_team" in tools else None
+    codex_binary = selected_codex_binary(install_dir) if "pira_team" in tools and use_codex else None
     store_plan = (stores.plan_store_environment(tools, codex_binary=codex_binary,
                   completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team,
                   exclude_ctx_records=args.exclude_ctx_record)
                   if not args.no_path else stores.StorePlan())
-    if "pira_team" in tools:
+    if "pira_team" in tools and use_codex:
         ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,
                          login=args.codex_login)
     indexes = {tool_name: index for tool_name in index["tools"]}
@@ -1164,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
             if not version_matches(selection.name, selection.version, version):
                 failures.append(f"{selection.name}: unexpected version: {version}")
         codex_bin = install_dir / CODEX_PACKAGE_DIR / "bin"
-        if ("pira_team" in tools and not shutil.which("codex") and not args.no_path
+        if (use_codex and "pira_team" in tools and not shutil.which("codex") and not args.no_path
                 and not path_is_configured(codex_bin)):
             failures.append("managed Codex directory is not configured in the user PATH")
         if not args.no_path and not path_is_configured(install_dir):
@@ -1219,10 +1310,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_path:
         stores.apply_store_environment(store_plan, dry_run=args.dry_run)
         ensure_path(install_dir, args.dry_run,
-                    include_codex="pira_team" in tools and not shutil.which("codex"))
+                    include_codex=use_codex and "pira_team" in tools and not shutil.which("codex"))
 
     if not args.dry_run:
-        restart_needed = "pira_team" in tools and not shutil.which("codex")
+        restart_needed = use_codex and "pira_team" in tools and not shutil.which("codex")
         for selection in selections:
             version = direct_version(selection.destination)
             if not version_matches(selection.name, selection.version, version):

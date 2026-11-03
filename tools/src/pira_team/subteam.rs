@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 const MARKER: &str = "shell_environment_policy.set.PIRA_TEAM_CONTEXT=";
 const LOCK_BUDGET: Duration = Duration::from_secs(5);
 
@@ -21,21 +22,22 @@ fn discover() -> Result<Option<Caller>, String> {
     discover_from(std::process::id())
 }
 
-#[cfg(any(target_os = "linux", windows, test))]
 fn marker(arguments: &[String]) -> Result<Option<PathBuf>, String> {
-    if !arguments
-        .windows(3)
-        .any(|a| a == ["app-server", "--strict-config", "--stdio"])
-    {
-        return Ok(None);
+    crate::harness::Harness::team_marker(arguments)
+}
+
+fn marker_candidate(arguments: &[String], executable: &Path) -> bool {
+    // Claude native images may have versioned names. PATH is worker-controlled;
+    // its exact argv marker is only a hint until retained PID/birth/revision bind.
+    if crate::harness::Harness::claude_stream_json(arguments) {
+        return true;
     }
-    arguments
-        .iter()
-        .find_map(|arg| arg.strip_prefix(MARKER))
-        .map(|value| {
-            serde_json::from_str::<PathBuf>(value).map_err(|_| "invalid Team context marker".into())
-        })
-        .transpose()
+    let name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.starts_with("codex") || name.starts_with("python")
 }
 
 #[cfg(target_os = "linux")]
@@ -77,12 +79,7 @@ fn inspect_linux_using(
             // No SSH/name/UID boundary is trusted. Only a possible backend
             // marker needs exe access; unmarked ancestors are still traversed.
             path = executable(pid).map_err(|_| "cannot verify process identity")?;
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if name.starts_with("codex") || name.starts_with("python") {
+            if marker_candidate(&arguments, &path) {
                 candidate?
             } else {
                 None
@@ -113,46 +110,16 @@ fn inspect(pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), Strin
         }
         Err(_) => return Err("cannot verify process identity".into()),
     };
-    let executable = identity
-        .executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !executable.starts_with("codex") && !executable.starts_with("python") {
-        return Ok((identity, None));
-    }
-    #[cfg(windows)]
-    let run = {
-        let args = crate::native::windows::arguments(pid)
-            .map_err(|_| "cannot inspect native Windows process arguments")?;
+    let args =
+        crate::native::arguments(pid).map_err(|_| "cannot inspect native process arguments")?;
+    let run = if marker_candidate(&args, &identity.executable) {
         marker(&args)?
+    } else {
+        None
     };
-    #[cfg(unix)]
-    let run = {
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-            .output()
-            .map_err(|_| "cannot verify Team process ancestry")?;
-        if !output.status.success() {
-            return Err("cannot verify Team process ancestry".into());
-        }
-        let command = String::from_utf8(output.stdout).map_err(|_| "invalid process ancestry")?;
-        if command.contains("app-server --strict-config --stdio") {
-            command
-                .split_once(MARKER)
-                .map(|(_, value)| {
-                    serde_json::Deserializer::from_str(value)
-                        .into_iter::<PathBuf>()
-                        .next()
-                        .ok_or("missing Team context")?
-                        .map_err(|_| "invalid Team context marker")
-                })
-                .transpose()?
-        } else {
-            None
-        }
-    };
+    if crate::native::identity(pid).map_err(|_| "cannot verify process identity")? != identity {
+        return Err("process identity changed during ancestry inspection".into());
+    }
     Ok((identity, run))
 }
 
@@ -259,7 +226,7 @@ pub fn authorize(args: &[String]) -> Result<(), String> {
     };
     let manifest = current_caller(&run)?;
     let context = profile::load()?;
-    if manifest["thread_id"] != context["caller_thread_id"]
+    if !profile::matches_native_session(&manifest, &context)
         || manifest["allow_subteam"] != true
         || !manifest["parent_run_id"].is_null()
     {
@@ -407,7 +374,10 @@ pub fn claim_authentication(
         || retained["status"] != "running"
         || retained["revision"] != request["revision"]
         || retained["parent_run_id"] != id(root)
-        || retained["creator_main_session_id"] != manifest["thread_id"]
+        || !profile::matches_native_session(
+            &manifest,
+            &json!({"caller_thread_id":retained["creator_main_session_id"]}),
+        )
         || retained["allow_subteam"] == true
     {
         return Err("credential request is outside the active admitted subtree/runtime".into());
@@ -1824,5 +1794,43 @@ mod tests {
             .is_err()
         );
         assert!(bound_backend_alive(12, 20, |_| Err(failure())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod claude_marker_tests {
+    use super::*;
+    fn args(settings: &str) -> Vec<String> {
+        vec![
+            "claude".into(),
+            "--input-format".into(),
+            "stream-json".into(),
+            "--settings".into(),
+            settings.into(),
+        ]
+    }
+    #[test]
+    fn exact_marker_preserves_whitespace_and_rejects_malformed_state() {
+        assert_eq!(
+            marker(&args(
+                r#"{"env":{"PIRA_TEAM_CONTEXT":"/path with spaces/team"}}"#
+            ))
+            .unwrap(),
+            Some(PathBuf::from("/path with spaces/team"))
+        );
+        assert!(marker(&args(r#"{"env":{"PIRA_TEAM_CONTEXT":42}}"#)).is_err());
+        assert!(marker(&args("{broken")).is_err());
+        assert_eq!(
+            marker(&args(r#"{"sandbox":{"enabled":false}}"#)).unwrap(),
+            None
+        );
+        assert_eq!(
+            marker(&[
+                "claude".into(),
+                "a prompt containing --settings and PIRA_TEAM_CONTEXT".into()
+            ])
+            .unwrap(),
+            None
+        );
     }
 }

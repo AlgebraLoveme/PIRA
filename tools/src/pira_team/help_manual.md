@@ -147,15 +147,31 @@ unchanged. Unknown or missing caller model identity falls back to gpt-6.1-sol/hi
 caller's effort. These bundled defaults apply unless config supplies an exact caller-model
 override; no aliases or network discovery are used. Config show displays bundled policy,
 overrides and their file path. Set requires both fields; reset removes only that caller's
-override. Config uses worker_defaults.json in the selected Team store, needs no Codex
+override. Config uses worker_defaults.json in the selected Team store, needs no agent
 session, and launches no worker. Invalid config fails visibly without being overwritten;
-fix/restore the reported file before retrying. Caller discovery requires a matching Codex session
-and verified execution context; fallback does not enable Claude/non-Codex session discovery.
+fix/restore the reported file before retrying. Caller discovery requires a matching native Codex or Claude session and verified
+execution context. Claude identities are namespaced separately from Codex IDs.
+Claude mains must have a current bypassPermissions turn and verified non-sandboxed
+execution. The current shell is checked directly; no prior tool-result record is
+required. Unsupported or missing permission evidence fails without elevation.
+Team workers additionally require the retained backend PID/birth and native session
+binding, independent of environment hints.
 Explicit --model and --effort independently override their respective fields, including
 partial overrides. Resume retains stored model/effort unless explicitly overridden; it does
 not reapply caller defaults. Missing effort for a recognized caller requires --effort;
 missing or ambiguous caller execution context always fails, even with explicit profile flags.
-Requires native Codex app-server with the published Team protocol and strict-config support,
+Canonical claude-* model identifiers select the installed Claude Code CLI; every
+other identifier retains the Codex route, including custom Codex providers. There
+is no model-release inventory or alias guessing. Claude callers inherit their
+model/effort unless configured or explicitly overridden. Claude uses native
+stream-json, retained sessions, and normal CLI authentication. Its workspace
+customizations, hooks, plugins and native agents are disabled; only assigned Team
+guidance is supplied. No Node bridge or SDK dependency is added. The selected CLI is
+assumed installed and authenticated; their native failures are returned rather
+than triggering setup or login. Claude currently accepts standard service tier
+and low|medium|high|xhigh|max effort. Resuming across backend families is rejected.
+
+The Codex transport requires native Codex app-server with the published Team protocol and strict-config support,
 plus existing local file auth or CODEX_API_KEY. Preflight generates native schemas without an execution deadline;
 missing API fields/methods fail before model work. Sent requests are schema-validated.
 Direct stdio is separate from the interactive shared daemon; its version/features are not
@@ -167,7 +183,7 @@ authentication sockets and named credential patterns. Team supplies its own hand
 Worker shell PATH starts with the canonical invoking Team launcher's directory, so bare
 pira_team child commands use that same launcher, including staged local coordinators.
 Other inherited PATH entries retain their order. Backend process PATH and the selected
-Codex executable/provider remain unchanged; executable-equality authentication is retained.
+backend executable/provider remain unchanged; executable-equality authentication is retained.
 Unknown variables pass through; this is not a secret detector. Existing absolute directories in
 CARGO_HOME, CARGO_TARGET_DIR, PIP_CACHE_DIR, UV_CACHE_DIR, PYTHONPYCACHEPREFIX, MYPY_CACHE_DIR,
 npm_config_cache, NPM_CONFIG_CACHE, YARN_CACHE_FOLDER, GOCACHE, GOMODCACHE, GRADLE_USER_HOME,
@@ -276,6 +292,8 @@ HOST is an SSH alias/hostname, not shell syntax; USER explicitly selects the SSH
 account. Remote executable/backend/store/cwd are explicit absolute canonical Linux
 paths, without . or .. components. --remote-exe is the actual candidate binary,
 not a wrapper; --remote-backend selects the existing server-side Codex executable.
+Claude models select `claude` from the server launcher PATH and retain that
+executable before launch; changing --model does not require new endpoint options.
 Candidate/backend directories enter the supervisor PATH for server-local tools.
 Remote workers inherit the server launcher environment, not the local client's.
 --remote-endpoint-id is the independently provisioned 64-hex PUBLIC endpoint nonce,

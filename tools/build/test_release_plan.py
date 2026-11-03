@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +108,23 @@ class ReleasePlanTests(unittest.TestCase):
             self.assertEqual(len(json.loads(records["changed_matrix"])["include"]), 6)
 
 
+class ReleaseMetadataTests(unittest.TestCase):
+    def test_all_six_workspace_versions_match_lockfile(self) -> None:
+        workspace = tomllib.loads((ROOT / "tools/Cargo.toml").read_text())
+        members = workspace["workspace"]["members"]
+        manifests = [tomllib.loads((ROOT / "tools" / member / "Cargo.toml").read_text())["package"]
+                     for member in members]
+        self.assertEqual({package["name"] for package in manifests}, set(plan.TOOLS))
+        self.assertEqual(len(manifests), len(plan.TOOLS))
+        locked = tomllib.loads((ROOT / "tools/Cargo.lock").read_text())["package"]
+        for package in manifests:
+            with self.subTest(tool=package["name"]):
+                entries = [entry for entry in locked
+                           if entry["name"] == package["name"] and "source" not in entry]
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["version"], package["version"])
+
+
 class WorkflowGateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -164,9 +182,14 @@ class WorkflowGateTests(unittest.TestCase):
                       "--skip unlinked_live_executable_never_becomes_missing_worker_or_exited_backend",
                       "shasum -a 256", "if-no-files-found: error"):
             self.assertIn(token, self.bundle)
-        for workflow in (self.source, self.bundle):
+        for workflow in (self.jobs["test-windows"], self.bundle):
             self.assertIn("tools.build.test_release_plan", workflow)
             self.assertIn("assets.scripts.test_setup_pira_communication", workflow)
+            self.assertIn("assets.scripts.test_setup_pira_claude", workflow)
+            self.assertIn("assets.scripts.test_python_bootstrap", workflow)
+        self.assertIn("runs-on: ubuntu-latest", self.jobs["authorize"])
+        self.assertIn("assets.scripts.test_setup_pira_claude", self.jobs["authorize"])
+        self.assertIn("assets.scripts.test_python_bootstrap", self.jobs["authorize"])
         self.assertIn('pattern: "*-bundle"', self.jobs["publish"])
         self.assertIn("package_github_release.py", self.jobs["publish"])
         self.assertIn("Refusing to replace existing published release", self.jobs["publish"])

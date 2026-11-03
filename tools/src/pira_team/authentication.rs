@@ -41,10 +41,20 @@ impl Drop for Secret {
 // These values travel only on the private peer-verified channel, never argv/logs.
 fn backend_variable(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
-    if ["CODEX_HOME", "CODEX_THREAD_ID", "CODEX_SESSION_ID"].contains(&name.as_str()) {
+    if [
+        "CODEX_HOME",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SHELL_PREFIX",
+    ]
+    .contains(&name.as_str())
+    {
         return false;
     }
-    name.starts_with("CODEX_")
+    name.starts_with("ANTHROPIC_")
+        || name.starts_with("CLAUDE_")
+        || name.starts_with("CODEX_")
         || name.starts_with("OPENAI_")
         || name.starts_with("AZURE_OPENAI_")
         || [
@@ -229,31 +239,52 @@ impl Authentication {
     }
 }
 
-#[cfg(unix)]
-fn resolve_program() -> Result<PathBuf, String> {
-    if let Some(program) = crate::remote::delegated_backend() {
+pub(crate) fn resolve_program_for(provider: crate::harness::Harness) -> Result<PathBuf, String> {
+    if provider == crate::harness::Harness::Codex
+        && let Some(program) = crate::remote::delegated_backend()
+    {
         return Ok(program);
     }
+    // The legacy signed remote backend selects Codex. Claude is selected from
+    // the server launcher PATH, then pinned before any worker can alter PATH.
+    resolve_local_program_for(provider)
+}
+#[cfg(unix)]
+fn resolve_local_program_for(provider: crate::harness::Harness) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     let paths = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
     for directory in std::env::split_paths(&paths) {
-        let program = directory.join("codex");
+        let program = directory.join(provider.executable());
         if program.is_file()
             && program
                 .metadata()
                 .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
         {
-            return program
-                .canonicalize()
-                .map_err(|_| "cannot retain selected Codex executable".into());
+            return program.canonicalize().map_err(|_| {
+                format!(
+                    "cannot retain selected {} executable",
+                    provider.executable()
+                )
+            });
         }
     }
-    Err("native Codex executable is unavailable on PATH".into())
+    Err(format!(
+        "native {} executable is unavailable on PATH",
+        provider.executable()
+    ))
 }
 #[cfg(windows)]
-fn resolve_program() -> Result<PathBuf, String> {
-    if let Some(program) = crate::remote::delegated_backend() {
-        return Ok(program);
+fn resolve_local_program_for(provider: crate::harness::Harness) -> Result<PathBuf, String> {
+    if provider == crate::harness::Harness::Claude {
+        for directory in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+            let path = directory.join("claude.exe");
+            if path.is_file() {
+                return path
+                    .canonicalize()
+                    .map_err(|_| "cannot retain Claude executable".into());
+            }
+        }
+        return Err("native claude.exe unavailable on PATH".into());
     }
     native::windows::resolve_program().map_err(|_| "cannot retain selected Codex executable".into())
 }
@@ -277,7 +308,11 @@ fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 
 pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
     let Some(parent) = subteam::caller_run()? else {
-        return Ok(Authentication::SelectedCaller(resolve_program()?));
+        return Ok(Authentication::SelectedCaller(resolve_program_for(
+            crate::harness::Harness::for_model(
+                manifest["model"].as_str().ok_or("missing worker model")?,
+            ),
+        )?));
     };
     let runtime = subteam::caller_runtime()?.ok_or("missing coordinator runtime")?;
     let control = read_json(&parent.join("control.json"))?;
@@ -322,7 +357,25 @@ pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
         )
     })?;
     let payload = Secret::new(payload)?;
-    let backend = Backend::decode(&payload.0)?;
+    let mut selection: Value =
+        serde_json::from_slice(&payload.0).map_err(|_| "invalid selected backend handoff")?;
+    let provider = crate::harness::Harness::for_model(
+        manifest["model"].as_str().ok_or("missing child model")?,
+    );
+    if let Some(programs) = selection.get("programs") {
+        let program = programs
+            .get(provider.executable())
+            .cloned()
+            .ok_or("requested child backend was unavailable to coordinator launcher")?;
+        selection["program"] = program;
+    } else if provider == crate::harness::Harness::Claude {
+        return Err(
+            "coordinator has no Claude backend handoff; resume it with current Team".into(),
+        );
+    }
+    let selected =
+        Secret::new(serde_json::to_vec(&selection).map_err(|_| "invalid backend selection")?)?;
+    let backend = Backend::decode(&selected.0)?;
     // Keep a Windows pipe connected until its buffered response has been read.
     // Parent exit after delivery does not revoke this already admitted child.
     let _ = connection.write_all(&[1]);
@@ -345,6 +398,27 @@ impl Server {
             return Err("coordinator backend selection is not retained".into());
         }
         let payload = Backend::capture(program)?.encode()?;
+        let mut value: Value =
+            serde_json::from_slice(&payload.0).map_err(|_| "cannot encode backend selection")?;
+        let manifest = read_json(&run.join("manifest.json"))?;
+        let selected = crate::harness::Harness::for_model(
+            manifest["model"]
+                .as_str()
+                .ok_or("missing coordinator model")?,
+        );
+        let mut programs = json!({});
+        programs[selected.executable()] = value["program"].clone();
+        for provider in crate::harness::Harness::ALL {
+            if provider != selected
+                && let Ok(program) = resolve_program_for(provider)
+            {
+                programs[provider.executable()] = json!(program);
+            }
+        }
+        value["programs"] = programs;
+        let payload = Secret::new(
+            serde_json::to_vec(&value).map_err(|_| "cannot encode backend selections")?,
+        )?;
         Self::listen(run, revision, payload)
     }
     fn listen(run: &Path, revision: &Value, payload: Secret) -> Result<Self, String> {

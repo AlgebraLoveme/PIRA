@@ -4,6 +4,8 @@ mod authentication;
 mod backend;
 mod bookmarks;
 mod build_roots;
+mod claude;
+mod harness;
 mod help;
 mod lifecycle;
 mod native;
@@ -507,6 +509,8 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
             "CODEX_API_KEY",
             "OPENAI_API_KEY",
             "OPENAI_ADMIN_KEY",
+            "ANTHROPIC_*",
+            "CLAUDE_*",
             "*_API_KEY",
             "*_TOKEN",
             "*_SECRET",
@@ -576,6 +580,9 @@ fn set_worker_launcher(command: &mut Command) -> Result<(), String> {
 
 /// Execute the Team CLI and return its process exit code.
 pub fn run() -> i32 {
+    if let Some(code) = claude::shell_entry() {
+        return code;
+    }
     #[cfg(unix)]
     unsafe {
         libc::signal(

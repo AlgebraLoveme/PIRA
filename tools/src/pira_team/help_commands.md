@@ -36,7 +36,13 @@ OPTIONS
 Task and gate must be nonempty. -- ends option parsing and requires exactly one
 following task. Only the task, gate, and label support local --name=VALUE forms.
 Model/effort defaults use exact caller-model mappings and store overrides; see
-help config. Execution permissions always require verified caller context.
+help config. Canonical claude-* models launch Claude Code; other model identifiers
+retain the Codex route. The selected CLI must already work on the execution host. Native
+CLI errors are retained and returned; Team does not install or authenticate them.
+Claude accepts low|medium|high|xhigh|max and standard service tier only. Native
+sessions cannot switch backend family on resume. Execution permissions always
+require verified caller context; Claude requires a current bypassPermissions turn
+and a verified unsandboxed shell, including on the first command.
 Guidance flags grant no edit authority. Select only required guidance. Combining
 review and implementation on a fresh run creates a staged review/implementation
 assignment. See help safety and help manual for retained guidance and constraints.
@@ -355,12 +361,12 @@ OPTIONS
 Show prints JSON with bundled policy, overrides, and path. Set requires both model
 and effort. Reset removes only the selected caller override. Effort accepts
 none|minimal|low|medium|high|xhigh|max|ultra. Options take separate values and each
-may appear once. Uses worker_defaults.json, needs no Codex session or backend
+may appear once. Uses worker_defaults.json, needs no agent session or backend
 authentication, and launches no worker. Invalid config fails visibly
 without overwriting it; fix/restore the reported file before retrying.
 
 For new runs, gpt-6-astra maps to gpt-6.1-sol/high. Recognized gpt-6.1-sol,
-gpt-6-sol, gpt-6-luna, and gpt-5.6-sol inherit caller model/effort. Unknown or missing
+gpt-6-sol, gpt-6-luna, gpt-5.6-sol, and all claude-* callers inherit model/effort. Unknown or missing
 caller model identity falls back to gpt-6.1-sol/high. Exact config overrides take
 precedence over bundled defaults. Explicit run --model and --effort independently
 win over their fields. Missing inherited effort requires --effort. Caller execution

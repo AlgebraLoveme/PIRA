@@ -300,3 +300,172 @@ mod tests {
         assert!(!super::windows::arguments(first.pid).unwrap().is_empty());
     }
 }
+
+#[cfg(target_os = "macos")]
+pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
+    // KERN_PROCARGS2 returns argc, the executable path, then the exact argv.
+    // Unlike ps output it preserves argument boundaries and embedded whitespace.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
+    let mut size = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if !(4..=16 * 1024 * 1024).contains(&size) {
+        return Err(io::Error::other("invalid native argument size"));
+    }
+    let mut bytes = vec![0u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    bytes.truncate(size);
+    let argc = i32::from_ne_bytes(
+        bytes
+            .get(..4)
+            .ok_or_else(|| io::Error::other("missing argc"))?
+            .try_into()
+            .unwrap(),
+    );
+    if argc <= 0 || argc > 100_000 {
+        return Err(io::Error::other("invalid argc"));
+    }
+    let mut rest = &bytes[4..];
+    let end = rest
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| io::Error::other("missing executable terminator"))?;
+    rest = &rest[end + 1..];
+    while rest.first() == Some(&0) {
+        rest = &rest[1..];
+    }
+    let mut args = Vec::new();
+    for _ in 0..argc {
+        let end = rest
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(|| io::Error::other("incomplete argv"))?;
+        args.push(
+            String::from_utf8(rest[..end].to_vec())
+                .map_err(|_| io::Error::other("non-UTF8 argv"))?,
+        );
+        rest = &rest[end + 1..];
+    }
+    Ok(args)
+}
+
+#[cfg(windows)]
+pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
+    windows::arguments(pid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn arguments(_: u32) -> io::Result<Vec<String>> {
+    Err(io::Error::other(
+        "native arguments unavailable on this platform",
+    ))
+}
+
+// Claude sandboxes individual shell commands, not its main CLI. Check the actual
+// invoking process before delegation rather than waiting for a completed tool result.
+#[cfg(target_os = "macos")]
+pub(crate) fn claude_shell_unsandboxed(_ancestor: u32) -> io::Result<bool> {
+    #[link(name = "sandbox")]
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            filter: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    match unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) } {
+        0 => Ok(true),
+        value if value > 0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn claude_shell_unsandboxed(ancestor: u32) -> io::Result<bool> {
+    // Bubblewrap changes namespaces. Preserve a containing VM/container's
+    // baseline restrictions, but reject extra isolation on this shell.
+    for namespace in ["mnt", "net", "user", "pid"] {
+        if std::fs::read_link(format!("/proc/self/ns/{namespace}"))?
+            != std::fs::read_link(format!("/proc/{ancestor}/ns/{namespace}"))?
+        {
+            return Ok(false);
+        }
+    }
+    let current = std::fs::read_to_string("/proc/self/status")?;
+    let parent = std::fs::read_to_string(format!("/proc/{ancestor}/status"))?;
+    same_execution_filters(&current, &parent)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn same_execution_filters(current: &str, parent: &str) -> io::Result<bool> {
+    for key in ["NoNewPrivs:", "Seccomp:", "Seccomp_filters:"] {
+        let field = |text: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key).map(str::trim).map(str::to_owned))
+        };
+        match (field(current), field(parent)) {
+            (Some(a), Some(b)) if a == b => (),
+            (None, None) if key == "Seccomp_filters:" => (), // Older kernels omit the count.
+            (Some(_), Some(_)) => return Ok(false),
+            _ => return Err(io::Error::other("missing process sandbox metadata")),
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+pub(crate) fn claude_shell_unsandboxed(_ancestor: u32) -> io::Result<bool> {
+    // Native Claude does not implement its shell sandbox on Windows. External
+    // process/job restrictions are inherited; WSL uses the Linux check above.
+    Ok(true)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn claude_shell_unsandboxed(_ancestor: u32) -> io::Result<bool> {
+    Err(io::Error::other(
+        "Claude sandbox verification unsupported on this platform",
+    ))
+}
+
+#[cfg(test)]
+mod claude_sandbox_tests {
+    use super::*;
+    #[test]
+    fn rejects_extra_or_missing_linux_restrictions() {
+        let base = "NoNewPrivs: 0\nSeccomp: 2\nSeccomp_filters: 1\n";
+        assert!(same_execution_filters(base, base).unwrap());
+        assert!(!same_execution_filters(&base.replace("filters: 1", "filters: 2"), base).unwrap());
+        assert!(!same_execution_filters(&base.replace("Privs: 0", "Privs: 1"), base).unwrap());
+        assert!(same_execution_filters("", base).is_err());
+    }
+    #[test]
+    fn current_native_sandbox_probe() {
+        let actual = claude_shell_unsandboxed(std::process::id()).unwrap();
+        let expected = std::env::var_os("PIRA_TEST_EXPECT_SANDBOX").is_none();
+        assert_eq!(actual, expected);
+    }
+}

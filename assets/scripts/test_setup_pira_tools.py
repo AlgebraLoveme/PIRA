@@ -379,6 +379,26 @@ class SetupPiraToolsTests(unittest.TestCase):
         network.start()
         self.addCleanup(network.stop)
 
+    def test_include_selection_controls_existing_codex_preflight(self) -> None:
+        for names, use_codex in [([], True), (["Codex"], True),
+                                 (["ClaudeCode"], False), (["Codex", "ClaudeCode"], True)]:
+            with self.subTest(names=names), \
+                 patch.object(setup, "release_index", return_value={"tools": {"pira_team": {}}}), \
+                 patch.object(setup, "prepare_claude_runtime") as claude, \
+                 patch.object(setup, "prepare_team_runtime", return_value=None) as prepare, \
+                 patch.object(setup, "selected_codex_binary", return_value="fixture-codex") as backend, \
+                 patch.object(setup, "ensure_team_auth") as auth, \
+                 patch.object(setup.stores, "plan_store_environment", return_value=setup.stores.StorePlan()) as plan, \
+                 patch.object(setup, "tool_selection", side_effect=RuntimeError("fixture barrier")):
+                selection = ["--include", *names] if names else []
+                with self.assertRaisesRegex(RuntimeError, "fixture barrier"):
+                    setup.main([*selection, "--dry-run"])
+                self.assertEqual(prepare.call_count, int(use_codex))
+                self.assertEqual(backend.call_count, int(use_codex))
+                self.assertEqual(auth.call_count, int(use_codex))
+                self.assertEqual(claude.call_count, int("ClaudeCode" in names))
+                self.assertEqual(plan.call_args.kwargs["codex_binary"], "fixture-codex" if use_codex else None)
+
     @unittest.skipIf(os.name == "nt", "POSIX execute permission")
     def test_nonexecutable_matching_binary_refresh_and_readonly_modes(self):
         root = Path(setup.os.environ["HOME"])

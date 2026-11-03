@@ -42,6 +42,66 @@ mod native_boundary_tests {
         )
     }
 
+    fn claude_arguments(run: &Path) -> Vec<String> {
+        arguments(&[
+            "versioned-native-image",
+            "--input-format",
+            "stream-json",
+            "--settings",
+            &json!({"env":{"PIRA_TEAM_CONTEXT":run}}).to_string(),
+        ])
+    }
+
+    #[test]
+    fn claude_marker_discovery_is_path_independent_but_requires_retained_owner() {
+        for stale in ["backend_pid", "backend_birth", "revision"] {
+            let fixture = DiscoveryFixture::new(12);
+            let inspect = |pid| {
+                let (identity, marker) = fixture.inspect(pid)?;
+                inspect_linux_using(
+                    pid,
+                    |_| Ok(metadata(&identity)),
+                    |_| Ok(marker.as_deref().map(claude_arguments).unwrap_or_default()),
+                    |_| Ok(PathBuf::from("/fixture/versions/2.1.100")),
+                )
+            };
+            let caller = discover_using(32, inspect).unwrap().unwrap();
+            assert_eq!(caller.runtime["backend_pid"], 12);
+            let path = fixture.run.join("runtime.json");
+            let mut runtime = read_json(&path).unwrap();
+            runtime[stale] = json!(999);
+            save_json(&path, &runtime).unwrap();
+            assert!(discover_using(32, inspect).is_err(), "{stale}");
+        }
+    }
+
+    #[test]
+    fn claude_marker_requires_readable_image_and_valid_settings() {
+        let fixture = DiscoveryFixture::new(12);
+        let args = claude_arguments(&fixture.run);
+        assert!(
+            inspect_linux_using(
+                24,
+                |_| Ok(metadata(&fixture.processes[1].0)),
+                |_| Ok(args.clone()),
+                |_| Err(io::ErrorKind::PermissionDenied.into()),
+            )
+            .is_err()
+        );
+        let mut malformed = args;
+        *malformed.last_mut().unwrap() = "{broken".into();
+        assert_eq!(
+            inspect_linux_using(
+                24,
+                |_| Ok(metadata(&fixture.processes[1].0)),
+                |_| Ok(malformed),
+                |_| Ok(PathBuf::from("/fixture/versions/2.1.100")),
+            )
+            .unwrap_err(),
+            "invalid Claude Team settings marker"
+        );
+    }
+
     #[test]
     fn protected_root_ancestors_are_traversed_not_trusted_as_boundary() {
         let mut fixture = DiscoveryFixture::new(12);

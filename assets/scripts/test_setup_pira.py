@@ -24,6 +24,46 @@ sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
 
+class HarnessSelectionTests(unittest.TestCase):
+    def test_selection_and_legacy_defaults_match_for_both_entrypoints(self) -> None:
+        cases = [
+            ([], "codex"),
+            (["--include", "Codex"], "codex"),
+            (["--include", "ClaudeCode"], "claude"),
+            (["--include", "Codex", "ClaudeCode"], "both"),
+            (["--include", "ClaudeCode", "Codex"], "both"),
+        ]
+        cases.extend((["--harness", name], name) for name in ("codex", "claude", "both"))
+        for entrypoint in (setup, setup.tool_setup):
+            for argv, expected in cases:
+                with self.subTest(entrypoint=entrypoint.__name__, argv=argv):
+                    self.assertEqual(entrypoint.build_parser().parse_args(argv).harness, expected)
+
+    def test_invalid_or_conflicting_selection_fails_before_setup(self) -> None:
+        cases = [
+            (["--include"], "expected at least one argument"),
+            (["--include", "codex"], "invalid choice"),
+            (["--include", "Codex", "Unknown"], "invalid choice"),
+            (["--harness", "Unknown"], "invalid choice"),
+        ]
+        for harness in ("codex", "claude"):
+            cases.extend([
+                (["--include", "Codex", "--harness", harness], "not allowed with argument"),
+                (["--harness", harness, "--include", "Codex"], "not allowed with argument"),
+            ])
+        for entrypoint in (setup, setup.tool_setup):
+            for argv, message in cases:
+                with self.subTest(entrypoint=entrypoint.__name__, argv=argv):
+                    error = io.StringIO()
+                    with contextlib.redirect_stderr(error), self.assertRaises(SystemExit) as raised:
+                        entrypoint.main(argv)
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn(message, error.getvalue())
+                    if "--harness" in argv and "--include" in argv:
+                        self.assertIn("--harness", error.getvalue().split("error:")[-1])
+                        self.assertIn("--include", error.getvalue().split("error:")[-1])
+
+
 class AutoRecapTests(unittest.TestCase):
     def setUp(self) -> None:
         home = tempfile.TemporaryDirectory()
@@ -38,6 +78,9 @@ class AutoRecapTests(unittest.TestCase):
         legacy_temp = patch.object(setup.stores.tempfile, "gettempdir", return_value=physical_home)
         legacy_temp.start()
         self.addCleanup(legacy_temp.stop)
+        claude_runtime = patch.object(setup.tool_setup, "prepare_claude_runtime", return_value="2.1.311 (Claude Code)")
+        claude_runtime.start()
+        self.addCleanup(claude_runtime.stop)
         # Synthetic configuration tests must not select the host's Codex backend.
         which = setup.tool_setup.shutil.which
         backend = patch.object(setup.tool_setup.shutil, "which", side_effect=lambda name, *args, **kwargs:
@@ -62,6 +105,61 @@ class AutoRecapTests(unittest.TestCase):
             notification = patch.object(setup.stores, "notify_windows_environment")
             notification.start()
             self.addCleanup(notification.stop)
+
+    def test_claude_only_setup_preserves_codex_and_is_rerun_safe(self) -> None:
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        codex = root / ".codex" / "config.toml"
+        codex.parent.mkdir()
+        codex.write_text("untouched-codex-fixture")
+        guard = root / "AGENTS.override.md"
+        guard.write_text("custom guard must stay untouched")
+        args = ["--include", "ClaudeCode", "--agent-dir", str(root),
+                "--skip-tools", "--execution-mode", "keep", "--legacy", "keep"]
+        with patch.object(setup, "ensure_agent_dir"), \
+             patch.object(setup, "migration_codex_binary") as backend:
+            self.assertEqual(setup.main([*args, "--dry-run"]), 0)
+            self.assertFalse((root / ".claude").exists())
+            self.assertEqual(setup.main([*args, "--verify"]), 1)
+            self.assertFalse((root / ".claude").exists())
+            self.assertEqual(setup.main(args), 0)
+            if os.name == "posix":
+                self.assertTrue((root / ".claude/CLAUDE.md").is_symlink())
+                self.assertEqual((root / ".claude/CLAUDE.md").resolve(), root / "AGENTS.md")
+            first = (root / ".claude" / "CLAUDE.md").read_bytes()
+            settings = (root / ".claude" / "settings.json").read_bytes()
+            self.assertEqual(setup.main(args), 0)
+            self.assertEqual(setup.main([*args, "--verify"]), 0)
+            backend.assert_not_called()
+        self.assertEqual((root / ".claude" / "CLAUDE.md").read_bytes(), first)
+        self.assertEqual((root / ".claude" / "settings.json").read_bytes(), settings)
+        self.assertEqual(codex.read_text(), "untouched-codex-fixture")
+        self.assertEqual(guard.read_text(), "custom guard must stay untouched")
+        self.assertTrue((root / "pira" / "AGENTS.md").is_file())
+        self.assertFalse(list((root / ".claude").glob("*.bak.*")))
+
+    def test_both_harness_setup_configures_and_verifies_each(self) -> None:
+        import json
+
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        codex = root / ".codex" / "config.toml"
+        codex.parent.mkdir()
+        codex.write_text('model = "preserved-model"\n')
+        args = ["--include", "Codex", "ClaudeCode", "--agent-dir", str(root),
+                "--skip-tools", "--execution-mode", "soft-safe", "--legacy", "keep"]
+        with patch.object(setup, "ensure_agent_dir"), \
+             patch.object(setup, "migration_codex_binary", return_value=None):
+            self.assertEqual(setup.main(args), 0)
+            self.assertEqual(setup.main([*args, "--verify"]), 0)
+        config = tomllib.loads(codex.read_text())
+        self.assertEqual(config["model"], "preserved-model")
+        self.assertEqual(config["sandbox_mode"], "danger-full-access")
+        claude = json.loads((root / ".claude" / "settings.json").read_text())
+        self.assertEqual(claude["permissions"]["defaultMode"], "bypassPermissions")
+        self.assertFalse(claude["sandbox"]["enabled"])
+        self.assertEqual(claude["env"]["PIRA_CTX_STORE_DIR"],
+                         config["shell_environment_policy"]["set"]["PIRA_CTX_STORE_DIR"])
 
     def test_setup_environment_preserves_only_execution_inputs(self):
         execution = {key: "fixture-" + key for key in
@@ -679,6 +777,31 @@ class AutoRecapTests(unittest.TestCase):
                 self.assertEqual(command[command.index("--codex-login") + 1], mode)
                 self.assertIn("--verify", command)
 
+    def test_harness_defaults_to_codex_and_is_forwarded_to_tool_setup(self) -> None:
+        self.assertEqual(setup.build_parser().parse_args([]).harness, "codex")
+        self.assertEqual(setup.tool_setup.build_parser().parse_args([]).harness, "codex")
+        state = setup.SetupState(repo_root=SCRIPT.parents[2], agent_dir=Path("/unused"),
+                                 dry_run=False, yes=False)
+        for harness in ("codex", "claude", "both"):
+            with self.subTest(harness=harness), patch.object(setup.subprocess, "run") as run:
+                setup.configure_tools(state, None, None, verify_only=True, harness=harness)
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("--harness") + 1], harness)
+
+    def test_include_selection_is_forwarded_from_full_setup(self) -> None:
+        root = Path(os.environ["HOME"])
+        (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        for names, expected in [([], "codex"), (["Codex"], "codex"),
+                                (["ClaudeCode"], "claude"), (["Codex", "ClaudeCode"], "both")]:
+            with self.subTest(names=names), patch.object(setup, "ensure_agent_dir"), \
+                 patch.object(setup, "migration_codex_binary", return_value=None), \
+                 patch.object(setup, "configure_tools") as configure:
+                selection = ["--include", *names] if names else []
+                self.assertEqual(setup.main(["--agent-dir", str(root), "--dry-run",
+                                             "--execution-mode", "keep", "--legacy", "keep",
+                                             *selection]), 0)
+                self.assertEqual(configure.call_args.kwargs["harness"], expected)
+
     def test_default_preserves_settings_and_is_idempotent(self) -> None:
         import tomllib
 
@@ -734,7 +857,7 @@ class AutomaticCommunicationTests(unittest.TestCase):
             self.assertNotIn(text, output)
 
     def assert_handoff(self, output: str) -> None:
-        self.assertIn(f"Open a NEW Codex or supported agent session in {self.workspace}.", output)
+        self.assertIn(f"Open a NEW Codex or Claude Code session in {self.workspace}.", output)
         self.assertIn("ONE conversation across all projects", output)
         self.assertIn("neither handled nor launched by the user's communicator", output)
         self.assertIn("delegated setup to a worker running from another directory", output)

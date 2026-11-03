@@ -27,6 +27,7 @@ import setup_pira_stores as stores
 import setup_pira_tools as tool_setup
 import retire_pira_audio as audio_retirement
 import setup_pira_communication as communication
+import setup_pira_claude as claude_setup
 
 VERIFY_TOKEN = "31415926535897932384626433832795"
 DEFAULT_PROJECT_DOC_MAX_BYTES = "65536"
@@ -153,6 +154,56 @@ def write_text(state: SetupState, path: Path, content: str, description: str, *,
         print(f"Backup: {display_path(path)} -> {display_path(backup)}")
     path.write_text(content, encoding="utf-8")
     state.note_change(f"updated {display_path(path)}")
+
+
+def write_claude_text(state: SetupState, path: Path, content: str) -> None:
+    """Preserve custom Claude text byte-for-byte, including its line endings."""
+    old = claude_setup.read_file(path)
+    if path.is_file() and old == content:
+        print(f"OK: Claude PIRA configuration already up to date ({display_path(path)})")
+        return
+    if state.dry_run:
+        print(f"DRY-RUN: would write Claude PIRA configuration: {display_path(path)}")
+        state.note_change(f"would update {display_path(path)}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        backup = backup_path(path)
+        shutil.copy2(path, backup)
+        print(f"Backup: {display_path(path)} -> {display_path(backup)}")
+    path.write_bytes(content.encode("utf-8"))
+    state.note_change(f"updated {display_path(path)}")
+
+
+def write_claude_link(state: SetupState, path: Path, target: Path) -> None:
+    """Publish the canonical link atomically; retain a backup of migrated text."""
+    if claude_setup.matches(path, target):
+        print(f"OK: Claude PIRA instruction link already up to date ({display_path(path)})")
+        return
+    if path.is_symlink():
+        raise RuntimeError(f"Conflicting Claude instruction symlink: {path}")
+    if state.dry_run:
+        state.note_change(f"would link {display_path(path)} -> {display_path(target)}")
+        print(f"DRY-RUN: would link {display_path(path)} -> {display_path(target)}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = backup_path(path)
+    try:
+        temporary.symlink_to(target)
+    except OSError:
+        if not claude_setup.IS_WINDOWS:
+            raise
+        write_claude_text(state, path, claude_setup.import_line(target))
+        return
+    try:
+        if path.exists():
+            backup = backup_path(path)
+            shutil.copy2(path, backup)
+            print(f"Backup: {display_path(path)} -> {display_path(backup)}")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    state.note_change(f"linked {display_path(path)} -> {display_path(target)}")
 
 
 def path_under(path: Path, root: Path) -> bool:
@@ -598,6 +649,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Set up PIRA for the current machine.")
     stores.add_migration_arguments(parser)
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
+    tool_setup.add_harness_arguments(parser)
+    parser.add_argument("--claude-dir", default=os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"), help="Claude user configuration directory.")
     parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
@@ -633,11 +686,12 @@ def configure_tools(
     *,
     verify_only: bool,
     codex_login: str = "auto",
+    harness: str = "codex",
 ) -> None:
     script = state.repo_root / "assets" / "scripts" / "setup_pira_tools.py"
     if not script.is_file():
         raise RuntimeError(f"PIRA tools setup script is missing: {script}")
-    command = [sys.executable, str(script), "--codex-login", codex_login]
+    command = [sys.executable, str(script), "--codex-login", codex_login, "--harness", harness]
     for name in state.exclude_ctx_records:
         command.extend(["--exclude-ctx-record", name])
     if state.completed_ctx_only:
@@ -657,6 +711,8 @@ def configure_tools(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.skip_codex = args.skip_codex or args.harness == "claude"
+    use_claude = args.harness in ("claude", "both")
     repo_root = Path(__file__).resolve().parents[2]
     state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team, exclude_ctx_records=tuple(args.exclude_ctx_record))
     config_path = expand_path(args.codex_config)
@@ -667,9 +723,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry run:    {state.dry_run}")
 
     try:
+        if use_claude:
+            runtime = tool_setup.prepare_claude_runtime(
+                verify=args.verify, dry_run=args.dry_run, config_dir=expand_path(args.claude_dir),
+            )
+            print(f"OK: Claude Code runtime {runtime}")
         codex_plan = None
         codex_binary = None
         audio_plan = None
+        claude_plan: dict[Path, str | Path] = {}
         if not args.skip_codex:
             guard_root = state.agent_dir
             if (not same_location(state.agent_dir, state.repo_root)
@@ -679,21 +741,26 @@ def main(argv: list[str] | None = None) -> int:
             audio_plan = audio_retirement.plan_retirement(config_path, audio_retirement.default_profiles())
             if args.verify:
                 audio_retirement.apply_retirement(audio_plan, verify=True)
-        if not args.skip_codex or not args.skip_tools:
+        if not args.skip_codex or not args.skip_tools or use_claude:
             stores.configuration_toml()
             existing = config_path.read_text(encoding="utf-8") if not args.skip_codex and config_path.exists() else None
             if not args.skip_codex and not args.verify:
                 codex_plan = plan_codex_configuration(state, config_path, args.execution_mode,
                                                      args.replace_permissions, include_stores=False)
-            codex_binary = migration_codex_binary(state, args.tools_install_dir,
-                                                 prepare_missing=not args.skip_tools and not state.dry_run)
+            if args.harness != "claude":
+                codex_binary = migration_codex_binary(state, args.tools_install_dir,
+                                                     prepare_missing=not args.skip_tools and not state.dry_run)
             store_plan = stores.plan_store_environment(store_tools(state), codex_text=existing, codex_binary=codex_binary, completed_ctx_only=state.completed_ctx_only, fresh_team=state.fresh_team, exclude_ctx_records=state.exclude_ctx_records)
             store_paths = store_plan.stores
             if codex_plan is not None:
                 codex_plan = stores.codex_store_configuration(codex_plan, store_tools(state), store_paths)
             for notice in store_plan.notices:
                 print(notice)
-            # Includes --skip-tools: Codex must not point at uncopied historical data.
+            # Includes --skip-tools: neither harness may point at uncopied historical data.
+            if use_claude:
+                claude_plan = claude_setup.plan(
+                    expand_path(args.claude_dir), state.agent_dir, store_paths, args.execution_mode,
+                )
             stores.apply_store_migrations(store_plan, dry_run=state.dry_run, verify=args.verify)
         if not args.verify:
             if audio_plan is not None:
@@ -702,6 +769,11 @@ def main(argv: list[str] | None = None) -> int:
             remove_legacy_files(state, args.legacy)
             if not args.skip_codex:
                 configure_codex(state, config_path, args.execution_mode, args.replace_permissions, plan=codex_plan)
+            for path, content in claude_plan.items():
+                if isinstance(content, Path):
+                    write_claude_link(state, path, content)
+                else:
+                    write_claude_text(state, path, content)
             if not args.skip_tools:
                 configure_tools(
                     state,
@@ -709,12 +781,17 @@ def main(argv: list[str] | None = None) -> int:
                     args.tools_version,
                     verify_only=False,
                     codex_login=args.codex_login,
+                    harness=args.harness,
                 )
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
         else:
             verify(state, config_path, skip_codex=args.skip_codex, codex_binary=codex_binary,
                    legacy_mode=args.legacy)
+            for path, content in claude_plan.items():
+                passed = claude_setup.matches(path, content)
+                state.verification.append(("Claude PIRA configuration", passed, str(path)))
+                print(f"{'PASS' if passed else 'FAIL'}: Claude PIRA configuration — {path}")
             if args.verify and not args.skip_tools:
                 configure_tools(
                     state,
@@ -722,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.tools_version,
                     verify_only=True,
                     codex_login=args.codex_login,
+                    harness=args.harness,
                 )
     except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
