@@ -13,6 +13,9 @@ For staged review and implementation, use the retained review findings and write
   2. Greater capability or scalability when the simplicity criteria above are similar.
   3. Fewer dependencies when the first two criteria are similar.
 
+- Actively look for harmless assumptions that hold in almost all intended use cases and greatly simplify implementation. An assumption is eligible only when avoiding it creates unavoidable implementation difficulty. Establish that difficulty from concrete constraints and reasonable assumption-free alternatives, rather than convenience or speculative complexity. Assess accidental mistakes as well as ordinary use when judging harmlessness.
+- Before adopting an eligible assumption, ask the user to confirm it. Explain why it should usually hold, concrete cases where it could fail and their consequences, and how much complexity it removes. Keep assumption-dependent implementation pending until explicit confirmation; continue independent work. Never treat likely truth or implementation convenience as approval.
+
 ## Workflow
 1. Define scope and the smallest useful acceptance check.
 2. Omit unnecessary code and briefly say so; otherwise choose the smallest sufficient route under the decision order above.
@@ -27,7 +30,6 @@ Before non-trivial refactoring, protect moved behavior with the smallest check. 
 - Avoid unrequested abstractions, boilerplate, future scaffolding, and configuration for constants.
 - Keep data flow explicit, side effects narrow, and one abstraction level per function. Extract only to name a real idea, remove duplication, or expose a boundary.
 - Avoid flag arguments creating distinct behaviors; split behavior or use an explicit mode only when simpler. Centralize true configuration; avoid scattered hardcoded constants.
-- For a complex request, implement a simpler sufficient solution and briefly name omissions; ask only when defaulting is risky.
 - When cheap, isolate stable core logic from volatile infrastructure (CLI, I/O, network, database, UI, frameworks, subprocesses); dependencies point inward. Pass simple data across boundaries. Core logic must not import infrastructure merely for convenience. Do not leak infrastructure objects into core logic unless the project is intentionally glue code.
 - Improve boundaries incrementally in touched code, leaving it slightly cleaner. Do not make architecture-wide or drive-by refactors.
 - Before fixing, trace the affected behavior through relevant callers, consumers, shared state and representations, including dependencies affected by transformation order. Identify the faulty assumption, intended correction, materially different affected categories, and consequential dependent behavior and compatibility constraints. Before preserving existing behavior, distinguish intended compatibility from the defect itself. Use proportionate baseline probes when unclear and escalate outcome-changing ambiguity under the ownership rules.
@@ -40,7 +42,7 @@ Before non-trivial refactoring, protect moved behavior with the smallest check. 
 - For large, likely open-source features, survey high-quality online implementations and raise promising options. Confirm design-level tradeoffs under the ownership rules; choose technical details independently.
 
 ## Contracts, Failures, and Security
-- Never simplify away trust-boundary validation, data-loss-preventing error handling, security behavior, accessibility basics, or real-hardware calibration controls.
+- Preserve trust-boundary validation, data-loss-preventing error handling, security behavior, accessibility basics, and real-hardware calibration controls required by the agreed behavior and threat model. Proposed changes to those requirements follow the assumption-approval gate; an honest-agent assumption never means agents are mistake-free.
 - Preserve in-scope authentication, authorization, permission and scope checks, secret handling, safe parsing and escaping, injection/XSS/CSRF/SSRF protections, resource limits, crypto/TLS defaults, and audit-relevant logs.
 - Add runtime checks only where strict assumptions matter (e.g., shape, range, dtype, device, trust, security boundaries). Checks must be narrow, fail fast, and actionable; avoid silent fallback unless explicitly requested.
 - Keep error paths visible without obscuring the main flow. Swallow/translate errors only to add actionable context. Failure/exception fixes require the smallest practical failure-path check.
