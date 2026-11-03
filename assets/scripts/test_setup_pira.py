@@ -69,7 +69,10 @@ class AutoRecapTests(unittest.TestCase):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         physical_home = str(Path(home.name).resolve())
-        environment = patch.dict(setup.os.environ, {**native_ctx_environment(Path(physical_home)), "SHELL": "/bin/sh"}, clear=True)
+        # Windows store defaults must not alias the ~/pira communicator fixture.
+        environment = patch.dict(setup.os.environ, {**native_ctx_environment(Path(physical_home)),
+                                 "LOCALAPPDATA": str(Path(physical_home) / "local-app-data"),
+                                 "SHELL": "/bin/sh"}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
         profiles = patch.object(setup.audio_retirement, "default_profiles", return_value=[Path(physical_home) / ".zshrc"])
@@ -176,8 +179,9 @@ class AutoRecapTests(unittest.TestCase):
                 home = os.environ["HOME"]
                 self.assertNotEqual(home, "do-not-inherit")
                 self.assertIsNone(setup.tool_setup.selected_codex_binary(Path(home) / "unused"))
-                for key in ("USERPROFILE", "LOCALAPPDATA", "APPDATA", "TMPDIR", "TMP", "TEMP"):
+                for key in ("USERPROFILE", "APPDATA", "TMPDIR", "TMP", "TEMP"):
                     self.assertEqual(os.environ[key], home)
+                self.assertEqual(Path(os.environ["LOCALAPPDATA"]), Path(home) / "local-app-data")
                 for key in ("OPENAI_API_KEY", "CODEX_HOME"):
                     self.assertNotIn(key, os.environ)
             finally:

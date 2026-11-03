@@ -239,7 +239,7 @@ class ClaudeSetupTests(unittest.TestCase):
         path = self.directory / "settings.json"
         path.write_text('{"model":"custom-model","env":{"CUSTOM":"keep"}}')
         instructions = self.directory / "CLAUDE.md"
-        instructions.write_text("My existing instruction.\n")
+        instructions.write_text("My existing instruction.\n", newline="")
         stores = {"PIRA_CTX_STORE_DIR": str(self.root / "ctx")}
         plan = claude.plan(self.directory, self.agent, stores, "keep")
         self.assertTrue(plan[instructions].startswith("My existing instruction.\n"))
@@ -249,16 +249,16 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertEqual(config["env"]["CUSTOM"], "keep")
         self.assertNotIn("permissions", config)
         for target, text in plan.items():
-            target.write_text(text)
+            target.write_text(text, newline="")
         self.assertEqual(claude.plan(self.directory, self.agent, stores, "keep"), plan)
 
     def test_migrates_only_generated_block_preserving_surrounding_custom_text(self) -> None:
         instructions = self.directory / "CLAUDE.md"
-        instructions.write_text("Before\n" + self.legacy_block() + "After\n")
+        instructions.write_text("Before\n" + self.legacy_block() + "After\n", newline="")
         plan = claude.plan(self.directory, self.agent, {}, "keep")
         expected = "Before\n" + claude.import_line(self.agent / "AGENTS.md") + "After\n"
         self.assertEqual(plan[instructions], expected)
-        instructions.write_text(expected)
+        instructions.write_text(expected, newline="")
         self.assertEqual(claude.plan(self.directory, self.agent, {}, "keep")[instructions], expected)
 
     def test_generated_only_block_becomes_canonical_link(self) -> None:
