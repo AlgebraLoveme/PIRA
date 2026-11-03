@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -35,6 +36,7 @@ CLAUDE_INSTALL_GUIDE = "https://code.claude.com/docs/en/setup"
 CODEX_RELEASE_API = "https://api.github.com/repos/openai/codex/releases/latest"
 MAX_CODEX_BYTES = 512 * 1024 * 1024
 CODEX_PACKAGE_DIR = ".pira-codex"
+MANAGED_SELECTION = "managed-v1\n"
 CODEX_TARGETS = {
     "darwin-x64": "x86_64-apple-darwin",
     "darwin-arm64": "aarch64-apple-darwin",
@@ -446,7 +448,7 @@ def codex_on_path(install_dir: Path | None = None) -> str | None:
         return shutil.which("codex")
     # SearchPathW starts with the application's directory. Team's directory is
     # the tool install directory, not the Python interpreter's directory.
-    team_image = (install_dir or default_install_dir()) / "codex.exe"
+    team_image = team_install_dir(install_dir or default_install_dir()) / "codex.exe"
     if team_image.is_file():
         return str(team_image.resolve())
     selected = windows_codex_binary()
@@ -465,7 +467,8 @@ def update_managed_block(path: Path, body: str, dry_run: bool) -> bool:
     return True
 
 
-def windows_user_path(directory: Path, dry_run: bool, *, append: bool = False) -> bool:
+def windows_user_path(directory: Path, dry_run: bool, *, append: bool = False,
+                      prefix: list[Path] | None = None) -> bool:
     import winreg
 
     try:
@@ -478,7 +481,13 @@ def windows_user_path(directory: Path, dry_run: bool, *, append: bool = False) -
     # Resolve both sides: Windows short names and directory aliases identify the same entry.
     present = [part for part in parts
                if os.path.normcase(os.path.realpath(os.path.expandvars(part))) == normalized]
-    if append:
+    if prefix is not None:
+        selected = {os.path.normcase(os.path.realpath(entry)) for entry in prefix}
+        updated = ";".join([*(str(entry) for entry in prefix), *(part for part in parts
+            if os.path.normcase(os.path.realpath(os.path.expandvars(part))) not in selected)])
+        if updated == current:
+            return False
+    elif append:
         # Move only this managed entry behind existing user choices, including on reruns.
         updated = ";".join([*(part for part in parts if part not in present), str(directory)])
         if updated == current:
@@ -497,23 +506,82 @@ def windows_user_path(directory: Path, dry_run: bool, *, append: bool = False) -
     return True
 
 
+def managed_codex_selected(install_dir: Path) -> bool:
+    package = install_dir / CODEX_PACKAGE_DIR
+    marker = package / "selected"
+    if package.is_symlink() or (package.exists() and not package.is_dir()):
+        raise RuntimeError(f"Refusing ambiguous managed Codex package: {package}")
+    if marker.is_symlink() or (marker.exists() and
+            (not marker.is_file() or marker.read_bytes() != MANAGED_SELECTION.encode("utf-8"))):
+        raise RuntimeError(f"Refusing ambiguous managed Codex selection: {marker}")
+    return marker.is_file()
+
+
+def team_install_dir(install_dir: Path) -> Path:
+    """Colocate managed Windows Team/Codex so application-directory lookup wins."""
+    if IS_WINDOWS and managed_codex_selected(install_dir):
+        # PATH alone cannot beat application/current/system directories. Keep the
+        # complete package together: copying codex.exe alone loses its resources.
+        return install_dir / CODEX_PACKAGE_DIR / "bin"
+    return install_dir
+
+
+def claude_managed_bin(install_dir: Path) -> Path | None:
+    package = install_dir / ".pira-claude"
+    marker = package / "selected"
+    if package.is_symlink() or marker.is_symlink():
+        raise RuntimeError(f"Refusing ambiguous managed Claude selection: {marker}")
+    if marker.exists():
+        if not marker.is_file() or marker.read_bytes() != MANAGED_SELECTION.encode("utf-8"):
+            raise RuntimeError(f"Refusing ambiguous managed Claude selection: {marker}")
+        return package / "bin"
+    return None
+
+
+def activate_directory(directory: Path) -> None:
+    """Process-local activation also works with --no-path; never persist here."""
+    parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    key = os.path.normcase(os.path.realpath(directory))
+    os.environ["PATH"] = os.pathsep.join([str(directory), *(part for part in parts
+        if os.path.normcase(os.path.realpath(part)) != key)])
+
+
+def activation_path_line(directory: Path | str) -> str:
+    # Unlike fallback PATH entries, an explicitly selected backend must win even
+    # when its directory was already present later in the caller's PATH.
+    value = shlex.quote(str(directory))
+    return f'case "$PATH" in {value}|{value}:*) ;; *) export PATH={value}:"$PATH" ;; esac'
+
+
 def ensure_path(directory: Path, dry_run: bool, *, include_codex: bool = False) -> bool:
     codex_bin = directory / CODEX_PACKAGE_DIR / "bin"
     directories = [directory]
     if include_codex or executable_path(codex_bin, "codex").is_file():
         directories.append(codex_bin)
-    selected = codex_on_path(directory)
+    claude_bin = claude_managed_bin(directory)
+    if claude_bin is not None:
+        directories.append(claude_bin)
+    selected = selected_codex_binary(directory)
     external = selected is not None and os.path.normcase(os.path.realpath(selected)) != os.path.normcase(
         os.path.realpath(executable_path(codex_bin, "codex")))
     changed = False
     if os.name == "nt":
-        for entry in directories:
-            changed = windows_user_path(entry, dry_run, append=entry == codex_bin and external) or changed
+        if managed_codex_selected(directory) or claude_bin is not None:
+            prefix = list(reversed([entry for entry in directories if entry != codex_bin or not external]))
+            changed = windows_user_path(prefix[0], dry_run, prefix=prefix)
+            if codex_bin in directories and external:
+                changed = windows_user_path(codex_bin, dry_run, append=True) or changed
+        else:
+            for entry in directories:
+                changed = windows_user_path(entry, dry_run, append=entry == codex_bin and external) or changed
     else:
-        # Do not activate a retained package over the external backend we checked.
-        # The package stays available to prepare_team_runtime if that backend disappears.
-        body = "\n".join(stores.shell_path_line(entry) for entry in directories
-                         if entry != codex_bin or not external)
+        retained = [entry for entry in directories if entry != codex_bin or not external]
+        lines = [stores.shell_path_line(entry) for entry in retained]
+        if managed_codex_selected(directory) or claude_bin is not None:
+            # Activate the whole prefix once: separate move-first lines would
+            # alternate order and grow PATH every time the profile is sourced.
+            lines.append(activation_path_line(os.pathsep.join(str(entry) for entry in reversed(retained))))
+        body = "\n".join(lines)
         for path in stores.shell_profiles():
             changed = update_managed_block(path, body, dry_run) or changed
     return changed
@@ -543,7 +611,8 @@ def path_is_configured(directory: Path) -> bool:
     return all(
         path.exists()
         and stores.BLOCK_START in path.read_text(encoding="utf-8")
-        and stores.shell_path_line(directory) in path.read_text(encoding="utf-8")
+        and any(line in path.read_text(encoding="utf-8") for line in
+                (stores.shell_path_line(directory), activation_path_line(directory)))
         for path in profiles
     )
 
@@ -574,7 +643,7 @@ def add_harness_arguments(parser: argparse.ArgumentParser) -> None:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--include", nargs="+", choices=["Codex", "ClaudeCode"],
                            dest="harness", action=_IncludeHarness, default="codex",
-                           help="CLIs to set up (default: Codex). Claude installation/login is caller-owned; old native CLIs are updated.")
+                           help="CLIs to prepare automatically (default: Codex); compatible native installs and existing authentication are preserved.")
     selection.add_argument("--harness", choices=["codex", "claude", "both"], default=argparse.SUPPRESS,
                            help="Compatibility selection; cannot be combined with --include.")
 
@@ -1004,7 +1073,7 @@ def install_codex(install_dir: Path, platform_key: str) -> Path:
         raise RuntimeError("Invalid Codex package checksum or size")
     # Construct the official URL; do not execute URLs/scripts supplied by metadata.
     url = f"https://github.com/openai/codex/releases/download/{tag}/{name}"
-    print(f"Installing missing Codex: {tag} ({platform_key}) -> {destination}")
+    print(f"Preparing official Codex: {tag} ({platform_key}) -> {destination}")
     with tempfile.TemporaryDirectory(prefix="pira-codex-download-") as temporary:
         archive = Path(temporary) / name
         request_to_path(url, archive, limit=MAX_CODEX_BYTES, expected_size=size,
@@ -1065,83 +1134,124 @@ def install_codex(install_dir: Path, platform_key: str) -> Path:
 
 
 def selected_codex_binary(install_dir: Path) -> str | None:
-    """Resolve the same external-first backend for setup and migration; no writes."""
-    existing = codex_on_path(install_dir)
+    """Resolve the persistent managed selection, otherwise external-first; no writes."""
     managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    selected = existing or (str(managed) if managed.is_file() else None)
+    if managed_codex_selected(install_dir):
+        if managed.exists() and not managed.is_file():
+            raise RuntimeError(f"Selected managed Codex is not a regular file: {managed}")
+        selected = str(managed)
+    else:
+        selected = codex_on_path(install_dir) or (str(managed) if managed.is_file() else None)
     if selected:
         resolved = Path(selected).resolve()
         if IS_WINDOWS and resolved.suffix.lower() != ".exe":
             raise RuntimeError(f"Windows codex.exe resolves to a non-native launcher: {resolved}. "
                                + WINDOWS_CODEX_GUIDANCE)
+        if Path(selected).parent == managed.parent and (managed.parent.is_symlink() or managed.is_symlink()):
+            raise RuntimeError(f"Refusing symlink in managed Codex binary: {managed}")
         return str(resolved)
-    if IS_WINDOWS and shutil.which("codex"):
-        raise RuntimeError(WINDOWS_CODEX_GUIDANCE)
     return None
 
 
-def prepare_claude_runtime(*, verify: bool, dry_run: bool, config_dir: Path | None = None) -> str:
-    """Require the Claude minimum, updating an older CLI only during normal setup."""
-    minimum = ".".join(map(str, TEAM_CLAUDE_MIN_VERSION))
-    guidance = (
-        f"Install/update Claude Code using the supported native instructions: {CLAUDE_INSTALL_GUIDE}; "
-        "make claude available in PATH, then rerun setup. Package-manager/custom-launcher installs "
-        "may need a manual upgrade. Setup does not change release channels; if your channel is "
-        "below the required floor, choose a suitable channel explicitly."
+def prepare_claude_runtime(*, verify: bool, dry_run: bool, config_dir: Path | None = None,
+                           install_dir: Path | None = None) -> str | None:
+    """Compatibility boundary shared with full setup and its mocked backend."""
+    import setup_pira_claude_runtime
+    return setup_pira_claude_runtime.prepare_runtime(
+        sys.modules[__name__], install_dir if install_dir is not None else default_install_dir(),
+        verify=verify, dry_run=dry_run, config_dir=config_dir,
     )
-    executable = shutil.which("claude")
-    if executable is None:
-        raise RuntimeError(f"Selected Claude setup requires Claude Code >= {minimum}. {guidance}")
-    # Disable background/opt-in package-manager updates, not the explicit native update.
-    environment = dict(os.environ, DISABLE_AUTOUPDATER="1", CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE="0")
-    if config_dir is not None:
-        environment["CLAUDE_CONFIG_DIR"] = str(config_dir)
 
-    def invoke(argument: str, timeout: int) -> subprocess.CompletedProcess[str]:
+
+def preserved_package_path(package: Path, label: str) -> Path:
+    for number in range(1, 10001):
+        candidate = package.with_name(f"{package.name}.{label}-{number}")
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise RuntimeError(f"Too many preserved Codex packages beside {package}")
+
+
+def select_managed_codex(install_dir: Path) -> None:
+    package = install_dir / CODEX_PACKAGE_DIR
+    managed_codex_selected(install_dir)  # Reject malformed markers rather than overwriting them.
+    marker = package / "selected"
+    if not marker.exists():
+        with marker.open("x", encoding="utf-8", newline="\n") as stream:
+            stream.write(MANAGED_SELECTION)
+
+
+def replace_managed_codex(install_dir: Path, platform_key: str) -> str:
+    """Serialize publication; a stale/foreign lock requires explicit operator recovery."""
+    install_dir.mkdir(parents=True, exist_ok=True)
+    lock = install_dir / ".pira-codex-prepare.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError as error:
+        raise RuntimeError(f"Managed Codex preparation is locked: {lock}. "
+                           "Wait for the other setup; if interrupted, inspect before removing the stale lock.") from error
+    try:
+        return publish_managed_codex(install_dir, platform_key)
+    finally:
+        lock.rmdir()
+
+
+def publish_managed_codex(install_dir: Path, platform_key: str) -> str:
+    """Validate before switching, retain old packages, and restore on activation failure."""
+    package = install_dir / CODEX_PACKAGE_DIR
+    managed_codex_selected(install_dir)
+    old = package.exists()
+    if old:
+        manifest = package / "codex-package.json"
+        if not manifest.is_file() or any(path.is_symlink() for path in package.rglob("*")):
+            raise RuntimeError(f"Refusing unrecognized or symlinked managed Codex package: {package}")
+        # Stage beside the destination, on the same filesystem as the atomic switch.
+        with tempfile.TemporaryDirectory(prefix=".pira-codex-update-", dir=install_dir) as temporary:
+            stage = Path(temporary)
+            install_codex(stage, platform_key)
+            replacement = stage / CODEX_PACKAGE_DIR
+            # Team can be activated beside Codex on Windows. Preserve that executable
+            # across a partial-tools Codex update, without changing its released bytes.
+            team = executable_path(package / "bin", "pira_team")
+            if team.exists():
+                if not team.is_file():
+                    raise RuntimeError(f"Refusing non-regular managed Team image: {team}")
+                shutil.copy2(team, replacement / "bin" / team.name)
+            backup = preserved_package_path(package, "backup")
+            package.rename(backup)
+            published = False
+            try:
+                if package.exists() or package.is_symlink():
+                    raise RuntimeError(f"Codex destination appeared during activation: {package}")
+                replacement.rename(package)
+                published = True
+                version = check_team_runtime(["pira_team"], str(executable_path(package / "bin", "codex")))
+                select_managed_codex(install_dir)
+            except BaseException:
+                if published:
+                    package.rename(preserved_package_path(package, "failed"))
+                elif package.exists() or package.is_symlink():
+                    raise RuntimeError(f"Codex activation was interrupted by another writer; "
+                                       f"previous package retained at {backup}; inspect before recovery")
+                backup.rename(package)
+                raise
+            print(f"Preserved previous managed Codex package: {backup}")
+    else:
+        installed = install_codex(install_dir, platform_key)
         try:
-            result = subprocess.run([executable, argument], stdin=subprocess.DEVNULL,
-                                    capture_output=True, text=True, timeout=timeout,
-                                    check=False, env=environment)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            outputs = (getattr(error, "stdout", None), getattr(error, "stderr", None))
-            detail = "\n".join(part.decode(errors="replace") if isinstance(part, bytes) else part
-                               for part in outputs if part)
-            raise RuntimeError(f"Cannot run Claude Code {argument}: {error}\n{detail}\n{guidance}") from error
-        if result.returncode:
-            raise RuntimeError(f"Claude Code {argument} failed (exit {result.returncode}).\n"
-                               f"{result.stdout}\n{result.stderr}\n{guidance}")
-        return result
+            version = check_team_runtime(["pira_team"], str(installed))
+            select_managed_codex(install_dir)
+        except BaseException:
+            if package.exists():
+                package.rename(preserved_package_path(package, "failed"))
+            raise
+    return version
 
-    def version() -> tuple[str, tuple[int, ...]]:
-        result = invoke("--version", 10)
-        text = result.stdout.strip()
-        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?: \(Claude Code\))?", text)
-        if match is None:
-            raise RuntimeError(f"Cannot parse Claude Code version: {text!r}.\n{result.stderr}\n{guidance}")
-        return text, tuple(map(int, match.groups()))
 
-    text, found = version()
-    if found < TEAM_CLAUDE_MIN_VERSION:
-        if verify or dry_run:
-            raise RuntimeError(f"Claude Code >= {minimum} required; found {text}. "
-                               f"Verify/dry-run will not update; upgrade manually or rerun normal setup for a native update attempt. {guidance}")
-        # npm's native binary can invoke global npm during self-update. Do not
-        # update npm installations or script launchers on the user's behalf.
-        resolved = Path(executable).resolve()
-        if ("node_modules" in (part.casefold() for part in resolved.parts)
-                or resolved.suffix.lower() in (".js", ".cjs", ".mjs", ".cmd", ".bat", ".ps1")):
-            raise RuntimeError(f"Claude Code >= {minimum} required; found {text}. "
-                               f"Refusing automatic update of an npm/script launcher: {executable}. {guidance}")
-        print(f"Updating Claude Code: found {text}, require >= {minimum}; release channel unchanged")
-        result = invoke("update", 300)
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
-        text, found = version()
-        if found < TEAM_CLAUDE_MIN_VERSION:
-            raise RuntimeError(f"Claude Code still below required >= {minimum} after claude update: {text}. {guidance}")
-    return text
+def prepare_codex_runtime(install_dir: Path, platform_key: str, *, verify: bool,
+                          dry_run: bool) -> str | None:
+    """Prepare the selected Codex even when released Team is filtered out."""
+    return prepare_team_runtime(["pira_team"], install_dir, platform_key,
+                                verify=verify, dry_run=dry_run)
 
 
 def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
@@ -1150,14 +1260,40 @@ def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
         return None
     executable = selected_codex_binary(install_dir)
     if executable:
-        return check_team_runtime(tools, executable)
-    managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    if verify:
-        return check_team_runtime(tools)  # Fail without downloading or writing.
+        try:
+            version = check_team_runtime(["pira_team"], executable)
+        except RuntimeError:
+            if verify:
+                raise
+        else:
+            managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
+            if not verify and not dry_run and Path(executable) == managed.resolve():
+                select_managed_codex(install_dir)
+                activate_directory(managed.parent)
+            return version
+    elif verify:
+        guidance = "Selected Codex is missing; rerun normal setup to install a supported native CLI."
+        raise RuntimeError(guidance + (" " + WINDOWS_CODEX_GUIDANCE if IS_WINDOWS else ""))
     if dry_run:
-        print(f"DRY-RUN: would download latest stable Codex into {managed.parent.parent}")
+        print("DRY-RUN: would prepare a supported official managed Codex package; "
+              "external installs and authentication remain unchanged")
         return None
-    return check_team_runtime(tools, str(install_codex(install_dir, platform_key)))
+    managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
+    # A previously retained compatible package can replace an old external CLI
+    # without another download. Only successful native checks authorize selection.
+    if managed.is_file() and (executable is None or Path(executable) != managed.resolve()):
+        try:
+            version = check_team_runtime(["pira_team"], str(managed.resolve()))
+        except RuntimeError:
+            pass
+        else:
+            select_managed_codex(install_dir)
+            activate_directory(managed.parent)
+            return version
+    version = replace_managed_codex(install_dir, platform_key)
+    activate_directory(managed.parent)
+    print("OK: managed Codex selected; external installs, account and credential storage unchanged")
+    return version
 
 
 def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
@@ -1171,25 +1307,20 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
     if os.environ.get("CODEX_API_KEY"):
         print("OK: CODEX_API_KEY is configured for Team (not remotely validated)")
         return
-    executable = codex_on_path(install_dir) or str(
-        executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    )
+    executable = selected_codex_binary(install_dir)
+    if executable is None:
+        raise RuntimeError("Cannot check authentication without the selected Codex executable")
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     auth_file = home / "auth.json"
-    # Team links file auth into a private home; a keyring-only status is insufficient.
-    command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
-    env = dict(os.environ)
-    for key in ("OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
-        env.pop(key, None)
+    if (auth_file.exists() or auth_file.is_symlink()) and not auth_file.is_file():
+        raise RuntimeError("Existing Codex credential path is not a regular file; preserved without login")
+    existing_file = auth_file.exists()
+    native_command = [executable, "login", "status"]
 
-    def cached_login_ready() -> bool:
-        if not auth_file.is_file():
-            return False
+    def status(command: list[str], environment: dict[str, str]) -> bool:
         try:
-            result = subprocess.run(
-                [*command, "status"], stdin=subprocess.DEVNULL, capture_output=True,
-                text=True, timeout=15, check=False, env=env,
-            )
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=15, check=False, env=environment)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise RuntimeError("Could not check Codex login status; fix the runtime/configuration "
                                "and rerun setup. No login was started.") from error
@@ -1197,18 +1328,35 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
             return True
         if result.returncode == 1 and "Not logged in" in (result.stdout + result.stderr).splitlines():
             return False
-        # Status may include an account identifier or partial key; never echo its output.
         raise RuntimeError("Codex login status failed unexpectedly; inspect Codex configuration "
                            "or run codex login status privately. No automatic re-login was attempted.")
 
-    if cached_login_ready():
-        print("OK: Codex recognizes Team's file-backed login (model access not remotely validated)")
+    if status(native_command, dict(os.environ)):
+        if existing_file:
+            print("OK: existing native Codex authentication preserved. LIMITATION: Team uses CODEX_HOME/auth.json "
+                  "or CODEX_API_KEY, not the native keyring; confirm the existing file is the intended "
+                  "Team account. File/native account equivalence and model access were not validated.")
+        else:
+            print("LIMITATION: native Codex is authenticated but no Team file cache exists. "
+                  "Current Team supports CODEX_API_KEY or CODEX_HOME/auth.json, not keyring-only "
+                  "or other native-only authentication. CLI preparation is complete; existing auth "
+                  "is unchanged. Explicitly configure supported Team authentication and rerun setup, "
+                  "or request runtime keyring support. No conversion, export or login was attempted.")
         return
     guidance = ("Rerun setup with --codex-login browser for local browser login, or "
                 "--codex-login device for a link/code. Device login must be enabled in "
                 "ChatGPT security/workspace settings. Admin-enforced storage rules are not bypassed.")
+    if existing_file:
+        raise RuntimeError("Existing Codex authentication was not accepted; preserved without overwrite. "
+                           "Check or renew the intended account privately, then rerun setup.")
     if verify or login == "skip":
         raise RuntimeError("Team-compatible Codex login is missing. " + guidance)
+    command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
+    env = dict(os.environ)
+    for key in ("OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
+        env.pop(key, None)
+    if auth_file.exists() or auth_file.is_symlink():
+        raise RuntimeError("Codex credential path appeared during preparation; preserved without login")
     mode = login
     if mode == "auto":
         mode = "browser" if sys.stdin.isatty() else "device"
@@ -1235,7 +1383,7 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
         raise RuntimeError("Could not launch Codex login. " + guidance) from error
     if result.returncode != 0:
         raise RuntimeError("Codex login did not complete. " + guidance)
-    if not cached_login_ready():
+    if not auth_file.is_file() or not status([executable, "-c", 'cli_auth_credentials_store="file"', "login", "status"], env):
         raise RuntimeError("Login returned without a Team-compatible file cache. "
                            "Check enforced credential-storage requirements. " + guidance)
     print("OK: Team-compatible Codex login is ready (model access not remotely validated)")
@@ -1243,13 +1391,18 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     use_codex = args.harness != "claude"
+    initial_path = os.environ.get("PATH", "")
+    install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
     if args.harness in ("claude", "both"):
-        runtime = prepare_claude_runtime(verify=args.verify, dry_run=args.dry_run)
-        print(f"OK: Claude Code runtime {runtime}")
+        runtime = prepare_claude_runtime(verify=args.verify, dry_run=args.dry_run, install_dir=install_dir)
+        if runtime:
+            print(f"OK: Claude Code runtime {runtime}")
+        claude_bin = claude_managed_bin(install_dir)
+        if claude_bin is not None and not args.verify and not args.dry_run:
+            activate_directory(claude_bin)
     if not args.no_path:
         stores.configuration_toml()
     selector = load_selector()
-    install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
     index = release_index()
     platform_key = selector.current_platform()
     tools = selected_tools(index, args.tools)
@@ -1260,14 +1413,14 @@ def main(argv: list[str] | None = None) -> int:
             "version specified for tool excluded by --tool: "
             + ", ".join(unselected_versions)
         )
-    if "pira_team" in tools and use_codex:
-        runtime = prepare_team_runtime(tools, install_dir, platform_key,
-                                       verify=args.verify, dry_run=args.dry_run)
+    if use_codex:
+        runtime = prepare_codex_runtime(install_dir, platform_key,
+                                        verify=args.verify, dry_run=args.dry_run)
         if runtime:
-            print(f"OK: Team backend {runtime}; native API inventory and isolated strict-config stdio initialize verified (not shared daemon/model access)")
+            print(f"OK: selected Codex {runtime}; native API inventory and isolated strict-config stdio initialize verified (not shared daemon/model access)")
     # Preparation can install a managed backend outside PATH. Pass that exact
     # selection to retained-history preflight before publishing any store paths.
-    codex_binary = selected_codex_binary(install_dir) if "pira_team" in tools and use_codex else None
+    codex_binary = selected_codex_binary(install_dir) if use_codex else None
     store_plan = (stores.plan_store_environment(tools, codex_binary=codex_binary,
                   completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team,
                   exclude_ctx_records=args.exclude_ctx_record)
@@ -1296,7 +1449,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         indexes[tool_name] = exact_index
     selections = [
-        tool_selection(indexes[tool_name], tool_name, platform_key, install_dir)
+        tool_selection(indexes[tool_name], tool_name, platform_key,
+                       team_install_dir(install_dir) if tool_name == "pira_team" else install_dir)
         for tool_name in tools
     ]
 
@@ -1314,9 +1468,12 @@ def main(argv: list[str] | None = None) -> int:
             if not version_matches(selection.name, selection.version, version):
                 failures.append(f"{selection.name}: unexpected version: {version}")
         codex_bin = install_dir / CODEX_PACKAGE_DIR / "bin"
-        if (use_codex and "pira_team" in tools and not codex_on_path(install_dir) and not args.no_path
+        if (use_codex and managed_codex_selected(install_dir) and not args.no_path
                 and not path_is_configured(codex_bin)):
             failures.append("managed Codex directory is not configured in the user PATH")
+        claude_bin = claude_managed_bin(install_dir)
+        if claude_bin is not None and not args.no_path and not path_is_configured(claude_bin):
+            failures.append("managed Claude directory is not configured in the user PATH")
         if not args.no_path and not path_is_configured(install_dir):
             failures.append("install directory is not configured in the user PATH")
         if failures:
@@ -1348,7 +1505,7 @@ def main(argv: list[str] | None = None) -> int:
                 installed = selector.install_binary(
                     source,
                     selection.record,
-                    install_dir,
+                    selection.destination.parent,
                     tool_name=selection.name,
                 )
                 actual = sha256(installed)
@@ -1366,13 +1523,16 @@ def main(argv: list[str] | None = None) -> int:
     if any(selection.name == "pira_nav" for selection in selections):
         remove_managed_legacy_tools(install_dir, args.dry_run)
 
+    path_changed = False
     if not args.no_path:
         stores.apply_store_environment(store_plan, dry_run=args.dry_run)
-        ensure_path(install_dir, args.dry_run,
-                    include_codex=use_codex and "pira_team" in tools and not codex_on_path(install_dir))
+        path_changed = ensure_path(install_dir, args.dry_run,
+                    include_codex=use_codex and (managed_codex_selected(install_dir) or not codex_on_path(install_dir)))
 
     if not args.dry_run:
-        restart_needed = use_codex and "pira_team" in tools and not codex_on_path(install_dir)
+        if any(selection.name == "pira_team" for selection in selections) and team_install_dir(install_dir) != install_dir:
+            activate_directory(team_install_dir(install_dir))
+        restart_needed = path_changed or os.environ.get("PATH", "") != initial_path
         for selection in selections:
             version = direct_version(selection.destination)
             if not version_matches(selection.name, selection.version, version):

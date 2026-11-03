@@ -653,7 +653,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-dir", default="~/agent", help="Global PIRA path to configure (default: ~/agent).")
     tool_setup.add_harness_arguments(parser)
     parser.add_argument("--claude-dir", default=os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"), help="Claude user configuration directory.")
-    parser.add_argument("--codex-config", default="~/.codex/config.toml", help="Codex config.toml path.")
+    parser.add_argument("--codex-config", default=str(Path(os.environ.get("CODEX_HOME") or "~/.codex") / "config.toml"),
+                        help="Codex config file (default: CODEX_HOME/config.toml or ~/.codex/config.toml). "
+                             "A file override does not change the authentication home.")
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
@@ -689,6 +691,7 @@ def configure_tools(
     verify_only: bool,
     codex_login: str = "auto",
     harness: str = "codex",
+    claude_dir: str | None = None,
 ) -> None:
     script = state.repo_root / "assets" / "scripts" / "setup_pira_tools.py"
     if not script.is_file():
@@ -708,7 +711,10 @@ def configure_tools(
         command.append("--verify")
     elif state.dry_run:
         command.append("--dry-run")
-    subprocess.run(command, check=True)
+    environment = dict(os.environ)
+    if claude_dir is not None:
+        environment["CLAUDE_CONFIG_DIR"] = str(expand_path(claude_dir))
+    subprocess.run(command, check=True, env=environment)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -718,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parents[2]
     state = SetupState(repo_root=repo_root, agent_dir=expand_path(args.agent_dir), dry_run=args.dry_run or args.verify, yes=args.yes, completed_ctx_only=args.completed_ctx_only, fresh_team=args.fresh_team, exclude_ctx_records=tuple(args.exclude_ctx_record))
     config_path = expand_path(args.codex_config)
+    native_install_dir = (expand_path(args.tools_install_dir) if args.tools_install_dir
+                          else tool_setup.default_install_dir())
 
     print("PIRA setup")
     print(f"Repository: {display_path(repo_root)}")
@@ -725,11 +733,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Dry run:    {state.dry_run}")
 
     try:
+        if args.harness != "claude":
+            runtime = tool_setup.prepare_codex_runtime(
+                native_install_dir, tool_setup.load_selector().current_platform(),
+                verify=args.verify, dry_run=args.dry_run,
+            )
+            if runtime:
+                print(f"OK: Codex runtime {runtime}")
         if use_claude:
             runtime = tool_setup.prepare_claude_runtime(
                 verify=args.verify, dry_run=args.dry_run, config_dir=expand_path(args.claude_dir),
+                install_dir=native_install_dir,
             )
-            print(f"OK: Claude Code runtime {runtime}")
+            if runtime:
+                print(f"OK: Claude Code runtime {runtime}")
         codex_plan = None
         codex_binary = None
         audio_plan = None
@@ -776,6 +793,9 @@ def main(argv: list[str] | None = None) -> int:
                     write_claude_link(state, path, content)
                 else:
                     write_claude_text(state, path, content)
+            if args.skip_tools and any((native_install_dir / name).is_dir()
+                                       for name in (tool_setup.CODEX_PACKAGE_DIR, ".pira-claude")):
+                tool_setup.ensure_path(native_install_dir, state.dry_run)
             if not args.skip_tools:
                 configure_tools(
                     state,
@@ -784,6 +804,7 @@ def main(argv: list[str] | None = None) -> int:
                     verify_only=False,
                     codex_login=args.codex_login,
                     harness=args.harness,
+                    claude_dir=args.claude_dir if use_claude else None,
                 )
         if args.dry_run and not args.verify:
             print("DRY-RUN: verification skipped because planned changes were not applied")
@@ -802,6 +823,7 @@ def main(argv: list[str] | None = None) -> int:
                     verify_only=True,
                     codex_login=args.codex_login,
                     harness=args.harness,
+                    claude_dir=args.claude_dir if use_claude else None,
                 )
     except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -287,6 +287,9 @@ class TeamAuthTests(unittest.TestCase):
         self.env.start(); self.addCleanup(self.env.stop)
         self.which = patch.object(setup.shutil, "which", return_value="/test/codex")
         self.which.start(); self.addCleanup(self.which.stop)
+        self.executable = str(self.root / ("codex.exe" if setup.IS_WINDOWS else "codex"))
+        selection = patch.object(setup, "selected_codex_binary", return_value=self.executable)
+        selection.start(); self.addCleanup(selection.stop)
 
     def ensure(self, **kwargs) -> None:
         options = dict(verify=False, dry_run=False, login="auto")
@@ -306,11 +309,12 @@ class TeamAuthTests(unittest.TestCase):
         self.assertEqual(list(self.home.iterdir()), [])
 
     def test_verify_and_skip_fail_missing_login_without_starting_flow(self) -> None:
-        with patch.object(setup.subprocess, "run") as run:
+        with patch.object(setup.subprocess, "run", return_value=self.result(1, "Not logged in")) as run:
             for options in (dict(verify=True), dict(login="skip"), dict(verify=True, dry_run=True)):
                 with self.assertRaisesRegex(RuntimeError, "login is missing"):
                     self.ensure(**options)
-            run.assert_not_called()
+            self.assertEqual(run.call_count, 3)
+            self.assertTrue(all(call.args[0][-2:] == ["login", "status"] for call in run.call_args_list))
         self.assertFalse(self.auth.exists())
 
     def test_existing_file_cache_reused_without_leaking_status_output(self) -> None:
@@ -321,9 +325,9 @@ class TeamAuthTests(unittest.TestCase):
             self.ensure()
             run.assert_called_once()
             call = run.call_args
-            self.assertEqual(call.args[0], ["/test/codex", "-c", 'cli_auth_credentials_store="file"', "login", "status"])
-            self.assertNotIn("OPENAI_API_KEY", call.kwargs["env"])
-            self.assertNotIn("CODEX_ACCESS_TOKEN", call.kwargs["env"])
+            self.assertEqual(call.args[0], [self.executable, "login", "status"])
+            self.assertEqual(call.kwargs["env"]["OPENAI_API_KEY"], "synthetic-other-key")
+            self.assertEqual(call.kwargs["env"]["CODEX_ACCESS_TOKEN"], "synthetic-other-token")
             self.assertNotIn("private-status", output.getvalue())
         self.assertEqual(self.auth.read_text(), "synthetic-cache")
 
@@ -338,12 +342,14 @@ class TeamAuthTests(unittest.TestCase):
                         self.assertEqual(kwargs["timeout"], 300)
                         self.assertEqual("--device-auth" in command, device)
                         self.auth.write_text("synthetic-cache")
-                    return self.result()
-                with patch.object(setup.subprocess, "run", side_effect=run) as calls, \
+                    return self.result() if self.auth.exists() else self.result(1, "Not logged in")
+                managed = str(setup.executable_path(self.root / setup.CODEX_PACKAGE_DIR / "bin", "codex"))
+                with patch.object(setup, "selected_codex_binary", return_value=managed), \
+                     patch.object(setup.subprocess, "run", side_effect=run) as calls, \
                      patch.object(setup.sys.stdin, "isatty", return_value=tty), \
                      patch.object(setup.shutil, "which", return_value=None):
                     self.ensure(login=login)
-                    self.assertEqual(calls.call_count, 2)
+                    self.assertEqual(calls.call_count, 3)
                     self.assertEqual(calls.call_args_list[0].args[0][0],
                                      str(setup.executable_path(self.root / setup.CODEX_PACKAGE_DIR / "bin", "codex")))
 
@@ -354,11 +360,10 @@ class TeamAuthTests(unittest.TestCase):
                                   (OSError("unavailable"), "Could not launch"),
                                   (self.result(), "without a Team-compatible")]:
             with self.subTest(message=message), patch.object(setup.subprocess, "run") as run:
-                if isinstance(response, BaseException): run.side_effect = response
-                else: run.return_value = response
+                run.side_effect = [self.result(1, "Not logged in"), response]
                 with self.assertRaisesRegex(RuntimeError, message):
                     self.ensure(login="device")
-                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_count, 2)
 
     def test_status_configuration_errors_never_trigger_login_or_echo_details(self) -> None:
         self.auth.write_text("synthetic-cache")
@@ -371,15 +376,63 @@ class TeamAuthTests(unittest.TestCase):
                 self.assertNotIn("private-error", str(error.exception))
                 self.assertEqual(run.call_count, 1)
 
-    def test_recognized_signed_out_status_starts_login_then_rechecks(self) -> None:
-        self.auth.write_text("synthetic-cache")
-        with patch.object(setup.subprocess, "run",
-                          side_effect=[self.result(1, "WARNING: helper aliases unavailable\nNot logged in\n"), self.result(), self.result()]) as run:
+    def test_existing_signed_out_cache_is_never_overwritten(self) -> None:
+        self.auth.write_text("synthetic-expired-cache")
+        with patch.object(setup.subprocess, "run", return_value=self.result(1, "Not logged in")) as run:
+            with self.assertRaisesRegex(RuntimeError, "preserved without overwrite"):
+                self.ensure(login="browser")
+            run.assert_called_once()
+        self.assertEqual(self.auth.read_text(), "synthetic-expired-cache")
+
+    def test_native_keyring_or_environment_auth_is_preserved_including_skip(self) -> None:
+        for options in ({}, {"login": "skip"}, {"verify": True}, {"verify": True, "dry_run": True}):
+            output = io.StringIO()
+            with self.subTest(options=options), \
+                 patch.object(setup.subprocess, "run", return_value=self.result(stderr="private-account")) as run, \
+                 patch.object(setup.sys, "stdout", output):
+                self.ensure(**options)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], [self.executable, "login", "status"])
+                self.assertIn("LIMITATION", output.getvalue())
+                self.assertIn("not keyring-only", output.getvalue())
+                self.assertNotIn("private-account", output.getvalue())
+                self.assertFalse(self.auth.exists())
+
+    def test_authentication_cache_is_not_opened_by_setup(self) -> None:
+        self.auth.write_text("synthetic-do-not-read")
+        native_open = Path.open
+        def reject_credentials(path, *args, **kwargs):
+            if path == self.auth:
+                raise AssertionError("setup must not read credential contents")
+            return native_open(path, *args, **kwargs)
+        with patch.object(Path, "open", reject_credentials), \
+             patch.object(setup.subprocess, "run", return_value=self.result()):
+            self.ensure()
+
+    @unittest.skipUnless(os.name == "posix", "credential-link fixture without Windows privileges")
+    def test_existing_credential_link_is_reused_without_open_or_relogin(self):
+        target = self.home / "private-cache"; target.write_bytes(b"synthetic-cache")
+        self.auth.symlink_to(target)
+        with patch.object(setup.subprocess, "run", return_value=self.result()) as run:
+            self.ensure(login="skip")
+            run.assert_called_once()
+        self.assertTrue(self.auth.is_symlink())
+        self.assertEqual(target.read_bytes(), b"synthetic-cache")
+
+    def test_fresh_signed_out_auth_logs_in_once_then_checks_file_source(self) -> None:
+        def native(command, **kwargs):
+            if command[-1] == "status":
+                return self.result() if self.auth.exists() else self.result(1, "Not logged in")
+            self.auth.write_text("synthetic-fresh-cache")
+            self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+            self.assertNotIn("CODEX_ACCESS_TOKEN", kwargs["env"])
+            return self.result()
+        with patch.object(setup.subprocess, "run", side_effect=native) as run:
             self.ensure(login="browser")
             self.assertEqual(run.call_count, 3)
-            self.assertEqual(run.call_args_list[0].args[0][-1], "status")
-            self.assertEqual(run.call_args_list[1].args[0][-1], "login")
-            self.assertEqual(run.call_args_list[2].args[0][-1], "status")
+            self.assertEqual(run.call_args_list[0].args[0], [self.executable, "login", "status"])
+            self.assertEqual(run.call_args_list[-1].args[0],
+                [self.executable, "-c", 'cli_auth_credentials_store="file"', "login", "status"])
 
 
 class SetupPiraToolsTests(unittest.TestCase):
@@ -437,7 +490,8 @@ class SetupPiraToolsTests(unittest.TestCase):
                 self.assertEqual(plan.call_args.kwargs["codex_binary"], "fixture-codex" if use_codex else None)
 
     @unittest.skipIf(os.name == "nt", "POSIX execute permission")
-    def test_nonexecutable_matching_binary_refresh_and_readonly_modes(self):
+    @patch.object(setup, "prepare_codex_runtime", return_value="codex-cli 0.166.0")
+    def test_nonexecutable_matching_binary_refresh_and_readonly_modes(self, prepared):
         root = Path(setup.os.environ["HOME"])
         binary = setup.executable_path(root / "bin", "pira_ctx")
         binary.parent.mkdir()
@@ -464,7 +518,8 @@ class SetupPiraToolsTests(unittest.TestCase):
             fetch.assert_called_once()
             self.assertEqual(binary.stat().st_ino, inode)
 
-    def test_no_path_skips_all_environment_persistence_and_verification(self) -> None:
+    @patch.object(setup, "prepare_codex_runtime", return_value="codex-cli 0.166.0")
+    def test_no_path_skips_all_environment_persistence_and_verification(self, prepared) -> None:
         root = Path(setup.os.environ["HOME"])
         binary = setup.executable_path(root / "bin", "pira_ctx")
         binary.parent.mkdir()
@@ -486,7 +541,8 @@ class SetupPiraToolsTests(unittest.TestCase):
         self.assertEqual(list(root.iterdir()), [binary.parent])
 
     @unittest.skipIf(sys.platform == "win32", "Windows Ctx default did not relocate")
-    def test_standalone_migration_barrier_precedes_profile_and_path_switch(self) -> None:
+    @patch.object(setup, "prepare_codex_runtime", return_value="codex-cli 0.166.0")
+    def test_standalone_migration_barrier_precedes_profile_and_path_switch(self, prepared) -> None:
         root = Path(setup.os.environ["HOME"])
         source = setup.stores.historical_store_paths("pira_ctx")[0]
         destination = Path(setup.stores.selected_store_paths(["pira_ctx"])["PIRA_CTX_STORE_DIR"])
@@ -537,14 +593,14 @@ class SetupPiraToolsTests(unittest.TestCase):
                 setup.main(["--tool", "pira_ctx", "--version", "team=0.2.0"])
             runtime.assert_not_called()
 
-    def test_partial_install_verify_and_dry_run_skip_backend_and_preserve_binary(self) -> None:
+    def test_partial_install_verify_and_dry_run_prepare_codex_and_preserve_team(self) -> None:
         selector = setup.load_selector()
         platform_key = selector.current_platform()
         index = self.index(platform_key)
         index["tools"]["pira_team"] = {"version": "0.2.0", "binaries": {}}
         for mode in ([], ["--verify"], ["--dry-run"]):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
+                root = Path(temp).resolve()
                 team = setup.executable_path(root, "pira_team")
                 team.write_bytes(b"preexisting team")
                 ctx = setup.executable_path(root, "pira_ctx")
@@ -559,7 +615,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                 with patch.object(setup, "release_index", return_value=index), \
                      patch.object(setup, "load_selector", return_value=selector), \
                      patch.object(selector, "current_platform", return_value=platform_key), \
-                     patch.object(setup, "prepare_team_runtime") as runtime, \
+                     patch.object(setup, "prepare_codex_runtime", return_value="valid") as runtime, \
                      patch.object(setup, "ensure_team_auth") as auth, \
                      patch.object(setup, "download_binary", side_effect=download) as fetch, \
                      patch.object(setup, "direct_version", return_value="pira_ctx 1.6.0"), \
@@ -568,7 +624,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                     if "--verify" in mode:
                         setup.stores.apply_store_environment(setup.stores.plan_store_environment(["pira_ctx"]), dry_run=False)
                     self.assertEqual(setup.main(["--tool", "pira_ctx", "--install-dir", str(root), *mode]), 0)
-                    runtime.assert_not_called()
+                    runtime.assert_called_once_with(root, platform_key, verify="--verify" in mode, dry_run="--dry-run" in mode)
                     auth.assert_not_called()
                     if mode:
                         fetch.assert_not_called()
@@ -577,7 +633,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                     if "--verify" in mode:
                         path.assert_not_called()
                     else:
-                        self.assertFalse(path.call_args.kwargs["include_codex"])
+                        self.assertTrue(path.call_args.kwargs["include_codex"])
                 self.assertEqual(team.read_bytes(), b"preexisting team")
                 self.assertEqual(ctx.read_bytes(), b"binary")
 
@@ -607,18 +663,19 @@ class SetupPiraToolsTests(unittest.TestCase):
             protocol.assert_called_once_with(str(native.resolve()))
             self.assertTrue(all(call.args == ("codex.exe",) for call in which.call_args_list))
 
-    def test_windows_shim_only_layout_fails_without_installing_or_executing_it(self) -> None:
+    def test_windows_shim_only_layout_plans_or_installs_native_without_executing_shim(self) -> None:
         root = Path(setup.os.environ["HOME"])
-        for verify, dry_run in ((False, False), (True, False), (False, True)):
-            with self.subTest(verify=verify, dry_run=dry_run), \
-                 patch.object(setup, "IS_WINDOWS", True, create=True), \
-                 patch.object(setup.shutil, "which", side_effect=lambda name: None if name == "codex.exe" else str(root / "codex.cmd")), \
-                 patch.object(setup, "check_team_runtime") as check, \
-                 patch.object(setup, "install_codex") as install:
-                with self.assertRaisesRegex(RuntimeError, "native codex.exe.*shims"):
-                    setup.prepare_team_runtime(["pira_team"], root, "windows-x64", verify=verify, dry_run=dry_run)
-                check.assert_not_called()
-                install.assert_not_called()
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup.shutil, "which", side_effect=lambda name: None if name == "codex.exe" else str(root / "codex.cmd")), \
+             patch.object(setup, "check_team_runtime") as check, \
+             patch.object(setup, "replace_managed_codex", return_value="valid") as install:
+            with self.assertRaisesRegex(RuntimeError, "Selected Codex is missing"):
+                setup.prepare_codex_runtime(root, "windows-x64", verify=True, dry_run=False)
+            self.assertIsNone(setup.prepare_codex_runtime(root, "windows-x64", verify=False, dry_run=True))
+            install.assert_not_called()
+            self.assertEqual(setup.prepare_codex_runtime(root, "windows-x64", verify=False, dry_run=False), "valid")
+            install.assert_called_once_with(root, "windows-x64")
+            check.assert_not_called()
 
     def test_windows_managed_native_is_used_when_only_npm_shim_is_on_path(self) -> None:
         root = Path(setup.os.environ["HOME"])
@@ -640,6 +697,19 @@ class SetupPiraToolsTests(unittest.TestCase):
         native.write_bytes(b"native fixture, never executed")
         with patch.object(setup, "IS_WINDOWS", True), \
              patch.object(setup, "windows_codex_binary", return_value=str(root / "other" / "codex.exe")) as search:
+            self.assertEqual(setup.selected_codex_binary(root), str(native.resolve()))
+            search.assert_not_called()
+
+    def test_windows_managed_application_directory_wins_other_native_search_locations(self):
+        root = Path(setup.os.environ["HOME"])
+        package = root / setup.CODEX_PACKAGE_DIR
+        native = package / "bin" / "codex.exe"
+        native.parent.mkdir(parents=True); native.write_bytes(b"fixture")
+        (package / "selected").write_bytes(b"managed-v1\n")
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup, "windows_codex_binary", return_value=str(root / "shadow" / "codex.exe")) as search:
+            self.assertEqual(setup.team_install_dir(root), native.parent)
+            self.assertEqual(setup.codex_on_path(root), str(native.resolve()))
             self.assertEqual(setup.selected_codex_binary(root), str(native.resolve()))
             search.assert_not_called()
 
@@ -796,26 +866,24 @@ class SetupPiraToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             platform = setup.load_selector().current_platform()
-            installed = setup.executable_path(root, "codex")
             existing = setup.executable_path(root / "existing", "codex")
             with patch.object(setup.shutil, "which", return_value=None), \
-                 patch.object(setup, "install_codex", return_value=installed) as install, \
-                 patch.object(setup, "check_team_runtime", return_value="codex-cli 0.166.0") as check:
+                 patch.object(setup, "replace_managed_codex", return_value="valid") as install, \
+                 patch.object(setup, "check_team_runtime") as check:
                 self.assertIsNone(setup.prepare_team_runtime(["pira_nav"], root, platform, verify=False, dry_run=False))
-                self.assertIsNone(setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=True))
+                self.assertIsNone(setup.prepare_codex_runtime(root, platform, verify=False, dry_run=True))
+                with self.assertRaisesRegex(RuntimeError, "Selected Codex is missing"):
+                    setup.prepare_codex_runtime(root, platform, verify=True, dry_run=False)
                 install.assert_not_called()
                 check.assert_not_called()
-                setup.prepare_team_runtime(["pira_team"], root, platform, verify=True, dry_run=False)
-                install.assert_not_called()
-                setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=False)
+                self.assertEqual(setup.prepare_codex_runtime(root, platform, verify=False, dry_run=False), "valid")
                 install.assert_called_once_with(root, platform)
             with patch.object(setup.shutil, "which", return_value=str(existing)), \
-                 patch.object(setup, "install_codex") as install, \
+                 patch.object(setup, "replace_managed_codex", return_value="new") as install, \
                  patch.object(setup, "check_team_runtime", side_effect=RuntimeError("old runtime")) as check:
-                with self.assertRaisesRegex(RuntimeError, "old runtime"):
-                    setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=False)
+                self.assertEqual(setup.prepare_codex_runtime(root, platform, verify=False, dry_run=False), "new")
                 check.assert_called_once_with(["pira_team"], str(existing.resolve()))
-                install.assert_not_called()
+                install.assert_called_once_with(root, platform)
 
     def codex_package(self, platform: str, extra: tarfile.TarInfo | None = None) -> tuple[bytes, bytes]:
         suffix = ".exe" if platform.startswith("windows-") else ""
@@ -1034,6 +1102,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                                   (str(managed / "codex.exe"), False), (None, False)):
             with self.subTest(selected=selected), patch.object(setup.os, "name", "nt"), \
                  patch.object(setup, "IS_WINDOWS", True), \
+                 patch.object(setup, "Path", type(root)), \
                  patch.object(setup, "codex_on_path", return_value=selected), \
                  patch.object(setup, "windows_user_path", return_value=False) as persist:
                 setup.ensure_path(root, False, include_codex=True)
@@ -1270,6 +1339,311 @@ class SetupPiraToolsTests(unittest.TestCase):
         index["tools"]["pira_ctx"]["binaries"]["linux-x64"]["asset"] = "other"
         with self.assertRaisesRegex(RuntimeError, "asset name"):
             setup.tool_selection(index, "pira_ctx", "linux-x64", Path("install"))
+
+
+class CodexPreparationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.install = self.root / "tools"
+        self.install.mkdir()
+        self.platform = "windows-x64" if setup.IS_WINDOWS else "linux-x64"
+        self.package = self.install / setup.CODEX_PACKAGE_DIR
+        self.external = setup.executable_path(self.root / "external", "codex")
+        environment = patch.dict(os.environ, {"HOME": str(self.root), "USERPROFILE": str(self.root),
+                                               "PATH": "", "LOCALAPPDATA": str(self.root)}, clear=True)
+        environment.start(); self.addCleanup(environment.stop)
+        for mocked in (
+            patch.object(setup, "urlopen", side_effect=AssertionError("unexpected network")),
+            patch.object(setup, "codex_on_path", side_effect=lambda directory=None:
+                         str(self.external) if self.external.exists() else None),
+            patch.object(setup, "check_team_runtime", side_effect=self.check),
+        ):
+            mocked.start(); self.addCleanup(mocked.stop)
+
+    def package_at(self, install, content=b"compatible", platform=None):
+        package = install / setup.CODEX_PACKAGE_DIR
+        (package / "bin").mkdir(parents=True)
+        (package / "codex-package.json").write_text('{"fixture":true}')
+        suffix = ".exe" if (platform or self.platform).startswith("windows-") else ""
+        binary = package / "bin" / ("codex" + suffix)
+        binary.write_bytes(content); binary.chmod(0o755)
+        (package / "bin" / ("codex-code-mode-host" + suffix)).write_bytes(b"resource")
+        return binary
+
+    def check(self, tools, executable):
+        self.assertEqual(tools, ["pira_team"])
+        if not Path(executable).is_file() or Path(executable).read_bytes() != b"compatible":
+            raise RuntimeError("incompatible native version/protocol")
+        return "codex-cli 0.166.0"
+
+    def install_package(self, install, platform):
+        return self.package_at(install, platform=platform)
+
+    def prepare(self, **options):
+        return setup.prepare_codex_runtime(self.install, self.platform,
+            verify=options.get("verify", False), dry_run=options.get("dry_run", False))
+
+    def test_compatible_external_is_unchanged_in_all_modes(self):
+        self.external.parent.mkdir(); self.external.write_bytes(b"compatible")
+        with patch.object(setup, "install_codex") as install:
+            for options in ({}, {"verify": True}, {"dry_run": True}, {"verify": True, "dry_run": True}):
+                self.assertEqual(self.prepare(**options), "codex-cli 0.166.0")
+                self.assertEqual(setup.selected_codex_binary(self.install), str(self.external.resolve()))
+                self.assertFalse(self.package.exists())
+                self.assertEqual(os.environ["PATH"], "")
+            install.assert_not_called()
+        self.assertEqual(self.external.read_bytes(), b"compatible")
+
+    def test_missing_readonly_then_install_and_rerun_are_deterministic(self):
+        with patch.object(setup, "install_codex", side_effect=self.install_package) as install:
+            with self.assertRaisesRegex(RuntimeError, "Selected Codex is missing"):
+                self.prepare(verify=True)
+            self.assertIsNone(self.prepare(dry_run=True))
+            install.assert_not_called(); self.assertEqual(list(self.install.iterdir()), [])
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            selected = setup.selected_codex_binary(self.install)
+            self.assertEqual(Path(selected).parent, self.package / "bin")
+            self.assertEqual((self.package / "selected").read_bytes(), b"managed-v1\n")
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(self.package / "bin"))
+            before = {p.relative_to(self.package): p.read_bytes() for p in self.package.rglob("*") if p.is_file()}
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            self.assertEqual(self.prepare(verify=True), "codex-cli 0.166.0")
+            install.assert_called_once_with(self.install, self.platform)
+            self.assertEqual(before, {p.relative_to(self.package): p.read_bytes() for p in self.package.rglob("*") if p.is_file()})
+
+    def test_incompatible_external_is_preserved_with_native_home_and_account(self):
+        self.external.parent.mkdir(); self.external.write_bytes(b"old")
+        home = self.root / "native-home"; home.mkdir()
+        for name in ("config.toml", "auth.json"):
+            (home / name).write_bytes(b"synthetic-preserve")
+        with patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+             patch.object(setup, "install_codex", side_effect=self.install_package) as install:
+            with self.assertRaisesRegex(RuntimeError, "incompatible native"):
+                self.prepare(verify=True)
+            self.assertIsNone(self.prepare(dry_run=True)); install.assert_not_called()
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            self.assertEqual(setup.selected_codex_binary(self.install),
+                             str(setup.executable_path(self.package / "bin", "codex").resolve()))
+            self.assertEqual(os.environ["CODEX_HOME"], str(home))
+        self.assertEqual(self.external.read_bytes(), b"old")
+        self.assertEqual([p.read_bytes() for p in sorted(home.iterdir())], [b"synthetic-preserve"] * 2)
+
+    def test_retained_compatible_package_is_selected_without_download(self):
+        self.external.parent.mkdir(); self.external.write_bytes(b"old")
+        binary = self.package_at(self.install)
+        with patch.object(setup, "install_codex") as install:
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            install.assert_not_called()
+        self.assertEqual(setup.selected_codex_binary(self.install), str(binary.resolve()))
+
+    def test_managed_update_retains_all_prior_data_and_team_and_is_idempotent(self):
+        binary = self.package_at(self.install, b"old")
+        setup.select_managed_codex(self.install)
+        team = setup.executable_path(binary.parent, "pira_team"); team.write_bytes(b"released-team")
+        (self.package / "custom-data").write_bytes(b"never-delete")
+        previous = self.package.with_name(self.package.name + ".backup-1")
+        previous.mkdir(); (previous / "sentinel").write_bytes(b"earlier-backup")
+        with patch.object(setup, "install_codex", side_effect=self.install_package) as install:
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            install.assert_called_once()
+        backup = self.package.with_name(self.package.name + ".backup-2")
+        self.assertEqual((backup / "bin" / binary.name).read_bytes(), b"old")
+        self.assertEqual((backup / "custom-data").read_bytes(), b"never-delete")
+        self.assertEqual((previous / "sentinel").read_bytes(), b"earlier-backup")
+        self.assertEqual(team.read_bytes(), b"released-team")
+        self.assertFalse(list(self.install.glob(".pira-codex-update-*")))
+
+    def test_selected_missing_payload_is_repaired_without_falling_back_to_external(self):
+        binary = self.package_at(self.install, b"old")
+        setup.select_managed_codex(self.install); binary.unlink()
+        self.external.parent.mkdir(); self.external.write_bytes(b"compatible")
+        with patch.object(setup, "install_codex", side_effect=self.install_package) as install:
+            with self.assertRaisesRegex(RuntimeError, "incompatible native"):
+                self.prepare(verify=True)
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+            install.assert_called_once()
+        self.assertEqual(setup.selected_codex_binary(self.install), str(binary.resolve()))
+
+    def test_foreign_or_stale_preparation_lock_is_not_removed(self):
+        lock = self.install / ".pira-codex-prepare.lock"; lock.mkdir()
+        with patch.object(setup, "install_codex") as install:
+            with self.assertRaisesRegex(RuntimeError, "preparation is locked"):
+                self.prepare()
+            install.assert_not_called()
+        self.assertTrue(lock.is_dir()); self.assertFalse(self.package.exists())
+
+    def test_failed_final_native_check_rolls_back_package_and_selection(self):
+        binary = self.package_at(self.install, b"old")
+        setup.select_managed_codex(self.install)
+        original = {p.relative_to(self.package): p.read_bytes() for p in self.package.rglob("*") if p.is_file()}
+        with patch.object(setup, "install_codex", side_effect=self.install_package), \
+             patch.object(setup, "check_team_runtime", side_effect=RuntimeError("final native failure")):
+            with self.assertRaisesRegex(RuntimeError, "final native failure"):
+                self.prepare()
+        self.assertEqual(original, {p.relative_to(self.package): p.read_bytes() for p in self.package.rglob("*") if p.is_file()})
+        failed = self.package.with_name(self.package.name + ".failed-1")
+        self.assertEqual((failed / "bin" / binary.name).read_bytes(), b"compatible")
+        self.assertEqual(os.environ["PATH"], "")
+        with patch.object(setup, "install_codex", side_effect=self.install_package):
+            self.assertEqual(self.prepare(), "codex-cli 0.166.0")
+        self.assertTrue(failed.is_dir())
+
+    def test_failed_download_or_publication_restores_old_package(self):
+        self.package_at(self.install, b"old")
+        native_rename = Path.rename
+        def reject_publication(path, target):
+            if path.name == setup.CODEX_PACKAGE_DIR and path.parent.name.startswith(".pira-codex-update-"):
+                raise OSError("publication denied")
+            return native_rename(path, target)
+        for fault in ("download", "publication"):
+            with self.subTest(fault=fault), \
+                 patch.object(setup, "install_codex", side_effect=RuntimeError("download failed") if fault == "download" else self.install_package), \
+                 patch.object(Path, "rename", reject_publication):
+                with self.assertRaisesRegex((RuntimeError, OSError), "download failed|publication denied"):
+                    self.prepare()
+                self.assertEqual(setup.executable_path(self.package / "bin", "codex").read_bytes(), b"old")
+                self.assertFalse(list(self.install.glob(".pira-codex-update-*")))
+
+    @unittest.skipUnless(os.name == "posix", "symlink fixture without Windows privileges")
+    def test_symlink_or_ambiguous_managed_state_fails_without_install(self):
+        foreign = self.root / "foreign"; foreign.mkdir()
+        with patch.object(setup, "install_codex") as install:
+            self.package.symlink_to(foreign, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "ambiguous managed"):
+                self.prepare()
+            self.package.unlink()
+            self.package_at(self.install, b"old")
+            marker = self.package / "selected"; marker.write_text("unexpected")
+            with self.assertRaisesRegex(RuntimeError, "ambiguous managed"):
+                self.prepare()
+            marker.unlink(); (self.package / "linked").symlink_to(foreign, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "symlinked managed"):
+                self.prepare()
+            install.assert_not_called()
+        self.assertEqual(list(foreign.iterdir()), [])
+
+    def test_windows_adjacent_collision_uses_managed_team_destination_and_reruns(self):
+        self.platform = "windows-x64"
+        adjacent = self.install / "codex.exe"; adjacent.write_bytes(b"old-external")
+        original_team = self.install / "pira_team.exe"; original_team.write_bytes(b"old-team")
+        data = b"released-team"
+        record = {"asset": "pira_team-0.2.0-windows-x64.exe", "size": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest()}
+        index = {"tag": "pira-tools-fixture", "tools": {"pira_team": {
+            "version": "0.2.0", "binaries": {"windows-x64": record}}}}
+        selector = setup.load_selector()
+        def download(tag, selection, directory):
+            binary = directory / record["asset"]; binary.write_bytes(data); return binary
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup, "codex_on_path", return_value=str(adjacent)), \
+             patch.object(setup, "install_codex", side_effect=self.install_package) as install, \
+             patch.object(setup, "release_index", return_value=index), \
+             patch.object(setup, "load_selector", return_value=selector), \
+             patch.object(selector, "current_platform", return_value=self.platform), \
+             patch.object(setup, "ensure_team_auth") as auth, \
+             patch.object(setup, "download_binary", side_effect=download) as fetch, \
+             patch.object(setup, "direct_version", return_value="pira_team 0.2.0"), \
+             patch.object(setup, "ensure_path") as persist:
+            args = ["--install-dir", str(self.install), "--tool", "pira_team", "--no-path"]
+            self.assertEqual(setup.main(args), 0)
+            target = self.package / "bin" / "pira_team.exe"
+            self.assertEqual(setup.team_install_dir(self.install), target.parent)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(target.parent))
+            self.assertEqual(setup.main(args), 0)
+            self.assertEqual(setup.main([*args, "--verify"]), 0)
+            install.assert_called_once(); fetch.assert_called_once(); persist.assert_not_called()
+            self.assertEqual(auth.call_count, 3)
+        self.assertEqual(adjacent.read_bytes(), b"old-external")
+        self.assertEqual(original_team.read_bytes(), b"old-team")
+
+    def test_parent_claude_boundary_and_marker_activation(self):
+        import types
+        parent = types.SimpleNamespace(prepare_runtime=MagicMock(return_value="2.1.311"))
+        config = self.root / "claude-work"
+        with patch.dict(sys.modules, {"setup_pira_claude_runtime": parent}):
+            self.assertEqual(setup.prepare_claude_runtime(verify=True, dry_run=False,
+                config_dir=config, install_dir=self.install), "2.1.311")
+        parent.prepare_runtime.assert_called_once_with(setup, self.install,
+            verify=True, dry_run=False, config_dir=config)
+        package = self.install / ".pira-claude"; (package / "bin").mkdir(parents=True)
+        (package / "selected").write_bytes(b"managed-v1\n")
+        self.assertEqual(setup.claude_managed_bin(self.install), package / "bin")
+        if os.name != "nt":
+            profile = self.root / "profile"
+            with patch.object(setup.stores, "shell_profiles", return_value=[profile]):
+                setup.ensure_path(self.install, True)
+                self.assertFalse(profile.exists())
+                setup.ensure_path(self.install, False)
+                prefix = os.pathsep.join(map(str, [package / "bin", self.install]))
+                self.assertIn(setup.activation_path_line(prefix), profile.read_text())
+                self.assertFalse(setup.ensure_path(self.install, False))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX combined profile activation")
+    def test_combined_managed_profile_sourcing_is_stable_with_existing_late_paths(self):
+        self.package_at(self.install); setup.select_managed_codex(self.install)
+        claude = self.install / ".pira-claude"; (claude / "bin").mkdir(parents=True)
+        (claude / "selected").write_bytes(b"managed-v1\n")
+        profile = self.root / "profile"
+        with patch.object(setup.stores, "shell_profiles", return_value=[profile]):
+            self.assertTrue(setup.ensure_path(self.install, False))
+            self.assertFalse(setup.ensure_path(self.install, False))
+        original = "/external/bin:" + str(self.package / "bin") + ":" + str(claude / "bin")
+        script = '. "$1"; printf "%s\\n" "$PATH"; . "$1"; printf "%s\\n" "$PATH"'
+        result = subprocess.run(["/bin/sh", "-c", script, "sh", str(profile)],
+            env={"PATH": original}, check=True, text=True, capture_output=True)
+        once, twice = result.stdout.splitlines()
+        self.assertEqual(once, twice)
+        self.assertTrue(once.startswith(":".join(map(str, [claude / "bin", self.package / "bin", self.install])) + ":"))
+        self.assertIn("/external/bin", once)
+
+    def test_windows_combined_managed_path_order_is_durable_and_rerun_does_not_write(self):
+        self.platform = "windows-x64"
+        self.package_at(self.install); setup.select_managed_codex(self.install)
+        claude = self.install / ".pira-claude"; (claude / "bin").mkdir(parents=True)
+        (claude / "selected").write_bytes(b"managed-v1\n")
+        external = str(self.root / "external")
+        state = {"path": external + ";" + str(self.package / "bin")}
+        registry = MagicMock(); registry.REG_EXPAND_SZ = 2
+        registry.QueryValueEx.side_effect = lambda *args: (state["path"], 2)
+        registry.SetValueEx.side_effect = lambda *args: state.__setitem__("path", args[-1])
+        with patch.object(setup, "IS_WINDOWS", True), patch.object(setup.os, "name", "nt"), \
+             patch.object(setup, "Path", type(self.root)), \
+             patch.dict(sys.modules, {"winreg": registry}), \
+             patch.object(setup.stores, "notify_windows_environment") as notify:
+            self.assertTrue(setup.ensure_path(self.install, True))
+            registry.SetValueEx.assert_not_called(); notify.assert_not_called()
+            self.assertTrue(setup.ensure_path(self.install, False))
+            self.assertEqual(state["path"], ";".join(map(str, [claude / "bin", self.package / "bin", self.install, external])))
+            self.assertFalse(setup.ensure_path(self.install, False))
+            registry.SetValueEx.assert_called_once(); notify.assert_called_once()
+
+    def test_tools_main_activates_managed_claude_locally_only_in_normal_mode(self):
+        claude = self.install / ".pira-claude"; (claude / "bin").mkdir(parents=True)
+        (claude / "selected").write_bytes(b"managed-v1\n")
+        for mode in (["--verify"], ["--dry-run"], []):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"PATH": "original"}), \
+                 patch.object(setup, "prepare_claude_runtime", return_value="2.1.311") as prepare, \
+                 patch.object(setup, "release_index", side_effect=RuntimeError("fixture release boundary")), \
+                 patch.object(setup, "ensure_path") as persist:
+                with self.assertRaisesRegex(RuntimeError, "fixture release boundary"):
+                    setup.main(["--include", "ClaudeCode", "--install-dir", str(self.install), "--no-path", *mode])
+                prepare.assert_called_once_with(verify="--verify" in mode, dry_run="--dry-run" in mode, install_dir=self.install)
+                expected = "original" if mode else str(claude / "bin") + os.pathsep + "original"
+                self.assertEqual(os.environ["PATH"], expected)
+                persist.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX activation script")
+    def test_selected_path_activation_wins_existing_late_entry_and_is_idempotent(self):
+        selected = self.root / "space quote' $literal" / "bin"
+        script = setup.activation_path_line(selected)
+        original = "/external/bin:" + str(selected) + ":/usr/bin"
+        result = subprocess.run(["/bin/sh", "-c", script + "; " + script + '; printf %s "$PATH"'],
+                                env={"PATH": original}, check=True, text=True, capture_output=True)
+        self.assertEqual(result.stdout, str(selected) + ":" + original)
 
 
 if __name__ == "__main__":

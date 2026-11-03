@@ -25,6 +25,16 @@ SPEC.loader.exec_module(setup)
 
 
 class HarnessSelectionTests(unittest.TestCase):
+    def test_codex_config_defaults_to_selected_home_without_changing_auth_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "codex-profile"
+            override = Path(temporary) / "config-only.toml"
+            with patch.dict(setup.os.environ, {"CODEX_HOME": str(home)}):
+                self.assertEqual(Path(setup.build_parser().parse_args([]).codex_config), home / "config.toml")
+                self.assertEqual(setup.build_parser().parse_args(["--codex-config", str(override)]).codex_config,
+                                 str(override))
+                self.assertEqual(setup.os.environ["CODEX_HOME"], str(home))
+
     def test_selection_and_legacy_defaults_match_for_both_entrypoints(self) -> None:
         cases = [
             ([], "codex"),
@@ -84,6 +94,9 @@ class AutoRecapTests(unittest.TestCase):
         claude_runtime = patch.object(setup.tool_setup, "prepare_claude_runtime", return_value="2.1.311 (Claude Code)")
         claude_runtime.start()
         self.addCleanup(claude_runtime.stop)
+        codex_runtime = patch.object(setup.tool_setup, "prepare_codex_runtime", return_value=None, create=True)
+        codex_runtime.start()
+        self.addCleanup(codex_runtime.stop)
         # Synthetic configuration tests must not select the host's Codex backend.
         which = setup.tool_setup.shutil.which
         backend = patch.object(setup.tool_setup.shutil, "which", side_effect=lambda name, *args, **kwargs:
@@ -814,6 +827,19 @@ class AutoRecapTests(unittest.TestCase):
                 self.assertEqual(command[command.index("--codex-login") + 1], mode)
                 self.assertIn("--verify", command)
 
+    def test_tools_phase_uses_explicit_claude_directory_and_preserves_codex_home(self) -> None:
+        root = Path(os.environ["HOME"])
+        state = setup.SetupState(repo_root=SCRIPT.parents[2], agent_dir=root, dry_run=False, yes=False)
+        selected = root / "selected Claude profile"
+        codex_home = root / "codex-profile"
+        with patch.dict(setup.os.environ, {"CODEX_HOME": str(codex_home), "CLAUDE_CONFIG_DIR": str(root / "ambient")}), \
+             patch.object(setup.subprocess, "run") as run:
+            setup.configure_tools(state, None, None, verify_only=True, harness="both", claude_dir=str(selected))
+            environment = run.call_args.kwargs["env"]
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(selected.resolve()))
+            self.assertEqual(environment["CODEX_HOME"], str(codex_home))
+            self.assertEqual(setup.os.environ["CLAUDE_CONFIG_DIR"], str(root / "ambient"))
+
     def test_harness_defaults_to_codex_and_is_forwarded_to_tool_setup(self) -> None:
         self.assertEqual(setup.build_parser().parse_args([]).harness, "codex")
         self.assertEqual(setup.tool_setup.build_parser().parse_args([]).harness, "codex")
@@ -827,17 +853,22 @@ class AutoRecapTests(unittest.TestCase):
 
     def test_include_selection_is_forwarded_from_full_setup(self) -> None:
         root = Path(os.environ["HOME"])
+        claude_dir = str(root / "selected-claude")
         (root / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
         for names, expected in [([], "codex"), (["Codex"], "codex"),
                                 (["ClaudeCode"], "claude"), (["Codex", "ClaudeCode"], "both")]:
+            setup.tool_setup.prepare_codex_runtime.reset_mock()
             with self.subTest(names=names), patch.object(setup, "ensure_agent_dir"), \
                  patch.object(setup, "migration_codex_binary", return_value=None), \
                  patch.object(setup, "configure_tools") as configure:
                 selection = ["--include", *names] if names else []
                 self.assertEqual(setup.main(["--agent-dir", str(root), "--dry-run",
+                                             "--claude-dir", claude_dir,
                                              "--execution-mode", "keep", "--legacy", "keep",
                                              *selection]), 0)
                 self.assertEqual(configure.call_args.kwargs["harness"], expected)
+                self.assertEqual(configure.call_args.kwargs["claude_dir"], claude_dir if "ClaudeCode" in names else None)
+                self.assertEqual(setup.tool_setup.prepare_codex_runtime.call_count, int(expected != "claude"))
 
     def test_default_preserves_settings_and_is_idempotent(self) -> None:
         import tomllib

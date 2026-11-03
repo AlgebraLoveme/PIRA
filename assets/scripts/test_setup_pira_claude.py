@@ -17,184 +17,238 @@ import setup_pira as setup
 
 class ClaudeRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
-        discovery = patch.object(tools.shutil, "which", return_value="/fixture/claude")
-        discovery.start()
-        self.addCleanup(discovery.stop)
-        execution = patch.object(tools.subprocess, "run")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.install = self.root / "tools"
+        self.config = self.root / "profile"
+        self.config.mkdir()
+        self.native = self.root / ("claude.exe" if tools.IS_WINDOWS else "claude")
+        self.native.write_bytes(b"\x7fELFsynthetic native fixture; never executed")
+        for mocker in (
+            patch.dict(os.environ, {"HOME": str(self.root), "USERPROFILE": str(self.root),
+                                    "CLAUDE_CONFIG_DIR": str(self.config)}, clear=True),
+            patch.object(tools.shutil, "which", return_value=str(self.native)),
+            patch.object(tools, "ensure_path"),
+        ):
+            mocker.start()
+            self.addCleanup(mocker.stop)
+        execution = patch.object(tools.subprocess, "run", return_value=self.result("2.1.311 (Claude Code)"))
         self.run_cli = execution.start()
         self.addCleanup(execution.stop)
+        network = patch.object(tools, "request_bytes", side_effect=AssertionError("unmocked installer request"))
+        self.requests = network.start()
+        self.addCleanup(network.stop)
+        download = patch.object(tools, "request_to_path", side_effect=AssertionError("unmocked binary download"))
+        self.download = download.start()
+        self.addCleanup(download.stop)
 
-    def result(self, stdout: str, *, stderr: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(["/fixture/claude"], code, stdout, stderr)
+    def result(self, stdout: str, *, stderr: str = "", code: int = 0):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
 
-    def test_floor_and_newer_are_accepted_without_update_in_all_modes(self) -> None:
-        for version in ("2.1.311 (Claude Code)", "2.1.312 (Claude Code)", "2.2.0 (Claude Code)", "3.0.0"):
-            for verify, dry_run in ((False, False), (True, False), (False, True)):
-                with self.subTest(version=version, verify=verify, dry_run=dry_run):
+    def prepare(self, **kwargs):
+        from setup_pira_claude_runtime import prepare_runtime
+        return prepare_runtime(tools, self.install, config_dir=self.config,
+                               verify=kwargs.get("verify", False), dry_run=kwargs.get("dry_run", False))
+
+    def native_downloads(self, version="2.1.311"):
+        import hashlib
+        data = b"synthetic verified native distribution"
+        platform = tools.load_selector().current_platform().replace("windows-", "win32-")
+        name = "claude.exe" if tools.IS_WINDOWS else "claude"
+        manifest = {"version": version, "platforms": {platform: {
+            "binary": name, "checksum": hashlib.sha256(data).hexdigest(), "size": len(data)}}}
+        self.requests.side_effect = [version.encode(), json.dumps(manifest).encode()]
+        def download(url, path, **kwargs):
+            self.assertEqual(kwargs["expected_hash"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(kwargs["expected_size"], len(data))
+            path.write_bytes(data)
+        self.download.side_effect = download
+        return data
+
+    def test_compatible_cli_is_unchanged_in_all_modes(self):
+        for version in ("2.1.311 (Claude Code)", "2.2.0 (Claude Code)", "3.0.0"):
+            for flags in ({}, {"verify": True}, {"dry_run": True}):
+                with self.subTest(version=version, flags=flags):
                     self.run_cli.reset_mock()
-                    self.run_cli.return_value = self.result(version + "\n")
-                    self.assertEqual(tools.prepare_claude_runtime(verify=verify, dry_run=dry_run), version)
+                    self.run_cli.return_value = self.result(version)
+                    self.assertEqual(self.prepare(**flags), version)
                     self.assertEqual([call.args[0] for call in self.run_cli.call_args_list],
-                                     [["/fixture/claude", "--version"]])
+                                     [[str(self.native), "--version"]])
+                    self.assertEqual(self.run_cli.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.config))
                     self.assertEqual(self.run_cli.call_args.kwargs["env"]["DISABLE_AUTOUPDATER"], "1")
+        self.requests.assert_not_called()
+        self.assertFalse(self.install.exists())
 
-    def test_old_native_cli_updates_once_and_rechecks_without_switching_channel(self) -> None:
+    def test_missing_cli_installs_checked_native_and_rerun_is_unchanged(self):
+        data = self.native_downloads()
+        with patch.object(tools.shutil, "which", return_value=None):
+            self.assertEqual(self.prepare(), "2.1.311 (Claude Code)")
+        binary = tools.executable_path(self.install / ".pira-claude" / "bin", "claude")
+        self.assertEqual(binary.read_bytes(), data)
+        requests = self.requests.call_count
+        self.assertEqual(self.prepare(), "2.1.311 (Claude Code)")
+        self.assertEqual(self.requests.call_count, requests)
+        self.assertEqual(self.run_cli.call_args.args[0][0], str(binary))
+        self.assertEqual(list(self.install.glob(".pira-claude.backup-*")), [])
+
+    def test_old_native_updates_once_without_changing_channel_or_auth(self):
+        settings = self.config / "settings.json"
+        settings.write_text('{"autoUpdatesChannel":"stable","custom":"keep"}')
+        auth = self.config / "synthetic-auth-fixture"
+        auth.write_bytes(b"preserve account fixture")
         self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
                                     self.result("native update done\n", stderr="native notice\n"),
                                     self.result("2.1.311 (Claude Code)")]
-        with tempfile.TemporaryDirectory() as temporary:
-            config_dir = Path(temporary)
-            settings = config_dir / "settings.json"
-            original = '{"autoUpdatesChannel":"stable","custom":"preserve"}'
-            settings.write_text(original)
-            output, error = io.StringIO(), io.StringIO()
-            with patch.dict(os.environ, {"CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE": "1"}), \
-                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
-                self.assertEqual(tools.prepare_claude_runtime(verify=False, dry_run=False, config_dir=config_dir),
-                                 "2.1.311 (Claude Code)")
-                self.assertEqual(os.environ["CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE"], "1")
-            self.assertEqual(settings.read_text(), original)
-            self.assertIn("native update done", output.getvalue())
-            self.assertIn("native notice", error.getvalue())
-            self.assertEqual([call.args[0] for call in self.run_cli.call_args_list],
-                             [["/fixture/claude", "--version"], ["/fixture/claude", "update"],
-                              ["/fixture/claude", "--version"]])
-            for call in self.run_cli.call_args_list:
-                self.assertEqual(call.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(config_dir))
-                self.assertEqual(call.kwargs["env"]["CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE"], "0")
-                self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            self.assertEqual(self.prepare(), "2.1.311 (Claude Code)")
+        self.assertIn("native update done", output.getvalue())
+        self.assertIn("native notice", error.getvalue())
+        self.assertEqual(settings.read_text(), '{"autoUpdatesChannel":"stable","custom":"keep"}')
+        self.assertEqual(auth.read_bytes(), b"preserve account fixture")
+        self.assertEqual([c.args[0][1] for c in self.run_cli.call_args_list], ["--version", "update", "--version"])
+        self.requests.assert_not_called()
 
-    def test_old_cli_readonly_modes_fail_without_update(self) -> None:
+    def test_failed_or_noop_native_update_falls_back_to_managed(self):
+        for failure in (self.result("native output", stderr="native denied", code=7),
+                        self.result("already current\n")):
+            with self.subTest(failure=failure.returncode), tempfile.TemporaryDirectory() as temporary:
+                self.install = Path(temporary) / "tools"
+                self.native_downloads()
+                replies = [self.result("2.1.310 (Claude Code)"), failure]
+                if not failure.returncode:
+                    replies.append(self.result("2.1.310 (Claude Code)"))
+                replies.extend([self.result("2.1.311 (Claude Code)")] * 2)
+                self.run_cli.side_effect = replies
+                self.assertEqual(self.prepare(), "2.1.311 (Claude Code)")
+                self.assertEqual(self.native.read_bytes(), b"\x7fELFsynthetic native fixture; never executed")
+
+    def test_npm_launcher_gets_managed_native_without_package_manager_update(self):
+        npm = self.root / "node_modules" / "package" / "claude"
+        npm.parent.mkdir(parents=True)
+        npm.write_bytes(b"\x7fELFnpm managed native fixture")
+        self.native_downloads()
+        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
+                                    self.result("2.1.311 (Claude Code)"), self.result("2.1.311 (Claude Code)")]
+        with patch.object(tools.shutil, "which", return_value=str(npm)):
+            self.assertEqual(self.prepare(), "2.1.311 (Claude Code)")
+        self.assertNotIn("update", [c.args[0][1] for c in self.run_cli.call_args_list])
+        self.assertEqual(npm.read_bytes(), b"\x7fELFnpm managed native fixture")
+
+    def test_readonly_missing_old_and_malformed_never_mutate(self):
+        for value in (None, "2.1.310 (Claude Code)", "bad version"):
+            for verify in (False, True):
+                with self.subTest(version=value, verify=verify):
+                    self.run_cli.reset_mock()
+                    self.run_cli.return_value = self.result(value or "")
+                    with patch.object(tools.shutil, "which", return_value=str(self.native) if value else None):
+                        if verify:
+                            with self.assertRaises(RuntimeError):
+                                self.prepare(verify=True, dry_run=True)
+                        else:
+                            self.assertIsNone(self.prepare(dry_run=True))
+                    self.assertNotIn("update", [c.args[0][1] for c in self.run_cli.call_args_list])
+                    self.assertFalse(self.install.exists())
+        self.requests.assert_not_called()
+
+    def test_bad_manifests_fail_before_binary_download(self):
+        for record in ({"version":"wrong"}, {"version":"2.1.311", "platforms":[]},
+                       {"version":"2.1.311", "platforms":{}}):
+            with self.subTest(manifest=record), patch.object(tools.shutil, "which", return_value=None):
+                self.requests.side_effect = [b"2.1.311", json.dumps(record).encode()]
+                with self.assertRaisesRegex(RuntimeError, "Managed Claude preparation failed"):
+                    self.prepare()
+        self.download.assert_not_called()
+        self.assertFalse(self.install.exists())
+
+    def test_stable_channel_preserved_and_managed_update_keeps_old_package(self):
+        settings = self.config / "settings.json"
+        original = '{"autoUpdatesChannel":"stable","custom":"keep"}'
+        settings.write_text(original)
+        self.native_downloads()
+        with patch.object(tools.shutil, "which", return_value=None):
+            self.prepare()
+        old = tools.executable_path(self.install / ".pira-claude" / "bin", "claude").read_bytes()
+        self.native_downloads("2.1.312")
+        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
+                                    self.result("2.1.312 (Claude Code)"), self.result("2.1.312 (Claude Code)")]
+        self.assertEqual(self.prepare(), "2.1.312 (Claude Code)")
+        backups = list(self.install.glob(".pira-claude.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(tools.executable_path(backups[0] / "bin", "claude").read_bytes(), old)
+        self.assertEqual(settings.read_text(), original)
+        self.assertTrue(self.requests.call_args_list[0].args[0].endswith("/stable"))
+
+    def test_downloaded_version_mismatch_preserves_previous_package(self):
+        self.native_downloads()
+        with patch.object(tools.shutil, "which", return_value=None):
+            self.prepare()
+        binary = tools.executable_path(self.install / ".pira-claude" / "bin", "claude")
+        before = binary.read_bytes()
+        self.native_downloads("2.1.312")
+        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"), self.result("2.1.311 (Claude Code)")]
+        with self.assertRaisesRegex(RuntimeError, "does not match native manifest"):
+            self.prepare()
+        self.assertEqual(binary.read_bytes(), before)
+        self.assertEqual(list(self.install.glob(".pira-claude.backup-*")), [])
+
+    def test_disable_updates_and_unknown_selection_fail_without_changes(self):
         self.run_cli.return_value = self.result("2.1.310 (Claude Code)")
-        for verify, dry_run in ((True, False), (False, True), (True, True)):
-            with self.subTest(verify=verify, dry_run=dry_run):
+        with patch.dict(os.environ, {"DISABLE_UPDATES":"1"}), self.assertRaisesRegex(RuntimeError, "DISABLE_UPDATES"):
+            self.prepare()
+        self.requests.assert_not_called()
+        marker = self.install / ".pira-claude" / "selected"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("unknown")
+        with self.assertRaisesRegex(RuntimeError, "Unrecognized managed Claude selection"):
+            self.prepare()
+
+    def test_failure_diagnostics_are_preserved_if_managed_download_also_fails(self):
+        failures = [
+            (self.result("native output", stderr="native error", code=3),
+             ("exit 3", "native output", "native error")),
+            (OSError("native loader failure"), ("native loader failure",)),
+            (subprocess.TimeoutExpired("claude", 10, output=b"partial stdout", stderr=b"partial stderr"),
+             ("partial stdout", "partial stderr")),
+            (self.result("malformed version", stderr="version diagnostic"),
+             ("Cannot parse", "version diagnostic")),
+        ]
+        for response, diagnostics in failures:
+            with self.subTest(diagnostics=diagnostics):
                 self.run_cli.reset_mock()
-                with self.assertRaisesRegex(RuntimeError, r"2\.1\.311.*found 2\.1\.310.*will not update"):
-                    tools.prepare_claude_runtime(verify=verify, dry_run=dry_run)
-                self.assertEqual([call.args[0] for call in self.run_cli.call_args_list],
-                                 [["/fixture/claude", "--version"]])
-
-    def test_update_success_that_stays_old_fails_with_manual_upgrade_guidance(self) -> None:
-        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
-                                    self.result("Claude is up to date!\n"),
-                                    self.result("2.1.310 (Claude Code)")]
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError) as raised:
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        message = str(raised.exception)
-        self.assertIn("still below required >= 2.1.311 after claude update", message)
-        self.assertIn("Package-manager/custom-launcher", message)
-        self.assertIn("channel", message)
-        self.assertIn(tools.CLAUDE_INSTALL_GUIDE, message)
-        self.assertEqual(self.run_cli.call_count, 3)
-
-    def test_update_failure_preserves_native_stdout_and_stderr(self) -> None:
-        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
-                                    self.result("native updater output", stderr="native updater denied", code=7)]
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError) as raised:
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        for detail in ("update failed (exit 7)", "native updater output", "native updater denied"):
-            self.assertIn(detail, str(raised.exception))
-        self.assertEqual(self.run_cli.call_count, 2)
-
-    def test_old_npm_and_script_launchers_require_manual_upgrade_without_update(self) -> None:
-        launchers = ["/fixture/node_modules/@anthropic-ai/claude-code/claude",
-                     "/fixture/claude.cmd", "/fixture/claude.ps1", "/fixture/cli.js"]
-        for executable in launchers:
-            with self.subTest(executable=executable), \
-                 patch.object(tools.shutil, "which", return_value=executable):
-                self.run_cli.reset_mock()
-                self.run_cli.return_value = self.result("2.1.310 (Claude Code)")
-                with self.assertRaisesRegex(RuntimeError, "Refusing automatic update.*npm/script launcher"):
-                    tools.prepare_claude_runtime(verify=False, dry_run=False)
-                self.assertEqual([call.args[0] for call in self.run_cli.call_args_list],
-                                 [[executable, "--version"]])
-
-    @unittest.skipUnless(os.name == "posix", "POSIX npm launcher symlink")
-    def test_npm_launcher_symlink_is_resolved_before_update(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            binary = root / "node_modules" / "@anthropic-ai" / "claude-code" / "claude"
-            binary.parent.mkdir(parents=True)
-            binary.touch()
-            launcher = root / "claude"
-            launcher.symlink_to(binary)
-            self.run_cli.return_value = self.result("2.1.310 (Claude Code)")
-            with patch.object(tools.shutil, "which", return_value=str(launcher)), \
-                 self.assertRaisesRegex(RuntimeError, "Refusing automatic update"):
-                tools.prepare_claude_runtime(verify=False, dry_run=False)
-            self.assertEqual(self.run_cli.call_count, 1)
-
-    def test_missing_cli_gives_supported_install_guidance_without_execution(self) -> None:
-        with patch.object(tools.shutil, "which", return_value=None), self.assertRaises(RuntimeError) as raised:
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        self.assertIn("Claude Code >= 2.1.311", str(raised.exception))
-        self.assertIn(tools.CLAUDE_INSTALL_GUIDE, str(raised.exception))
-        self.assertIn("native", str(raised.exception))
-        self.run_cli.assert_not_called()
-
-    def test_malformed_version_fails_without_attempting_update(self) -> None:
-        for version in ("", "not a version", "2.1", "2.1.311 (Claude Code)\nextra output"):
-            with self.subTest(version=version):
-                self.run_cli.reset_mock()
-                self.run_cli.return_value = self.result(version, stderr="version diagnostic")
-                with self.assertRaisesRegex(RuntimeError, "Cannot parse Claude Code version") as raised:
-                    tools.prepare_claude_runtime(verify=False, dry_run=False)
-                self.assertIn("version diagnostic", str(raised.exception))
+                self.run_cli.side_effect = response if isinstance(response, BaseException) else None
+                self.run_cli.return_value = response
+                self.requests.side_effect = RuntimeError("distribution unavailable")
+                with self.assertRaises(RuntimeError) as raised:
+                    self.prepare()
+                for text in (*diagnostics, "distribution unavailable"):
+                    self.assertIn(text, str(raised.exception))
                 self.assertEqual(self.run_cli.call_count, 1)
 
-    def test_malformed_post_update_version_is_not_accepted(self) -> None:
-        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"), self.result("updated\n"),
-                                    self.result("unrecognizable")]
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "Cannot parse"):
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        self.assertEqual(self.run_cli.call_count, 3)
-
-    def test_version_command_failure_preserves_native_diagnostics(self) -> None:
-        self.run_cli.return_value = self.result("native output", stderr="native error", code=3)
-        with self.assertRaises(RuntimeError) as raised:
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        for detail in ("--version failed (exit 3)", "native output", "native error"):
-            self.assertIn(detail, str(raised.exception))
-        self.assertEqual(self.run_cli.call_count, 1)
-
-    def test_unlaunchable_cli_fails_without_update(self) -> None:
-        self.run_cli.side_effect = OSError("native loader failure")
-        with self.assertRaisesRegex(RuntimeError, "native loader failure"):
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        self.assertEqual(self.run_cli.call_count, 1)
-
-    def test_update_timeout_preserves_partial_native_diagnostics(self) -> None:
-        self.run_cli.side_effect = [self.result("2.1.310 (Claude Code)"),
-                                    subprocess.TimeoutExpired(["claude", "update"], 300,
-                                                              output=b"partial stdout", stderr=b"partial stderr")]
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError) as raised:
-            tools.prepare_claude_runtime(verify=False, dry_run=False)
-        self.assertIn("partial stdout", str(raised.exception))
-        self.assertIn("partial stderr", str(raised.exception))
-        self.assertEqual(self.run_cli.call_count, 2)
-
-    def test_full_setup_checks_only_selected_claude_before_writes_even_without_tools(self) -> None:
-        config_dir = Path(tempfile.gettempdir()).resolve() / "claude-gate-config"
+    def test_full_setup_checks_only_selected_claude_before_writes_even_without_tools(self):
         selections = [[], ["--include", "Codex"], ["--include", "ClaudeCode"],
                       ["--include", "Codex", "ClaudeCode"], ["--harness", "claude"], ["--harness", "both"]]
         for selection in selections:
             selected = "ClaudeCode" in selection or "--harness" in selection
             for flags in ([], ["--verify"], ["--dry-run"]):
                 with self.subTest(selection=selection, flags=flags), \
+                     patch.object(tools, "prepare_codex_runtime", return_value=None), \
                      patch.object(tools, "prepare_claude_runtime", side_effect=RuntimeError("runtime boundary")) as gate, \
                      patch.object(setup, "ensure_agent_dir", side_effect=RuntimeError("write boundary")) as writes, \
                      patch.object(setup, "verify", side_effect=RuntimeError("verify boundary")), \
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(setup.main([*selection, *flags, "--skip-codex", "--skip-tools",
-                                                 "--claude-dir", str(config_dir)]), 1)
+                                                "--claude-dir", str(self.config),
+                                                "--tools-install-dir", str(self.install)]), 1)
                     self.assertEqual(gate.call_count, int(selected))
                     if selected:
                         gate.assert_called_once_with(verify="--verify" in flags, dry_run="--dry-run" in flags,
-                                                     config_dir=config_dir)
+                                                     config_dir=self.config, install_dir=self.install)
                         writes.assert_not_called()
         self.run_cli.assert_not_called()
 
-    def test_tools_only_gate_selection_and_modes_before_release_access(self) -> None:
+    def test_tools_only_gate_selection_and_modes_before_release_access(self):
         selections = [[], ["--include", "Codex"], ["--include", "ClaudeCode"],
                       ["--include", "Codex", "ClaudeCode"], ["--harness", "claude"], ["--harness", "both"]]
         for selection in selections:
@@ -205,10 +259,11 @@ class ClaudeRuntimeTests(unittest.TestCase):
                      patch.object(tools, "release_index", side_effect=RuntimeError("release boundary")), \
                      contextlib.redirect_stdout(io.StringIO()):
                     with self.assertRaisesRegex(RuntimeError, "release boundary"):
-                        tools.main([*selection, *flags, "--no-path"])
+                        tools.main([*selection, *flags, "--no-path", "--install-dir", str(self.install)])
                     self.assertEqual(gate.call_count, int(selected))
                     if selected:
-                        gate.assert_called_once_with(verify="--verify" in flags, dry_run="--dry-run" in flags)
+                        gate.assert_called_once_with(verify="--verify" in flags, dry_run="--dry-run" in flags,
+                                                    install_dir=self.install)
         self.run_cli.assert_not_called()
 
 
@@ -454,7 +509,8 @@ class ClaudeSetupTests(unittest.TestCase):
                 prepare.assert_not_called()
                 backend.assert_not_called()
                 auth.assert_not_called()
-                runtime.assert_called_once_with(verify="--verify" in flags, dry_run="--dry-run" in flags)
+                runtime.assert_called_once_with(verify="--verify" in flags, dry_run="--dry-run" in flags,
+                                                install_dir=self.root.resolve())
                 self.assertIsNone(stores.call_args.kwargs["codex_binary"])
 
 
