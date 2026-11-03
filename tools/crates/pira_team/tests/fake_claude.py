@@ -6,6 +6,9 @@ args=sys.argv[1:]
 def option(name): return args[args.index(name)+1]
 def send(value): print(json.dumps(value),flush=True)
 settings=json.loads(option('--settings'))
+attempt=Path(settings['env']['PIRA_TEAM_ATTEMPT'])
+assert Path(option('--system-prompt-file')).read_bytes() == (attempt/'policy.md').read_bytes()+b'\n\n'+(attempt/'phase.md').read_bytes()
+assert '--system-prompt' not in args
 session=option('--resume') if '--resume' in args else option('--session-id')
 state_path=Path.cwd()/('claude-fixture-'+session+'.json')
 history=json.loads(state_path.read_text()) if '--resume' in args else []
@@ -25,13 +28,22 @@ for line in sys.stdin:
         send(message)
         send({"type":"system","subtype":"session_state_changed","state":"running","session_id":session})
         if task=='hold': continue
-        if task == 'ancestry-probe':
+        if task == 'delegate-probe':
+            import os, subprocess
+            env = dict(os.environ, CLAUDE_CODE_SESSION_ID=session)
+            child = subprocess.run([env['TEAM_CLAUDE_BIN'], 'run', '--model', 'test-model',
+                '--effort', 'low', '--task', 'child', '--completion-gate', 'fixture child'],
+                env=env, text=True, capture_output=True, timeout=15)
+            report = {'returncode': child.returncode, 'stderr': child.stderr}
+            if child.returncode == 0:
+                receipt = json.loads(child.stdout)
+                report['manifest'] = json.loads((Path(receipt['run_root']) / 'manifest.json').read_text())
+            handoff = json.dumps(report)
+        elif task == 'context-probe':
             import os, subprocess
             checks = []
             for case in ['normal', 'missing', 'replaced']:
                 env = dict(os.environ, CLAUDE_CODE_SESSION_ID=session)
-                for key in ['PIRA_TEAM_CHILD', 'PIRA_TEAM_CONTEXT']:
-                    env.pop(key, None)
                 if case != 'normal':
                     env['PATH'] = env['TEAM_CLAUDE_CODEX_ONLY'] + os.pathsep + os.defpath
                 if case == 'replaced':
@@ -41,7 +53,7 @@ for line in sys.stdin:
                 result = subprocess.run(args, env=env, text=True, capture_output=True, timeout=5)
                 checks.append({'case': case, 'operation': 'config', 'returncode': result.returncode,
                                'stderr': result.stderr})
-                # Even another matching caller transcript must not hide actual worker ancestry.
+                # An accidentally selected session/harness must disagree with the supplied run.
                 env.pop('CLAUDE_CODE_SESSION_ID', None)
                 env.update(CODEX_THREAD_ID='parent-session', CODEX_HOME=env['TEAM_CLAUDE_CODEX_HOME'])
                 args = [env['TEAM_CLAUDE_BIN'], 'run', '--store', env['TEAM_CLAUDE_STORE'],

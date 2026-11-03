@@ -41,12 +41,6 @@ struct FileTime {
     high: u32,
 }
 #[repr(C)]
-struct UnicodeString {
-    length: u16,
-    maximum: u16,
-    buffer: *const u16,
-}
-#[repr(C)]
 struct Security {
     length: u32,
     descriptor: Raw,
@@ -219,18 +213,7 @@ unsafe extern "system" {
 }
 #[link(name = "ntdll")]
 unsafe extern "system" {
-    fn NtQueryInformationProcess(
-        process: Raw,
-        class: i32,
-        data: Raw,
-        length: u32,
-        required: *mut u32,
-    ) -> i32;
     fn NtResumeProcess(process: Raw) -> i32;
-}
-#[link(name = "shell32")]
-unsafe extern "system" {
-    fn CommandLineToArgvW(command: *const u16, count: *mut i32) -> *mut *mut u16;
 }
 fn checked(ok: i32) -> io::Result<()> {
     if ok != 0 {
@@ -274,65 +257,6 @@ pub fn identity(pid: u32) -> io::Result<Identity> {
         )),
         alive: exit_code == 259,
     })
-}
-
-pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
-    let process = open_process(pid)?;
-    let mut required = 0;
-    unsafe {
-        NtQueryInformationProcess(process.0, 60, ptr::null_mut(), 0, &mut required);
-    }
-    if required < mem::size_of::<UnicodeString>() as u32 || required > 131072 {
-        return Err(io::Error::other("invalid native command-line size"));
-    }
-    let mut buffer = vec![0_usize; (required as usize).div_ceil(mem::size_of::<usize>())];
-    let status = unsafe {
-        NtQueryInformationProcess(
-            process.0,
-            60,
-            buffer.as_mut_ptr().cast(),
-            required,
-            &mut required,
-        )
-    };
-    if status < 0 {
-        return Err(io::Error::other("native command line unavailable"));
-    }
-    let value = unsafe { &*(buffer.as_ptr().cast::<UnicodeString>()) };
-    let start = buffer.as_ptr() as usize;
-    let pointer = value.buffer as usize;
-    let end = start + buffer.len() * mem::size_of::<usize>();
-    if value.length % 2 != 0
-        || pointer % 2 != 0
-        || pointer < start
-        || pointer
-            .checked_add(value.length as usize)
-            .is_none_or(|v| v > end)
-    {
-        return Err(io::Error::other("invalid native command line"));
-    }
-    let mut command =
-        unsafe { std::slice::from_raw_parts(value.buffer, value.length as usize / 2) }.to_vec();
-    command.push(0);
-    let mut count = 0;
-    let argv = unsafe { CommandLineToArgvW(command.as_ptr(), &mut count) };
-    if argv.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let _memory = LocalMemory(argv.cast());
-    let mut result = Vec::new();
-    for index in 0..count as usize {
-        let item = unsafe { *argv.add(index) };
-        let mut length = 0;
-        while unsafe { *item.add(length) } != 0 {
-            length += 1;
-        }
-        result.push(
-            String::from_utf16(unsafe { std::slice::from_raw_parts(item, length) })
-                .map_err(|_| io::Error::other("invalid command argument"))?,
-        );
-    }
-    Ok(result)
 }
 
 pub struct Job {
@@ -467,7 +391,7 @@ fn pipe_security() -> io::Result<LocalMemory> {
         .map_err(|_| io::Error::other("invalid user SID"))?;
     drop(memory);
     // Same user, restricted-code tokens, and a low-integrity label. Credential
-    // authority still requires the admitted peer PID/birth/executable/ancestry.
+    // authority still requires the admitted peer PID/birth/executable and run binding.
     let sddl = wide(format!("D:P(A;;GA;;;{user})(A;;GRGW;;;RC)S:(ML;;NW;;;LW)"));
     let mut descriptor = ptr::null_mut();
     checked(unsafe {

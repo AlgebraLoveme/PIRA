@@ -489,8 +489,8 @@ def plan_codex_configuration(
             state.warn("Execution mode left unchanged; pass --execution-mode safe or soft-safe to set it non-interactively")
         else:
             print("Execution modes:")
-            print("  1. safe: approval_policy=on-request, sandbox_mode=workspace-write")
-            print("  2. soft-safe: approval_policy=never, sandbox_mode=danger-full-access")
+            print("  1. safe: approval_policy=on-request, sandbox_mode=workspace-write (Team unavailable)")
+            print("  2. soft-safe: approval_policy=never, sandbox_mode=danger-full-access (Team requires this full-access mode)")
             print("  3. keep: do not change approval/sandbox settings")
             choice = input("Choose execution mode [1/2/3, default 1]: ").strip()
             execution_mode = {"": "safe", "1": "safe", "2": "soft-safe", "3": "keep"}.get(choice, "safe")  # type: ignore[assignment]
@@ -507,6 +507,8 @@ def plan_codex_configuration(
     }
     remove_keys: list[str] = []
     if execution_mode == "safe":
+        state.warn("Team is unavailable in safe mode: Team requires verified full access with approval_policy=never. "
+                   "The selected on-request/workspace-write permissions are not broadened.")
         updates.update({"approval_policy": toml_string("on-request"), "sandbox_mode": toml_string("workspace-write")})
     elif execution_mode == "soft-safe":
         updates.update({"approval_policy": toml_string("never"), "sandbox_mode": toml_string("danger-full-access")})

@@ -487,6 +487,10 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
         "shell_environment_policy.set.PIRA_TEAM_CONTEXT={}",
         json!(run)
     ));
+    cmd.arg("-c").arg(format!(
+        "shell_environment_policy.set.PIRA_TEAM_ATTEMPT={}",
+        json!(dir)
+    ));
     // Keep unknown task configuration without serializing its values into argv/logs.
     // Backend authentication remains available to Codex, not to worker shells.
     cmd.arg("-c")
@@ -503,6 +507,7 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
             "PIRA_TEAM_HANDOFF",
             "PIRA_TEAM_CHILD",
             "PIRA_TEAM_CONTEXT",
+            "PIRA_TEAM_ATTEMPT",
             "PIRA_CTX_STORE_DIR",
             "PIRA_DEC_STORE_DIR",
             "PIRA_DEC_WORKSPACE_DIR",

@@ -166,7 +166,7 @@ if expected := os.environ.get("TEAM_EXPECT_AUTH_SHA256"):
     assert all(selected_key not in str(value) for value in shell.values()), "credential exposed to worker environment"
     assert all(selected_key not in arg for arg in args), "credential exposed in backend arguments"
     del selected_key
-policy = Path(json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("model_instructions_file=")))).read_text(encoding="utf-8")
+policy = Path(json.loads(next(a.split("=", 1)[1] for a in args if a.startswith("model_instructions_file=")))).read_bytes().decode("utf-8")
 assert "Never read or expose secrets files" in policy and "pira_nav" in policy
 assert Path.cwd() != home
 state_path = home / "fixture-state.json"

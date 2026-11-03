@@ -183,8 +183,7 @@ pub(crate) fn codex_context() -> Result<Value, String> {
                 .map(|p| PathBuf::from(p).join(".codex"))
         })
         .ok_or("cannot locate Codex home")?;
-    // A root may know its coordinator's thread ID/home, but selecting that log
-    // through environment variables must not turn root into the immediate parent.
+    // Catch an accidentally selected worker home without its required launch context.
     if worker.is_none()
         && let Ok(physical) = home.canonicalize()
         && physical.file_name().and_then(|name| name.to_str()) == Some("codex-home")
@@ -195,7 +194,7 @@ pub(crate) fn codex_context() -> Result<Value, String> {
         let manifest = crate::lifecycle::read_json(&run.join("manifest.json"))?;
         if manifest["transport"] == "app-server" && manifest["thread_id"] == thread {
             return Err(
-                "Team worker identity requires actual backend ancestry, not environment assertions"
+                "Team worker session identity requires its complete launch context; resume with current Team"
                     .into(),
             );
         }

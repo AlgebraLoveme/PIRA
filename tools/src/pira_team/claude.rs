@@ -3,6 +3,7 @@ use crate::{Options, lifecycle};
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -148,7 +149,7 @@ pub(crate) fn command(
     .map_err(|e| format!("create Claude shell filter: {e}"))?;
     let path = crate::worker_path(&launcher, std::env::var_os("PATH").as_deref())?;
     let mut environment = json!({
-        "PIRA_TEAM_CONTEXT":run, "PIRA_TEAM_CHILD":"1", "PIRA_TEAM_HANDOFF":handoff,
+        "PIRA_TEAM_CONTEXT":run, "PIRA_TEAM_CHILD":"1", "PIRA_TEAM_ATTEMPT":dir, "PIRA_TEAM_HANDOFF":handoff,
         "PIRA_CTX_STORE_DIR":options.ctx_store,"PIRA_DEC_STORE_DIR":options.dec_store,
         "PATH":path,"CLAUDE_CODE_SHELL_PREFIX":wrapper,
         "CLAUDE_CODE_EFFORT_LEVEL":options.effort,
@@ -195,11 +196,19 @@ pub(crate) fn command(
         &options.effort,
     ]);
     command.arg("--settings").arg(settings.to_string());
-    command.arg("--system-prompt").arg(format!(
-        "{}\n\n{}",
-        fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?,
-        fs::read_to_string(dir.join("phase.md")).map_err(|e| e.to_string())?
-    ));
+    // Keep the complete policy without exceeding Windows' command-line limit.
+    let prompt = dir.join("system-prompt.md");
+    crate::create(&prompt)?
+        .write_all(
+            format!(
+                "{}\n\n{}",
+                fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?,
+                fs::read_to_string(dir.join("phase.md")).map_err(|e| e.to_string())?
+            )
+            .as_bytes(),
+        )
+        .map_err(|e| format!("write Claude system prompt: {e}"))?;
+    command.arg("--system-prompt-file").arg(prompt);
     command
         .arg(if manifest["claude_session_started"] == true {
             "--resume"
@@ -292,11 +301,13 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn is_executable(path: &Path) -> bool {
     crate::authentication::resolve_program_for(crate::harness::Harness::Claude)
         .is_ok_and(|selected| selected_image_matches(&selected, path))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn selected_image_matches(selected: &Path, image: &Path) -> bool {
     // Windows image queries use Win32 paths; selected executables are canonical
     // verbatim paths. Compare the same representation without basename matching.
@@ -306,38 +317,60 @@ fn selected_image_matches(selected: &Path, image: &Path) -> bool {
 pub(crate) fn caller_context(session: &str) -> Result<Value, String> {
     crate::profile::validate_session_id(session)?;
     let worker = crate::subteam::caller_run()?;
-    let mut pid = std::process::id();
-    let mut birth = u64::MAX;
-    let mut verified = false;
-    for _ in 0..64 {
-        let identity =
-            crate::native::identity(pid).map_err(|_| "cannot verify Claude caller ancestry")?;
-        if !identity.alive || identity.birth > birth {
-            break;
+    // Only Linux needs a native baseline for its per-command namespace/seccomp
+    // check. This is a permission check, not caller-role or session authority.
+    #[cfg(target_os = "linux")]
+    let ancestor = if worker.is_some() {
+        let runtime = crate::subteam::caller_runtime()?.ok_or("missing Claude worker runtime")?;
+        let pid = runtime["backend_pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or("invalid Claude backend PID")?;
+        let actual =
+            crate::native::identity(pid).map_err(|_| "cannot verify Claude sandbox baseline")?;
+        if !actual.alive || runtime["backend_birth"].as_u64() != Some(actual.birth) {
+            return Err("Claude sandbox baseline expired".into());
         }
-        if is_executable(&identity.executable) {
-            verified = true;
-            if !crate::native::claude_shell_unsandboxed(pid)
-                .map_err(|e| format!("cannot verify current Claude shell sandbox: {e}"))?
-            {
-                return Err("Claude Team requires an unsandboxed full-access shell; current command is sandboxed".into());
+        pid
+    } else {
+        let mut pid = std::process::id();
+        let mut birth = u64::MAX;
+        let mut found = None;
+        for _ in 0..64 {
+            let actual = crate::native::identity(pid)
+                .map_err(|_| "cannot verify Claude sandbox baseline")?;
+            if !actual.alive || actual.birth > birth {
+                break;
             }
-            if crate::native::identity(pid)
-                .map_err(|_| "Claude caller exited during verification")?
-                != identity
-            {
-                return Err("Claude caller identity changed during verification".into());
+            if is_executable(&actual.executable) {
+                found = Some(pid);
+                break;
             }
-            break;
+            birth = actual.birth;
+            pid = actual.parent;
+            if pid <= 1 {
+                break;
+            }
         }
-        birth = identity.birth;
-        pid = identity.parent;
-        if pid <= if cfg!(windows) { 4 } else { 1 } {
-            break;
-        }
+        found.ok_or("native Claude sandbox baseline unavailable")?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let ancestor = 0;
+    #[cfg(target_os = "linux")]
+    let baseline =
+        crate::native::identity(ancestor).map_err(|_| "Claude sandbox baseline exited")?;
+    if !crate::native::claude_shell_unsandboxed(ancestor)
+        .map_err(|e| format!("cannot verify current Claude shell sandbox: {e}"))?
+    {
+        return Err(
+            "Claude Team requires an unsandboxed full-access shell; current command is sandboxed"
+                .into(),
+        );
     }
-    if !verified {
-        return Err("CLAUDE_CODE_SESSION_ID requires a native Claude ancestor, not an environment assertion".into());
+    #[cfg(target_os = "linux")]
+    if crate::native::identity(ancestor).map_err(|_| "Claude sandbox baseline exited")? != baseline
+    {
+        return Err("Claude sandbox baseline changed during verification".into());
     }
     if let Some(run) = worker {
         let manifest = lifecycle::read_json(&run.join("manifest.json"))?;

@@ -27,6 +27,9 @@ def main():
             subprocess.run(["rustc","--edition=2024",str(tests/"native_fake_codex.rs"),
                             "-o",str(executable)], check=True)
             environment["PIRA_TEAM_TEST_CODEX"] = str(executable)
+            claude = home / "claude.exe"
+            subprocess.run(["rustc", "--edition=2024", str(tests/"native_fake_claude.rs"), "-o", str(claude)], check=True)
+            environment["PIRA_TEAM_TEST_CLAUDE"] = str(claude)
         os.environ.clear()
         os.environ.update(environment)
         tempfile.tempdir = str(home)
@@ -37,14 +40,20 @@ def main():
             # These two non-exec shell-wrapper fixtures require POSIX. Keep the
             # remaining suite's no-skips gate, including newly added tests.
             posix_wrappers = {
-                "test_wrapped_backend_rejects_unrelated_pid_stale_birth_and_revision",
-                "test_wrapped_backend_verifies_owner_and_preserves_delegation_limits",
+                "test_wrapped_backend_rejects_malformed_runtime_and_stale_revision",
+                "test_wrapped_backend_preserves_context_and_delegation_limits",
             }
             suite = loader.loadTestsFromNames([
                 "test_subteams.SubteamTests." + name
                 for name in loader.getTestCaseNames(test_subteams.SubteamTests)
                 if name not in posix_wrappers
             ])
+            import test_claude
+            suite.addTests(loader.loadTestsFromNames([
+                "test_claude.ClaudeTests." + name
+                for name in loader.getTestCaseNames(test_claude.ClaudeTests)
+                if name != "test_worker_context_preserves_role_when_path_changes"
+            ]))
             suite.addTests(loader.loadTestsFromNames([
                 "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
                 "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",

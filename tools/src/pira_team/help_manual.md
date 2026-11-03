@@ -136,11 +136,10 @@ migration, and current handoff/gate are supplied each turn. Cache hits are not g
 
 Execution permissions always inherit the matching caller session's latest recorded context,
 including on resume; explicit model/effort do not bypass permission verification. Missing,
-malformed or unrepresentable policies fail closed. Only approval-never is supported; Team
-cannot handle interactive approvals. Read-only callers cannot supply required managed writes.
-Fine-grained restricted permission profiles are unsupported by this native API. Workspace-write
-callers must place managed Team/tool stores and configured build roots within their writable scope;
-Team does not add filesystem/network authority. Full access does not expand task ownership.
+malformed or unrepresentable policies fail closed. Supported launches require verified
+full access with approval-never; Team cannot handle interactive approvals. Workspace-write,
+read-only and fine-grained restricted permission profiles are unsupported. Team does not
+add filesystem/network authority. Full access does not expand task ownership.
 On new runs, caller model exactly gpt-6-astra (at any effort) maps to gpt-6.1-sol/high.
 Recognized callers gpt-6.1-sol, gpt-6-sol, gpt-6-luna and gpt-5.6-sol inherit model/effort
 unchanged. Unknown or missing caller model identity falls back to gpt-6.1-sol/high, not the
@@ -154,8 +153,6 @@ execution context. Claude identities are namespaced separately from Codex IDs.
 Claude mains must have a current bypassPermissions turn and verified non-sandboxed
 execution. The current shell is checked directly; no prior tool-result record is
 required. Unsupported or missing permission evidence fails without elevation.
-Team workers additionally require the retained backend PID/birth and native session
-binding, independent of environment hints.
 Explicit --model and --effort independently override their respective fields, including
 partial overrides. Resume retains stored model/effort unless explicitly overridden; it does
 not reapply caller defaults. Missing effort for a recognized caller requires --effort;
@@ -194,7 +191,7 @@ physical paths are deduplicated. Run/resume/repair use current invoking configur
 build_roots in manifests. Other inherited variables grant no extra writes. No cache deletion is
 authorized; task/ownership constraints still apply. Unix cancellation excludes detached descendants.
 Subteams: exactly main -> coordinator -> ordinary children. Authorization is retained and
-bound to the actual native backend ancestry and verified thread, not environment assertions.
+bound to the retained run, launch attempt, and matching native session.
 A coordinator cannot grant --allow-subteam or change config, escape its retained store,
 or access siblings, ancestors or root runs. Tags and child content belong to the immediate
 parent only. Root read of a coordinator manifest includes descendant activity/usage summaries,
@@ -209,7 +206,7 @@ Coordinators must integrate and finish required child work; completed is rejecte
 child remains active. Incomplete/needs_decision preserve child lifecycle visibility.
 Legacy runs gain no subteam permission without an explicit root grant. Original cached policy
 prefixes are preserved; migration injects current rules. These are Team-interface controls,
-not filesystem security against same-user manual tampering.
+not filesystem isolation.
 Windows backend scopes use owned job handles; child launchers explicitly break away from
 the coordinator job without escaping caller-owned outer jobs. Backend authentication for
 children uses a local OS-peer-verified, one-time launcher handoff and remains in launcher

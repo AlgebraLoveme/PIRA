@@ -3,10 +3,7 @@
 //! Add a harness here, its native launch/caller adapter, and its protocol loop.
 use crate::{Options, app_server, authentication};
 use serde_json::Value;
-use std::{
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{path::Path, process::Command};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PolicyDelivery {
@@ -25,43 +22,6 @@ pub(crate) enum Harness {
 }
 
 impl Harness {
-    pub(crate) fn claude_stream_json(arguments: &[String]) -> bool {
-        arguments
-            .windows(2)
-            .any(|args| args == ["--input-format", "stream-json"])
-    }
-
-    pub(crate) fn team_marker(arguments: &[String]) -> Result<Option<PathBuf>, String> {
-        if Self::claude_stream_json(arguments)
-            && let Some(pair) = arguments.windows(2).find(|pair| pair[0] == "--settings")
-            && pair[1].starts_with('{')
-        {
-            let settings: Value = serde_json::from_str(&pair[1])
-                .map_err(|_| "invalid Claude Team settings marker")?;
-            if let Some(value) = settings["env"].get("PIRA_TEAM_CONTEXT") {
-                return value
-                    .as_str()
-                    .map(PathBuf::from)
-                    .map(Some)
-                    .ok_or("invalid Claude Team context path".into());
-            }
-        }
-        if !arguments
-            .windows(3)
-            .any(|a| a == ["app-server", "--strict-config", "--stdio"])
-        {
-            return Ok(None);
-        }
-        arguments
-            .iter()
-            .find_map(|arg| arg.strip_prefix("shell_environment_policy.set.PIRA_TEAM_CONTEXT="))
-            .map(|value| {
-                serde_json::from_str::<PathBuf>(value)
-                    .map_err(|_| "invalid Team context marker".into())
-            })
-            .transpose()
-    }
-
     pub(crate) const ALL: [Self; 2] = [Self::Codex, Self::Claude];
 
     pub(crate) fn inherits_native_profile(self) -> bool {

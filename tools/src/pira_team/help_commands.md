@@ -407,11 +407,11 @@ EXIT STATUS
 pira_team — execution, guidance, and subteam safety
 
 Execution inherits the matching caller session's latest verified context, including
-on resume. Only approval-never is supported. Missing, malformed, ambiguous, or
-unrepresentable permissions fail closed. Read-only callers cannot supply required
-managed writes. Workspace-write callers must keep stores/build roots within their
-writable scope. Full access does not expand task ownership. Fine-grained restricted
-permission profiles are unsupported. No rollback/merge is automatic.
+on resume. Supported launches require verified full access with approval-never.
+Missing, malformed, ambiguous, or unrepresentable permissions fail closed.
+Workspace-write, read-only, and fine-grained restricted permission profiles are
+unsupported. Team does not broaden caller permissions. Full access does not expand
+task ownership. No rollback/merge is automatic.
 
 Workers always receive main Ctx/Nav/Dec guidance. Optional review, implementation,
 figure, and writing guidance are independent; inject only what the task requires.
@@ -424,7 +424,7 @@ Root-only --allow-subteam permits main -> coordinator -> ordinary children.
 Children cannot delegate or select remote hosts. Native subagents are disabled.
 Coordinator completion is rejected while children remain active. Recursive control
 grants no descendant content access. These are Team-interface/instructional
-boundaries, not OS isolation against same-user tampering. See help sessions for
+boundaries, not OS isolation. See help sessions for
 ownership, help recovery for settlement, and help manual for full safety details.
 
 # recovery

@@ -87,9 +87,13 @@ class AutoRecapTests(unittest.TestCase):
         # Synthetic configuration tests must not select the host's Codex backend.
         which = setup.tool_setup.shutil.which
         backend = patch.object(setup.tool_setup.shutil, "which", side_effect=lambda name, *args, **kwargs:
-                               None if name == "codex" else which(name, *args, **kwargs))
+                               None if name in ("codex", "codex.exe") else which(name, *args, **kwargs))
         backend.start()
         self.addCleanup(backend.stop)
+        native_search = patch.object(setup.tool_setup, "windows_codex_binary",
+                                     side_effect=lambda: setup.tool_setup.shutil.which("codex.exe"))
+        native_search.start()
+        self.addCleanup(native_search.stop)
         # Native file operations stay real; registry persistence uses a private test double.
         if setup.os.name == "nt":
             from unittest.mock import MagicMock
@@ -593,6 +597,35 @@ class AutoRecapTests(unittest.TestCase):
         parsed = tomllib.loads(config.read_text())
         self.assertEqual(parsed["default_permissions"], "custom")
         self.assertNotIn("sandbox_mode", parsed)
+
+    def test_safe_interactive_default_and_explicit_mode_warn_without_broadening(self) -> None:
+        root = Path(os.environ["HOME"])
+        for mode in ("ask", "safe"):
+            state = setup.SetupState(root, root, False, False)
+            output = io.StringIO()
+            with self.subTest(mode=mode), patch.object(setup.sys.stdin, "isatty", return_value=True), \
+                 patch("builtins.input", return_value="") as prompt, contextlib.redirect_stdout(output):
+                text = setup.plan_codex_configuration(state, root / "config.toml", mode, False,
+                                                      include_stores=False)
+            parsed = tomllib.loads(text)
+            self.assertEqual(parsed["approval_policy"], "on-request")
+            self.assertEqual(parsed["sandbox_mode"], "workspace-write")
+            self.assertIn("Team is unavailable in safe mode", output.getvalue())
+            if mode == "ask":
+                self.assertIn("workspace-write (Team unavailable)", output.getvalue())
+                prompt.assert_called_once()
+            else:
+                prompt.assert_not_called()
+
+    def test_windows_migration_checks_the_selected_native_codex_image(self) -> None:
+        root = Path(os.environ["HOME"])
+        native = root / "codex.exe"
+        state = setup.SetupState(root, root, False, False)
+        with patch.object(setup.tool_setup, "IS_WINDOWS", True), \
+             patch.object(setup.tool_setup.shutil, "which", side_effect=lambda name: str(native) if name == "codex.exe" else str(root / "codex.cmd")), \
+             patch.object(setup.tool_setup, "check_team_runtime") as check:
+            self.assertEqual(setup.migration_codex_binary(state), str(native.resolve()))
+            check.assert_called_once_with(["pira_team"], str(native.resolve()))
 
     def test_python_requirement_fails_before_configuration_writes(self) -> None:
         import os

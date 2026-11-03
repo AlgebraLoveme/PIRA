@@ -1,21 +1,52 @@
 """Native Claude wire and provider-family tests, without inference or credentials."""
-import json, os, subprocess, unittest
+import json, os, shutil, subprocess, sys, unittest
 from pathlib import Path
 import test_team
 
-@unittest.skipUnless(os.name=='posix','POSIX executable fixture; native Windows adapter tested separately')
+def install_claude(root, environment):
+    peer = Path(__file__).with_name('fake_claude.py')
+    if os.name == 'nt':
+        shutil.copyfile(os.environ['PIRA_TEAM_TEST_CLAUDE'], root / 'claude.exe')
+        environment.update(TEAM_CLAUDE_PYTHON=sys.executable, TEAM_CLAUDE_PEER=str(peer))
+    else:
+        executable = root / 'claude'
+        executable.write_text(peer.read_text()); executable.chmod(0o700)
+
 class ClaudeTests(unittest.TestCase):
     def setUp(self):
         self.f=test_team.TeamTests(); self.f.setUp(); self.addCleanup(self.f.doCleanups)
         self.f.parent([{'sandbox_policy':{'type':'danger-full-access'}}])
         self.f.env.pop('CLAUDE_CODE_SESSION_ID',None)
         self.f.env['PYTHONPYCACHEPREFIX']=str(self.f.root/'pycache')
-        executable=self.f.root/'claude'
-        executable.write_text(Path(__file__).with_name('fake_claude.py').read_text()); executable.chmod(0o700)
+        install_claude(self.f.root, self.f.env)
+        self.f.env['TEAM_CLAUDE_BIN'] = str(self.f.bin)
     def launch(self,task,*extra):
         return subprocess.run([str(self.f.bin),'run','--cwd',str(self.f.root),'--store',str(self.f.root/'logs'),
             '--model','claude-future-family-100','--effort','low','--task',task,'--completion-gate','fixture output',*extra],
             env=self.f.env,text=True,capture_output=True,timeout=10)
+    @unittest.skipUnless(os.name == 'nt', 'Windows external-main caller regression')
+    def test_windows_claude_main_uses_native_session_without_backend_ancestor(self):
+        session = 'main-native-session'
+        home = self.f.root / 'claude-main-home'
+        project = home / 'projects' / 'fixture'
+        project.mkdir(parents=True)
+        transcript = project / (session + '.jsonl')
+        def write(mode):
+            transcript.write_text(json.dumps({'type':'user', 'sessionId':session,
+                'cwd':str(self.f.root), 'permissionMode':mode,
+                'message':{'content':'fixture task'}}) + '\n')
+        self.f.env.update(CLAUDE_CONFIG_DIR=str(home), CLAUDE_CODE_SESSION_ID=session)
+        write('bypassPermissions')
+        result = self.launch('initial')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = Path(json.loads(result.stdout)['run_root'])
+        self.assertEqual(json.loads((run/'manifest.json').read_text())['creator_main_session_id'],
+                         'claude-' + session)
+        write('plan')
+        rejected = self.launch('restricted')
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('bypassPermissions', rejected.stderr)
+        self.assertEqual(len(list((self.f.root/'logs').glob('*/manifest.json'))), 1)
     def test_launch_resume_and_cumulative_usage(self):
         first=self.launch('initial'); self.assertEqual(first.returncode,0,first.stderr)
         receipt=json.loads(first.stdout); run=Path(receipt['run_root'])
@@ -40,7 +71,8 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual({m['transport'] for m in manifests},{'app-server','claude-stream-json'})
         self.assertEqual(len({m['creator_main_session_id'] for m in manifests}),1)
 
-    def test_native_leaf_cannot_hide_ancestry_with_stripped_hints_and_changed_path(self):
+    @unittest.skipUnless(os.name == "posix", "POSIX PATH symlink fixture")
+    def test_worker_context_preserves_role_when_path_changes(self):
         import sys
         tests = Path(__file__).parent
         native = self.f.root / 'versioned-native-image'
@@ -52,14 +84,14 @@ class ClaudeTests(unittest.TestCase):
         (codex_only / 'codex').symlink_to(self.f.root / 'codex')
         (codex_only / 'python3').symlink_to(sys.executable)
         replacement = self.f.root / 'replacement'; replacement.mkdir()
-        # A different resolver result must not hide the actual bound native image either.
+        # Ambient CLI resolution does not change the supplied run/session context.
         (replacement / 'claude').symlink_to(self.f.root / 'codex')
         self.f.env.update(TEAM_CLAUDE_PYTHON=sys.executable,
             TEAM_CLAUDE_PEER=str(tests / 'fake_claude.py'), TEAM_CLAUDE_BIN=str(self.f.bin),
             TEAM_CLAUDE_STORE=str(self.f.root / 'logs'), TEAM_CLAUDE_CODEX_ONLY=str(codex_only),
             TEAM_CLAUDE_CODEX_HOME=str(self.f.root / 'original-home'),
             TEAM_CLAUDE_REPLACEMENT=str(replacement))
-        result = self.launch('ancestry-probe')
+        result = self.launch('context-probe')
         self.assertEqual(result.returncode, 0, result.stderr)
         run = Path(json.loads(result.stdout)['run_root'])
         checks = json.loads(Path(json.loads(result.stdout)['handoff_path']).read_text())
@@ -83,15 +115,15 @@ class ClaudeTests(unittest.TestCase):
         again=self.f.access('resume',receipt['run_id'],'--task','still writing')
         self.assertEqual(again.returncode,0,again.stderr)
         writing=Path(__file__).resolve().parents[4]/'modules/SCIENTIFIC_WRITING.md'
-        self.assertIn(writing.read_text(),(run/'revisions/000003/policy.md').read_text())
-        self.assertEqual((run/'revisions/000003/phase.md').read_text().count(writing.read_text()),0)
+        self.assertIn(writing.read_bytes(),(run/'revisions/000003/policy.md').read_bytes())
+        self.assertEqual((run/'revisions/000003/phase.md').read_bytes().count(writing.read_bytes()),0)
 
     def test_codex_coordinator_launches_claude_child(self):
         import test_subteams
         f=test_subteams.SubteamTests();f.setUp();self.addCleanup(f.doCleanups)
         f.parent([{'sandbox_policy':{'type':'danger-full-access'}}])
         f.env['PYTHONPYCACHEPREFIX']=str(f.root/'pycache')
-        fake=f.root/'claude';fake.write_text(Path(__file__).with_name('fake_claude.py').read_text());fake.chmod(0o700)
+        install_claude(f.root, f.env)
         process,coordinator=f.start()
         child=f.command(coordinator,'run','--model','claude-future-family-100','--effort','low','--task','child-work','--completion-gate','fixture child completion')
         self.assertEqual(child['returncode'],0,child)
@@ -102,6 +134,19 @@ class ClaudeTests(unittest.TestCase):
         f.request(coordinator,operation='finish')
         process.communicate(timeout=10)
         self.assertEqual(process.returncode,0)
+
+    def test_claude_coordinator_launches_codex_child(self):
+        result = self.launch('delegate-probe', '--allow-subteam')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(result.stdout)
+        parent = json.loads((Path(receipt['run_root']) / 'manifest.json').read_text())
+        report = json.loads(Path(receipt['handoff_path']).read_text())
+        self.assertEqual(report['returncode'], 0, report)
+        child = report['manifest']
+        self.assertEqual(child['parent_run_id'], receipt['run_id'])
+        self.assertEqual(child['transport'], 'app-server')
+        self.assertEqual(child['creator_main_session_id'], 'claude-' + parent['thread_id'])
+        self.assertFalse(child['allow_subteam'])
 
     def test_refuses_backend_switch_on_resume(self):
         receipt=json.loads(self.launch('initial').stdout)

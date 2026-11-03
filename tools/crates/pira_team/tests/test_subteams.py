@@ -117,18 +117,17 @@ class SubteamTests(unittest.TestCase):
             command = shlex.quote(str(wrapper))
 
     @unittest.skipUnless(os.name == "posix", "POSIX non-exec wrapper fixture")
-    def test_wrapped_backend_verifies_owner_and_preserves_delegation_limits(self):
+    def test_wrapped_backend_preserves_context_and_delegation_limits(self):
         self.wrap_backend(depth=2)
         process, coordinator = self.start()
-        no_hints = {"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None}
-        child = self.child(coordinator, env=no_hints)
+        child = self.child(coordinator)
         self.assertIn("run_id", child, child)
         rejected = self.command(child["run_id"], "run", "--task", "x",
-                                "--completion-gate", "x", env=no_hints)
+                                "--completion-gate", "x")
         self.assertNotEqual(rejected["returncode"], 0, rejected)
         self.assertIn("not an authorized coordinator", rejected["stderr"])
         grant = self.command(coordinator, "run", "--allow-subteam", "--task", "x",
-                             "--completion-gate", "x", env=no_hints)
+                             "--completion-gate", "x")
         self.assertNotEqual(grant["returncode"], 0, grant)
         self.assertIn("cannot grant --allow-subteam", grant["stderr"])
         self.assertEqual(len(list((self.root / "logs").iterdir())), 2)
@@ -138,32 +137,26 @@ class SubteamTests(unittest.TestCase):
         self.assertEqual(self.wait(process)[0], 0)
 
     @unittest.skipUnless(os.name == "posix", "POSIX non-exec wrapper fixture")
-    def test_wrapped_backend_rejects_unrelated_pid_stale_birth_and_revision(self):
+    def test_wrapped_backend_rejects_malformed_runtime_and_stale_revision(self):
         self.wrap_backend()
         process, coordinator = self.start()
         path = self.root / "logs" / coordinator / "runtime.json"
         original = path.read_bytes()
         runtime = json.loads(original)
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                              stdin=subprocess.PIPE, env=self.env) as unrelated:
-            for field, value in (("backend_pid", unrelated.pid),
-                                 ("backend_birth", runtime["backend_birth"] + 1),
-                                 ("revision", runtime["revision"] + 1)):
-                with self.subTest(field=field):
-                    try:
-                        path.write_text(json.dumps({**runtime, field: value}))
-                        rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x",
-                                                env={"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None})
-                        self.assertNotEqual(rejected["returncode"], 0, rejected)
-                        self.assertIn("runtime does not match actual worker ancestry", rejected["stderr"])
-                        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
-                    finally:
-                        path.write_bytes(original)
+        for field, value in (("backend_pid", 0), ("backend_birth", None), ("revision", runtime["revision"] + 1)):
+            with self.subTest(field=field):
+                try:
+                    path.write_text(json.dumps({**runtime, field: value}))
+                    rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x")
+                    self.assertNotEqual(rejected["returncode"], 0, rejected)
+                    self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                finally:
+                    path.write_bytes(original)
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
 
     def test_backend_rejects_malformed_birth_and_revision(self):
-        # Direct ownership discriminates malformed-state acceptance from the wrapper bug.
+        # Malformed launch state must fail before any child is published.
         process, coordinator = self.start()
         run = self.root / "logs" / coordinator
         runtime, manifest = run / "runtime.json", run / "manifest.json"
@@ -181,10 +174,8 @@ class SubteamTests(unittest.TestCase):
                             else:
                                 state[field] = value
                             path.write_text(json.dumps(state))
-                        rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x",
-                                                env={"PIRA_TEAM_CHILD": None, "PIRA_TEAM_CONTEXT": None})
+                        rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x")
                         self.assertNotEqual(rejected["returncode"], 0, rejected)
-                        self.assertIn("runtime does not match actual worker ancestry", rejected["stderr"])
                         self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
                     finally:
                         for path, original in originals.items():
@@ -249,30 +240,30 @@ class SubteamTests(unittest.TestCase):
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
 
-    def test_forged_environment_cross_store_and_caller_identity(self):
+    def test_context_rejects_wrong_session_partial_metadata_and_cross_store(self):
         process, coordinator = self.start()
         outside = self.root / "outside"
         outside.mkdir()
         for args, overrides in (
             (("run", "--store", str(outside), "--task", "x", "--completion-gate", "x"), {}),
             (("read", coordinator, "manifest.json"), {"CODEX_THREAD_ID":"parent-session", "CODEX_HOME":self.env["CODEX_HOME"]}),
-            (("run", "--task", "x", "--completion-gate", "x", "--allow-subteam"), {"PIRA_TEAM_CHILD":None, "PIRA_TEAM_CONTEXT":None}),
+            (("run", "--task", "x", "--completion-gate", "x", "--allow-subteam"), {"PIRA_TEAM_ATTEMPT":None}),
         ):
             result = self.command(coordinator, *args, env=overrides)
             self.assertNotEqual(result["returncode"], 0, result)
-        # Removing environment discovery hints cannot escape actual backend ancestry.
+        # Supplied context retains the correct store despite ambient default changes.
         result = self.command(coordinator, "run", "--task", "ordinary", "--completion-gate", "x", env={
-            "PIRA_TEAM_CHILD":None, "PIRA_TEAM_CONTEXT":None, "PIRA_TEAM_DIR":str(outside), "CODEX_HOME":self.env["CODEX_HOME"]})
+            "PIRA_TEAM_DIR":str(outside), "CODEX_HOME":self.env["CODEX_HOME"]})
         self.assertEqual(result["returncode"], 0, result)
         self.assertEqual(len(list(outside.iterdir())), 0)
         self.assertEqual(len(json.loads(self.root_command("read", coordinator, "manifest.json").stdout)["descendants"]["runs"]), 1)
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
-        fake_env = dict(self.env, PIRA_TEAM_CHILD="1", PIRA_TEAM_CONTEXT=str(self.root / "logs" / coordinator))
+        partial_env = dict(self.env, PIRA_TEAM_CHILD="1", PIRA_TEAM_CONTEXT=str(self.root / "logs" / coordinator))
         result = subprocess.run([str(self.bin), "read", coordinator, "manifest.json", "--store", str(self.root / "logs")],
-                                env=fake_env, capture_output=True, text=True, encoding="utf-8")
+                                env=partial_env, capture_output=True, text=True, encoding="utf-8")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("ancestry", result.stderr)
+        self.assertIn("launch context", result.stderr)
 
     def test_completion_rejected_with_active_child_and_accounting_resume(self):
         process, coordinator = self.start()
@@ -535,17 +526,17 @@ class SubteamTests(unittest.TestCase):
         finally:
             boundary.close()
 
-    def test_root_cannot_impersonate_coordinator_by_selecting_worker_home(self):
+    def test_worker_home_without_launch_context_is_not_a_main_session(self):
         process, coordinator = self.start()
         child = self.child(coordinator)
-        forged = dict(self.env, CODEX_THREAD_ID=self.manifest(coordinator)["thread_id"],
+        wrong_home = dict(self.env, CODEX_THREAD_ID=self.manifest(coordinator)["thread_id"],
                       CODEX_HOME=str(self.root / "logs" / coordinator / "codex-home"))
-        for args in (("read", child["run_id"], "manifest.json"), ("bookmark", child["run_id"], "--label", "forged"),
+        for args in (("read", child["run_id"], "manifest.json"), ("bookmark", child["run_id"], "--label", "wrong-home"),
                      ("interrupt", child["run_id"]), ("resume", child["run_id"]),
                      ("run", "--allow-subteam", "--task", "x", "--completion-gate", "x")):
             with self.subTest(args=args):
                 result = subprocess.run([str(self.bin), *args, "--store", str(self.root / "logs")],
-                                        env=forged, text=True, encoding="utf-8", capture_output=True, timeout=5)
+                                        env=wrong_home, text=True, encoding="utf-8", capture_output=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("identity", result.stderr)
 

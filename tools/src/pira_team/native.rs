@@ -87,27 +87,6 @@ pub fn executable(pid: u32) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
 }
 
-#[cfg(target_os = "linux")]
-pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
-    parse_arguments(&std::fs::read(format!("/proc/{pid}/cmdline"))?)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_arguments(bytes: &[u8]) -> io::Result<Vec<String>> {
-    // Empty/redacted or incomplete argv cannot establish absence of a marker.
-    let bytes = bytes
-        .strip_suffix(&[0])
-        .filter(|bytes| !bytes.is_empty() && bytes[0] != 0)
-        .ok_or_else(|| io::Error::other("unavailable process arguments"))?;
-    bytes
-        .split(|byte| *byte == 0)
-        .map(|arg| {
-            String::from_utf8(arg.to_vec())
-                .map_err(|_| io::Error::other("invalid process arguments"))
-        })
-        .collect()
-}
-
 #[cfg(target_os = "macos")]
 pub fn identity(pid: u32) -> io::Result<Identity> {
     #[repr(C)]
@@ -269,23 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn linux_arguments_preserve_boundaries_and_reject_unavailable_data() {
-        assert_eq!(
-            parse_arguments(b"codex\0a b\0\0").unwrap(),
-            ["codex", "a b", ""]
-        );
-        for bytes in [
-            b"".as_slice(),
-            b"\0",
-            b"codex",
-            b"\0hidden\0",
-            b"codex\0\xff\0",
-        ] {
-            assert!(parse_arguments(bytes).is_err(), "{bytes:?}");
-        }
-    }
-
-    #[test]
     fn current_process_identity_is_kernel_stable() {
         let first = super::current().unwrap();
         let second = super::current().unwrap();
@@ -296,92 +258,7 @@ mod tests {
             first.executable.canonicalize().unwrap(),
             std::env::current_exe().unwrap().canonicalize().unwrap()
         );
-        #[cfg(windows)]
-        assert!(!super::windows::arguments(first.pid).unwrap().is_empty());
     }
-}
-
-#[cfg(target_os = "macos")]
-pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
-    // KERN_PROCARGS2 returns argc, the executable path, then the exact argv.
-    // Unlike ps output it preserves argument boundaries and embedded whitespace.
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
-    let mut size = 0usize;
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if !(4..=16 * 1024 * 1024).contains(&size) {
-        return Err(io::Error::other("invalid native argument size"));
-    }
-    let mut bytes = vec![0u8; size];
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            bytes.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    bytes.truncate(size);
-    let argc = i32::from_ne_bytes(
-        bytes
-            .get(..4)
-            .ok_or_else(|| io::Error::other("missing argc"))?
-            .try_into()
-            .unwrap(),
-    );
-    if argc <= 0 || argc > 100_000 {
-        return Err(io::Error::other("invalid argc"));
-    }
-    let mut rest = &bytes[4..];
-    let end = rest
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or_else(|| io::Error::other("missing executable terminator"))?;
-    rest = &rest[end + 1..];
-    while rest.first() == Some(&0) {
-        rest = &rest[1..];
-    }
-    let mut args = Vec::new();
-    for _ in 0..argc {
-        let end = rest
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or_else(|| io::Error::other("incomplete argv"))?;
-        args.push(
-            String::from_utf8(rest[..end].to_vec())
-                .map_err(|_| io::Error::other("non-UTF8 argv"))?,
-        );
-        rest = &rest[end + 1..];
-    }
-    Ok(args)
-}
-
-#[cfg(windows)]
-pub fn arguments(pid: u32) -> io::Result<Vec<String>> {
-    windows::arguments(pid)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub fn arguments(_: u32) -> io::Result<Vec<String>> {
-    Err(io::Error::other(
-        "native arguments unavailable on this platform",
-    ))
 }
 
 // Claude sandboxes individual shell commands, not its main CLI. Check the actual

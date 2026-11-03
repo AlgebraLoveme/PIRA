@@ -26,6 +26,10 @@ class TeamTests(unittest.TestCase):
         self.env["TEAM_TEST_BACKEND_FIXTURE"] = str(Path(__file__).with_name("backend_fixture.py").resolve())
         self.env.pop("PIRA_TEAM_BUILD_ROOTS", None)
         self.env.pop("PIRA_TEAM_CHILD", None)
+        self.env.pop("PIRA_TEAM_ATTEMPT", None)
+        self.env.pop("PIRA_TEAM_CONTEXT", None)
+        self.env.pop("PIRA_TEAM_HANDOFF", None)
+        self.env.pop("CLAUDE_CODE_SESSION_ID", None)
         self.env.pop("CODEX_THREAD_ID", None)
         self.env.pop("CODEX_API_KEY", None)
         self.env.pop("PIRA_TEAM_DIR", None)
@@ -1655,7 +1659,6 @@ class TeamTests(unittest.TestCase):
             "SSH_AUTH_SOCK": "/synthetic/agent.sock",
             "CODEX_SESSION_ID": "parent-session",
             "PIRA_CTX_THREAD_ID": "parent-context",
-            "PIRA_TEAM_HANDOFF": "stale-parent-handoff",
             "FONTCONFIG_FILE": str(self.root / "fonts config.conf"),
             "CARGO_BUILD_JOBS": "2",
             "UNRECOGNIZED_TASK_OPTION": "spaces 'quotes'\nλ",
@@ -1715,13 +1718,13 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertTrue(set(roots) <= set(self.metadata(receipt)["build_roots"]))
 
-    def test_nested_workers_are_rejected(self) -> None:
+    def test_partial_worker_context_is_rejected(self) -> None:
         self.env["PIRA_TEAM_CHILD"] = "1"
         for op in ("run", "resume", "steer", "interrupt", "read", "path", "wait", "tier", "resolve"):
             with self.subTest(op=op):
                 result = subprocess.run([str(self.bin), op], env=self.env, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("nested delegation is forbidden", result.stderr)
+                self.assertIn("incomplete/malformed Team launch context", result.stderr)
                 self.assertFalse((self.root / "logs").exists())
 
     def test_task_file_and_space_paths(self) -> None:

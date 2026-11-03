@@ -2,7 +2,7 @@
 
 PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
 
-It adds a small, inspectable set of instructions and tools to Codex or Claude Code. The goal is simple: make the agent more careful, useful, and consistent without hiding how it works.
+It adds a small, inspectable set of instructions and tools to Codex or Claude Code to make the agent more careful, useful, and consistent.
 
 ## What PIRA helps with
 
@@ -14,7 +14,7 @@ It adds a small, inspectable set of instructions and tools to Codex or Claude Co
 
 PIRA follows five principles:
 
-- **Useful:** give concrete next steps, not vague advice.
+- **Useful:** give concrete next steps.
 - **Honest:** never invent claims, citations, or results.
 - **Evidence-first:** prefer primary sources when facts matter.
 - **Transparent:** separate facts from interpretation and state uncertainty.
@@ -28,9 +28,9 @@ PIRA follows five principles:
 
 ## Tested compatibility
 
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Other models or agent platforms may work, but have not received the same level of testing.
+PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Other models and agent platforms have received less testing.
 
-> **Using Claude Code?** Use this same `master` checkout with setup's `--include ClaudeCode`, or `--include Codex ClaudeCode` for both. No separate branch is needed. Setup defaults to Codex; see the Claude setup options below.
+> **Using Claude Code?** Use the same `master` checkout with setup's `--include ClaudeCode`, or `--include Codex ClaudeCode` for both. Setup defaults to Codex. See [Claude setup options](#claude-setup-options).
 
 ## Install or update
 
@@ -40,12 +40,12 @@ PIRA installs to `~/agent` by default. Before updating, close active PIRA sessio
 Install or update PIRA, including its tools, following https://github.com/AlgebraLoveme/PIRA. Preserve my existing preferences and local changes.
 ```
 
-For Claude Code, also specify whether you want Claude-only setup or both harnesses.
+For Claude Code, specify whether to configure Claude Code alone or both CLIs.
 
 <details>
 <summary>Technical installation and update instructions</summary>
 
-Setup is safe to rerun: it leaves global `USER.md` unmanaged, backs up user-level configuration files before changing them, and can preview or verify its work. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help; if your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
+Setup supports reruns, leaves global `USER.md` unmanaged, and backs up user-level configuration files before changing them. It can also preview changes or verify an installation. Git and Python 3.11+ are required for PIRA configuration. The setup wrapper checks interpreter versions and can offer platform-specific installation help. If your default Python is older, install Python 3.11+ and make it available on PATH before retrying.
 
 ### Complete update procedure
 
@@ -53,17 +53,17 @@ Setup is safe to rerun: it leaves global `USER.md` unmanaged, backs up user-leve
 2. **Run full setup.** With tool runs stopped, use `assets/scripts/setup_pira.sh` on macOS/Linux or `assets/scripts/setup_pira.ps1` on Windows. Retain your selection (`--include Codex`, `--include ClaudeCode`, or `--include Codex ClaudeCode`; default `Codex`), custom configuration/install paths and version pins. Preserve existing choices with `--execution-mode keep` and `--legacy keep`. Team is included in every normal installation. Run every PIRA setup entrypoint directly, never inside `pira_ctx` (including `exact`), even for updates, dry-runs or verification: an enclosing wrapper can write records after setup exits. Setup refreshes released binaries and handles storage migration; do not skip tools or delete old stores to make migration pass.
 3. **Verify and restart.** Run the same setup with `--verify` and the selected options, check the installed tool versions, and restart shells or agents when configuration or environment changes require it. Report any incomplete step.
 
-Pulling Git alone does not refresh executables. Setup installs the latest **published tool releases**, which may lag source changes on `master`; an update report should distinguish the checkout revision from installed tool versions. The commands below explicitly select the recommended configuration rather than preserve every existing preference.
+A Git pull alone does not refresh executables. Setup installs the latest **published tool releases**, which may lag source changes on `master`. Report the checkout revision and installed tool versions separately. The commands below select the recommended configuration. To retain existing preferences, use the preservation flags described below.
 
 ### Command-line install or update
 
-The recommended command installs or updates PIRA, then connects it to Codex. It:
-- uses the existing `~/agent` git checkout when present, otherwise clones PIRA into `~/agent`;
-- enables **soft-safe** mode;
-- configures Codex to load PIRA's canonical `AGENTS.md` once;
-- installs or refreshes bundled PIRA tools in the user's `PATH`;
-- creates the communicator workspace at `~/pira` if it is missing, preserving an existing directory;
-- moves old PIRA-managed legacy files into backup.
+The recommended commands install or update PIRA and connect it to Codex. They:
+- use the existing `~/agent` Git checkout when present, otherwise clone PIRA into `~/agent`;
+- enable **soft-safe** mode;
+- configure Codex to load PIRA's canonical `AGENTS.md` once;
+- install or refresh bundled PIRA tools in the user's `PATH`;
+- create the communicator workspace at `~/pira` if it is missing, preserving an existing directory;
+- move old PIRA-managed legacy files into backup.
 
 macOS/Linux:
 
@@ -79,7 +79,7 @@ if (Test-Path "$HOME/agent/.git") { Set-Location "$HOME/agent"; git pull --ff-on
 
 To preserve an existing installation’s preferences, use `--execution-mode keep --legacy keep` instead of the corresponding flags above.
 
-`git pull --ff-only` refuses to create an automatic merge. If your checkout has conflicting local work, it stops so you can review it safely.
+`git pull --ff-only` stops for conflicting local work or a diverged history so you can review it before proceeding.
 
 > **Soft-safe is not a sandbox.** It sets Codex to no-approval/full-permission mode, or Claude to `bypassPermissions` with its shell sandbox disabled, for each selected harness. It relies on PIRA's explicit safety rules before state-changing commands.
 
@@ -97,45 +97,23 @@ On Windows:
 powershell.exe -ExecutionPolicy Bypass -File assets/scripts/setup_pira.ps1 --include ClaudeCode --yes --execution-mode soft-safe --legacy remove
 ```
 
-Use `--include Codex ClaudeCode` instead to configure both CLIs, or `--include Codex`
-for Codex alone (also the default). The same selection works with the tools-only
-entrypoint, for example `python3 assets/scripts/setup_pira_tools.py --include Codex ClaudeCode`.
-Values are case-sensitive and at least one is required after `--include`.
-Legacy `--harness codex|claude|both` remains supported, but cannot be combined with
-`--include`. Claude-only setup preserves
-Codex configuration and does not install or authenticate Codex. Install and
-authenticate Claude Code yourself. Selected Claude setup requires **2.1.311 or newer**
-(the native AGENTS integration was tested on Linux with 2.1.311); newer versions
-are accepted unchanged, not pinned. Full setup (including `--skip-tools`) and tools-only
-setup check `claude --version`. Normal setup runs `claude update` once for an older
-native CLI, then rechecks; recognized npm installations and JS/Windows script launchers instead
-require manual upgrade, avoiding global npm mutations. `--verify` and `--dry-run` never update and fail if
-the CLI is missing, too old, or unrecognizable. Native CLI failure diagnostics remain visible.
-Missing CLI installation is manual: follow the [official native setup instructions](https://code.claude.com/docs/en/setup).
-Setup does not initiate Claude login, inspect Claude credentials, switch release channels,
-or run package-manager upgrades. If `claude update` leaves a package-manager/custom
-launcher or stable-channel installation below the floor, setup fails with manual
-upgrade/channel guidance instead of silently replacing it.
+Use `--include Codex ClaudeCode` to configure both CLIs, or `--include Codex` for Codex alone (the default). The same selection works with the tools-only entrypoint, for example `python3 assets/scripts/setup_pira_tools.py --include Codex ClaudeCode`. Values are case-sensitive, and at least one is required after `--include`. Legacy `--harness codex|claude|both` remains supported and cannot be combined with `--include`. Claude-only setup preserves Codex configuration and does not install or authenticate Codex.
 
-Claude setup preserves custom settings, adds physical PIRA store paths to
-`settings.json`, and links global `CLAUDE.md` to the same canonical `AGENTS.md`
-used by Codex. Windows uses a one-line `@` import if symlinks are unavailable.
-Existing custom global instructions are preserved with a canonical import;
-conflicting symlinks and customized managed blocks require manual resolution.
-Known generated import blocks migrate with a backup. Only `AGENTS.md` needs
-policy maintenance: setup also configures the native built-in AGENTS plugin's
-`instructionFiles` option as `claude-md-and-agents-md`, so project `AGENTS.md`
-loads alongside project `CLAUDE.md` (validated with Claude Code 2.1.311).
-The configuration directory defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`;
-override it with `--claude-dir DIR`. `--execution-mode keep` leaves
-existing Claude permissions and sandbox settings unchanged. Claude Team requires
-a current `bypassPermissions` turn and an unsandboxed shell; `safe` mode is not
-supported. Preview with `--dry-run`, then verify with the same options plus
-`--verify`.
+Install and authenticate Claude Code yourself using the [official native setup instructions](https://code.claude.com/docs/en/setup). Claude setup requires **2.1.311 or newer**. Native AGENTS integration was tested on Linux with 2.1.311. Newer versions are accepted unchanged, without pinning.
+
+Full setup (including `--skip-tools`) and tools-only setup check `claude --version`. For an older native CLI, normal setup runs `claude update` once and rechecks. Recognized npm installations and JS/Windows script launchers require manual upgrade to avoid global npm mutations. `--verify` and `--dry-run` never update and fail if the CLI is missing, too old, or unrecognizable. Native CLI failure diagnostics remain visible.
+
+Setup does not initiate Claude login, inspect credentials, switch release channels, or run package-manager upgrades. If `claude update` leaves a package-manager/custom launcher or stable-channel installation below the minimum version, setup stops with manual upgrade or channel guidance without replacing the installation.
+
+Claude setup preserves custom settings, adds physical PIRA store paths to `settings.json`, and links global `CLAUDE.md` to the canonical `AGENTS.md` used by Codex. Windows uses a one-line `@` import if symlinks are unavailable. Existing custom global instructions are preserved with a canonical import. Conflicting symlinks and customized managed blocks require manual resolution. Known generated import blocks migrate with a backup.
+
+`AGENTS.md` is the single policy file to maintain. Setup configures the native built-in AGENTS plugin's `instructionFiles` option as `claude-md-and-agents-md`, so project `AGENTS.md` loads alongside project `CLAUDE.md` (validated with Claude Code 2.1.311).
+
+The configuration directory defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`. Override it with `--claude-dir DIR`. `--execution-mode keep` leaves existing Claude permissions and sandbox settings unchanged. Claude Team requires a current `bypassPermissions` turn and an unsandboxed shell. It does not support `safe` mode. Preview with `--dry-run`, then verify with the same options plus `--verify`.
 
 ### Inspect-first install
 
-Use this path if you prefer to inspect setup before it changes anything:
+To inspect setup before applying changes:
 
 ```bash
 git clone https://github.com/AlgebraLoveme/PIRA.git ~/agent
@@ -157,14 +135,14 @@ The macOS/Linux and Windows wrappers support the same options. If Python is miss
 
 ## One assistant across projects
 
-Standard PIRA setup also creates your communication workspace at `~/pira` when it is missing. An existing directory stays unchanged. After setup, open a new agent session there and use it across all your projects.
+Setup creates your communication workspace at `~/pira` if it is missing and leaves an existing directory unchanged. Open a new agent session there to work across all your projects.
 
 Your communicator’s local instructions and workbook keep track of your preferences, projects and unfinished work, so you can manage them through one conversation. Project details stay in their own project workbooks.
 
 <details>
 <summary>Communication-workspace guidance for agents</summary>
 
-Use the standard setup flow above; no separate communicator installation is needed. The workspace location is fixed to the `pira` directory under the current user’s home directory. Create it only when missing; do not populate, repair or overwrite an existing directory. Report conflicting path types or symlinks rather than replacing them.
+Use the standard setup flow above. The workspace location is fixed to the `pira` directory under the current user’s home directory. Create it only when missing; do not populate, repair or overwrite an existing directory. Report conflicting path types or symlinks rather than replacing them.
 
 Fresh setup installs the [coordination instructions](assets/COMMUNICATION_AGENTS_TEMPLATE.md) and [initial workbook](assets/COMMUNICATION_WORKBOOK_TEMPLATE.md).
 
@@ -178,7 +156,7 @@ Append the collaborator article from **PIRA blogs** to the handoff, with its lin
 
 ## Remote Team setup
 
-For a Linux server, make sure `ssh YOUR_SERVER` works in your terminal. PIRA can help you set this up. Then ask PIRA to configure remote Team on that server.
+To use Team on a Linux server, first make sure `ssh YOUR_SERVER` works in your terminal. PIRA can help configure SSH and then set up remote Team.
 
 <details>
 <summary>Setup instructions for the agent</summary>
@@ -195,7 +173,7 @@ For a Linux server, make sure `ssh YOUR_SERVER` works in your terminal. PIRA can
 <details>
 <summary>Execution, user configuration, and tool-install options</summary>
 
-Most users can keep the recommended defaults. Open this section when you want stricter permissions, a custom install path or a tools-only update. Interactive setup asks before sensitive choices; unattended setup requires explicit flags.
+Use these options for stricter permissions, a custom install path or a tools-only update. Interactive setup asks before sensitive choices. Unattended setup requires explicit flags.
 
 ### Tool storage and migration
 
@@ -207,11 +185,11 @@ Default stores share one persistent parent, with `ctx/`, `decision/`, and `team/
 | Linux | `$XDG_DATA_HOME/pira` when XDG_DATA_HOME is absolute and nonempty, otherwise `$HOME/.local/share/pira` |
 | Windows | `%LOCALAPPDATA%\PIRA` |
 
-Full setup and tools-only setup detect historical default locations and verify migration before publishing store configuration. Stop other tool runs and invoke setup directly, never inside `pira_ctx`; keep the same options when retrying. Existing destination data is preserved: identical records are reused, disjoint records are copied, and conflicting identities stop migration rather than overwrite history. Originals remain available for recovery. Successful reruns also preserve records created in the destination after migration. Retained Team migration supports validated single-thread Codex 0.161.0 histories using exactly the 0.161.0 backend. This unchanged relocation guard does not yet accept setup's 0.166.0-or-newer backend, so setup requiring retained Team relocation stops rather than bypassing it. Unsupported or unsafe histories also stop setup with a diagnostic.
+Full setup and tools-only setup detect historical default locations and verify migration before publishing store configuration. Stop other tool runs and invoke setup directly, never inside `pira_ctx`; keep the same options when retrying. Existing destination data is preserved: identical records are reused, disjoint records are copied, and conflicting identities stop migration rather than overwrite history. Originals remain available for recovery. Successful reruns also preserve records created in the destination after migration. Retained Team migration supports validated single-thread Codex 0.161.0 histories using exactly the 0.161.0 backend. The relocation guard rejects setup's 0.166.0-or-newer backend, so setup stops when retained Team relocation is required. Unsupported or unsafe histories also stop setup with a diagnostic.
 
-For an explicitly selective migration, use `--completed-ctx-only` to leave Ctx live/watch state behind, repeat `--exclude-ctx-record FILENAME.piractx` for rejected captures, and use `--fresh-team` to retain historical Team runs without importing them. Successful migration barriers persist these choices in private `.pira-setup-choice-*` directories beside the destination stores; ordinary setup reruns reuse them while still checking destination conflicts and owner leases. Receipts are bound to the tool, exact physical source set and destination, and full historical inventory. Any source addition, removal or change (including empty directories) stops automatic reuse: inspect it and explicitly reselect the intended flags. Changed/repaired records are not silently excluded. Stop legacy writers throughout setup.
+For an explicitly selective migration, use `--completed-ctx-only` to leave Ctx live/watch state behind, repeat `--exclude-ctx-record FILENAME.piractx` for rejected captures, and use `--fresh-team` to retain historical Team runs without importing them. Successful migration barriers persist these choices in private `.pira-setup-choice-*` directories beside the destination stores; ordinary setup reruns reuse them while still checking destination conflicts and owner leases. Receipts are bound to the tool, exact physical source set and destination, and full historical inventory. Any source addition, removal or change (including empty directories) stops automatic reuse: inspect it and explicitly reselect the intended flags. Changed or repaired records require explicit reselection. Stop legacy writers throughout setup.
 
-If an earlier selective migration predates receipts, rerun the corrected setup **once with the same explicit flags and rejected filenames**, with tools idle. Existing identical/disjoint destination data is safe; conflicting records still fail. Only a successful migration barrier writes receipts; dry-run/verify never create them. Receipt persistence does not imply that later installation or configuration steps succeeded.
+If an earlier selective migration predates receipts, rerun the corrected setup **once with the same explicit flags and rejected filenames**, with tools idle. Existing identical/disjoint destination data is safe; conflicting records still fail. Receipts are written only after a successful migration barrier, never during dry-run or verification. They record migration choices, independently of whether later installation or configuration succeeds.
 
 Explicit custom `PIRA_CTX_STORE_DIR`, `PIRA_DEC_STORE_DIR`, and `PIRA_TEAM_DIR` choices remain respected. Setup resolves directory aliases to physical paths. On macOS/Linux it preserves unrelated profile text and maintains a `PIRA store paths` block; Windows uses `HKCU\Environment`. Full setup also updates the selected Codex `config.toml`, preserving independent global/profile overrides. Restart shells and agents afterward. Python 3.11+ is required for configuration and migration; native tool use does not require Python.
 
@@ -223,7 +201,7 @@ Setup does not execute shell profiles or interpret sourced files. For dynamic, s
 
 | Option | Codex settings | Use when |
 | --- | --- | --- |
-| `--execution-mode safe` | `approval_policy = "on-request"`, `sandbox_mode = "workspace-write"` | You want a real approval/sandbox boundary. |
+| `--execution-mode safe` | `approval_policy = "on-request"`, `sandbox_mode = "workspace-write"` | You want a real approval/sandbox boundary; Team is unavailable in this mode. |
 | `--execution-mode soft-safe` | `approval_policy = "never"`, `sandbox_mode = "danger-full-access"` | You want convenience and accept full-permission risk. |
 | `--execution-mode keep` | Leaves existing approval/sandbox settings unchanged. | You already manage Codex permissions yourself. |
 
@@ -285,7 +263,7 @@ PIRA has one source/install branch: `master`. Change tool source there and bump 
 <details>
 <summary>Files, settings, tools, and verification performed by setup</summary>
 
-In plain language, setup connects PIRA to Codex, installs its tools, and checks the result. More precisely, it:
+For Codex, setup:
 
 1. Detects the repository directory and ensures it is available as `~/agent`, unless another `--agent-dir` is given.
 2. Leaves global `USER.md` unmanaged; it is neither required nor created.
@@ -310,9 +288,9 @@ PIRA separates memory by how long it should remain useful. This prevents raw com
 | Decisions | Important choices, alternatives, and reasons | `pira_dec` | Agents search it when needed |
 | Project knowledge | Durable state, validated results, lessons, and limitations | `AGENT_WORKBOOK.md` | Agents and humans read it directly |
 
-Detailed activity remains searchable for as long as retention allows. After a conversation is compacted, `pira_ctx recap` can restore the recent activity needed to continue the work; it is part of the activity layer, not another memory layer.
+Detailed activity remains searchable within the retention limits. After a conversation is compacted, `pira_ctx recap` can restore recent activity from this layer so work can continue.
 
-PIRA creates `AGENT_WORKBOOK.md` lazily at the workspace root only when the first durable project entry is warranted. It starts with only the needed headings. In Git, the workbook stays untracked and its anchored repository-relative path goes in the local exclude file located by `git rev-parse --git-path info/exclude`, without changing `.gitignore`.
+PIRA creates `AGENT_WORKBOOK.md` lazily at the workspace root only when the first durable project entry is warranted. It starts with the needed headings. In Git, the workbook stays untracked and its anchored repository-relative path goes in the local exclude file located by `git rev-parse --git-path info/exclude`, without changing `.gitignore`.
 
 <details>
 <summary><strong>Difference from a Codex session log</strong></summary>
@@ -327,28 +305,17 @@ A Codex session log is **session-centered and chronological**: it preserves the 
 | Cross-session value | Preserves each session's history | Carries operational evidence, decisions, and durable project understanding across sessions |
 | Noise policy | Retains the conversational sequence | Separates event detail, concluded decisions, and promoted high-level knowledge |
 
-The two are complementary. A session log answers **“what happened in this conversation?”** PIRA answers **“what has been done in this project, what evidence remains available, and what should future work remember?”**
+A session log answers **“what happened in this conversation?”** PIRA answers **“what has been done in this project, what evidence remains available, and what should future work remember?”**
 
 </details>
 
 Information moves upward only when its lasting value increases. Activity stays in `pira_ctx`; concluded choices go to `pira_dec`; durable consequences become self-contained workbook entries. The workbook never requires a reader to look up a lower-level record.
 
-## PIRA Internal Tools
-
-PIRA includes six native tools for agent continuity, repository work, figure validation, writing review, and delegation. Built-in command help provides exact syntax.
-
-| Tool | What problem it solves |
-|---|---|
-| `pira_ctx` | Keeps large command output available without flooding the active conversation. |
-| `pira_dec` | Records important choices in a consistent, searchable form. |
-| `pira_nav` | Provides portable lexical/structural navigation and language-server-backed dependency/semantic navigation. |
-| `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
-| `pira_write_check` | Flags English negation, contrast, hedging and minimization markers for contextual review. |
-| `pira_team` | Delegates technical artifact review or implementation to Codex or Claude Code workers, returning tool-managed handoffs to the main agent. |
+## Evaluations
 
 ### Agent-level evaluation
 
-Isolated agentic benchmarks tested whether the three agent-operation tools (`pira_ctx`, `pira_dec`, and `pira_nav`) help fresh agents complete real tasks, not merely whether individual binaries are fast in microbenchmarks. `pira_svg_check` is validated separately with synthetic SVG cases and release-platform builds.
+Isolated agentic benchmarks tested whether `pira_ctx`, `pira_dec`, and `pira_nav` help fresh agents complete real tasks. `pira_svg_check` is validated separately with synthetic SVG cases and release-platform builds.
 
 <details>
 <summary>Method, results, and interpretation</summary>
@@ -364,7 +331,7 @@ A private behavior-based evaluator was added only after each agent finished. It 
 | Baseline | 7/7 | \$7.50 | 1,908.6 s | 907,239 B | 72 | 14,328 B |
 | PIRA tools | 7/7 | \$4.81 (**−35.9%**) | 1,824.2 s (**−4.4%**) | 234,285 B (**−74.2%**) | 100 | 22,836 B |
 
-The estimate applies a fixed table matching standard GPT-5.6 Sol rates at run time—\$5 per million uncached input tokens, \$0.50 per million cached input tokens, and \$30 per million output tokens—to aggregate usage telemetry. It is not an observed invoice and does not model request-level long-context multipliers, cache-write pricing, tool charges, fast mode, included plan usage, or account-specific terms. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls, but exposed substantially less command text and reduced the base-rate estimate. Its 8,508 additional instruction bytes are reported rather than subtracted through an unsupported token estimate. This is one controlled task and two agent trajectories, not a general causal estimate; it demonstrates a successful difficult case rather than guaranteed savings on every task.
+The estimate applies standard GPT-5.6 Sol rates at run time to aggregate usage telemetry: \$5 per million uncached input tokens, \$0.50 per million cached input tokens, and \$30 per million output tokens. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls. It exposed substantially less command text and reduced the base-rate estimate. PIRA used 8,508 additional instruction bytes.
 
 #### `pira_ctx`: natural implementation task
 
@@ -376,7 +343,7 @@ Each generated implementation was then run inside its sandbox against the same 2
 |---:|---:|---:|---:|---:|---:|
 | 20/20 / 20/20 | 670,031 / 819,876 (**−18.3%**) | 70,735 / 108,964 (**−35.1%**) | 690.2 / 918.2 s (**−24.8%**) | 21,924 / 26,808 B (**−18.2%**) | 18 / 11 |
 
-The ctx agent used the wrapper for all 18 commands with no protocol violations. It read PIRA help once, adding 3,229 output bytes already included above, and used exact mode for the complete authoritative design. More commands did not imply more context: its median command response was 260 B versus 1,483 B for the baseline, while status-only checks and a failed test retained bounded reports. However, this is one development trial rather than a causal estimate. The agents chose different implementations: the baseline produced 1,348 source/test lines and 14 self-tests, versus 1,086 lines and six self-tests for the ctx agent, although both passed every hidden case. That behavioral variance may explain part of the token and time difference. The valid ctx run was executed first, so run order did not give the tool a later prompt-cache advantage.
+The ctx agent used the wrapper for all 18 commands with no protocol violations. It read PIRA help once, adding 3,229 output bytes already included above, and used exact mode for the complete authoritative design. Its median command response was 260 B versus 1,483 B for the baseline. Status-only checks and a failed test retained bounded reports. The baseline produced 1,348 source/test lines and 14 self-tests, versus 1,086 lines and six self-tests for the ctx agent. Both passed every hidden case.
 
 </details>
 
@@ -384,9 +351,24 @@ The ctx agent used the wrapper for all 18 commands with no protocol violations. 
 
 PIRA achieves better writing performance using fewer words on average. [View the writing benchmark](assets/bench/writing_bench.pdf).
 
+Tool-specific evaluations: [Ctx output handling](#comprehensive-held-out-benchmark), [Nav performance](#performance), and [Team delegation](#bug-hunt-benchmark) appear in their tool sections below.
+
+## PIRA Internal Tools
+
+PIRA includes six native tools for agent continuity, repository work, figure validation, writing review, and delegation. Built-in command help provides exact syntax.
+
+| Tool | What problem it solves |
+|---|---|
+| `pira_ctx` | Keeps large command output available without flooding the active conversation. |
+| `pira_dec` | Records important choices in a consistent, searchable form. |
+| `pira_nav` | Provides portable lexical/structural navigation and language-server-backed dependency/semantic navigation. |
+| `pira_svg_check` | Emits conservative warnings for text obstruction, clipping, overlap, and low contrast in SVG figures. |
+| `pira_write_check` | Flags English negation, contrast, hedging and minimization markers for contextual review. |
+| `pira_team` | Delegates technical artifact review or implementation to Codex or Claude Code workers, returning tool-managed handoffs to the main agent. |
+
 ### `pira_ctx`: lightweight command context
 
-Long build logs, test output, and file listings can consume a model's working context. `pira_ctx` returns short output normally, but stores large output locally and gives the agent a compact summary. The full evidence remains available for focused follow-up.
+Long build logs, test output, and file listings can consume a model's working context. `pira_ctx` returns short output directly and stores large output locally, giving the agent a compact summary. The full evidence remains available for focused follow-up.
 
 <details>
 <summary>Technical behavior, security, comparison, and validation</summary>
@@ -409,7 +391,7 @@ For complete stdout-only JSON up to 512 KiB, the compact view exposes bounded sc
 
 Streams remain in memory through 64 KiB and spill only once when they grow larger or a live checkpoint needs an append-only path. Rebuildable event indexes avoid synchronous durability barriers; exact captures and authoritative event records remain durably published.
 
-For jobs where only the outcome matters—such as builds, tests, or linting—`check` stores the log but returns a single PASS/FAIL line, exit code, and capture ID.
+For status checks such as builds, tests, or linting, `check` stores the log and returns a single PASS/FAIL line, exit code, and capture ID.
 
 `exact` mode normally returns output unchanged. In non-interactive use, it may replace extremely repetitive or oversized output with a retained report rather than flood or silently truncate the context. It always announces that switch.
 
@@ -423,14 +405,14 @@ Setup downloads a checksum-verified native executable from GitHub Releases into 
 
 #### Security design
 
-`pira_ctx` treats program output as untrusted data. It protects the capture and display path, but it is not a sandbox and cannot make the wrapped program safe:
+`pira_ctx` treats program output as untrusted data and protects the capture and display path. It adds no sandbox around the wrapped program, which retains the caller's permissions:
 
 - **Injection-aware display.** Agent-facing extracts are labeled as PROGRAM data, which PIRA rules treat as untrusted, and use trusted line and stream prefixes. Terminal escapes, Unicode line separators, bidirectional overrides, and invisible direction controls are sanitized so output cannot forge report structure or manipulate normal automatic display. A bounded heuristic scans the final displayed text for reserved role/wrapper markers and common **English** injection keywords, including English instructions split across displayed lines. Keyword detection is not multilingual; non-English text is detected only when it also contains a recognized marker or unsafe display control. When triggered, one warning appears before the evidence. Detection never suppresses or re-ranks evidence, and benign output pays no warning-token cost.
 - **Explicit exactness.** Automatic mode retains short output matched by the advisory heuristic instead of replaying it directly; short `exec` output follows the same routing. `search` applies the same warning. Exact byte-replay paths in `exact`, `raw`, and `range` remain unsanitized because utility and faithful recovery take precedence; they remain untrusted data under PIRA's agent rules.
 - **Bounded space, unbounded time.** Retention defaults to 512 MiB and 1,000,000 indexed lines, with a 2,000,000-line hard ceiling, while eager Python `exec` materialization defaults to 64 MiB. These ceilings are configurable within their safety bounds. Excess output is drained but not retained, and the command continues. `pira_ctx` imposes no runtime timeout or time-based termination, leaving cancellation to the agent or user.
 - **Private, checked storage.** Captures use private user-cache files, independently compressed and SHA-256-checked blocks, validated offsets and lengths, and authenticated metadata/index tables. Common secret-bearing command arguments are redacted from metadata, and result IDs do not derive from raw arguments. Output may still contain secrets, and integrity hashes detect corruption rather than authenticate data against a same-user attacker.
 
-Security checks are separate from ordinary functional tests and run as fixed, non-destructive fixtures in a deny-by-default sandbox with deliberately tiny configurable limits. Against 0.7.1 on 45 held-out benign real logs, 0.8.0 produced no false warnings, returned byte-identical responses, and showed no measurable median runtime regression in an alternating comparison. The live concurrency contract was also exercised with an inert delayed program in an isolated Linux Docker Sandbox. This is best-effort hardening, not a guarantee that every adversarial instruction will be detected; the primary boundary is the rule that PROGRAM output is data and cannot grant authority.
+Security checks are separate from ordinary functional tests and run as fixed, non-destructive fixtures in a deny-by-default sandbox with deliberately tiny configurable limits. Against 0.7.1 on 45 held-out benign real logs, 0.8.0 produced no false warnings, returned byte-identical responses, and showed no measurable median runtime regression in an alternating comparison. The live concurrency contract was also exercised with an inert delayed program in an isolated Linux Docker Sandbox. Detection is best-effort. The primary boundary is the rule that PROGRAM output is data and cannot grant authority.
 
 #### Relationship to Context Mode
 
@@ -465,7 +447,7 @@ The remote importer scanned raw logs in memory and persisted only fixed-point sa
 | `pira_ctx 1.4.0 check` | 3,064 B (99.9% reduction) | 628,191 B (72.1% reduction) | +20.3 ms | N/A—status only |
 | Context Mode `ctx_index` receipt | 7,843 B (99.7% reduction) | 13,992,387 B (522.3% overhead) | N/A—no corresponding raw baseline | 0/13 |
 
-All 45 PIRA cases preserved child status and exact immediate content. Thirty-seven long or repetitive responses entered summary mode, were retained exactly, reconstructed, and passed integrity verification; eight bounded non-repetitive responses were replayed exactly and intentionally not retained. Across the 13 frozen marker/basename annotations, immediate output exposed 8, versus 9 for Context Mode generic passthrough. The one-point context-reduction trade-off buys direct readability for dense outputs that previously required a second retrieval. These quality figures were not used for tuning.
+All 45 PIRA cases preserved child status and exact immediate content. Thirty-seven long or repetitive responses entered summary mode, were retained exactly, reconstructed, and passed integrity verification; eight bounded non-repetitive responses were replayed exactly and intentionally not retained. Across the 13 frozen marker/basename annotations, immediate output exposed 8, versus 9 for Context Mode generic passthrough. The one-percentage-point decrease in context reduction makes dense outputs directly readable where they previously required a second retrieval.
 
 <details>
 <summary>Benchmark method, category results, Context Mode comparison, and limitations</summary>
@@ -478,7 +460,7 @@ The remote extension was fixed before inspecting output content. It reconstructe
 
 LaTeX coverage therefore uses arXiv sources compiled inside an isolated Linux Docker Sandbox with TeX Live and shell escape disabled. Candidate papers came from a binary-seeded shuffle of the recent `cs.LG` API pool. Repeated transport interruptions caused the live recent-entry pool to drift, so the five already downloaded public identifiers were frozen before corpus persistence or PIRA evaluation. One paper compiled successfully; its fresh source also produced a controlled undefined-command failure. Three additional papers contributed natural compilation failures, yielding one pass and four failures. Raw paper sources were disposable and were not committed.
 
-Each suite's output-quality labels were fixed during the original holdout evaluation and were not revised for 1.4.0. The current routing thresholds and common-form filtering were fixed from live use before the selected fixtures were replayed. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. Retained state includes captures, indexes, and event history but excludes installed binaries, runtimes, and the eight exact-replayed outputs that deliberately created no capture.
+Each suite retained its original holdout output-quality labels for 1.4.0. Every call used an identical raw fixture-emitter baseline; overhead is `wrapped wall time - raw-operation wall time`. Retained state includes captures, indexes, and event history but excludes installed binaries, runtimes, and the eight exact-replayed outputs that deliberately created no capture.
 
 | Held-out category | Cases | Outcomes | Summary / exact | Context reduction |
 |---|---:|---:|---:|---:|
@@ -497,13 +479,13 @@ Each suite's output-quality labels were fixed during the original holdout evalua
 
 Context Mode 1.0.169 was installed inside an isolated Linux Docker Sandbox and rerun without errors on the exact final 45 sanitized fixtures. Generic passthrough used one persistent server, `ctx_execute_file`, the same category-level intent as PIRA, and JavaScript that printed each fixture while preserving its recorded exit status. Its direct Node emitter produced the same bytes and exit status as its raw baseline, so Docker startup and server initialization are excluded from overhead. It returned 71,621 bytes, classified all 45 statuses correctly, and immediately exposed 9/13 labeled outcomes: 7/8 failure markers and 2/5 changed basenames.
 
-`ctx_index` used a separate persistent server and returned 7,843 bytes of indexing receipts. It exposed none of the 13 labels immediately, while exact content remained available through later search. Indexing has no equivalent raw operation, so no synthetic latency overhead is reported. Both Context Mode storage figures include its SQLite FTS5 retrieval state after shutdown; installed packages are excluded.
+`ctx_index` used a separate persistent server and returned 7,843 bytes of indexing receipts. It exposed none of the 13 labels immediately, while exact content remained available through later search. Both Context Mode storage figures include its SQLite FTS5 retrieval state after shutdown; installed packages are excluded.
 
-Generic passthrough is the closest automatic wrapper-level comparison, not Context Mode's recommended workflow. Context Mode normally asks the model to run task-specific analysis code and return only the derived answer. Its [published benchmark](https://github.com/mksglu/context-mode/blob/main/BENCHMARK.md) reports 98% reduction for task-specific execution, 82% for exact index-plus-search retrieval, and 96% overall. Returned-context measurements here count UTF-8 bytes rather than tokenizer-specific tokens, and immediate visibility does not measure evidence recoverable by later search.
+Generic passthrough is the closest automatic wrapper-level comparison. Context Mode's recommended workflow asks the model to run task-specific analysis code and return the derived answer. Its [published benchmark](https://github.com/mksglu/context-mode/blob/main/BENCHMARK.md) reports 98% reduction for task-specific execution, 82% for exact index-plus-search retrieval, and 96% overall. Returned context is measured in UTF-8 bytes. Immediate visibility counts evidence in the first response. Further evidence remains retrievable by search.
 
 ##### Limitations
 
-This remains a private implementation benchmark on one arm64 macOS evaluation host, not a universal performance claim. The remote suite is genuinely unseen and post-freeze imported, but its logs predate the freeze and are therefore not prospective outputs. Setup/install and static-analysis coverage remains below the five-case cap because no more eligible unique remote responses were available. Failure markers measure visibility of broad outcome evidence rather than complete diagnostic usefulness. arXiv selection required baseline build availability and includes one intentionally mutated source. Privacy sanitation changes path separators in LaTeX logs. Binary, non-UTF-8, and interactive-terminal behavior are covered by functional tests rather than this corpus. Web-search returns remain excluded because Codex built-in web output is not directly captured by the local command wrapper.
+This private implementation benchmark ran on one arm64 macOS host. The remote suite was unseen during development and imported after the freeze, using logs that predate the freeze. Setup/install and static-analysis coverage remains below the five-case cap because no more eligible unique remote responses were available. Failure-marker scoring measures immediate visibility of broad outcomes. arXiv selection required baseline build availability and includes one intentionally mutated source. Privacy sanitation changes path separators in LaTeX logs. Functional tests cover binary, non-UTF-8, and interactive-terminal behavior. Web-search returns remain excluded because Codex built-in web output is not directly captured by the local command wrapper.
 
 </details>
 
@@ -530,7 +512,7 @@ Public source is under `tools/src/pira_dec`. Build it with `cargo build --manife
 
 ### `pira_nav`: lightweight repository navigation
 
-Reading an entire repository is slow and context-heavy. `pira_nav` provides portable text search plus bounded code structure, structured-document paths, and language-server-backed file relationships and semantics in one read-only native executable. Run `pira_nav --help` for the command chooser and `pira_nav COMMAND --help` for exact syntax.
+Reading an entire repository consumes time and working context. `pira_nav` provides portable text search plus bounded code structure, structured-document paths, and language-server-backed file relationships and semantics in one read-only native executable. Run `pira_nav --help` for the command chooser and `pira_nav COMMAND --help` for exact syntax.
 
 <details>
 <summary>Technical behavior, language support, security, and validation</summary>
@@ -557,11 +539,11 @@ Source and hover text is framed as untrusted data, and unsafe terminal controls 
 
 #### Validation
 
-The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files have unavailable native structure and need explicit `--lsp` for server inventories; default topology maps mark unavailable native landmarks as partial coverage. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips, 967/967 unique canonical-name round trips, and 74/74 curated essential target checks. Current validation also includes 38 functional black-box tests, 12 inert security tests, 51 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 29 code/document formats. These are implementation tests, not an agentic evaluation.
+The correctness corpus contains 86 real and synthetic code/document files: 79 produce clean native structure and seven intentionally dirty code files have unavailable native structure and need explicit `--lsp` for server inventories; default topology maps mark unavailable native landmarks as partial coverage. It contains 1,125 structural targets with 1,125/1,125 location and freshness-selector round trips, 967/967 unique canonical-name round trips, and 74/74 curated essential target checks. Current validation also includes 38 functional black-box tests, 12 inert security tests, 51 Rust unit tests, strict Clippy, and 49 assertion-checked performance tasks spanning every command family and all 29 code/document formats. These checks assess the implementation. Agent-level results appear in [Evaluations](#evaluations).
 
 #### Performance
 
-The table reports complete subprocess calls for the optimized 0.8.0 macOS arm64 binary on an Apple M1 Pro. Each row uses five warmups and 40 measured calls over committed fixtures. Semantic rows use a deterministic minimal Python LSP server to measure PIRA's protocol path; they are not production-language-server latency estimates.
+The table reports complete subprocess calls for the optimized 0.8.0 macOS arm64 binary on an Apple M1 Pro. Each row uses five warmups and 40 measured calls over committed fixtures. Semantic rows measure PIRA's protocol path with a deterministic minimal Python LSP server.
 
 | Operation | Median latency | Peak RSS | Output |
 |---|---:|---:|---:|
@@ -579,29 +561,23 @@ The table reports complete subprocess calls for the optimized 0.8.0 macOS arm64 
 | LSP `definition` | 32.326 ms | 17.7 MiB | 145 B |
 | Three-operation LSP `query` | 33.734 ms | 18.1 MiB | 2,109 B |
 
-Across all 49 tasks, the median of task medians was 4.206 ms; task medians ranged from 2.784 to 33.734 ms, median peak RSS was 4.2 MiB, and maximum peak RSS was 18.1 MiB. On a repository-scale default `map --native` of this development workspace, 153 navigable code/document files contained 1,681,918 bytes; the bounded 6,141-byte map reduced returned text by 99.6%, took 97.294 ms median / 103.101 ms p95 over five warmups and 20 measured calls, and used 44.5 MiB peak RSS. An untimed deliberately expanded inventory was 22,446 bytes. Broad-map fixture skipping excluded low-value fixture/corpus subtrees from structural rows; seven deliberately dirty non-skipped fixtures remained explicit failures in `--native` mode. Context reduction compares UTF-8 bytes, not model-specific tokens.
+Across all 49 tasks, the median of task medians was 4.206 ms; task medians ranged from 2.784 to 33.734 ms, median peak RSS was 4.2 MiB, and maximum peak RSS was 18.1 MiB. On a repository-scale default `map --native` of this development workspace, 153 navigable code/document files contained 1,681,918 bytes; the bounded 6,141-byte map reduced returned text by 99.6%, took 97.294 ms median / 103.101 ms p95 over five warmups and 20 measured calls, and used 44.5 MiB peak RSS. An untimed deliberately expanded inventory was 22,446 bytes. Broad-map fixture skipping excluded low-value fixture/corpus subtrees from structural rows; seven deliberately dirty non-skipped fixtures remained explicit failures in `--native` mode. Context reduction is measured in UTF-8 bytes.
 
-Validation used pinned real fixtures with retained upstream provenance, hashes, and adjacent licenses; fixture code was parsed but never executed. The fixtures and functional, security, correctness, and benchmark runners remain local rather than shipping in the release repository. Machine, filesystem, caches, source mix, server choice, and project configuration affect results.
+Validation used pinned real fixtures with retained upstream provenance, hashes, and adjacent licenses; fixture code was parsed but never executed. The fixtures and functional, security, correctness, and benchmark runners remain local rather than shipping in the release repository.
 
 </details>
 
 ### `pira_write_check`: native English lexical review markers
 
-The Rust checker scans explicit UTF-8 files for configured literal English words
-and phrases, including defensive wording, stock phrasing and filler. It retains
-exact locations, source context and every overlapping occurrence. Findings prompt review of necessity in context; they are not semantic
-verdicts and never trigger automatic rewriting. Warnings exit `0`; input errors
-exit `2`, and output failures exit `1`. The default JSON lexicon is embedded in the executable. Use `pira_write_check --help`
-for options, examples, marker interpretation and exit statuses. See
-[`tools/crates/pira_write_check/README.md`](tools/crates/pira_write_check/README.md)
-for usage, Unicode semantics and limitations. Release availability follows the
-selected published manifest used by setup.
+The Rust checker scans explicit UTF-8 files for configured literal English words and phrases, including defensive wording, stock phrasing and filler. It retains exact locations, source context and every overlapping occurrence. Findings prompt contextual review. They are lexical markers, and the tool never rewrites text automatically.
+
+Warnings exit `0`, input errors exit `2`, and output failures exit `1`. The default JSON lexicon is embedded in the executable. Use `pira_write_check --help` for options, examples, marker interpretation and exit statuses. See [`tools/crates/pira_write_check/README.md`](tools/crates/pira_write_check/README.md) for usage, Unicode semantics and limitations. Release availability follows the published manifest selected by setup.
 
 ### `pira_svg_check`: conservative SVG text-legibility warnings
 
 Run `pira_svg_check FIGURE.svg` on a finalized SVG. It warns about low contrast, clipped or masked text, text overlap, and visible strokes crossing text; findings are review prompts and return exit code `0`, while analysis errors return `2`. Opaque label backgrounds are supported, and only semantic `<text>` can be analyzed reliably, so a clear report never replaces inspection at the final display size. See [`tools/crates/pira_svg_check/README.md`](tools/crates/pira_svg_check/README.md) for options and limits.
 
-For reproducible font selection, use `--isolated-fonts --font-dir DIR` with explicitly named supplied families. Normal system-font discovery remains the default. Reference-based analysis must preserve renderer pixels; unsupported or lossy analysis fails explicitly instead of reporting clear. Clipping warnings indicate measured pixel loss, not merely a clipping declaration.
+For reproducible font selection, use `--isolated-fonts --font-dir DIR` with explicitly named supplied families. Normal system-font discovery remains the default. Reference-based analysis must preserve renderer pixels; unsupported or lossy analysis fails explicitly instead of reporting clear. Clipping warnings indicate measured pixel loss.
 
 ### `pira_team`: scoped technical workers
 
@@ -609,7 +585,7 @@ For reproducible font selection, use `--isolated-fonts --font-dir DIR` with expl
 for focused syntax, `pira_team help remote` for remote interfaces, and
 `pira_team help manual` for the full safety, recovery, session and transport reference.
 
-`pira_team` delegates substantial reviews and implementation tasks to Codex or Claude Code workers, keeping your main agent focused on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
+`pira_team` delegates substantial reviews and implementation tasks to Codex or Claude Code workers so your main agent can focus on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
 
 <details>
 <summary>When to use Team, design differences, requirements, and benchmark results</summary>
@@ -618,7 +594,7 @@ for focused syntax, `pira_team help remote` for remote interfaces, and
 
 Use Team for substantial, self-contained work with clear ownership and acceptance criteria. Workers can review software or other technical artifacts, implement changes, and verify their work. They bring significant design decisions back to the main agent. One worker can provide an independent review; several can implement or assess separate components.
 
-Keep small or closely coupled tasks with the main agent, where delegation overhead is unlikely to pay off.
+Keep small or closely coupled tasks with the main agent to avoid delegation overhead.
 
 `run` and `resume` accept `--inject-fig` to add public figure guidance, alone or with `--inject-review` and `--inject-implement`. Resume retains received guidance and adds only missing selections. Figure guidance grants no edit authority and does not change the review-then-implementation workflow of a fresh run combining the review and implementation flags.
 
@@ -635,20 +611,15 @@ Keep small or closely coupled tasks with the main agent, where delegation overhe
 | PIRA tool integration | Workers receive Ctx, Nav, and Dec guidance. Main and worker decisions share the same searchable Dec workspace/store, including non-Git descendant directories. | Can use the same tools; PIRA guidance and shared-store conventions depend on the caller's configuration. |
 | Completion and results | Explicit completion gates and decision/incomplete outcomes; format validation and repair. Reports and logs are retained with bookmarks and script-accessible paths. | Native messages and thread results; acceptance criteria, report validation, and external artifact conventions are caller-defined. |
 | Cost and main-agent workload | Benchmark-backed model recommendations. Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks; recommended mixed-model pairs also reduced total cost in the comparisons below. | Model selection is configurable. Cost efficiency depends on the chosen models and workflow; native results are measured alongside Team below. |
-| Continuity during parallel work | Continuation rules require all assigned tasks to finish or be identified as blocked. Lower main-context consumption leaves more room between compactions. We have observed no forgotten assignments in day-to-day use, so no dedicated to-do-list mechanism is included; this is not a guarantee. | Threads and messages support coordination. Follow-through conventions depend on the caller's instructions; native delegation alone does not establish the PIRA continuation policy. |
+| Continuity during parallel work | Continuation rules require all assigned tasks to finish or be identified as blocked. Lower main-context consumption leaves more room between compactions. We have observed no forgotten assignments in day-to-day use, so no dedicated to-do-list mechanism is included. | Threads and messages support coordination. Follow-through conventions depend on the caller's instructions; native delegation alone does not establish the PIRA continuation policy. |
 
 #### Requirements and limits
 
-`--model claude-*` selects Claude Code; other model identifiers retain the Codex
-launcher. Either native CLI can be the main, and one main can launch workers from
-both families. Use canonical Claude model names, not aliases. Team launches assume
-the selected CLI is already installed and authenticated; they never install or
-log in. Claude requires a verified full-access
-caller; its native sessions support resume, steer, interrupt, and same-host
-subteams. Claude currently supports standard service tier and efforts
-`low|medium|high|xhigh|max`. A retained session cannot change backend families.
+`--model claude-*` selects Claude Code. Other model identifiers use the Codex launcher. Either native CLI can be the main, and one main can launch workers from both families. Use canonical Claude model names rather than aliases. The selected CLI must already be installed and authenticated. Team never installs it or initiates login.
 
-- **Codex setup:** Codex workers need stable Codex CLI **0.166.0 or newer** on the agent's execution host, network access, and file-backed Codex login or an API key. Setup also checks the required native protocol, exporting schemas with `--experimental` as Team does; a passing version alone is insufficient. PIRA setup installs the CLI if missing and guides login when needed; an existing incompatible CLI fails without replacement. App/extension users can keep their usual interface, but a ChatGPT app login or keyring-only credentials are not sufficient for Team authentication.
+Team requires a verified full-access caller with approval-never for both Codex and Claude. Interactive setup defaults to `safe`, which cannot run Team; selecting `soft-safe` explicitly grants no-approval/full-access execution. Claude native sessions support resume, steer, interrupt, and same-host subteams. Claude currently supports the standard service tier and efforts `low|medium|high|xhigh|max`. A retained session cannot change backend families.
+
+- **Codex setup:** Codex workers need stable Codex CLI **0.166.0 or newer** on the agent's execution host, network access, and file-backed Codex login or an API key. Setup also checks the required native protocol, exporting schemas with `--experimental` as Team does; a passing version alone is insufficient. PIRA setup installs the CLI if missing and guides login when needed; an existing incompatible CLI fails without replacement. Team authentication requires file-backed Codex credentials or an API key, independently of the app or extension login. On Windows, setup and Team select native `codex.exe`; npm shims alone are unsupported. Make the native executable discoverable to both through PATH and restart the session before rerunning setup.
 - **Included:** Team is installed with PIRA. Setup sets `features.multi_agent_v2.multi_agent_mode_hint_text = ""` so Codex's additional explicit-request-only instruction does not interfere with PIRA's delegation policy; native-tool availability is unchanged.
 - **Model:** Shipped defaults map Astra mains to Sol 6.1/high workers, regardless of main effort. Other recognized models inherit the main model and effort; unrecognized mains fall back to Sol 6.1/high. Saved per-main-model settings override these defaults; explicit launch flags take precedence. Resumed runs retain their selected model and effort unless explicitly overridden.
 - **Session isolation:** Runs and bookmarks belong to the creating main-agent session, not the workspace. Verified caller identity is required for all run/bookmark access and controls, including literal IDs and explicit stores; resume preserves ownership. The same label can exist independently in different sessions. Legacy global tags remain preserved but hidden; ambiguous legacy runs are retained but inaccessible unless original creator evidence is available. This isolates the Team interface only, not OS/filesystem/process access. Use updated Team and setup tooling together for the session-scoped bookmark format.
@@ -667,24 +638,24 @@ pira_team config set --main gpt-6.1-sol --model gpt-6-luna --effort max
 pira_team config reset --main gpt-6.1-sol
 ```
 
-`set` saves an exact-main-model override; `reset` restores its shipped behavior. Settings live in `worker_defaults.json` inside the selected Team store (`--store` or `PIRA_TEAM_DIR`), so no source edits are needed. These commands do not launch workers. For all options, run `pira_team --help`.
+`set` saves an exact-main-model override; `reset` restores its shipped behavior. Settings live in `worker_defaults.json` inside the selected Team store (`--store` or `PIRA_TEAM_DIR`). These commands do not launch workers. For all options, run `pira_team --help`.
 
 #### Recommended configurations
 
-**TL;DR:** Use **Sol / Luna Team** for easy, well-defined tasks when cost matters most. Otherwise, **keep the default configuration**; no adjustment is needed.
+Use **Sol / Luna Team** for easy, well-defined tasks when cost matters most. Otherwise, **keep the default configuration**.
 
 The three benchmarks cover finding bugs, applying known fixes, and building prototypes. Paired names identify the **main / worker** models: Sol is `gpt-6.1-sol/high`, Astra is `gpt-6-astra/medium`, and Luna is `gpt-6-luna/max`. **Solo** uses no workers; **Native** uses Codex's built-in subagents with the same model and effort as its main agent.
 
-- **Known-target tasks, such as applying an existing bug report: Sol / Luna Team.** In the fix benchmark below, it matched Astra Solo's aggregate result—**15/20 clean fixes**, three partial fixes and two regressions—at **about one-twelfth the cost** (\$1.09 versus \$13.25). This is our recommendation when targets are already defined and lower cost matters more than turnaround time.
+- **Known-target tasks, such as applying an existing bug report: Sol / Luna Team.** In the fix benchmark below, it matched Astra Solo's aggregate result—**15/20 clean fixes**, three partial fixes and two regressions—at **about one-twelfth the cost** (\$1.09 versus \$13.25). Choose it when targets are defined and cost matters more than turnaround time.
 - **General-purpose technical tasks: Sol Team or Astra / Sol Team.** Choose the main model you prefer to communicate and work with; both use Sol-high workers. In the open-ended bug hunt, these configurations found the most confirmed issues: **10 and 8**, respectively, versus 3 for Sol Solo and 5 for Astra Solo. Sol / Luna found 4, so we recommend Sol workers for exploratory work.
-- **New prototypes:** Sol / Luna Team delivered similar feature coverage at **43% lower cost than Sol Solo** (\$0.30 versus \$0.52), with two ordinary-use gaps. Astra / Sol Team **matched Astra Solo and Astra Native on all ten assessed features**, at roughly half the cost—**39% less than Solo and 64% less than Native**. Choose Sol / Luna for economical prototypes, or Astra / Sol for the stronger assessed result.
-- **Less main-agent work, fewer compactions:** Team achieved the lowest main-agent API cost and final context use in each benchmark. Every tested Team configuration used less main context than its corresponding Solo baseline—**64–82% less for bug hunting and fixes, and 46–50% less for prototypes**. Less context consumed per task leaves room for more work before compaction, reducing compaction pressure and supporting long-term task continuity.
+- **New prototypes:** Sol / Luna Team delivered similar feature coverage at **43% lower cost than Sol Solo** (\$0.30 versus \$0.52), with two ordinary-use gaps. Astra / Sol Team **matched Astra Solo and Astra Native on all ten assessed features**, at **39% less cost than Solo and 64% less than Native**. Choose Sol / Luna for economical prototypes, or Astra / Sol for the stronger assessed result.
+- **Less main-agent work, fewer compactions:** Team achieved the lowest main-agent API cost and final context use in each benchmark. Every tested Team configuration used less main context than its corresponding Solo baseline: **64–82% less for bug hunting and fixes, and 46–50% less for prototypes**. Less context consumed per task leaves room for more work before compaction, reducing compaction pressure and supporting long-term task continuity.
 
 Ask your main agent to use Luna/max workers for Sol / Luna Team. Astra / Sol is the default when the main model is Astra.
 
 #### Bug hunt benchmark
 
-**Task:** find defects in the Rust implementations of Ctx, Dec, Nav and SVG, without modifying them. Findings from all seven settings were deduplicated and independently validated, yielding **23 confirmed issues**. The denominator is this observed union, not an exhaustive inventory of all possible defects.
+**Task:** find defects in the Rust implementations of Ctx, Dec, Nav and SVG, without modifying them. Findings from all seven settings were deduplicated and independently validated, yielding **23 confirmed issues**. The denominator is the observed union of confirmed issues across these runs.
 
 🟢 confirmed findings or zero false positives; 🔴 false positives. **High** affects normal use or represents a significant security issue; **Medium** affects boundary, extreme or adversarial use; **Low** is an optional improvement that can remain unfixed without affecting use.
 
@@ -716,17 +687,15 @@ Ask your main agent to use Luna/max workers for Sol / Luna Team. Astra / Sol is 
 | Astra Native | 🟢 16 | 🟢 3/6 | 🟢 13/14 | — | 🟡 2 | 🔴 2 | 11.81 min | \$4.00 | 101,643 | \$7.45 | \$11.45 |
 | Astra / Sol Team | 🟢 17 | 🟢 3/6 | 🟢 14/14 | — | 🟡 2 | 🔴 1 | 15.70 min | \$2.13 | 56,805 | \$3.70 | **\$5.83** |
 
-**Sol / Luna matched Astra Solo's clean-fix count at about 12× lower cost.** Sol Native and Astra / Sol Team achieved the highest clean count (17/20); Sol Native was fastest, while Astra / Sol Team used the least main context. Every setting left partial fixes and introduced at least one regression, so completion reports still require proportionate quality checks.
+**Sol / Luna matched Astra Solo's clean-fix count at about 12× lower cost.** Sol Native and Astra / Sol Team achieved the highest clean count (17/20); Sol Native was fastest, while Astra / Sol Team used the least main context. Every setting left partial fixes and introduced at least one regression.
 
 #### Python prototype benchmark
 
-**Task:** implement Python versions of Ctx and Dec from the same two plans. Assessment covered normal use and plan realization across ten equally weighted features: command execution, live output, storage, replay and log search for Ctx; record creation, history, lookup, HTML export and deletion for Dec. It did not add adversarial robustness requirements.
-
-**Sol / Luna delivered similar feature coverage at 43% lower cost than Sol Solo. Astra / Sol matched both Astra baselines in assessed quality, costing 39% less than Solo and 64% less than Native.**
+**Task:** implement Python versions of Ctx and Dec from the same two plans. Assessment covered normal use and plan realization across ten equally weighted features: command execution, live output, storage, replay and log search for Ctx; record creation, history, lookup, HTML export and deletion for Dec.
 
 Eight features tied across all seven settings. Five implementations tied on all ten, with Sol Solo cheapest among that group. The differences were live output and lookup behavior: Sol / Luna buffered short progress until command completion and omitted JSON for empty search results; Sol Team rejected a valid whitespace-only search query.
 
-All seven broadly implemented the planned workflows. Lower mean feature rank indicates a preferred implementation; ties share the average of their occupied positions. Rank differences express relative preference rather than proportional quality gaps.
+All seven broadly implemented the planned workflows. Lower mean feature rank indicates a preferred implementation; ties share the average of their occupied positions.
 
 | Setting | Ctx mean rank | Dec mean rank | Combined rank | Time | Main USD | Final main context | Worker USD | Total USD |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -742,17 +711,17 @@ All seven broadly implemented the planned workflows. Lower mean feature rank ind
 
 The bug hunt and fix benchmarks used frozen source at `c3710e46c0a832cf407e644799bf2ac72ec5b343`: Ctx 2.0.0, Dec 0.8.1, Nav 0.19.2 and SVG 0.1.2; Team itself was excluded. Each setting ran once after setup preflight in a fresh workspace on Linux aarch64. Sol / Luna ran in a later batch. Quality checks included controlled boundary and preservation cases.
 
-The prototype benchmark used frozen Ctx/Dec plans and a normal-use rubric. Assessment combined source inspection and representative CLI checks; it was not release certification. Rankings depend on the selected features and weights, and model identities were visible to the assessor. Each table row reports one completed run. Across all three benchmarks, delegation, investigation, validation effort and host load could differ despite matched task inputs; individual runs do not establish general model rankings.
+The prototype benchmark used frozen Ctx/Dec plans and a normal-use rubric, assessed through source inspection and representative CLI checks. Rankings depend on the selected features and weights, and model identities were visible to the assessor. Each table row reports one completed run.
 
-Time is measured task wall time. **Final main context** is the main thread's final used-context snapshot in tokens, not cumulative input or summed worker context. No main thread compacted during these runs; one Sol / Luna fix worker did.
+Time is task wall time. **Final main context** is the main thread's final used-context snapshot in tokens, not cumulative input or summed worker context. No main thread compacted during these runs; one Sol / Luna fix worker did.
 
-Costs are **Standard API-equivalent USD estimates**, excluding setup and independent assessment, not subscription charges. Rates per million uncached-input / cached-input / output tokens were Sol \$2 / \$0.10 / \$10, Astra \$10 / \$1 / \$50, and Luna \$0.10 / \$0.01 / \$0.50, checked October 8–9, 2026 against the official [Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) pricing. Cached tokens are excluded from uncached input; output includes reasoning tokens. No cache writes or requests above 272K input were recorded. Raw paid-run artifacts and local benchmark harnesses are not distributed.
+Costs are **Standard API-equivalent USD estimates**, excluding setup and independent assessment. Rates per million uncached-input / cached-input / output tokens were Sol \$2 / \$0.10 / \$10, Astra \$10 / \$1 / \$50, and Luna \$0.10 / \$0.01 / \$0.50, checked October 8–9, 2026 against the official [Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) and [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) pricing. Cached tokens are excluded from uncached input; output includes reasoning tokens. No cache writes or requests above 272K input were recorded. Raw paid-run artifacts and local benchmark harnesses are not distributed.
 
 </details>
 
 ## Why this design
 
-PIRA is intentionally small and inspectable:
+PIRA keeps its design small and inspectable:
 
 - **Inspectable.** Behavior is organized in readable policy and module files that are easy to review and customize.
 - **Lightweight.** It avoids a heavy framework and keeps instruction overhead low.
@@ -765,16 +734,14 @@ PIRA is intentionally small and inspectable:
 <details>
 <summary>Permission boundaries and operating rules</summary>
 
-PIRA can run with full system permissions, but full-permission mode is not a sandbox. Its rules require the agent to:
+PIRA can run with full system permissions. Full-permission mode is not a sandbox. Its rules require the agent to:
 
 - in full-permission/no-approval mode, print a brief review beginning with `Safety:` before any state-changing command, including small writes; cover the action, scope/blast radius, destructive risk, secrets/privacy impact, and rollback when available, with no other required formatting;
 - prefer narrow, reversible actions;
 - avoid destructive commands without explicit permission;
 - keep temporary artifacts in the platform temp directory unless the user wants them preserved.
 
-Built-in Codex subagents can inherit the main agent's policy. `pira_team` instead
-starts fresh technical artifact workers with scoped implementation/review/tool guidance and a no-secrets rule. Behavior on
-other agent platforms has not been equally tested.
+Built-in Codex subagents can inherit the main agent's policy. `pira_team` starts fresh technical artifact workers with scoped implementation/review/tool guidance and a no-secrets rule.
 
 </details>
 
@@ -798,7 +765,7 @@ other agent platforms has not been equally tested.
 - `tools/src/pira_ctx/`, `tools/src/pira_dec/`, `tools/src/pira_nav/`, `tools/src/pira_svg_check/`, `tools/src/pira_team/`, and `tools/src/pira_write_check/` — public Rust implementations
 - GitHub Releases — published platform executables; generated binaries are not stored on a second branch or in the source tree
 
-PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)**: filler and repetition are removed, but each rule keeps who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
+PIRA instructions use **Meaning-Preserving Telegraphic Compression (MPTC)** to remove filler and repetition while retaining who acts, what is required, when it applies, its scope, and its exceptions. Safety and permission rules stay fully grammatical. The initial tracked-file pass reduced instruction size by **20.0%** and whitespace-delimited word count by **26.0%**; actual token savings depend on the tokenizer.
 
 </details>
 
@@ -818,7 +785,7 @@ The public repository contains the shared policy framework plus tool source, rep
 
 ## Acknowledgement and citation
 
-If PIRA materially assists a research project, disclose that assistance where appropriate, such as in an acknowledgement, LLM-use disclosure, or reproducibility checklist, and cite this repository. Adapt the scope of assistance to what was actually used, and include the actual model/version or reasoning setting if your venue asks for that level of detail.
+If PIRA materially assists a research project, disclose that assistance where appropriate, such as in an acknowledgement, LLM-use disclosure, or reproducibility checklist, and cite this repository. Describe the assistance actually used, including the model/version or reasoning setting if your venue requires it.
 
 Suggested disclosure text:
 
@@ -835,7 +802,7 @@ Suggested BibTeX entry:
 }
 ```
 
-PIRA should be acknowledged as tool assistance, not as scientific authorship.
+Credit PIRA for tool assistance. Do not list it as a scientific author.
 
 ## License
 

@@ -12,178 +12,69 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-const MARKER: &str = "shell_environment_policy.set.PIRA_TEAM_CONTEXT=";
 const LOCK_BUDGET: Duration = Duration::from_secs(5);
 
-// Discovery hints never grant authority. Verify the actual backend PID/birth,
-// retained revision and native thread, including when every hint is stripped.
+// PIRA: honest-agent misuse prevention, not isolation from marker stripping or
+// metadata tampering. Native session and retained role checks remain mandatory.
 fn discover() -> Result<Option<Caller>, String> {
-    discover_from(std::process::id())
-}
-
-fn marker(arguments: &[String]) -> Result<Option<PathBuf>, String> {
-    crate::harness::Harness::team_marker(arguments)
-}
-
-fn marker_candidate(arguments: &[String], executable: &Path) -> bool {
-    // Claude native images may have versioned names. PATH is worker-controlled;
-    // its exact argv marker is only a hint until retained PID/birth/revision bind.
-    if crate::harness::Harness::claude_stream_json(arguments) {
-        return true;
-    }
-    let name = executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    name.starts_with("codex") || name.starts_with("python")
-}
-
-#[cfg(target_os = "linux")]
-fn inspect(pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
-    inspect_linux_using(
-        pid,
-        crate::native::metadata,
-        crate::native::arguments,
-        crate::native::executable,
+    supplied_caller(
+        std::env::var_os("PIRA_TEAM_CONTEXT"),
+        std::env::var_os("PIRA_TEAM_CHILD"),
+        std::env::var_os("PIRA_TEAM_ATTEMPT"),
+        std::env::var_os("PIRA_TEAM_HANDOFF"),
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn inspect_linux_using(
-    pid: u32,
-    mut metadata: impl FnMut(u32) -> std::io::Result<crate::native::Metadata>,
-    arguments: impl FnOnce(u32) -> std::io::Result<Vec<String>>,
-    executable: impl FnOnce(u32) -> std::io::Result<PathBuf>,
-) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
-    let before = match metadata(pid) {
-        Ok(metadata) => metadata,
-        Err(error) if crate::native::missing(&error) => crate::native::Metadata {
-            pid,
-            parent: 0,
-            birth: 0,
-            alive: false,
-        },
-        Err(_) => return Err("cannot verify process identity".into()),
-    };
-    if !before.alive {
-        return Ok((before.with_executable(PathBuf::new()), None));
-    }
-    let arguments = arguments(pid).map_err(|_| "cannot verify Team process ancestry")?;
-    let candidate = marker(&arguments);
-    let mut path = PathBuf::new();
-    let run = match candidate {
-        Ok(None) => None,
-        candidate => {
-            // No SSH/name/UID boundary is trusted. Only a possible backend
-            // marker needs exe access; unmarked ancestors are still traversed.
-            path = executable(pid).map_err(|_| "cannot verify process identity")?;
-            if marker_candidate(&arguments, &path) {
-                candidate?
-            } else {
-                None
-            }
-        }
-    };
-    if metadata(pid).map_err(|_| "cannot verify process identity")? != before {
-        return Err("process identity changed during ancestry inspection".into());
-    }
-    Ok((before.with_executable(path), run))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn inspect(pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
-    let identity = match crate::native::identity(pid) {
-        Ok(identity) => identity,
-        Err(error) if crate::native::missing(&error) => {
-            return Ok((
-                crate::native::Identity {
-                    pid,
-                    parent: 0,
-                    birth: 0,
-                    executable: PathBuf::new(),
-                    alive: false,
-                },
-                None,
-            ));
-        }
-        Err(_) => return Err("cannot verify process identity".into()),
-    };
-    let args =
-        crate::native::arguments(pid).map_err(|_| "cannot inspect native process arguments")?;
-    let run = if marker_candidate(&args, &identity.executable) {
-        marker(&args)?
-    } else {
-        None
-    };
-    if crate::native::identity(pid).map_err(|_| "cannot verify process identity")? != identity {
-        return Err("process identity changed during ancestry inspection".into());
-    }
-    Ok((identity, run))
-}
-
-fn discover_from(pid: u32) -> Result<Option<Caller>, String> {
-    discover_using(pid, inspect)
-}
-fn discover_using(
-    mut pid: u32,
-    mut inspect: impl FnMut(u32) -> Result<(crate::native::Identity, Option<PathBuf>), String>,
+fn supplied_caller(
+    run: Option<std::ffi::OsString>,
+    child: Option<std::ffi::OsString>,
+    attempt: Option<std::ffi::OsString>,
+    handoff: Option<std::ffi::OsString>,
 ) -> Result<Option<Caller>, String> {
-    const MISMATCH: &str = "Team runtime does not match actual worker ancestry";
-    let initial = pid;
-    let mut child_birth = u64::MAX;
-    let mut caller: Option<Caller> = None;
-    for _ in 0..64 {
-        let (identity, candidate) = inspect(pid)?;
-        if !identity.alive || identity.birth > child_birth {
-            return if caller.is_some() {
-                Err(MISMATCH.into())
-            } else {
-                Ok(None)
-            };
-        }
-        if pid != initial
-            && let Some(path) = candidate
-        {
-            let run = path
-                .canonicalize()
-                .map_err(|_| "Team context unavailable")?;
-            if let Some(bound) = &caller {
-                if bound.run != run {
-                    return Err(MISMATCH.into());
-                }
-            } else {
-                let runtime = read_json(&run.join("runtime.json"))?;
-                let manifest = read_json(&run.join("manifest.json"))?;
-                let revision = runtime["revision"].as_u64().ok_or(MISMATCH)?;
-                if Some(revision) != manifest["revision"].as_u64() {
-                    return Err(MISMATCH.into());
-                }
-                caller = Some(Caller { run, runtime });
-            }
-        }
-        // Persistent wrappers own the backend scope; their marked descendants
-        // identify the context, but only the exact retained owner grants authority.
-        if let Some(bound) = &caller
-            && bound.runtime["backend_pid"] == pid
-        {
-            if bound.runtime["backend_birth"].as_u64() != Some(identity.birth) {
-                return Err(MISMATCH.into());
-            }
-            return Ok(caller);
-        }
-        child_birth = identity.birth;
-        pid = identity.parent;
-        if pid <= if cfg!(windows) { 4 } else { 1 } {
-            return if caller.is_some() {
-                Err(MISMATCH.into())
-            } else {
-                Ok(None)
-            };
-        }
+    let (run, attempt) = match (run, child, attempt, handoff) {
+        (None, None, None, None) => return Ok(None),
+        (Some(run), Some(child), Some(attempt), _) if child == "1" => (PathBuf::from(run), PathBuf::from(attempt)),
+        _ => return Err("incomplete/malformed Team launch context; stop and resume the worker with current Team".into()),
+    };
+    if !run.is_absolute() || !attempt.is_absolute() {
+        return Err("Team launch paths must be absolute".into());
     }
-    Err("Team ancestry exceeds 64 levels".into())
+    let run = run
+        .canonicalize()
+        .map_err(|_| "Team run context unavailable")?;
+    let attempt = attempt
+        .canonicalize()
+        .map_err(|_| "Team attempt context unavailable")?;
+    let runtime = read_json(&run.join("runtime.json"))?;
+    let manifest = read_json(&run.join("manifest.json"))?;
+    let run_id = run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid Team run path")?;
+    crate::storage::validate_run_id(run_id)?;
+    let revision = runtime["revision"]
+        .as_u64()
+        .filter(|revision| *revision > 0)
+        .ok_or("invalid Team runtime revision")?;
+    if manifest["revision"].as_u64() != Some(revision)
+        || manifest["run_id"] != run_id
+        || manifest["status"] != "running"
+        || runtime["attempt_logs"]
+            .as_str()
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+            .and_then(|path| path.canonicalize().ok())
+            .as_ref()
+            != Some(&attempt)
+        || !attempt.starts_with(&run)
+    {
+        return Err("stale or inconsistent Team launch context".into());
+    }
+    recorded_identity(&runtime, "backend")?;
+    recorded_identity(&runtime, "launcher")?;
+    profile::native_caller_identity(&manifest)
+        .ok_or("Team run lacks retained native session identity")?;
+    Ok(Some(Caller { run, runtime }))
 }
 
 #[derive(Clone)]
@@ -205,7 +96,7 @@ pub fn caller_run() -> Result<Option<PathBuf>, String> {
     Ok(caller_binding()?.map(|caller| caller.run))
 }
 fn current_caller(run: &Path) -> Result<Value, String> {
-    let caller = caller_binding()?.ok_or("verified worker ancestry required")?;
+    let caller = caller_binding()?.ok_or("Team worker launch context required")?;
     let runtime = read_json(&run.join("runtime.json"))?;
     let manifest = read_json(&run.join("manifest.json"))?;
     if caller.run != run || caller.runtime != runtime || runtime["revision"] != manifest["revision"]
@@ -217,11 +108,6 @@ fn current_caller(run: &Path) -> Result<Value, String> {
 
 pub fn authorize(args: &[String]) -> Result<(), String> {
     let Some(run) = caller_run()? else {
-        if std::env::var_os("PIRA_TEAM_CHILD").is_some()
-            || std::env::var_os("PIRA_TEAM_CONTEXT").is_some()
-        {
-            return Err("nested delegation is forbidden without verified worker ancestry; environment assertions grant nothing".into());
-        }
         return Ok(());
     };
     let manifest = current_caller(&run)?;
@@ -337,7 +223,6 @@ pub fn claim_authentication(
     if !identity.alive || executable != own_executable {
         return Err("credential peer is not the Team launcher".into());
     }
-    let caller = discover_from(peer)?.ok_or("credential client lacks coordinator ancestry")?;
     let _lock = lock(root)?;
     let manifest = read_json(&root.join("manifest.json"))?;
     let runtime = read_json(&root.join("runtime.json"))?;
@@ -355,8 +240,6 @@ pub fn claim_authentication(
             .join("manifest.json"),
     )?;
     if crate::CANCELLED.load(Ordering::SeqCst)
-        || caller.run != root
-        || caller.runtime != runtime
         || request["runtime"] != runtime
         || manifest["revision"] != *revision
         || runtime["revision"] != *revision
@@ -1223,7 +1106,7 @@ mod tests {
         let launcher = crate::native::current().unwrap();
         let member = json!({"active":true,"revision":2,"blocked":false,
             "launcher_pid":launcher.pid,"launcher_birth":launcher.birth,"credential_claimed":false});
-        // Test the undo primitive after admission, without bypassing ancestry to launch a child.
+        // Test the undo primitive after admission, without launching a child.
         let admission = Admission {
             owner: &owner,
             run: run.clone(),
@@ -1468,290 +1351,6 @@ mod tests {
         }
     }
     #[test]
-    fn windows_argument_adapter_preserves_json_paths_and_rejects_task_hints() {
-        let path = PathBuf::from(r"C:\Program Files\Team\run");
-        let mut args = arguments(&[
-            "codex.exe",
-            "app-server",
-            "--strict-config",
-            "--stdio",
-            "-c",
-        ]);
-        args.push(format!("{MARKER}{}", json!(path)));
-        assert_eq!(marker(&args).unwrap(), Some(path));
-        let forged = arguments(&[
-            "pira_team.exe",
-            "run",
-            "--task",
-            r#"app-server --strict-config --stdio shell_environment_policy.set.PIRA_TEAM_CONTEXT="C:\bad""#,
-        ]);
-        assert!(marker(&forged).unwrap().is_none());
-    }
-    #[test]
-    fn windows_process_adapter_binds_birth_revision_and_parent_chain() {
-        let run = std::env::temp_dir().join(format!(
-            "team-win-adapter-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        crate::private_dir(&run).unwrap();
-        save_json(
-            &run.join("runtime.json"),
-            &json!({"backend_pid":12,"backend_birth":20,"revision":2}),
-        )
-        .unwrap();
-        save_json(&run.join("manifest.json"), &json!({"revision":2})).unwrap();
-        let probe = |pid| {
-            Ok((
-                crate::native::Identity {
-                    pid,
-                    parent: if pid == 32 { 12 } else { 1 },
-                    birth: if pid == 32 { 30 } else { 20 },
-                    executable: PathBuf::from(r"C:\Program Files\Codex.exe"),
-                    alive: true,
-                },
-                (pid == 12).then_some(run.clone()),
-            ))
-        };
-        assert_eq!(
-            discover_using(32, probe).unwrap().unwrap().run,
-            run.canonicalize().unwrap()
-        );
-        save_json(
-            &run.join("runtime.json"),
-            &json!({"backend_pid":12,"backend_birth":19,"revision":2}),
-        )
-        .unwrap();
-        assert!(discover_using(32, probe).is_err());
-        save_json(
-            &run.join("runtime.json"),
-            &json!({"backend_pid":12,"backend_birth":20,"revision":1}),
-        )
-        .unwrap();
-        assert!(discover_using(32, probe).is_err());
-        assert!(
-            discover_using(32, |pid| Ok((
-                crate::native::Identity {
-                    pid,
-                    parent: 12,
-                    birth: if pid == 32 { 10 } else { 20 },
-                    executable: PathBuf::new(),
-                    alive: true
-                },
-                Some(run.clone())
-            )))
-            .unwrap()
-            .is_none()
-        );
-        std::fs::remove_dir_all(run).unwrap();
-    }
-
-    struct DiscoveryFixture {
-        run: PathBuf,
-        processes: Vec<(crate::native::Identity, Option<PathBuf>)>,
-    }
-    impl DiscoveryFixture {
-        fn new(owner: u32) -> Self {
-            let run = std::env::temp_dir().join(format!(
-                "team-discovery-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            crate::private_dir(&run).unwrap();
-            save_json(
-                &run.join("runtime.json"),
-                &json!({"backend_pid":owner,"backend_birth":owner,"revision":2}),
-            )
-            .unwrap();
-            save_json(&run.join("manifest.json"), &json!({"revision":2})).unwrap();
-            let processes = [(32, 24), (24, 16), (16, 12), (12, 1)]
-                .into_iter()
-                .map(|(pid, parent)| {
-                    (
-                        crate::native::Identity {
-                            pid,
-                            parent,
-                            birth: u64::from(pid),
-                            executable: PathBuf::new(),
-                            alive: true,
-                        },
-                        (pid == 24).then_some(run.clone()),
-                    )
-                })
-                .collect();
-            Self { run, processes }
-        }
-        fn inspect(&self, pid: u32) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
-            self.processes
-                .iter()
-                .find(|(identity, _)| identity.pid == pid)
-                .cloned()
-                .ok_or_else(|| "unexpected fixture PID".into())
-        }
-        fn discover(&self) -> Result<Option<Caller>, String> {
-            discover_using(32, |pid| self.inspect(pid))
-        }
-    }
-    impl Drop for DiscoveryFixture {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.run).unwrap();
-        }
-    }
-
-    #[test]
-    fn discovery_accepts_direct_and_wrapped_retained_owners() {
-        for owner in [24, 16, 12] {
-            let mut fixture = DiscoveryFixture::new(owner);
-            // Repeated matching markers on wrappers must not change the binding.
-            fixture.processes[2].1 = Some(fixture.run.clone());
-            let caller = fixture.discover().unwrap().unwrap();
-            assert_eq!(caller.run, fixture.run.canonicalize().unwrap());
-            assert_eq!(caller.runtime["backend_pid"], owner);
-        }
-    }
-
-    #[test]
-    fn discovery_rejects_malformed_birth() {
-        for owner in [24, 12] {
-            let fixture = DiscoveryFixture::new(owner);
-            let path = fixture.run.join("runtime.json");
-            let valid = read_json(&path).unwrap();
-            for birth in [
-                None,
-                Some(Value::Null),
-                Some(json!("24")),
-                Some(json!(-1)),
-                Some(json!(24.0)),
-                Some(json!(true)),
-                Some(json!({})),
-                Some(json!([])),
-            ] {
-                let mut runtime = valid.clone();
-                runtime.as_object_mut().unwrap().remove("backend_birth");
-                if let Some(value) = &birth {
-                    runtime["backend_birth"] = value.clone();
-                }
-                save_json(&path, &runtime).unwrap();
-                assert!(
-                    fixture.discover().is_err(),
-                    "owner={owner}, birth={birth:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn discovery_rejects_malformed_revisions() {
-        let fixture = DiscoveryFixture::new(24);
-        let runtime_path = fixture.run.join("runtime.json");
-        let manifest_path = fixture.run.join("manifest.json");
-        let valid = read_json(&runtime_path).unwrap();
-        for revision in [
-            None,
-            Some(Value::Null),
-            Some(json!("2")),
-            Some(json!(-1)),
-            Some(json!(2.0)),
-            Some(json!(true)),
-            Some(json!({})),
-            Some(json!([])),
-        ] {
-            for targets in [
-                vec!["runtime"],
-                vec!["manifest"],
-                vec!["runtime", "manifest"],
-            ] {
-                let mut runtime = valid.clone();
-                let mut manifest = json!({"revision":2});
-                for (name, value) in [("runtime", &mut runtime), ("manifest", &mut manifest)] {
-                    if targets.contains(&name) {
-                        value.as_object_mut().unwrap().remove("revision");
-                        if let Some(revision) = &revision {
-                            value["revision"] = revision.clone();
-                        }
-                    }
-                }
-                save_json(&runtime_path, &runtime).unwrap();
-                save_json(&manifest_path, &manifest).unwrap();
-                assert!(
-                    fixture.discover().is_err(),
-                    "targets={targets:?}, revision={revision:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn discovery_rejects_unrelated_or_recycled_owner() {
-        for (field, value) in [("backend_pid", 99), ("backend_birth", 13)] {
-            let fixture = DiscoveryFixture::new(12);
-            let path = fixture.run.join("runtime.json");
-            let mut runtime = read_json(&path).unwrap();
-            runtime[field] = json!(value);
-            save_json(&path, &runtime).unwrap();
-            assert!(fixture.discover().is_err(), "{field}");
-        }
-    }
-
-    #[test]
-    fn discovery_rejects_conflicting_context() {
-        let mut fixture = DiscoveryFixture::new(12);
-        let other = DiscoveryFixture::new(12);
-        fixture.processes[2].1 = Some(other.run.clone());
-        assert!(fixture.discover().is_err());
-    }
-
-    #[test]
-    fn discovery_rejects_broken_wrapper_chain() {
-        for broken in [
-            "dead wrapper",
-            "dead owner",
-            "birth order",
-            "missing owner",
-            "cycle",
-        ] {
-            let mut fixture = DiscoveryFixture::new(12);
-            match broken {
-                "dead wrapper" => fixture.processes[2].0.alive = false,
-                "dead owner" => fixture.processes[3].0.alive = false,
-                "birth order" => fixture.processes[2].0.birth = 25,
-                "missing owner" => fixture.processes[2].0.parent = 1,
-                "cycle" => fixture.processes[2].0.parent = 16,
-                _ => unreachable!(),
-            }
-            assert!(fixture.discover().is_err(), "{broken}");
-        }
-    }
-
-    #[test]
-    fn discovery_propagates_inspection_errors() {
-        let fixture = DiscoveryFixture::new(12);
-        let result = discover_using(32, |pid| {
-            if pid == 16 {
-                Err("cannot verify process identity".into())
-            } else {
-                fixture.inspect(pid)
-            }
-        });
-        assert_eq!(
-            result.err().as_deref(),
-            Some("cannot verify process identity")
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_native_ancestry_probe_is_available() {
-        assert!(discover_from(std::process::id()).is_ok());
-    }
-
-    #[test]
     fn backend_exit_probe_never_confuses_reused_or_inaccessible_pids() {
         let identity = |birth, alive| crate::native::Identity {
             pid: 12,
@@ -1778,59 +1377,10 @@ mod tests {
     }
 
     #[test]
-    fn live_executable_inspection_failure_never_means_absent_worker_or_backend() {
-        let fixture = DiscoveryFixture::new(12);
+    fn live_executable_inspection_failure_never_means_backend_exit() {
         let failure =
             || crate::native::unavailable_executable(12, std::io::ErrorKind::NotFound.into());
         assert!(!crate::native::missing(&failure()));
-        assert!(
-            discover_using(32, |pid| {
-                if pid == 12 {
-                    Err(failure().to_string())
-                } else {
-                    fixture.inspect(pid)
-                }
-            })
-            .is_err()
-        );
         assert!(bound_backend_alive(12, 20, |_| Err(failure())).is_err());
-    }
-}
-
-#[cfg(test)]
-mod claude_marker_tests {
-    use super::*;
-    fn args(settings: &str) -> Vec<String> {
-        vec![
-            "claude".into(),
-            "--input-format".into(),
-            "stream-json".into(),
-            "--settings".into(),
-            settings.into(),
-        ]
-    }
-    #[test]
-    fn exact_marker_preserves_whitespace_and_rejects_malformed_state() {
-        assert_eq!(
-            marker(&args(
-                r#"{"env":{"PIRA_TEAM_CONTEXT":"/path with spaces/team"}}"#
-            ))
-            .unwrap(),
-            Some(PathBuf::from("/path with spaces/team"))
-        );
-        assert!(marker(&args(r#"{"env":{"PIRA_TEAM_CONTEXT":42}}"#)).is_err());
-        assert!(marker(&args("{broken")).is_err());
-        assert_eq!(
-            marker(&args(r#"{"sandbox":{"enabled":false}}"#)).unwrap(),
-            None
-        );
-        assert_eq!(
-            marker(&[
-                "claude".into(),
-                "a prompt containing --settings and PIRA_TEAM_CONTEXT".into()
-            ])
-            .unwrap(),
-            None
-        );
     }
 }

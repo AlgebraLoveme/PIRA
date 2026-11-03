@@ -1,260 +1,115 @@
-mod native_boundary_tests {
+mod launch_context_tests {
     use super::*;
-    use crate::native::Metadata;
-    use std::{cell::RefCell, io};
-
-    fn metadata(identity: &crate::native::Identity) -> Metadata {
-        Metadata {
-            pid: identity.pid,
-            parent: identity.parent,
-            birth: identity.birth,
-            alive: identity.alive,
+    use std::fs;
+    struct Fixture {
+        root: PathBuf,
+        run: PathBuf,
+        attempt: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "team-context-{}-{}",
+                std::process::id(),
+                crate::claude::uuid().unwrap()
+            ));
+            crate::private_dir(&root).unwrap();
+            let run = root.join("run");
+            crate::private_dir(&run).unwrap();
+            let attempt = run.join("attempt-1");
+            crate::private_dir(&attempt).unwrap();
+            save_json(&run.join("manifest.json"), &json!({"run_id":"run","status":"running","revision":1,"thread_id":"worker-session","transport":"app-server","creator_main_session_id":"main-session","allow_subteam":false,"parent_run_id":null})).unwrap();
+            save_json(&run.join("runtime.json"), &json!({"revision":1,"backend_pid":10,"backend_birth":100,"launcher_pid":11,"launcher_birth":90,"attempt_logs":attempt})).unwrap();
+            Self { root, run, attempt }
+        }
+        fn caller(&self, attempt: &Path) -> Result<Caller, String> {
+            supplied_caller(
+                Some(self.run.clone().into_os_string()),
+                Some("1".into()),
+                Some(attempt.as_os_str().to_owned()),
+                None,
+            )?
+            .ok_or("missing supplied caller".into())
         }
     }
-
-    fn backend_arguments(run: &Path) -> Vec<String> {
-        let mut args = arguments(&["codex", "app-server", "--strict-config", "--stdio", "-c"]);
-        args.push(format!("{MARKER}{}", json!(run)));
-        args
-    }
-
-    fn inspect_fixture(
-        fixture: &DiscoveryFixture,
-        pid: u32,
-    ) -> Result<(crate::native::Identity, Option<PathBuf>), String> {
-        let (identity, marker) = fixture.inspect(pid)?;
-        inspect_linux_using(
-            pid,
-            |_| Ok(metadata(&identity)),
-            |_| {
-                Ok(marker
-                    .as_deref()
-                    .map(backend_arguments)
-                    .unwrap_or_else(|| arguments(&["sshd: fixture"])))
-            },
-            |_| {
-                if marker.is_some() {
-                    Ok(PathBuf::from("/fixture/codex"))
-                } else {
-                    Err(io::ErrorKind::PermissionDenied.into())
-                }
-            },
-        )
-    }
-
-    fn claude_arguments(run: &Path) -> Vec<String> {
-        arguments(&[
-            "versioned-native-image",
-            "--input-format",
-            "stream-json",
-            "--settings",
-            &json!({"env":{"PIRA_TEAM_CONTEXT":run}}).to_string(),
-        ])
-    }
-
-    #[test]
-    fn claude_marker_discovery_is_path_independent_but_requires_retained_owner() {
-        for stale in ["backend_pid", "backend_birth", "revision"] {
-            let fixture = DiscoveryFixture::new(12);
-            let inspect = |pid| {
-                let (identity, marker) = fixture.inspect(pid)?;
-                inspect_linux_using(
-                    pid,
-                    |_| Ok(metadata(&identity)),
-                    |_| Ok(marker.as_deref().map(claude_arguments).unwrap_or_default()),
-                    |_| Ok(PathBuf::from("/fixture/versions/2.1.100")),
-                )
-            };
-            let caller = discover_using(32, inspect).unwrap().unwrap();
-            assert_eq!(caller.runtime["backend_pid"], 12);
-            let path = fixture.run.join("runtime.json");
-            let mut runtime = read_json(&path).unwrap();
-            runtime[stale] = json!(999);
-            save_json(&path, &runtime).unwrap();
-            assert!(discover_using(32, inspect).is_err(), "{stale}");
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
         }
     }
-
     #[test]
-    fn claude_marker_requires_readable_image_and_valid_settings() {
-        let fixture = DiscoveryFixture::new(12);
-        let args = claude_arguments(&fixture.run);
-        assert!(
-            inspect_linux_using(
-                24,
-                |_| Ok(metadata(&fixture.processes[1].0)),
-                |_| Ok(args.clone()),
-                |_| Err(io::ErrorKind::PermissionDenied.into()),
-            )
-            .is_err()
-        );
-        let mut malformed = args;
-        *malformed.last_mut().unwrap() = "{broken".into();
-        assert_eq!(
-            inspect_linux_using(
-                24,
-                |_| Ok(metadata(&fixture.processes[1].0)),
-                |_| Ok(malformed),
-                |_| Ok(PathBuf::from("/fixture/versions/2.1.100")),
-            )
-            .unwrap_err(),
-            "invalid Claude Team settings marker"
-        );
+    fn unmarked_main_needs_no_process_ancestry() {
+        assert!(supplied_caller(None, None, None, None).unwrap().is_none());
     }
-
     #[test]
-    fn protected_root_ancestors_are_traversed_not_trusted_as_boundary() {
-        let mut fixture = DiscoveryFixture::new(12);
-        for (_, marker) in &mut fixture.processes {
-            *marker = None;
-        }
-        let visited = RefCell::new(Vec::new());
-        let result = discover_using(32, |pid| {
-            visited.borrow_mut().push(pid);
-            inspect_fixture(&fixture, pid)
-        });
-        assert!(result.unwrap().is_none());
-        assert_eq!(*visited.borrow(), [32, 24, 16, 12]);
-    }
-
-    #[test]
-    fn protected_unmarked_ancestor_cannot_hide_marked_worker_above_it() {
-        let mut fixture = DiscoveryFixture::new(12);
-        fixture.processes[1].1 = None;
-        fixture.processes[2].1 = Some(fixture.run.clone());
-        let caller = discover_using(32, |pid| inspect_fixture(&fixture, pid))
-            .unwrap()
-            .unwrap();
-        assert_eq!(caller.run, fixture.run.canonicalize().unwrap());
-        assert_eq!(caller.runtime["backend_pid"], 12);
-    }
-
-    #[test]
-    fn protected_wrapper_metadata_still_binds_exact_owner_birth_and_revision() {
-        for owner in [24, 16, 12] {
-            let fixture = DiscoveryFixture::new(owner);
-            let caller = discover_using(32, |pid| inspect_fixture(&fixture, pid))
-                .unwrap()
-                .unwrap();
-            assert_eq!(caller.runtime["backend_pid"], owner);
-
-            let runtime_path = fixture.run.join("runtime.json");
-            let valid = read_json(&runtime_path).unwrap();
-            for field in ["backend_birth", "revision"] {
-                let mut stale = valid.clone();
-                stale[field] = json!(999);
-                save_json(&runtime_path, &stale).unwrap();
-                assert!(
-                    discover_using(32, |pid| inspect_fixture(&fixture, pid)).is_err(),
-                    "owner={owner}, field={field}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn marked_backends_require_executable_identity_even_when_protected() {
-        let fixture = DiscoveryFixture::new(12);
-        for executable in [
-            Err(io::ErrorKind::PermissionDenied),
-            Err(io::ErrorKind::NotFound),
+    fn partial_or_malformed_launch_context_is_not_main() {
+        assert!(supplied_caller(None, None, None, Some("handoff".into())).is_err());
+        let f = Fixture::new();
+        let run = Some(f.run.clone().into_os_string());
+        let attempt = Some(f.attempt.clone().into_os_string());
+        for input in [
+            (run.clone(), None, attempt.clone()),
+            (None, Some("1".into()), attempt.clone()),
+            (run.clone(), Some("1".into()), None),
+            (run, Some("0".into()), attempt),
         ] {
-            let result = inspect_linux_using(
-                24,
-                |_| Ok(metadata(&fixture.processes[1].0)),
-                |_| Ok(backend_arguments(&fixture.run)),
-                |_| executable.map_err(Into::into),
-            );
-            assert_eq!(result.unwrap_err(), "cannot verify process identity");
+            assert!(supplied_caller(input.0, input.1, input.2, None).is_err());
         }
     }
-
     #[test]
-    fn protected_argument_or_stat_denials_never_become_root() {
-        let fixture = DiscoveryFixture::new(12);
-        for denied in ["stat", "argv"] {
-            let result = discover_using(32, |pid| {
-                if pid != 24 {
-                    return inspect_fixture(&fixture, pid);
-                }
-                inspect_linux_using(
-                    pid,
-                    |_| {
-                        if denied == "stat" {
-                            Err(io::ErrorKind::PermissionDenied.into())
-                        } else {
-                            Ok(metadata(&fixture.processes[1].0))
-                        }
-                    },
-                    |_| Err(io::ErrorKind::PermissionDenied.into()),
-                    |_| panic!("no executable query after metadata/arguments denial"),
-                )
-            });
-            assert!(result.is_err(), "{denied}");
+    fn supplied_run_retains_session_and_role_without_pid_authority() {
+        let f = Fixture::new();
+        let caller = f.caller(&f.attempt).unwrap();
+        assert_eq!(caller.run, f.run.canonicalize().unwrap());
+        let mut manifest = read_json(&f.run.join("manifest.json")).unwrap();
+        for transport in ["app-server", "claude-stream-json"] {
+            manifest["transport"] = json!(transport);
+            let expected = profile::native_caller_identity(&manifest).unwrap();
+            assert!(profile::matches_native_session(
+                &manifest,
+                &json!({"caller_thread_id":expected})
+            ));
+            assert!(!profile::matches_native_session(
+                &manifest,
+                &json!({"caller_thread_id":"wrong-session"})
+            ));
         }
     }
-
     #[test]
-    fn changing_or_disappearing_metadata_during_inspection_fails_closed() {
-        let fixture = DiscoveryFixture::new(12);
-        for changed in ["birth", "parent", "alive", "missing"] {
-            let mut reads = 0;
-            let result = inspect_linux_using(
-                24,
-                |_| {
-                    reads += 1;
-                    let mut value = metadata(&fixture.processes[1].0);
-                    if reads == 2 {
-                        match changed {
-                            "birth" => value.birth += 1,
-                            "parent" => value.parent = 1,
-                            "alive" => value.alive = false,
-                            "missing" => return Err(io::ErrorKind::NotFound.into()),
-                            _ => unreachable!(),
-                        }
-                    }
-                    Ok(value)
-                },
-                |_| Ok(arguments(&["sshd: fixture"])),
-                |_| panic!("unmarked process needs no executable access"),
-            );
-            assert!(result.is_err(), "{changed}");
-        }
+    fn resumed_session_accepts_new_pid_and_rejects_previous_attempt() {
+        let f = Fixture::new();
+        let old = f.caller(&f.attempt).unwrap();
+        let attempt = f.run.join("attempt-2");
+        crate::private_dir(&attempt).unwrap();
+        let mut runtime = old.runtime;
+        runtime["backend_pid"] = json!(20);
+        runtime["backend_birth"] = json!(200);
+        runtime["revision"] = json!(2);
+        runtime["attempt_logs"] = json!(attempt);
+        let mut manifest = read_json(&f.run.join("manifest.json")).unwrap();
+        manifest["revision"] = json!(2);
+        save_json(&f.run.join("runtime.json"), &runtime).unwrap();
+        save_json(&f.run.join("manifest.json"), &manifest).unwrap();
+        assert!(f.caller(&f.attempt).is_err());
+        assert_eq!(f.caller(&attempt).unwrap().runtime["backend_pid"], 20);
+        assert_eq!(manifest["creator_main_session_id"], "main-session");
+        assert_eq!(manifest["thread_id"], "worker-session");
+        assert_eq!(manifest["allow_subteam"], false);
     }
-
     #[test]
-    fn backend_marker_still_requires_supported_executable_and_valid_json() {
-        let fixture = DiscoveryFixture::new(12);
-        let mut malformed = backend_arguments(&fixture.run);
-        *malformed.last_mut().unwrap() = format!("{MARKER}not-json");
-        for name in ["codex", "python3", "sshd"] {
-            let result = inspect_linux_using(
-                24,
-                |_| Ok(metadata(&fixture.processes[1].0)),
-                |_| Ok(malformed.clone()),
-                |_| Ok(PathBuf::from(name)),
-            );
-            if name == "sshd" {
-                assert!(result.unwrap().1.is_none());
-            } else {
-                assert_eq!(result.unwrap_err(), "invalid Team context marker");
-            }
+    fn inconsistent_runtime_or_finished_run_is_rejected() {
+        let f = Fixture::new();
+        let runtime = read_json(&f.run.join("runtime.json")).unwrap();
+        for field in ["revision", "backend_birth", "launcher_pid", "attempt_logs"] {
+            let mut invalid = runtime.clone();
+            invalid[field] = Value::Null;
+            save_json(&f.run.join("runtime.json"), &invalid).unwrap();
+            assert!(f.caller(&f.attempt).is_err(), "{field}");
         }
-        let forged = arguments(&[
-            "pira_team",
-            "--task",
-            "app-server --strict-config --stdio shell_environment_policy.set.PIRA_TEAM_CONTEXT=\"bad\"",
-        ]);
-        assert!(
-            inspect_linux_using(
-                24,
-                |_| Ok(metadata(&fixture.processes[1].0)),
-                |_| Ok(forged),
-                |_| panic!("task text is not a backend marker"),
-            )
-            .unwrap()
-            .1
-            .is_none()
-        );
+        save_json(&f.run.join("runtime.json"), &runtime).unwrap();
+        let mut manifest = read_json(&f.run.join("manifest.json")).unwrap();
+        manifest["status"] = json!("completed");
+        save_json(&f.run.join("manifest.json"), &manifest).unwrap();
+        assert!(f.caller(&f.attempt).is_err());
     }
 }

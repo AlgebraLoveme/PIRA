@@ -15,7 +15,7 @@ import tarfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SCRIPT = Path(__file__).with_name("setup_pira_tools.py")
 sys.path.insert(0, str(SCRIPT.parent.resolve()))
@@ -26,7 +26,38 @@ sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
 
+class WindowsCodexSearchTests(unittest.TestCase):
+    def test_searchpath_uses_exact_native_image_name_and_preserves_errors(self):
+        import ctypes
+        native = str(Path(tempfile.gettempdir()) / "native" / "codex.exe")
+        search = MagicMock()
+        def found(path, name, extension, capacity, buffer, file_part):
+            self.assertEqual((path, name, extension, capacity, file_part),
+                             (None, "codex.exe", None, 32768, None))
+            buffer.value = native
+            return len(native)
+        search.side_effect = found
+        library = MagicMock(SearchPathW=search)
+        with patch.object(ctypes, "WinDLL", return_value=library, create=True) as loader:
+            self.assertEqual(setup.windows_codex_binary(), native)
+            loader.assert_called_once_with("kernel32", use_last_error=True)
+            search.side_effect = None
+            search.return_value = 0
+            for code in (2, 3):
+                with self.subTest(error=code), patch.object(ctypes, "get_last_error", return_value=code, create=True):
+                    self.assertIsNone(setup.windows_codex_binary())
+            with patch.object(ctypes, "get_last_error", return_value=5, create=True), \
+                 patch.object(ctypes, "WinError", return_value=OSError(5, "native access denied"), create=True), \
+                 self.assertRaisesRegex(OSError, "native access denied"):
+                setup.windows_codex_binary()
+
+
 class TeamInitializeProcessTests(unittest.TestCase):
+    def setUp(self):
+        search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
+        search.start()
+        self.addCleanup(search.stop)
+
     PEER = r"""
 import json, sys, threading, time
 request = json.loads(sys.stdin.readline())
@@ -242,6 +273,9 @@ sys.stdin.read()
 
 class TeamAuthTests(unittest.TestCase):
     def setUp(self) -> None:
+        search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
+        search.start()
+        self.addCleanup(search.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -350,6 +384,9 @@ class TeamAuthTests(unittest.TestCase):
 
 class SetupPiraToolsTests(unittest.TestCase):
     def setUp(self) -> None:
+        search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
+        search.start()
+        self.addCleanup(search.stop)
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         environment = patch.dict(setup.os.environ, {"HOME": home.name, "LOCALAPPDATA": home.name, "USERPROFILE": home.name, "SHELL": "/bin/sh"}, clear=True)
@@ -551,6 +588,94 @@ class SetupPiraToolsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "requires the Codex executable"):
                 setup.check_team_runtime(["pira_team"])
 
+    def test_windows_checks_native_image_instead_of_earlier_npm_shim(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        (root / "external").mkdir()
+        native, shim = root / "external" / "codex.exe", root / "codex.cmd"
+        native.write_bytes(b"native fixture, never executed")
+        shim.write_text("arbitrary shim must not be parsed or executed")
+        with patch.object(setup, "IS_WINDOWS", True, create=True), \
+             patch.object(setup.shutil, "which", side_effect=lambda name: str(native if name == "codex.exe" else shim)) as which, \
+             patch.object(setup.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, "codex-cli 0.166.0", ""),
+                 subprocess.CompletedProcess([], 0, "--stdio --strict-config", "")]) as run, \
+             patch.object(setup, "check_team_protocol") as protocol:
+            self.assertEqual(setup.selected_codex_binary(root), str(native.resolve()))
+            self.assertEqual(setup.prepare_team_runtime(["pira_team"], root, "windows-x64",
+                                                        verify=True, dry_run=False), "codex-cli 0.166.0")
+            self.assertEqual([call.args[0][0] for call in run.call_args_list], [str(native.resolve())] * 2)
+            protocol.assert_called_once_with(str(native.resolve()))
+            self.assertTrue(all(call.args == ("codex.exe",) for call in which.call_args_list))
+
+    def test_windows_shim_only_layout_fails_without_installing_or_executing_it(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        for verify, dry_run in ((False, False), (True, False), (False, True)):
+            with self.subTest(verify=verify, dry_run=dry_run), \
+                 patch.object(setup, "IS_WINDOWS", True, create=True), \
+                 patch.object(setup.shutil, "which", side_effect=lambda name: None if name == "codex.exe" else str(root / "codex.cmd")), \
+                 patch.object(setup, "check_team_runtime") as check, \
+                 patch.object(setup, "install_codex") as install:
+                with self.assertRaisesRegex(RuntimeError, "native codex.exe.*shims"):
+                    setup.prepare_team_runtime(["pira_team"], root, "windows-x64", verify=verify, dry_run=dry_run)
+                check.assert_not_called()
+                install.assert_not_called()
+
+    def test_windows_managed_native_is_used_when_only_npm_shim_is_on_path(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        native = root / setup.CODEX_PACKAGE_DIR / "bin" / "codex.exe"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"native fixture, never executed")
+        with patch.object(setup, "IS_WINDOWS", True, create=True), \
+             patch.object(setup.shutil, "which", side_effect=lambda name: None if name == "codex.exe" else str(root / "codex.cmd")), \
+             patch.object(setup, "check_team_runtime", return_value="valid") as check, \
+             patch.object(setup, "install_codex") as install:
+            self.assertEqual(setup.prepare_team_runtime(["pira_team"], root, "windows-x64",
+                                                       verify=True, dry_run=False), "valid")
+            check.assert_called_once_with(["pira_team"], str(native.resolve()))
+            install.assert_not_called()
+
+    def test_windows_team_application_directory_takes_native_search_priority(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        native = root / "codex.exe"
+        native.write_bytes(b"native fixture, never executed")
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup, "windows_codex_binary", return_value=str(root / "other" / "codex.exe")) as search:
+            self.assertEqual(setup.selected_codex_binary(root), str(native.resolve()))
+            search.assert_not_called()
+
+    def test_windows_python_application_directory_shadow_is_rejected(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        shadow = str(Path(sys.executable).resolve().with_name("codex.exe"))
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup, "windows_codex_binary", return_value=shadow), \
+             self.assertRaisesRegex(RuntimeError, "Ambiguous codex.exe.*cannot certify"):
+            setup.selected_codex_binary(root)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX alias fixture without Windows symlink privileges")
+    def test_windows_native_name_cannot_disguise_a_command_shim(self) -> None:
+        root = Path(setup.os.environ["HOME"])
+        shim = root / "codex.cmd"
+        shim.write_text("arbitrary shim must not be read or executed")
+        alias = root / "codex.exe"
+        alias.symlink_to(shim)
+        with patch.object(setup, "IS_WINDOWS", True), \
+             patch.object(setup, "check_team_runtime") as check, \
+             self.assertRaisesRegex(RuntimeError, "resolves to a non-native launcher"):
+            setup.prepare_team_runtime(["pira_team"], root, "windows-x64", verify=True, dry_run=False)
+        check.assert_not_called()
+
+    def test_codex_version_and_help_failures_preserve_native_diagnostics(self) -> None:
+        for first, replies in [
+            ("--version", [subprocess.CompletedProcess([], 7, "native output", "native error")]),
+            ("app-server --help", [subprocess.CompletedProcess([], 0, "codex-cli 0.166.0", ""),
+                                   subprocess.CompletedProcess([], 7, "native output", "native error")]),
+        ]:
+            with self.subTest(command=first), patch.object(setup.subprocess, "run", side_effect=replies), \
+                 self.assertRaises(RuntimeError) as raised:
+                setup.check_team_runtime(["pira_team"], "/fixture/codex.exe")
+            for text in (first, "exit 7", "native output", "native error"):
+                self.assertIn(text, str(raised.exception))
+
     def test_team_preflight_checks_version_and_required_options_without_login(self) -> None:
         def result(text: str, code: int = 0):
             return subprocess.CompletedProcess([], code, text, "")
@@ -670,22 +795,26 @@ class SetupPiraToolsTests(unittest.TestCase):
     def test_missing_codex_install_modes_and_existing_runtime_preservation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            platform = setup.load_selector().current_platform()
+            installed = setup.executable_path(root, "codex")
+            existing = setup.executable_path(root / "existing", "codex")
             with patch.object(setup.shutil, "which", return_value=None), \
-                 patch.object(setup, "install_codex", return_value=root / "codex") as install, \
+                 patch.object(setup, "install_codex", return_value=installed) as install, \
                  patch.object(setup, "check_team_runtime", return_value="codex-cli 0.166.0") as check:
-                self.assertIsNone(setup.prepare_team_runtime(["pira_nav"], root, "linux-x64", verify=False, dry_run=False))
-                self.assertIsNone(setup.prepare_team_runtime(["pira_team"], root, "linux-x64", verify=False, dry_run=True))
+                self.assertIsNone(setup.prepare_team_runtime(["pira_nav"], root, platform, verify=False, dry_run=False))
+                self.assertIsNone(setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=True))
                 install.assert_not_called()
                 check.assert_not_called()
-                setup.prepare_team_runtime(["pira_team"], root, "linux-x64", verify=True, dry_run=False)
+                setup.prepare_team_runtime(["pira_team"], root, platform, verify=True, dry_run=False)
                 install.assert_not_called()
-                setup.prepare_team_runtime(["pira_team"], root, "linux-x64", verify=False, dry_run=False)
-                install.assert_called_once_with(root, "linux-x64")
-            with patch.object(setup.shutil, "which", return_value="/existing/codex"), \
+                setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=False)
+                install.assert_called_once_with(root, platform)
+            with patch.object(setup.shutil, "which", return_value=str(existing)), \
                  patch.object(setup, "install_codex") as install, \
-                 patch.object(setup, "check_team_runtime", side_effect=RuntimeError("old runtime")):
+                 patch.object(setup, "check_team_runtime", side_effect=RuntimeError("old runtime")) as check:
                 with self.assertRaisesRegex(RuntimeError, "old runtime"):
-                    setup.prepare_team_runtime(["pira_team"], root, "linux-x64", verify=False, dry_run=False)
+                    setup.prepare_team_runtime(["pira_team"], root, platform, verify=False, dry_run=False)
+                check.assert_called_once_with(["pira_team"], str(existing.resolve()))
                 install.assert_not_called()
 
     def codex_package(self, platform: str, extra: tarfile.TarInfo | None = None) -> tuple[bytes, bytes]:
@@ -904,7 +1033,8 @@ class SetupPiraToolsTests(unittest.TestCase):
         for selected, append in ((str(root / "external" / "codex.exe"), True),
                                   (str(managed / "codex.exe"), False), (None, False)):
             with self.subTest(selected=selected), patch.object(setup.os, "name", "nt"), \
-                 patch.object(setup.shutil, "which", return_value=selected), \
+                 patch.object(setup, "IS_WINDOWS", True), \
+                 patch.object(setup, "codex_on_path", return_value=selected), \
                  patch.object(setup, "windows_user_path", return_value=False) as persist:
                 setup.ensure_path(root, False, include_codex=True)
                 self.assertEqual(persist.call_args.args, (managed, False))

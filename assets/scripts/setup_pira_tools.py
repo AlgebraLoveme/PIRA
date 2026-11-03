@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 
 import setup_pira_stores as stores
 
+IS_WINDOWS = os.name == "nt"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR_PATH = REPO_ROOT / "tools" / "select_tool_for_platform.py"
 RETIRED_TOOLS = {"pira_codenav"}
@@ -43,6 +44,12 @@ CODEX_TARGETS = {
     "windows-arm64": "aarch64-pc-windows-msvc",
 }
 CODEX_INSTALL_GUIDE = "https://learn.chatgpt.com/docs/cli"
+WINDOWS_CODEX_GUIDANCE = (
+    "Windows Team requires a native codex.exe, not codex.cmd/codex.ps1 shims. "
+    "Add the directory containing a supported stable codex.exe to PATH for both setup and Team, "
+    f"restart the session, then rerun setup: {CODEX_INSTALL_GUIDE}. "
+    "Setup does not parse shims or request elevation."
+)
 RELEASE_REPOSITORY = "AlgebraLoveme/PIRA"
 RELEASE_INDEX_NAME = "pira-tools-release.json"
 LATEST_RELEASE_BASE = (
@@ -408,8 +415,45 @@ def download_binary(tag: str, selection: ToolSelection, directory: Path) -> Path
 
 
 def executable_path(directory: Path, tool_name: str) -> Path:
-    suffix = ".exe" if os.name == "nt" else ""
+    suffix = ".exe" if IS_WINDOWS else ""
     return directory / f"{tool_name}{suffix}"
+
+
+def windows_codex_binary() -> str | None:
+    """Use Team's native SearchPathW lookup, ignoring PATHEXT command shims."""
+    import ctypes
+    from ctypes import wintypes
+
+    search = ctypes.WinDLL("kernel32", use_last_error=True).SearchPathW
+    search.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                       wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.LPWSTR)]
+    search.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    count = search(None, "codex.exe", None, len(buffer), buffer, None)
+    if count == 0:
+        error = ctypes.get_last_error()
+        if error in (2, 3):  # File/path not found; other native failures must stay visible.
+            return None
+        raise ctypes.WinError(error)
+    if count >= len(buffer):
+        raise RuntimeError("Windows codex.exe search result exceeds 32768 characters")
+    return buffer.value
+
+
+def codex_on_path(install_dir: Path | None = None) -> str | None:
+    """Resolve Team's native Windows image, never an npm command shim."""
+    if not IS_WINDOWS:
+        return shutil.which("codex")
+    # SearchPathW starts with the application's directory. Team's directory is
+    # the tool install directory, not the Python interpreter's directory.
+    team_image = (install_dir or default_install_dir()) / "codex.exe"
+    if team_image.is_file():
+        return str(team_image.resolve())
+    selected = windows_codex_binary()
+    if selected and Path(selected).resolve().parent == Path(sys.executable).resolve().parent:
+        raise RuntimeError("Ambiguous codex.exe in the Python application directory; "
+                           "setup cannot certify that Team will launch this image. " + WINDOWS_CODEX_GUIDANCE)
+    return selected
 
 
 def update_managed_block(path: Path, body: str, dry_run: bool) -> bool:
@@ -458,7 +502,7 @@ def ensure_path(directory: Path, dry_run: bool, *, include_codex: bool = False) 
     directories = [directory]
     if include_codex or executable_path(codex_bin, "codex").is_file():
         directories.append(codex_bin)
-    selected = shutil.which("codex")
+    selected = codex_on_path(directory)
     external = selected is not None and os.path.normcase(os.path.realpath(selected)) != os.path.normcase(
         os.path.realpath(executable_path(codex_bin, "codex")))
     changed = False
@@ -860,7 +904,8 @@ def check_team_protocol(executable: str) -> None:
             check=False, env=env,
         )
         if result.returncode:
-            raise ValueError(f"native schema generation failed (exit {result.returncode}): {result.stderr.strip()}")
+            raise ValueError(f"native schema generation failed (exit {result.returncode}): "
+                             f"{result.stdout.strip()}\n{result.stderr.strip()}")
         for name, expected in contract["schemas"].items():
             path = schema_dir / name
             if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
@@ -877,12 +922,14 @@ def check_team_runtime(tools: list[str], executable: str | None = None) -> str |
     """Check the backend only when Team is selected; never log in or install Codex."""
     if "pira_team" not in tools:
         return None
-    executable = executable or shutil.which("codex")
+    executable = executable or codex_on_path()
     guidance = (
         "Install/update the Codex CLI on the agent's execution host and make codex available "
         f"in its PATH, then rerun setup: {CODEX_INSTALL_GUIDE}. "
         "You can keep using the app or IDE extension; the terminal UI need not be running."
     )
+    if IS_WINDOWS:
+        guidance += " " + WINDOWS_CODEX_GUIDANCE
     if executable is None:
         raise RuntimeError(f"pira_team requires the Codex executable. {guidance}")
     def probe(arguments: list[str]) -> str:
@@ -894,9 +941,14 @@ def check_team_runtime(tools: list[str], executable: str | None = None) -> str |
                     env=dict(os.environ, CODEX_HOME=home),
                 )
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError(f"Cannot check the Codex backend for pira_team: {error}. {guidance}") from error
+            outputs = (getattr(error, "stdout", None), getattr(error, "stderr", None))
+            detail = "\n".join(part.decode(errors="replace") if isinstance(part, bytes) else part
+                               for part in outputs if part)
+            raise RuntimeError(f"Cannot check the Codex backend for pira_team: {error}. "
+                               f"{detail}\n{guidance}") from error
         if result.returncode != 0:
-            raise RuntimeError(f"Codex {' '.join(arguments)} failed (exit {result.returncode}). {guidance}")
+            raise RuntimeError(f"Codex {' '.join(arguments)} failed (exit {result.returncode}).\n"
+                               f"{result.stdout}\n{result.stderr}\n{guidance}")
         return result.stdout.strip()
     version_text = probe(["--version"])
     version = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)(?:\+[A-Za-z0-9.-]+)?", version_text)
@@ -1014,11 +1066,18 @@ def install_codex(install_dir: Path, platform_key: str) -> Path:
 
 def selected_codex_binary(install_dir: Path) -> str | None:
     """Resolve the same external-first backend for setup and migration; no writes."""
-    existing = shutil.which("codex")
-    if existing:
-        return str(Path(existing).resolve())
+    existing = codex_on_path(install_dir)
     managed = executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
-    return str(managed.resolve()) if managed.is_file() else None
+    selected = existing or (str(managed) if managed.is_file() else None)
+    if selected:
+        resolved = Path(selected).resolve()
+        if IS_WINDOWS and resolved.suffix.lower() != ".exe":
+            raise RuntimeError(f"Windows codex.exe resolves to a non-native launcher: {resolved}. "
+                               + WINDOWS_CODEX_GUIDANCE)
+        return str(resolved)
+    if IS_WINDOWS and shutil.which("codex"):
+        raise RuntimeError(WINDOWS_CODEX_GUIDANCE)
+    return None
 
 
 def prepare_claude_runtime(*, verify: bool, dry_run: bool, config_dir: Path | None = None) -> str:
@@ -1112,7 +1171,7 @@ def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
     if os.environ.get("CODEX_API_KEY"):
         print("OK: CODEX_API_KEY is configured for Team (not remotely validated)")
         return
-    executable = shutil.which("codex") or str(
+    executable = codex_on_path(install_dir) or str(
         executable_path(install_dir / CODEX_PACKAGE_DIR / "bin", "codex")
     )
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -1255,7 +1314,7 @@ def main(argv: list[str] | None = None) -> int:
             if not version_matches(selection.name, selection.version, version):
                 failures.append(f"{selection.name}: unexpected version: {version}")
         codex_bin = install_dir / CODEX_PACKAGE_DIR / "bin"
-        if (use_codex and "pira_team" in tools and not shutil.which("codex") and not args.no_path
+        if (use_codex and "pira_team" in tools and not codex_on_path(install_dir) and not args.no_path
                 and not path_is_configured(codex_bin)):
             failures.append("managed Codex directory is not configured in the user PATH")
         if not args.no_path and not path_is_configured(install_dir):
@@ -1310,10 +1369,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_path:
         stores.apply_store_environment(store_plan, dry_run=args.dry_run)
         ensure_path(install_dir, args.dry_run,
-                    include_codex=use_codex and "pira_team" in tools and not shutil.which("codex"))
+                    include_codex=use_codex and "pira_team" in tools and not codex_on_path(install_dir))
 
     if not args.dry_run:
-        restart_needed = use_codex and "pira_team" in tools and not shutil.which("codex")
+        restart_needed = use_codex and "pira_team" in tools and not codex_on_path(install_dir)
         for selection in selections:
             version = direct_version(selection.destination)
             if not version_matches(selection.name, selection.version, version):
