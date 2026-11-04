@@ -1,4 +1,4 @@
-"""Claude setup planning; native CLI installation and authentication are caller-owned."""
+"""Plan Claude settings/instructions; selected-CLI preparation lives in tools setup."""
 from __future__ import annotations
 
 import json
@@ -115,11 +115,20 @@ def plan(
         if not isinstance(options, dict):
             raise RuntimeError(f"Claude {key} settings must be a JSON object")
     options["instructionFiles"] = "claude-md-and-agents-md"
+    value["autoMemoryEnabled"] = False
+    permissions = value.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        raise RuntimeError("Claude permissions settings must be a JSON object")
+    denied = permissions.setdefault("deny", [])
+    if not isinstance(denied, list) or not all(isinstance(rule, str) for rule in denied):
+        raise RuntimeError("Claude permissions.deny must be an array of strings")
+    # Block native subagents only; Bash/pira_team delegation keeps its existing rules.
+    if "Agent" not in denied:
+        denied.append("Agent")
     if execution_mode == "soft-safe":
-        for key in ("permissions", "sandbox"):
-            if not isinstance(value.setdefault(key, {}), dict):
-                raise RuntimeError(f"Claude {key} settings must be a JSON object")
-        value["permissions"]["defaultMode"] = "bypassPermissions"
+        if not isinstance(value.setdefault("sandbox", {}), dict):
+            raise RuntimeError("Claude sandbox settings must be a JSON object")
+        permissions["defaultMode"] = "bypassPermissions"
         value["sandbox"]["enabled"] = False
     if raw and before == json.dumps(value, sort_keys=True):
         rendered = raw

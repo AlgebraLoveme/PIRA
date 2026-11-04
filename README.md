@@ -109,7 +109,9 @@ Claude setup preserves custom settings, adds physical PIRA store paths to `setti
 
 `AGENTS.md` is the single policy file to maintain. Setup configures the native built-in AGENTS plugin's `instructionFiles` option as `claude-md-and-agents-md`, so project `AGENTS.md` loads alongside project `CLAUDE.md` (validated with Claude Code 2.1.311).
 
-The configuration directory defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`. Override it with `--claude-dir DIR`. `--execution-mode keep` leaves existing Claude permissions and sandbox settings unchanged. Claude Team requires a current `bypassPermissions` turn and an unsandboxed shell. It does not support `safe` mode. Preview with `--dry-run`, then verify with the same options plus `--verify`.
+Full Claude setup adds `Agent` to `permissions.deny` to disable native subagents and sets `autoMemoryEnabled: false` to disable native automatic memory, including in `keep` mode. Bash/`pira_team` permission rules stay unchanged; PIRA delegation is separate from the native Agent tool (formerly Task). Existing native memory files are not deleted. Global/local AGENTS and explicit CLAUDE instructions still load automatically without model read calls; PIRA workbook memory is unaffected.
+
+The configuration directory defaults to `CLAUDE_CONFIG_DIR` or `~/.claude`. Override it with `--claude-dir DIR`. `--execution-mode keep` preserves the existing Claude execution mode, sandbox settings, and unrelated permission rules. Claude Team requires a current `bypassPermissions` turn and an unsandboxed shell. It does not support `safe` mode. Preview with `--dry-run`, then verify with the same options plus `--verify`.
 
 Full setup forwards `--claude-dir` to its tools phase as `CLAUDE_CONFIG_DIR`; use that same environment variable for later Claude commands. Set `CODEX_HOME` before setup to select Codex's configuration and authentication home. `--codex-config FILE` overrides only the edited file, not the authentication home or account.
 

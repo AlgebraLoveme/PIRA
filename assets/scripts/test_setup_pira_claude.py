@@ -271,7 +271,7 @@ class ClaudeSetupTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.directory = self.root / "claude"
         self.directory.mkdir()
         self.agent = self.root / "agent with space"
@@ -283,6 +283,8 @@ class ClaudeSetupTests(unittest.TestCase):
         self.assertTrue(settings["enabledPlugins"]["cc-plugin-agents-md@builtin"])
         self.assertEqual(settings["pluginConfigs"]["cc-plugin-agents-md@builtin"]["options"],
                          {"instructionFiles": "claude-md-and-agents-md"})
+        self.assertEqual(settings["permissions"], {"deny": ["Agent"]})
+        self.assertFalse(settings["autoMemoryEnabled"])
         self.assertEqual(list(self.directory.iterdir()), [])
 
     def legacy_block(self) -> str:
@@ -302,7 +304,7 @@ class ClaudeSetupTests(unittest.TestCase):
         config = json.loads(plan[path])
         self.assertEqual(config["model"], "custom-model")
         self.assertEqual(config["env"]["CUSTOM"], "keep")
-        self.assertNotIn("permissions", config)
+        self.assertEqual(config["permissions"], {"deny": ["Agent"]})
         for target, text in plan.items():
             target.write_text(text, newline="")
         self.assertEqual(claude.plan(self.directory, self.agent, stores, "keep"), plan)
@@ -422,13 +424,100 @@ class ClaudeSetupTests(unittest.TestCase):
 
     def test_keep_preserves_permission_settings_and_json_formatting(self) -> None:
         path = self.directory / "settings.json"
-        raw = ('{"env": {}, "permissions": {"defaultMode": "plan"}, "sandbox": {"enabled": true}, '
+        raw = ('{"env": {}, "permissions": {"defaultMode": "plan", "deny": ["Agent"]}, '
+               '"autoMemoryEnabled": false, "sandbox": {"enabled": true}, '
                '"enabledPlugins": {"cc-plugin-agents-md@builtin": true}, '
                '"pluginConfigs": {"cc-plugin-agents-md@builtin": '
                '{"options": {"instructionFiles": "claude-md-and-agents-md"}}}}')
         path.write_text(raw)
         plan = claude.plan(self.directory, self.agent, {}, "keep")
         self.assertEqual(plan[path], raw)
+
+    def test_native_agent_and_auto_memory_disabled_without_changing_other_settings(self) -> None:
+        path = self.directory / "settings.json"
+        permissions = {"allow": ["Bash(pira_team *)", "Agent(Explore)"],
+                       "ask": ["Bash(git push *)"], "deny": ["Read(./private/**)", "Task(custom)"],
+                       "additionalDirectories": [str(self.root)], "defaultMode": "plan"}
+        original = {"permissions": permissions, "sandbox": {"enabled": True, "custom": "keep"},
+                    "autoMemoryEnabled": True, "autoMemoryDirectory": str(self.root / "native-memory"),
+                    "model": "custom-model"}
+        memory = self.root / "native-memory" / "MEMORY.md"
+        memory.parent.mkdir()
+        memory.write_bytes(b"Existing native memory must not be deleted.\r\n")
+        workbook = self.root / "AGENT_WORKBOOK.md"
+        workbook.write_bytes(b"Preserve PIRA workbook memory.\n")
+        for mode in ("keep", "soft-safe"):
+            with self.subTest(mode=mode):
+                path.write_text(json.dumps(original))
+                planned = claude.plan(self.directory, self.agent, {}, mode)
+                config = json.loads(planned[path])
+                expected = dict(permissions, deny=[*permissions["deny"], "Agent"])
+                if mode == "soft-safe":
+                    expected["defaultMode"] = "bypassPermissions"
+                self.assertEqual(config["permissions"], expected)
+                self.assertEqual(config["sandbox"], dict(original["sandbox"],
+                    enabled=False if mode == "soft-safe" else True))
+                self.assertFalse(config["autoMemoryEnabled"])
+                self.assertEqual(config["autoMemoryDirectory"], original["autoMemoryDirectory"])
+                self.assertEqual(config["model"], "custom-model")
+                path.write_text(planned[path], newline="")
+                self.assertEqual(claude.plan(self.directory, self.agent, {}, mode), planned)
+                self.assertEqual(memory.read_bytes(), b"Existing native memory must not be deleted.\r\n")
+                self.assertEqual(workbook.read_bytes(), b"Preserve PIRA workbook memory.\n")
+
+    def test_invalid_native_deny_settings_fail_without_writes(self) -> None:
+        path = self.directory / "settings.json"
+        for permissions in ([], {"deny": "Agent"}, {"deny": [None]}):
+            with self.subTest(permissions=permissions):
+                raw = json.dumps({"permissions": permissions})
+                path.write_text(raw)
+                with self.assertRaisesRegex(RuntimeError, "Claude permissions"):
+                    claude.plan(self.directory, self.agent, {}, "keep")
+                self.assertEqual(path.read_text(), raw)
+                self.assertFalse((self.directory / "CLAUDE.md").exists())
+
+    def test_readonly_update_plans_native_restrictions_without_applying_them(self) -> None:
+        path = self.directory / "settings.json"
+        raw = '{"permissions":{"defaultMode":"plan","deny":["Read(./private/**)"]}}'
+        path.write_text(raw)
+        self.agent.mkdir()
+        (self.agent / "AGENTS.md").write_text(setup.VERIFY_TOKEN)
+        env = {"HOME": str(self.root), "USERPROFILE": str(self.root),
+               "LOCALAPPDATA": str(self.root / "local-app-data"),
+               "CLAUDE_CONFIG_DIR": str(self.directory), "CODEX_HOME": str(self.root / "codex")}
+        args = ["--include", "ClaudeCode", "--skip-codex", "--skip-tools",
+                "--agent-dir", str(self.agent), "--claude-dir", str(self.directory),
+                "--force-agent-link", "--execution-mode", "keep", "--legacy", "keep"]
+        for flag, expected in (("--dry-run", 0), ("--verify", 1)):
+            with self.subTest(flag=flag), patch.dict(os.environ, env, clear=True), \
+                 patch.object(setup.tool_setup, "prepare_claude_runtime", return_value="2.1.311 (Claude Code)"), \
+                 patch.object(setup.stores, "plan_store_environment", return_value=setup.stores.StorePlan()), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(setup.main([*args, flag]), expected)
+                if flag == "--verify":
+                    self.assertIn("FAIL: Claude PIRA configuration", output.getvalue())
+                self.assertEqual(path.read_text(), raw)
+                self.assertEqual(list(self.directory.iterdir()), [path])
+        workspace = self.root / "pira"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("Existing communicator instructions.\n")
+        (workspace / "AGENT_WORKBOOK.md").write_text("Existing PIRA memory.\n")
+        workbook_before = (workspace / "AGENT_WORKBOOK.md").read_bytes()
+        state = setup.SetupState(self.root, self.agent, False, True)
+        for target, content in claude.plan(self.directory, self.agent, {}, "keep").items():
+            if isinstance(content, Path):
+                setup.write_claude_link(state, target, content)
+            else:
+                setup.write_claude_text(state, target, content)
+        before = {p.name: (p.lstat().st_mtime_ns, p.read_bytes()) for p in self.directory.iterdir()}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(setup.tool_setup, "prepare_claude_runtime", return_value="2.1.311 (Claude Code)"), \
+             patch.object(setup.stores, "plan_store_environment", return_value=setup.stores.StorePlan()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(setup.main([*args, "--verify"]), 0)
+        self.assertEqual({p.name: (p.lstat().st_mtime_ns, p.read_bytes())
+                          for p in self.directory.iterdir()}, before)
+        self.assertEqual((workspace / "AGENT_WORKBOOK.md").read_bytes(), workbook_before)
 
     def test_configures_agents_coexistence_without_changing_other_plugin_settings(self) -> None:
         path = self.directory / "settings.json"

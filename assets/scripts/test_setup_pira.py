@@ -746,6 +746,7 @@ class AutoRecapTests(unittest.TestCase):
                 + "historical=lambda tool: [Path(" + repr(str(old)) + ")] if tool=='pira_ctx' else []; "
                 + "ctx=patch.object(s.stores,'historical_store_paths',side_effect=historical); ctx.start(); "
                 + "backend=patch.object(s,'migration_codex_binary',return_value=None); backend.start(); "
+                + "runtime=patch.object(s.tool_setup,'prepare_codex_runtime',return_value=None); runtime.start(); "
                 + "link=patch.object(s,'ensure_agent_dir'); link.start(); "
                 + "paths=" + repr({"PIRA_CTX_STORE_DIR": str(destination), "PIRA_DEC_STORE_DIR": str(root / "dec"), "PIRA_TEAM_DIR": str(root / "team")}) + "; "
                 + "choose=lambda tools,*a,**kw: {s.stores.STORE_ENV_KEYS[t]:paths[s.stores.STORE_ENV_KEYS[t]] for t in tools if t in s.stores.STORE_ENV_KEYS}; "
