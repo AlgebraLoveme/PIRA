@@ -319,7 +319,7 @@ def resolve_retained(repository: str, requests: dict) -> dict:
         record = origin["index"]["tools"][tool]
         source = record.get("build_source_sha", origin["index"]["source_sha"])
         previous = record.get("retained_from")
-        if previous is not None:
+        if "retained_from" in record:
             fields = {"release_id", "tag", "assembly_source_sha", "index_asset_id", "index_sha256"}
             if (not isinstance(previous, dict) or set(previous) != fields
                     or not all(positive_integer(previous[k]) for k in ("release_id", "index_asset_id"))

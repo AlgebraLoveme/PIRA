@@ -366,6 +366,18 @@ class MixedReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(package.PackageError, "cyclic/overlong"):
             self.receipts([package.TOOLS[-1]])
 
+    def test_null_retained_provenance_cannot_claim_a_different_build_source(self):
+        self.origin["index"]["source_sha_scope"] = "assembly"
+        for record in self.origin["index"]["tools"].values():
+            record["build_source_sha"] = self.source
+        tool = package.TOOLS[-1]
+        self.origin["index"]["tools"][tool].update(build_source_sha="f" * 40, retained_from=None)
+        self.refresh()
+        requests = self.requests([tool])
+        requests[tool]["source_sha"] = "f" * 40
+        with self.assertRaisesRegex(package.PackageError, "malformed retained provenance"):
+            package.resolve_retained(self.repository, requests)
+
     def test_malformed_retained_provenance_is_not_a_fresh_source_claim(self):
         self.origin["index"]["source_sha_scope"] = "assembly"
         for record in self.origin["index"]["tools"].values():
