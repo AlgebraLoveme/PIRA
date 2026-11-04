@@ -10,7 +10,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from tools.build.package_github_release import TOOLS, PackageError, resolve_retained, retained_requests
+from tools.build.package_github_release import TOOLS, PackageError, resolve_retained, retained_requests, strict_json
 
 
 def version_only_lock_changes(before: str, after: str) -> set[str] | None:
@@ -114,17 +114,32 @@ def plan_retained(root: Path, repository: str, requests: dict) -> dict[str, obje
     return make_plan(set(TOOLS) - set(receipts), "explicit pinned output selection, not inferred unchanged inputs", receipts)
 
 
+def first_tools(text: str) -> list[str]:
+    """Validate an explicit first phase; every remaining fresh tool still builds."""
+    tools = strict_json(text)
+    if (not isinstance(tools, list) or any(not isinstance(tool, str) or tool not in TOOLS for tool in tools)
+            or len(tools) != len(set(tools))):
+        raise PackageError("first tools must be a JSON list of distinct known tool names")
+    return tools
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--base", default="", help="Full local ancestor commit SHA; absent/uncertain means all tools")
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--retained-tools", default="{}", help="JSON map of explicit tool tag/version/source_sha pins")
+    parser.add_argument("--first-tools", default="[]", help="JSON list of fresh tools to finish before other fresh builds; empty preserves automatic ordering")
     parser.add_argument("--repository", default="", help="GitHub owner/repo for authenticated retained origins")
     args = parser.parse_args()
     try:
+        first = first_tools(args.first_tools)
         requests = retained_requests(args.retained_tools)
         plan = plan_retained(args.root, args.repository, requests) if requests else plan_repository(args.root, args.base)
+        if first:
+            if set(first) & set(plan["retained_tools"]):
+                raise PackageError("first tools cannot include retained tools")
+            plan = make_plan(set(first), "explicit fresh first phase; all other fresh tools follow", plan["retained_tools"])
     except (PackageError, OSError, ValueError) as error:
         parser.error(str(error))
     if args.github_output:

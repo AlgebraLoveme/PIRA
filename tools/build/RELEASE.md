@@ -39,8 +39,11 @@ must explicitly pin its published release tag, version and **actual build source
 
 Replace placeholders with approved immutable identities. The pinned version must
 match the assembly's Cargo manifest; at least one tool must build fresh. Every
-non-retained tool builds in phase one. Phase two is disabled; the single Windows
-gate tests only fresh tool packages. Setup and packaging contract tests still run.
+non-retained tool builds in phase one by default. Optional `first_tools` is a JSON
+list of distinct fresh tool names: those finish in phase one, then every other
+fresh tool builds in phase two. Unknown, duplicate or retained names fail. An
+empty list preserves automatic ordering. The single Windows gate tests only fresh
+tool packages. Setup and packaging contract tests still run.
 The release is complete, never a standalone or partial tool release.
 
 ```sh

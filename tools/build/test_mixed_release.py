@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import gzip
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -131,6 +132,40 @@ class MixedReleaseTests(unittest.TestCase):
                 self.assertEqual(record["build_source_sha"], "b" * 40)
                 self.assertEqual(record["build_run_id"], 900)
                 self.assertNotIn("retained_from", record)
+
+    def test_team_first_then_ctx_dec_keeps_three_pinned_tools_and_complete_bundle(self):
+        retained = ["pira_nav", "pira_svg_check", "pira_write_check"]
+        for tool in retained:
+            manifest = self.root / f"tools/crates/{tool}/Cargo.toml"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text('[package]\nversion="1.0.0"\n')
+        args = ["release_plan", "--root", str(self.root), "--repository", self.repository,
+                "--retained-tools", json.dumps(self.requests(retained)), "--first-tools", '["pira_team"]']
+        with patch("sys.argv", args), patch("builtins.print") as printed:
+            release_plan.main()
+        plan = json.loads(printed.call_args.args[0])
+        self.assertEqual(plan["changed"], ["pira_team"])
+        self.assertEqual(plan["remaining"], ["pira_ctx", "pira_dec"])
+        self.assertEqual(set(plan["build_tools"]), {"pira_team", "pira_ctx", "pira_dec"})
+        self.assertTrue(plan["has_changed"] and plan["has_remaining"])
+        index, output = self.assemble(plan["retained_tools"])
+        self.assertEqual(len(list(output.iterdir())), 31)
+        self.assertEqual(index["tools"]["pira_team"]["build_source_sha"], "b" * 40)
+        self.assertNotIn("retained_from", index["tools"]["pira_team"])
+        for tool in retained:
+            for platform, binary in index["tools"][tool]["binaries"].items():
+                asset = plan["retained_tools"][tool]["assets"][platform]
+                self.assertEqual((output / binary["asset"]).read_bytes(), self.blobs[asset["id"]])
+        with patch("sys.argv", args[:-1] + ['["pira_nav"]']), patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as error:
+                release_plan.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_first_tools_rejects_unknown_duplicate_or_nonlist_values(self):
+        for text in ('null', '{}', '[{}]', '["unknown"]', '["pira_team", "pira_team"]'):
+            with self.subTest(text=text), self.assertRaises(package.PackageError):
+                release_plan.first_tools(text)
+        self.assertEqual(release_plan.first_tools('[]'), [])
 
     def test_existing_schema2_reader_accepts_additive_origins_without_changing_binary_selection(self):
         from assets.scripts.test_setup_pira_tools import setup

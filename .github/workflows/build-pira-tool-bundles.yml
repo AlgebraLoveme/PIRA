@@ -13,6 +13,11 @@ on:
         type: string
         default: "{}"
         required: false
+      first_tools:
+        description: 'Optional JSON list of fresh tools to finish before other fresh builds; empty preserves automatic ordering'
+        type: string
+        default: "[]"
+        required: false
       publish_release:
         description: Publish publicly only after required acceptance results are approved
         type: boolean
@@ -74,8 +79,9 @@ jobs:
         env:
           BASE_SHA: ${{ inputs.baseline_sha }}
           RETAINED_TOOLS: ${{ inputs.retained_tools }}
+          FIRST_TOOLS: ${{ inputs.first_tools }}
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B -m tools.build.release_plan --base "${BASE_SHA}" --retained-tools "${RETAINED_TOOLS}" --repository "${GITHUB_REPOSITORY}" --github-output "${GITHUB_OUTPUT}"
+        run: python3 -B -m tools.build.release_plan --base "${BASE_SHA}" --first-tools "${FIRST_TOOLS}" --retained-tools "${RETAINED_TOOLS}" --repository "${GITHUB_REPOSITORY}" --github-output "${GITHUB_OUTPUT}"
 
   build_changed:
     name: Validate changed ${{ matrix.tool }} first
