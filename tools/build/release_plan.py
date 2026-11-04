@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Order fresh release builds; this plan never authorizes cross-release reuse."""
+"""Order fresh builds or explicitly pin authenticated retained tool outputs."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from tools.build.package_github_release import TOOLS
+from tools.build.package_github_release import TOOLS, PackageError, resolve_retained, retained_requests
 
 
 def version_only_lock_changes(before: str, after: str) -> set[str] | None:
@@ -53,11 +53,12 @@ def changed_tools(paths: list[str], lock_versions: set[str] | None = None) -> se
     return changed
 
 
-def make_plan(changed: set[str], reason: str) -> dict[str, object]:
-    if not changed <= set(TOOLS):
+def make_plan(changed: set[str], reason: str, retained: dict | None = None) -> dict[str, object]:
+    retained = retained or {}
+    if not changed <= set(TOOLS) or not set(retained) < set(TOOLS) or changed & set(retained):
         raise ValueError("unknown release tool")
     first = [tool for tool in TOOLS if tool in changed]
-    remaining = [tool for tool in TOOLS if tool not in changed]
+    remaining = [tool for tool in TOOLS if tool not in changed and tool not in retained]
 
     def matrix(tools: list[str]) -> dict[str, object]:
         # GitHub rejects empty matrices. A disabled phase gets one inert row;
@@ -72,7 +73,9 @@ def make_plan(changed: set[str], reason: str) -> dict[str, object]:
         "changed_matrix": matrix(first),
         "remaining_matrix": matrix(remaining),
         "reason": reason,
-        "reuse": "same-workflow artifacts only; all six tools freshly built",
+        "retained_tools": retained,
+        "build_tools": [tool for tool in TOOLS if tool not in retained],
+        "reuse": "explicit authenticated output retention; no current-input equivalence claimed" if retained else "same-workflow artifacts only; all six tools freshly built",
     }
 
 
@@ -101,16 +104,32 @@ def plan_repository(root: Path, base: str, head: str = "HEAD") -> dict[str, obje
         return make_plan(set(TOOLS), "baseline/diff unavailable; validate all tools first")
 
 
+def plan_retained(root: Path, repository: str, requests: dict) -> dict[str, object]:
+    requests = retained_requests(json.dumps(requests))
+    for tool, pin in requests.items():
+        manifest = tomllib.loads((root / f"tools/crates/{tool}/Cargo.toml").read_text())
+        if manifest["package"]["version"] != pin["version"]:
+            raise PackageError(f"retained pin disagrees with assembly manifest version: {tool}")
+    receipts = resolve_retained(repository, requests)
+    return make_plan(set(TOOLS) - set(receipts), "explicit pinned output selection, not inferred unchanged inputs", receipts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--base", default="", help="Full local ancestor commit SHA; absent/uncertain means all tools")
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--retained-tools", default="{}", help="JSON map of explicit tool tag/version/source_sha pins")
+    parser.add_argument("--repository", default="", help="GitHub owner/repo for authenticated retained origins")
     args = parser.parse_args()
-    plan = plan_repository(args.root, args.base)
+    try:
+        requests = retained_requests(args.retained_tools)
+        plan = plan_retained(args.root, args.repository, requests) if requests else plan_repository(args.root, args.base)
+    except (PackageError, OSError, ValueError) as error:
+        parser.error(str(error))
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as output:
-            for key in ("has_changed", "has_remaining", "changed_matrix", "remaining_matrix"):
+            for key in ("has_changed", "has_remaining", "changed_matrix", "remaining_matrix", "retained_tools", "build_tools"):
                 output.write(f"{key}={json.dumps(plan[key], separators=(',', ':'))}\n")
     print(json.dumps(plan, indent=2))
 

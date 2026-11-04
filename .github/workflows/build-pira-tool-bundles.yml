@@ -8,6 +8,11 @@ on:
         type: string
         default: ""
         required: false
+      retained_tools:
+        description: 'Optional JSON tool pins: {"TOOL":{"tag":"pira-tools-...","version":"...","source_sha":"FULL_BUILD_SHA"}}; other tools build fresh'
+        type: string
+        default: "{}"
+        required: false
       publish_release:
         description: Publish publicly only after required acceptance results are approved
         type: boolean
@@ -30,6 +35,8 @@ jobs:
       has_remaining: ${{ steps.plan.outputs.has_remaining }}
       changed_matrix: ${{ steps.plan.outputs.changed_matrix }}
       remaining_matrix: ${{ steps.plan.outputs.remaining_matrix }}
+      retained_tools: ${{ steps.plan.outputs.retained_tools }}
+      build_tools: ${{ steps.plan.outputs.build_tools }}
     steps:
       - name: Require owner dispatch from master
         env:
@@ -59,13 +66,16 @@ jobs:
             assets.scripts.test_setup_pira_tools \
             assets.scripts.test_setup_pira_communication \
             assets.scripts.test_setup_pira_claude \
-            assets.scripts.test_python_bootstrap
+            assets.scripts.test_python_bootstrap \
+            tools.build.test_mixed_release
 
       - name: Plan changed-first fresh builds
         id: plan
         env:
           BASE_SHA: ${{ inputs.baseline_sha }}
-        run: python3 -B -m tools.build.release_plan --base "${BASE_SHA}" --github-output "${GITHUB_OUTPUT}"
+          RETAINED_TOOLS: ${{ inputs.retained_tools }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -m tools.build.release_plan --base "${BASE_SHA}" --retained-tools "${RETAINED_TOOLS}" --repository "${GITHUB_REPOSITORY}" --github-output "${GITHUB_OUTPUT}"
 
   build_changed:
     name: Validate changed ${{ matrix.tool }} first
@@ -107,6 +117,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run native Windows tests
+        env:
+          BUILD_TOOLS: ${{ needs.authorize.outputs.build_tools }}
+          RETAINED_TOOLS: ${{ needs.authorize.outputs.retained_tools }}
         run: |
           python -m unittest `
             assets.scripts.test_setup_pira `
@@ -118,9 +131,19 @@ jobs:
             assets.scripts.test_retire_pira_audio `
             tools.build.test_build_pira_ctx_platform_bins `
             tools.build.test_package_github_release `
+            tools.build.test_mixed_release `
             tools.build.test_release_plan
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --manifest-path tools/Cargo.toml --workspace --locked -- --test-threads=1
+          if ($env:RETAINED_TOOLS -eq '{}') {
+            cargo test --manifest-path tools/Cargo.toml --workspace --locked -- --test-threads=1
+          } else {
+            $tools = @(ConvertFrom-Json $env:BUILD_TOOLS)
+            if ($tools.Count -eq 0) { throw 'No fresh tool packages selected' }
+            $packages = @()
+            foreach ($tool in $tools) { $packages += @('--package', $tool) }
+            cargo test --manifest-path tools/Cargo.toml --locked @packages -- --test-threads=1
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   publish:
     name: Publish GitHub Release
@@ -151,15 +174,20 @@ jobs:
         env:
           ARTIFACTS_DIR: ${{ runner.temp }}/pira-build-artifacts
           ASSETS_DIR: ${{ runner.temp }}/pira-release-assets
+          RETAINED_TOOLS: ${{ needs.authorize.outputs.retained_tools }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="pira-tools-r${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:12}"
+          python3 -c 'import os; from pathlib import Path; Path(os.environ["RUNNER_TEMP"], "retained-tools.json").write_text(os.environ["RETAINED_TOOLS"])'
           python3 tools/build/package_github_release.py \
             --artifacts-dir "${ARTIFACTS_DIR}" \
             --output-dir "${ASSETS_DIR}" \
             --repository "${GITHUB_REPOSITORY}" \
             --tag "${tag}" \
-            --source-sha "${GITHUB_SHA}"
+            --source-sha "${GITHUB_SHA}" \
+            --build-run-id "${GITHUB_RUN_ID}" \
+            --retained-manifest "${RUNNER_TEMP}/retained-tools.json"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Prepare immutable-versioned draft or approved public release
@@ -183,7 +211,7 @@ jobs:
               --target "${GITHUB_SHA}" \
               --draft \
               --title "PIRA tools ${TAG#pira-tools-}" \
-              --notes "Cloud-built PIRA tool binaries from ${GITHUB_SHA}."
+              --notes "Complete PIRA tools assembled at ${GITHUB_SHA}. The schema-2 index records each tool build_source_sha; retained tools are byte-for-byte copies with authenticated release and asset origins. This assembly source is not a claim that every tool was rebuilt."
           fi
           gh release upload "${TAG}" "${ASSETS_DIR}"/* \
             --repo "${GITHUB_REPOSITORY}" \

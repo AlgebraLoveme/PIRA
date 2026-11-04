@@ -46,6 +46,7 @@ jobs:
             assets.scripts.test_retire_pira_audio \
             tools.build.test_build_pira_ctx_platform_bins \
             tools.build.test_package_github_release \
+            tools.build.test_mixed_release \
             tools.build.test_release_plan
           cargo fmt --manifest-path tools/Cargo.toml --package "${TOOL}" -- --check
           # The copied/unlinked live-executable fixture is prohibited on macOS.
