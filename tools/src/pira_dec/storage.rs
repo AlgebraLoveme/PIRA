@@ -431,7 +431,8 @@ fn effective_store_dir(option: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = option {
         return Ok(path.to_path_buf());
     }
-    if let Some(path) = std::env::var_os("PIRA_DEC_STORE_DIR") {
+    // An empty variable is unset, matching pira_team's store resolution.
+    if let Some(path) = std::env::var_os("PIRA_DEC_STORE_DIR").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path));
     }
     #[cfg(target_os = "windows")]

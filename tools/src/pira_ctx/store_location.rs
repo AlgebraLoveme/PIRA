@@ -21,21 +21,19 @@ fn select(
     os: &str,
     env: impl Fn(&str) -> Option<OsString>,
 ) -> Result<StoreLocation, String> {
-    // Explicit overrides retain their existing interpretation, including relative paths.
-    if let Some(path) = option
-        .cloned()
-        .or_else(|| env("PIRA_CTX_STORE_DIR").map(PathBuf::from))
-    {
-        return Ok(StoreLocation {
-            path,
-            legacy: vec![],
-        });
-    }
     let base = |name| {
         env(name)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     };
+    // Explicit overrides retain their existing interpretation, including relative paths.
+    // An empty variable is unset, as for every other variable read here and in pira_team.
+    if let Some(path) = option.cloned().or_else(|| base("PIRA_CTX_STORE_DIR")) {
+        return Ok(StoreLocation {
+            path,
+            legacy: vec![],
+        });
+    }
     let home = base("HOME");
     let mut legacy = Vec::new();
     let path = match os {
@@ -152,6 +150,11 @@ mod tests {
         }
         for os in ["macos", "linux", "windows"] {
             assert!(select(None, os, |_| None).is_err());
+            let empty = |key: &str| (key == "PIRA_CTX_STORE_DIR").then(OsString::new);
+            assert!(select(None, os, empty).is_err());
+            let mut empty_override = values.to_vec();
+            empty_override.push(("PIRA_CTX_STORE_DIR", OsString::new()));
+            assert_eq!(choose(os, &empty_override).path, choose(os, &values).path);
             let override_path = PathBuf::from("explicit");
             let chosen = select(Some(&override_path), os, |_| {
                 panic!("CLI override must not consult environment")

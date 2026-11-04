@@ -566,7 +566,7 @@ pub(crate) fn atomic_replace(temporary: &Path, destination: &Path) -> io::Result
 
 #[cfg(windows)]
 fn windows_rename_snapshot(temporary: &Path, destination: &Path, replace: bool) -> io::Result<()> {
-    use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
     };
@@ -579,14 +579,8 @@ fn windows_rename_snapshot(temporary: &Path, destination: &Path, replace: bool) 
         .access_mode(0x0001_0000) // DELETE, required for rename
         .share_mode(7)
         .open(temporary)?;
-    let destination = std::path::absolute(destination)?;
-    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
-    if name.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "NUL in snapshot destination",
-        ));
-    }
+    let mut name = win32_path(destination)?;
+    name.pop(); // FileNameLength excludes the terminator, which the buffer adds below.
     let name_bytes = name
         .len()
         .checked_mul(2)
@@ -937,10 +931,12 @@ pub(crate) fn publish_immutable(temporary: &Path, path: &Path) -> Result<(), Str
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
-        let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide = |file: &Path| {
+            win32_path(file)
+                .map_err(|error| format!("publish {} without replacement: {error}", path.display()))
+        };
+        let (source, destination) = (wide(temporary)?, wide(path)?);
         // SAFETY: valid NUL-terminated paths; omission of REPLACE_EXISTING preserves records.
         if unsafe {
             MoveFileExW(
@@ -958,6 +954,40 @@ pub(crate) fn publish_immutable(temporary: &Path, path: &Path) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// NUL-terminated wide path for direct Win32 calls. `std::fs` adds the verbatim
+/// prefix itself; raw calls do not, so long paths would fail at MAX_PATH.
+#[cfg(windows)]
+pub(crate) fn win32_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+    // Normalize with the OS path routine, as pira_dec does, before going verbatim.
+    let path = std::path::absolute(path)?;
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "NUL in Windows path",
+        ));
+    }
+    if encoded.len() >= 248 {
+        match path.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(_) => encoded = r"\\?\".encode_utf16().chain(encoded).collect(),
+                Prefix::UNC(_, _) => {
+                    encoded = r"\\?\UNC\"
+                        .encode_utf16()
+                        .chain(encoded.into_iter().skip(2))
+                        .collect()
+                }
+                _ => {} // Already verbatim paths keep their native representation.
+            },
+            _ => return Err(io::Error::other("Windows path is not absolute")),
+        }
+    }
+    encoded.push(0);
+    Ok(encoded)
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -3118,6 +3148,88 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn win32_path_normalizes_without_double_prefixing() {
+        use std::os::windows::ffi::OsStrExt;
+        for relative in [r"relative\..\child", r"C:relative"] {
+            let absolute = std::path::absolute(relative).unwrap();
+            assert_eq!(
+                win32_path(Path::new(relative)).unwrap(),
+                win32_path(&absolute).unwrap()
+            );
+        }
+        for path in [
+            r"C:\short",
+            r"\rooted",
+            r"\\server\share\short",
+            r"\\?\C:\short",
+            r"\\?\UNC\server\share\short",
+            r"C:\博士\😀",
+        ] {
+            let expected: Vec<_> = std::path::absolute(path)
+                .unwrap()
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            assert_eq!(win32_path(Path::new(path)).unwrap(), expected, "{path}");
+        }
+        let verbatim = format!(r"\\?\C:\{}", "x".repeat(260));
+        assert_eq!(
+            win32_path(Path::new(&verbatim)).unwrap(),
+            verbatim.encode_utf16().chain(Some(0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_path_prefixes_long_disk_and_unc_paths_by_utf16_length() {
+        for (length, prefix) in [(247, ""), (248, r"\\?\")] {
+            let path = format!("C:\\{}", "x".repeat(length - 3));
+            let expected = format!("{prefix}{path}\0");
+            assert_eq!(
+                win32_path(Path::new(&path)).unwrap(),
+                expected.encode_utf16().collect::<Vec<_>>()
+            );
+        }
+        let unc = format!(r"\\server\share\{}", "x".repeat(240));
+        let expected = format!("\\\\?\\UNC\\server\\share\\{}\0", "x".repeat(240));
+        assert_eq!(
+            win32_path(Path::new(&unc)).unwrap(),
+            expected.encode_utf16().collect::<Vec<_>>()
+        );
+        let supplementary = format!("C:\\{}", "😀".repeat(123));
+        assert!(supplementary.chars().count() < 248);
+        let expected = format!("\\\\?\\{supplementary}\0");
+        assert_eq!(
+            win32_path(Path::new(&supplementary)).unwrap(),
+            expected.encode_utf16().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_path_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_wide(&[67, 58, 92, 0xd800]);
+        assert_eq!(
+            win32_path(Path::new(&path)).unwrap(),
+            [67, 58, 92, 0xd800, 0]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_path_rejects_embedded_nul() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_wide(&[67, 58, 92, 97, 0, 98]);
+        assert_eq!(
+            win32_path(Path::new(&path)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn snapshot_readers_share_delete_and_keep_complete_old_generation() {
         use std::os::windows::fs::OpenOptionsExt;
         let root = std::env::temp_dir().join(format!(
@@ -3128,6 +3240,20 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let path = root.join("snapshot.json");
         let next = root.join("next.json");
+        let deep = root.join("d".repeat(120)).join("e".repeat(120));
+        fs::create_dir_all(&deep).unwrap();
+        let long_path = deep.join("snapshot.json");
+        fs::write(&next, b"long").unwrap();
+        atomic_replace(&next, &long_path).expect("publication beyond MAX_PATH");
+        let mut long_reader = crate::util::open_regular_file(&long_path, "snapshot").unwrap();
+        fs::write(&next, b"long replacement").unwrap();
+        atomic_replace(&next, &long_path)
+            .expect("replacement beyond MAX_PATH with retained reader");
+        let mut long_old = String::new();
+        long_reader.read_to_string(&mut long_old).unwrap();
+        assert_eq!(long_old, "long");
+        assert_eq!(fs::read(&long_path).unwrap(), b"long replacement");
+        drop(long_reader);
         fs::write(&next, b"old generation").unwrap();
         atomic_replace(&next, &path).expect("first publication into absent destination");
         // Model a destination appearing after the caller observed its absence.

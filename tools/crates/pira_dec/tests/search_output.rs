@@ -108,6 +108,28 @@ fn platform_default_store_root() {
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
+fn empty_store_environment_uses_platform_default() {
+    let sandbox = Sandbox::new();
+    let output = isolated_add(&sandbox)
+        .env("PIRA_DEC_STORE_DIR", "")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    #[cfg(target_os = "macos")]
+    let expected = sandbox
+        .path()
+        .join("home/Library/Application Support/PIRA/decision");
+    #[cfg(windows)]
+    let expected = sandbox.path().join("local/PIRA/decision");
+    #[cfg(target_os = "linux")]
+    let expected = sandbox.path().join("home/.local/share/pira/decision");
+    assert_one_published_record(&expected);
+    // Only the platform home may be created, never a cwd-rooted store.
+    assert_eq!(fs::read_dir(sandbox.path()).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[test]
 fn explicit_store_overrides_precede_platform_defaults() {
     for cli in [false, true] {
         let sandbox = Sandbox::new();

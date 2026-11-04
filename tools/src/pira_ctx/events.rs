@@ -1710,21 +1710,12 @@ fn replace_file(source: &Path, destination: &Path, _durable: bool) -> std::io::R
 
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path, durable: bool) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    let source = storage::win32_path(source)?;
+    let destination = storage::win32_path(destination)?;
     let flags = MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 };
     // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that remain
     // alive for the duration of the call.
@@ -1875,6 +1866,40 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_accepts_paths_beyond_windows_max_path() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-event-long-path-{}-{:016x}",
+            std::process::id(),
+            short_nonce()
+        ));
+        let directory = root.join("d".repeat(120)).join("e".repeat(120));
+        fs::create_dir_all(&directory).unwrap();
+        let record = directory.join("record.piraevt");
+        assert!(record.as_os_str().len() > 260);
+        publish_event(&record, b"event").unwrap();
+        assert!(publish_event(&record, b"other").is_err());
+        assert_eq!(fs::read(&record).unwrap(), b"event");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn index_replacement_accepts_paths_beyond_windows_max_path() {
+        let root = std::env::temp_dir().join(format!(
+            "pira-index-long-path-{}-{:016x}",
+            std::process::id(),
+            short_nonce()
+        ));
+        let directory = root.join("d".repeat(120)).join("e".repeat(120));
+        fs::create_dir_all(&directory).unwrap();
+        let index = directory.join("state.piraidx");
+        assert!(index.as_os_str().len() > 260);
+        atomic_write(&index, b"old").unwrap();
+        atomic_write(&index, b"new").unwrap();
+        assert_eq!(fs::read(&index).unwrap(), b"new");
         fs::remove_dir_all(root).unwrap();
     }
 
