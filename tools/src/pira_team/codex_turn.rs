@@ -17,38 +17,7 @@ pub(crate) fn turn(
     options.execution.require_writable(handoff)?;
     manifest["build_roots"] = json!(build_roots);
     let repair = manifest["repairs"].as_u64().ok_or("missing repair state")? > 0;
-    let (sender, events) = mpsc::sync_channel(64);
-    // Protocol backpressure must not prevent admission of authenticated controls.
-    let (control_sender, control_events) = mpsc::sync_channel(PENDING_CONTROLS + 1);
-    let mut controls = create(&dir.join("controls.jsonl"))?;
-    let endpoint = Endpoint::start(
-        run,
-        manifest,
-        &options.execution.sandbox,
-        control_sender,
-        controls.try_clone().map_err(|e| e.to_string())?,
-        if options.allow_subteam {
-            Some(crate::authentication::Server::start(
-                run,
-                &manifest["revision"],
-                &options.authentication,
-            )?)
-        } else {
-            None
-        },
-    )?;
-    let mut server = Server::new(
-        options,
-        run,
-        dir,
-        handoff,
-        endpoint.attempt_gate.clone(),
-        sender,
-        events,
-        control_events,
-    )?;
-    // Server owns cleanup before the fallible binding write; no separate spawn rollback.
-    crate::subteam::bind(run, &manifest["revision"], &server.scope, dir)?;
+    let (mut controls, endpoint, mut server) = start_attempt(options, run, dir, manifest, handoff)?;
     let mut stopping: Option<(&str, Instant)> = None;
     let outcome = (|| -> Result<(String, Option<String>), String> {
         server.request("initialize", json!({"clientInfo":{"name":"pira_team","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))
@@ -93,14 +62,7 @@ pub(crate) fn turn(
             lifecycle::save_json(&run.join("manifest.json"), manifest)?;
         }
         // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
-        manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
-        if options.allow_subteam {
-            manifest["coordinator_policy_version"] = json!(crate::COORDINATOR_POLICY_VERSION);
-        }
-        manifest["inject_review"] = json!(guidance.0);
-        manifest["inject_implement"] = json!(guidance.1);
-        manifest["inject_fig"] = json!(guidance.2);
-        manifest["inject_write"] = json!(guidance.3);
+        acknowledge_guidance(options, manifest, guidance);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
         let tier = crate::service_tier::Tier::retained(manifest)?;
         let started = server.request(

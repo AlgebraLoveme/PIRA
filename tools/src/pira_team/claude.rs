@@ -149,8 +149,7 @@ pub(crate) fn command(
     .map_err(|e| format!("create Claude shell filter: {e}"))?;
     let path = crate::worker_path(&launcher, std::env::var_os("PATH").as_deref())?;
     let mut environment = json!({
-        "PIRA_TEAM_CONTEXT":run, "PIRA_TEAM_CHILD":"1", "PIRA_TEAM_ATTEMPT":dir, "PIRA_TEAM_HANDOFF":handoff,
-        "PIRA_CTX_STORE_DIR":options.ctx_store,"PIRA_DEC_STORE_DIR":options.dec_store,
+        "PIRA_TEAM_CHILD":"1",
         "PATH":path,"CLAUDE_CODE_SHELL_PREFIX":wrapper,
         "CLAUDE_CODE_EFFORT_LEVEL":options.effort,
         "CLAUDE_CODE_SKIP_PROMPT_HISTORY":"0",
@@ -158,14 +157,12 @@ pub(crate) fn command(
         "CLAUDE_CODE_SDK_READS_SESSION_STATE":"1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"
     });
-    if let Some(workspace) = &options.dec_workspace {
-        environment["PIRA_DEC_WORKSPACE_DIR"] = json!(workspace);
+    for (key, value) in crate::worker_context_environment(options, run, dir, handoff)
+        .into_iter()
+        .chain(crate::worker_temp_environment(run))
+    {
+        environment[key] = json!(value);
     }
-    let scratch = run.join("scratch");
-    for key in ["TMPDIR", "TEMP", "TMP"] {
-        environment[key] = json!(scratch);
-    }
-    environment["TMPPREFIX"] = json!(scratch.join("zsh"));
     let settings = json!({"env":environment,"sandbox":{"enabled":false},"fastMode":false});
     let mut command = Command::new(options.authentication.program());
     options.authentication.apply(&mut command);

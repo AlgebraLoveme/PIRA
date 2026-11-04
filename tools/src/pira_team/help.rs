@@ -1,6 +1,6 @@
-const OVERVIEW: &str = include_str!("help.md");
-const COMMANDS: &str = include_str!("help_commands.md");
-const MANUAL: &str = include_str!("help_manual.md");
+const OVERVIEW: &str = include_str!("docs/help.md");
+const COMMANDS: &str = include_str!("docs/help_commands.md");
+const MANUAL: &str = include_str!("docs/help_manual.md");
 
 pub(super) fn topic(name: &str) -> Option<&'static str> {
     let name = match name {

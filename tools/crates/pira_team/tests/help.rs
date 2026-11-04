@@ -152,7 +152,7 @@ fn manual_preserves_full_reference_and_remote_recovery_interfaces() {
     let manual = success(&["help", "manual"]);
     assert_eq!(
         manual,
-        include_str!("../../../src/pira_team/help_manual.md")
+        include_str!("../../../src/pira_team/docs/help_manual.md")
     );
     for args in [
         vec!["help", "all"],

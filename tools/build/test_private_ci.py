@@ -102,6 +102,7 @@ class PrivateCITests(unittest.TestCase):
             'assets/scripts/setup_pira_tools.py': b'import setup_pira_stores',
             'assets/scripts/test_setup_pira_tools.py': b'# fixture',
             'assets/scripts/setup_pira_claude.py': b'# Claude setup fixture',
+            'assets/scripts/setup_pira_claude_runtime.py': b'# Claude runtime fixture\r\n',
             'assets/scripts/test_setup_pira_claude.py': b'# Claude setup tests',
             'assets/scripts/test_python_bootstrap.py': b'# wrapper tests',
             'assets/scripts/setup_pira.sh': b'# shell wrapper',
@@ -147,7 +148,7 @@ class PrivateCITests(unittest.TestCase):
         for name in ci.POLICIES:
             files[f'tools/src/pira_team/{name}'] = b'policy'
         files['tools/src/pira_team/lib.rs'] = (
-            b'const S: &str = include_str!("main.md");\n'
+            b'const S: &str = include_str!("docs/main.md");\n'
             b'const FIG: &str = include_str!("../../../modules/PUBLIC_FIGURE_STYLE.md");')
         self.files = files
         for name, content in files.items():
@@ -390,22 +391,34 @@ class PrivateCITests(unittest.TestCase):
         expected = {}
         includes = []
         for name in policies:
-            path = 'tools/src/pira_team/' + name
+            path = 'tools/src/pira_team/docs/' + name
             expected[path] = name.encode() + b' policy\r\n'
             self.write(path, expected[path])
+            includes.append(f'include_str!("docs/{name}");')
+            self.write('tools/src/pira_team/' + name, b'obsolete policy path')
+        for name in ('backend_contract.json', 'worker_profiles.json'):
+            path = 'tools/src/pira_team/' + name
+            expected[path] = self.files[path]
             includes.append(f'include_str!("{name}");')
         for module in ('PUBLIC_FIGURE_STYLE.md', 'SCIENTIFIC_WRITING.md'):
             path = 'modules/' + module
             expected[path] = self.files[path]
             includes.append(f'include_str!("../../../{path}");')
         self.write('tools/src/pira_team/lib.rs', '\n'.join(includes).encode())
-        unselected = 'tools/src/pira_team/unselected.md'
+        unselected = 'tools/src/pira_team/docs/unselected.md'
         self.write(unselected, b'not a bundled runtime policy')
         data = ci.verify(self.stage(('pira_team',)))
         for name, content in expected.items():
             with self.subTest(name=name):
                 self.assertEqual(data[name], content)
         self.assertNotIn(unselected, data)
+        self.assertEqual({name for name in data if name.startswith('tools/src/pira_team/docs/')},
+                         {'tools/src/pira_team/docs/' + name for name in policies})
+        for name in policies:
+            with self.subTest(old_path=name):
+                self.assertNotIn('tools/src/pira_team/' + name, data)
+        for name in ('backend_contract.json', 'worker_profiles.json'):
+            self.assertNotIn('tools/src/pira_team/docs/' + name, data)
 
 
     def test_staging_exclusions_dependencies_bytes_and_provenance(self):
@@ -452,7 +465,8 @@ class PrivateCITests(unittest.TestCase):
         self.assertNotIn("if: matrix.crate == 'pira_team'\n        run: python -m unittest", workflow)
         for name in ('setup_pira.py', 'test_setup_pira.py', 'setup_pira_tools.py',
                      'test_setup_pira_tools.py', 'setup_pira_stores.py', 'test_setup_pira_stores.py',
-                     'setup_pira_claude.py', 'test_setup_pira_claude.py', 'test_python_bootstrap.py',
+                     'setup_pira_claude.py', 'setup_pira_claude_runtime.py',
+                     'test_setup_pira_claude.py', 'test_python_bootstrap.py',
                      'setup_pira.sh', 'setup_pira.ps1',
                      'lib/pira_python_bootstrap.sh', 'lib/pira_python_bootstrap.ps1',
                      'migrate_pira_stores.py', 'test_migrate_pira_stores.py',
@@ -532,7 +546,8 @@ class PrivateCITests(unittest.TestCase):
     def test_missing_setup_dependency_fails_staging(self):
         for name in ('retire_pira_audio.py', 'test_retire_pira_audio.py',
                      'setup_pira_stores.py', 'setup_migration_choices.py',
-                     'setup_pira_claude.py', 'test_setup_pira_claude.py', 'test_python_bootstrap.py',
+                     'setup_pira_claude.py', 'setup_pira_claude_runtime.py',
+                     'test_setup_pira_claude.py', 'test_python_bootstrap.py',
                      'setup_pira.sh', 'setup_pira.ps1',
                      'lib/pira_python_bootstrap.sh', 'lib/pira_python_bootstrap.ps1',
                      'test_setup_migration_choices.py'):

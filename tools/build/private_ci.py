@@ -20,12 +20,12 @@ import tempfile
 import sys
 
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team", "pira_write_check")
-POLICIES = ("main.md", "coordinator.md", "implementation.md", "review.md",
-            "assignment_contract.md", "continue_task.md", "edit_authority.md", "fix_task.md",
-            "handoff.md", "help.md", "help_commands.md", "help_manual.md",
-            "implementation_stage.md", "implementation_task.md",
-            "ordinary_worker.md", "repair_stage.md", "repair_task.md", "review_stage.md",
-            "writing_application.md", "backend_contract.json", "worker_profiles.json")
+POLICIES = ("docs/main.md", "docs/coordinator.md", "docs/implementation.md", "docs/review.md",
+            "docs/assignment_contract.md", "docs/continue_task.md", "docs/edit_authority.md", "docs/fix_task.md",
+            "docs/handoff.md", "docs/help.md", "docs/help_commands.md", "docs/help_manual.md",
+            "docs/implementation_stage.md", "docs/implementation_task.md",
+            "docs/ordinary_worker.md", "docs/repair_stage.md", "docs/repair_task.md", "docs/review_stage.md",
+            "docs/writing_application.md", "backend_contract.json", "worker_profiles.json")
 BLOCKED = {"__pycache__", "target", "cache", "caches", "logs", "stores", "credentials", "node_modules", "debug", "generated", "profiles", "auth"}
 
 NATIVE_CODEX_VERSION = "0.161.0"
@@ -287,7 +287,8 @@ def selected(root: Path) -> list[Path]:
         "assets/scripts/setup_pira.py", "assets/scripts/test_setup_pira.py",
         "assets/scripts/retire_pira_audio.py", "assets/scripts/test_retire_pira_audio.py",
         "assets/scripts/setup_pira_tools.py", "assets/scripts/test_setup_pira_tools.py",
-        "assets/scripts/setup_pira_claude.py", "assets/scripts/test_setup_pira_claude.py",
+        "assets/scripts/setup_pira_claude.py", "assets/scripts/setup_pira_claude_runtime.py",
+        "assets/scripts/test_setup_pira_claude.py",
         "assets/scripts/test_python_bootstrap.py",
         "assets/scripts/setup_pira.sh", "assets/scripts/setup_pira.ps1",
         "assets/scripts/lib/pira_python_bootstrap.sh", "assets/scripts/lib/pira_python_bootstrap.ps1",

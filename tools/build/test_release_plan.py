@@ -29,6 +29,7 @@ class ReleasePlanTests(unittest.TestCase):
     def test_tool_local_source_tests_manifest_and_help(self) -> None:
         for tool in plan.TOOLS:
             for path in (f"tools/src/{tool}/lib.rs", f"tools/src/{tool}/help.md",
+                         f"tools/src/{tool}/docs/help.md",
                          f"tools/crates/{tool}/Cargo.toml", f"tools/crates/{tool}/tests/a.rs"):
                 with self.subTest(path=path):
                     self.assertEqual(plan.changed_tools([path]), {tool})

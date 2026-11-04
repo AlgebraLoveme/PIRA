@@ -128,7 +128,7 @@ class WriteTests(unittest.TestCase):
 
     def test_retained_coordinator_refresh_is_additive_and_injected_once(self) -> None:
         repo = Path(__file__).resolve().parents[4]
-        coordinator = (repo / "tools/src/pira_team/coordinator.md").read_text().rstrip()
+        coordinator = (repo / "tools/src/pira_team/docs/coordinator.md").read_text().rstrip()
         for flags in ((), ("--inject-write",)):
             with self.subTest(flags=flags):
                 first = self.launch("--allow-subteam", "--inject-review")

@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::path::Path;
 
-pub const INSTRUCTIONS: &str = include_str!("handoff.md");
+pub const INSTRUCTIONS: &str = include_str!("docs/handoff.md");
 
 pub struct Contract {
     pub format: String,

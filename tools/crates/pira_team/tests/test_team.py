@@ -744,7 +744,7 @@ class TeamTests(unittest.TestCase):
     def test_shared_rules_mirror_main_policy(self):
         root = Path(__file__).resolve().parents[4]
         main = (root / "AGENTS.md").read_text()
-        worker = (root / "tools/src/pira_team/main.md").read_text()
+        worker = (root / "tools/src/pira_team/docs/main.md").read_text()
         for start, end in (("### Concurrency", "## Safety"),
                            ("### `pira_nav`:", "### `pira_team`:")):
             self.assertIn(main[main.index(start):main.index(end, main.index(start))].rstrip(), worker)
@@ -762,7 +762,7 @@ class TeamTests(unittest.TestCase):
         for name in ("pira_ctx", "pira_dec", "pira_nav"):
             section = global_policy.split(f"### `{name}`:", 1)[1].split("\n### ", 1)[0]
             self.assertIn(section.rstrip(), policy)
-        source = root / "tools/src/pira_team"
+        source = root / "tools/src/pira_team/docs"
         for name in ("main.md", "review.md"):
             self.assertIn((source / name).read_text().rstrip(), policy)
         self.assertNotIn("# Implementation\n", policy)

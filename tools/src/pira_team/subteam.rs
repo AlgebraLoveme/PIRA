@@ -1075,7 +1075,7 @@ pub(super) fn close_bound_gate_for_test(run: &Path, target: &Value) -> Result<()
 }
 
 // Shared Team clauses are copied verbatim except coordinator-specific authority.
-pub const POLICY: &str = include_str!("coordinator.md");
+pub const POLICY: &str = include_str!("docs/coordinator.md");
 
 #[cfg(test)]
 mod tests {

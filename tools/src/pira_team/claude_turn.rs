@@ -26,36 +26,7 @@ pub(crate) fn turn(
         .to_owned();
     let turn = claude::uuid()?;
     lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-    let (sender, events) = mpsc::sync_channel(64);
-    let (control_sender, controls_rx) = mpsc::sync_channel(PENDING_CONTROLS + 1);
-    let mut controls = create(&dir.join("controls.jsonl"))?;
-    let endpoint = Endpoint::start(
-        run,
-        manifest,
-        &options.execution.sandbox,
-        control_sender,
-        controls.try_clone().map_err(|e| e.to_string())?,
-        if options.allow_subteam {
-            Some(crate::authentication::Server::start(
-                run,
-                &manifest["revision"],
-                &options.authentication,
-            )?)
-        } else {
-            None
-        },
-    )?;
-    let mut server = Server::new(
-        options,
-        run,
-        dir,
-        handoff,
-        endpoint.attempt_gate.clone(),
-        sender,
-        events,
-        controls_rx,
-    )?;
-    crate::subteam::bind(run, &manifest["revision"], &server.scope, dir)?;
+    let (mut controls, endpoint, mut server) = start_attempt(options, run, dir, manifest, handoff)?;
     let baseline = manifest["usage"].clone();
     let repair = manifest["repairs"].as_u64().unwrap_or(0) > 0;
     let mut stopping: Option<Instant> = None;
@@ -204,19 +175,7 @@ pub(crate) fn turn(
                         }
                         manifest["claude_session_started"] = json!(true);
                         manifest["active_turn"] = json!(turn);
-                        manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
-                        if options.allow_subteam {
-                            manifest["coordinator_policy_version"] =
-                                json!(crate::COORDINATOR_POLICY_VERSION);
-                        }
-                        for (key, flag) in [
-                            ("inject_review", guidance.0),
-                            ("inject_implement", guidance.1),
-                            ("inject_fig", guidance.2),
-                            ("inject_write", guidance.3),
-                        ] {
-                            manifest[key] = json!(flag);
-                        }
+                        acknowledge_guidance(options, manifest, guidance);
                         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
                         endpoint.activate(&turn)?;
                         started = true;

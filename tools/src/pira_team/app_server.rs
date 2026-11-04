@@ -35,6 +35,63 @@ struct WriteRequest {
     tier_id: Option<u64>,
 }
 
+fn start_attempt(
+    options: &Options,
+    run: &Path,
+    dir: &Path,
+    manifest: &Value,
+    handoff: &Path,
+) -> Result<(File, Endpoint, Server), String> {
+    let (sender, events) = mpsc::sync_channel(64);
+    // Protocol backpressure must not prevent admission of authenticated controls.
+    let (control_sender, control_events) = mpsc::sync_channel(PENDING_CONTROLS + 1);
+    let controls = create(&dir.join("controls.jsonl"))?;
+    let endpoint = Endpoint::start(
+        run,
+        manifest,
+        &options.execution.sandbox,
+        control_sender,
+        controls.try_clone().map_err(|e| e.to_string())?,
+        if options.allow_subteam {
+            Some(crate::authentication::Server::start(
+                run,
+                &manifest["revision"],
+                &options.authentication,
+            )?)
+        } else {
+            None
+        },
+    )?;
+    let server = Server::new(
+        options,
+        run,
+        dir,
+        handoff,
+        endpoint.attempt_gate.clone(),
+        sender,
+        events,
+        control_events,
+    )?;
+    // Server owns cleanup before the fallible binding write; no separate spawn rollback.
+    crate::subteam::bind(run, &manifest["revision"], &server.scope, dir)?;
+    Ok((controls, endpoint, server))
+}
+
+fn acknowledge_guidance(
+    options: &Options,
+    manifest: &mut Value,
+    guidance: (bool, bool, bool, bool),
+) {
+    manifest["worker_policy_version"] = json!(crate::WORKER_POLICY_VERSION);
+    if options.allow_subteam {
+        manifest["coordinator_policy_version"] = json!(crate::COORDINATOR_POLICY_VERSION);
+    }
+    manifest["inject_review"] = json!(guidance.0);
+    manifest["inject_implement"] = json!(guidance.1);
+    manifest["inject_fig"] = json!(guidance.2);
+    manifest["inject_write"] = json!(guidance.3);
+}
+
 pub(crate) fn codex_relevant_event(value: &Value) -> bool {
     value.get("id").is_some()
         || match value["method"].as_str() {

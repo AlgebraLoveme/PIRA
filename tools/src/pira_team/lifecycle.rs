@@ -146,7 +146,7 @@ pub(super) fn owner(run: &Path) -> Result<Owner, String> {
     })
 }
 
-const FIX_TASK: &str = include_str!("fix_task.md");
+const FIX_TASK: &str = include_str!("docs/fix_task.md");
 
 pub fn launch(options: Options) -> Result<(), String> {
     for path in [
@@ -314,7 +314,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
             (op == "resume").then_some(if allow_fix.unwrap_or(false) {
                 FIX_TASK
             } else {
-                include_str!("continue_task.md")
+                include_str!("docs/continue_task.md")
             }),
         )?
     };
@@ -701,7 +701,7 @@ fn policy_bundle(
         common.push_str("\n\n");
         common.push_str(crate::subteam::POLICY);
     } else {
-        common.push_str(include_str!("ordinary_worker.md"));
+        common.push_str(include_str!("docs/ordinary_worker.md"));
     }
     // Earlier retained policies already contained both task guides. Never pretend to unload them.
     let legacy = manifest["worker_policy_version"].as_u64().unwrap_or(0) < 6;
@@ -801,7 +801,7 @@ fn generate_stage(
     let (bundle, guidance) = policy_bundle(options, manifest, review_stage);
     let mut task = if manifest["stage"] == "implementation" && !review_stage {
         format!(
-            include_str!("implementation_task.md"),
+            include_str!("docs/implementation_task.md"),
             manifest["task"].as_str().unwrap_or(&options.task),
             manifest["review_checkpoint"]
         )
@@ -843,7 +843,7 @@ fn generate_stage(
             )
         };
         let phase = format!(
-            include_str!("assignment_contract.md"),
+            include_str!("docs/assignment_contract.md"),
             migration,
             json!({"workspace":options.cwd,"handoff_path":handoff,"scratch":scratch,
                 "completion_gate":manifest["completion_gate"],"output_contract":options.contract.description(),
@@ -851,13 +851,13 @@ fn generate_stage(
                 "ctx_store":options.ctx_store,"dec_store":options.dec_store,
                 "execution_permissions":manifest["execution_permissions"]}),
             if index > 0 {
-                include_str!("repair_stage.md")
+                include_str!("docs/repair_stage.md")
             } else if review_stage {
-                include_str!("review_stage.md")
+                include_str!("docs/review_stage.md")
             } else if manifest["stage"] == "implementation" {
-                include_str!("implementation_stage.md")
+                include_str!("docs/implementation_stage.md")
             } else {
-                include_str!("edit_authority.md")
+                include_str!("docs/edit_authority.md")
             }
         );
         create(&attempt_dir.join("policy.md"))?
@@ -970,7 +970,7 @@ fn generate_stage(
                     return Err("artifact validation failed after one repair; inspect candidate and validation.json".into());
                 }
                 task = format!(
-                    include_str!("repair_task.md"),
+                    include_str!("docs/repair_task.md"),
                     json!(candidate_path),
                     json!(diagnostics),
                     json!(handoff)
@@ -1004,7 +1004,7 @@ mod tests {
                 "{}\n\n{}{}",
                 crate::POLICY,
                 artifact::INSTRUCTIONS,
-                include_str!("ordinary_worker.md")
+                include_str!("docs/ordinary_worker.md")
             );
             for (enabled, text) in [
                 (mask & 1 != 0, crate::REVIEW_POLICY),

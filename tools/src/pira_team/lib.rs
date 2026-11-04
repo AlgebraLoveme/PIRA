@@ -35,11 +35,11 @@ extern "C" fn cancel_worker(_: libc::c_int) {
 const WORKER_POLICY_VERSION: u64 = 21;
 const COORDINATOR_POLICY_VERSION: u64 = 22;
 
-pub const POLICY: &str = include_str!("main.md");
-const IMPLEMENTATION_POLICY: &str = include_str!("implementation.md");
-const REVIEW_POLICY: &str = include_str!("review.md");
+pub const POLICY: &str = include_str!("docs/main.md");
+const IMPLEMENTATION_POLICY: &str = include_str!("docs/implementation.md");
+const REVIEW_POLICY: &str = include_str!("docs/review.md");
 const WRITING_POLICY: &str = include_str!("../../../modules/SCIENTIFIC_WRITING.md");
-const WRITING_APPLICATION: &str = include_str!("writing_application.md");
+const WRITING_APPLICATION: &str = include_str!("docs/writing_application.md");
 const FIGURE_POLICY: &str = include_str!("../../../modules/PUBLIC_FIGURE_STYLE.md");
 
 struct Options {
@@ -434,6 +434,39 @@ impl Drop for IsolatedHome {
     }
 }
 
+fn worker_context_environment(
+    options: &Options,
+    run: &Path,
+    dir: &Path,
+    handoff: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut environment = vec![
+        ("PIRA_CTX_STORE_DIR", options.ctx_store.clone()),
+        ("PIRA_DEC_STORE_DIR", options.dec_store.clone()),
+    ];
+    if let Some(workspace) = &options.dec_workspace {
+        environment.push(("PIRA_DEC_WORKSPACE_DIR", workspace.clone()));
+    }
+    environment.extend([
+        ("PIRA_TEAM_HANDOFF", handoff.to_owned()),
+        ("PIRA_TEAM_CONTEXT", run.to_owned()),
+        ("PIRA_TEAM_ATTEMPT", dir.to_owned()),
+    ]);
+    environment
+}
+
+fn worker_temp_environment(run: &Path) -> [(&'static str, PathBuf); 4] {
+    // Worker temporary defaults must match the managed writable root, not ambient host paths.
+    let scratch = run.join("scratch");
+    [
+        ("TMPDIR", scratch.clone()),
+        ("TMP", scratch.clone()),
+        ("TEMP", scratch.clone()),
+        // zsh uses TMPPREFIX rather than TMPDIR for heredocs.
+        ("TMPPREFIX", scratch.join("zsh")),
+    ]
+}
+
 fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command {
     let mut cmd = Command::new(options.authentication.program());
     options.authentication.apply(&mut cmd);
@@ -464,33 +497,12 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     ] {
         cmd.arg("-c").arg(setting);
     }
-    for (key, value) in [
-        ("PIRA_CTX_STORE_DIR", &options.ctx_store),
-        ("PIRA_DEC_STORE_DIR", &options.dec_store),
-    ] {
+    for (key, value) in worker_context_environment(options, run, dir, handoff) {
         cmd.arg("-c").arg(format!(
             "shell_environment_policy.set.{key}={}",
             json!(value)
         ));
     }
-    if let Some(workspace) = &options.dec_workspace {
-        cmd.arg("-c").arg(format!(
-            "shell_environment_policy.set.PIRA_DEC_WORKSPACE_DIR={}",
-            json!(workspace)
-        ));
-    }
-    cmd.arg("-c").arg(format!(
-        "shell_environment_policy.set.PIRA_TEAM_HANDOFF={}",
-        json!(handoff)
-    ));
-    cmd.arg("-c").arg(format!(
-        "shell_environment_policy.set.PIRA_TEAM_CONTEXT={}",
-        json!(run)
-    ));
-    cmd.arg("-c").arg(format!(
-        "shell_environment_policy.set.PIRA_TEAM_ATTEMPT={}",
-        json!(dir)
-    ));
     // Keep unknown task configuration without serializing its values into argv/logs.
     // Backend authentication remains available to Codex, not to worker shells.
     cmd.arg("-c")
@@ -536,15 +548,7 @@ fn command(options: &Options, run: &Path, dir: &Path, handoff: &Path) -> Command
     ] {
         cmd.env_remove(key);
     }
-    // Worker temporary defaults must match the managed writable root, not ambient host paths.
-    let scratch = run.join("scratch");
-    for (key, path) in [
-        ("TMPDIR", scratch.clone()),
-        ("TMP", scratch.clone()),
-        ("TEMP", scratch.clone()),
-        // zsh uses TMPPREFIX rather than TMPDIR for heredocs.
-        ("TMPPREFIX", scratch.join("zsh")),
-    ] {
+    for (key, path) in worker_temp_environment(run) {
         cmd.env(key, &path);
         cmd.arg("-c").arg(format!(
             "shell_environment_policy.set.{key}={}",
@@ -979,6 +983,41 @@ mod tests {
             assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
             let policy = format!("model_instructions_file={}", json!(dir.join("policy.md")));
             assert!(cmd.get_args().any(|arg| arg == policy.as_str()));
+        }
+    }
+
+    #[test]
+    fn command_projects_worker_context_only_into_shell_settings() {
+        let mut opt = options(&["review"]).unwrap();
+        let run = Path::new("/tmp/worker \"run\" ü");
+        opt.ctx_store = run.join("context store");
+        opt.dec_store = run.join("decision store");
+        for workspace in [None, Some(run.join("workspace anchor"))] {
+            opt.dec_workspace = workspace;
+            for dir in [run.to_owned(), run.join("revisions/000002/repair")] {
+                let handoff = dir.join("artifacts/handoff.md");
+                let cmd = command(&opt, run, &dir, &handoff);
+                for (key, path) in [
+                    ("PIRA_CTX_STORE_DIR", Some(opt.ctx_store.as_path())),
+                    ("PIRA_DEC_STORE_DIR", Some(opt.dec_store.as_path())),
+                    ("PIRA_DEC_WORKSPACE_DIR", opt.dec_workspace.as_deref()),
+                    ("PIRA_TEAM_CONTEXT", Some(run)),
+                    ("PIRA_TEAM_ATTEMPT", Some(dir.as_path())),
+                    ("PIRA_TEAM_HANDOFF", Some(handoff.as_path())),
+                ] {
+                    assert!(!cmd.get_envs().any(|(name, _)| name == key), "{key}");
+                    let prefix = format!("shell_environment_policy.set.{key}=");
+                    let actual: Vec<_> = cmd
+                        .get_args()
+                        .filter_map(|arg| arg.to_str().unwrap().strip_prefix(&prefix))
+                        .collect();
+                    let expected: Vec<_> = path
+                        .map(|path| json!(path).to_string())
+                        .into_iter()
+                        .collect();
+                    assert_eq!(actual, expected, "{key}");
+                }
+            }
         }
     }
 
