@@ -242,7 +242,8 @@ def watch_stop(root):
 def replay(root):
     for mode in ("auto", "exact"):
         root2, store, env = fixture(root, mode)
-        env = env | {"PIRA_CTX_STORE_DIR": "store"}
+        # This case targets replay before checkpoint retention; call() already bounds execution to 6s.
+        env = env | {"PIRA_CTX_STORE_DIR": "store", "PIRA_CTX_LIVE_CHECKPOINT_MS": "60000"}
         result = call(env, mode, "--intent", "Preserve short replay", "--", sys.executable,
                       "-c", "print('small exact output')", cwd=root2)
         assert result.returncode == 0 and result.stdout == b"small exact output\n", result
