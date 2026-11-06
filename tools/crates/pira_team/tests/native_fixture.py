@@ -6,6 +6,26 @@ from pathlib import Path
 import socket
 
 
+def cleanup_temporary(temporary):
+    """Fixture teardown may briefly race finite-lived automatic cleaners."""
+    import errno
+    import time
+    deadline = time.monotonic() + 8
+    while True:
+        try:
+            temporary.cleanup()
+            return
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EACCES, errno.EBUSY, errno.ENOENT) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def run_directories(store):
+    """Run allocations exclude store-wide cleanup metadata."""
+    return (path for path in Path(store).iterdir() if path.is_dir() and not path.name.startswith("."))
+
+
 class Boundary:
     def __init__(self):
         self.listener = socket.socket()
@@ -102,6 +122,9 @@ def raw_authentication(endpoint):
         api.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
             ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         api.CreateFileW.restype = wintypes.HANDLE
+        api.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        if not api.WaitNamedPipeW(endpoint["name"], 8000):
+            raise ctypes.WinError(ctypes.get_last_error())
         handle = api.CreateFileW(endpoint["name"], 0xC0000000, 0, None, 3, 0, None)
         if handle == wintypes.HANDLE(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())

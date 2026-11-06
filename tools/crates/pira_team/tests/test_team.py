@@ -1,6 +1,8 @@
 """CLI contract checks using a fake Codex process; no model calls or credentials."""
 from __future__ import annotations
 
+from native_fixture import cleanup_temporary, run_directories
+
 import concurrent.futures
 import json
 import os
@@ -13,7 +15,7 @@ import unittest
 class TeamTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="team-test-")
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(cleanup_temporary, self.temp)
         self.root = Path(self.temp.name).resolve()
         self.bin = Path(os.environ["PIRA_TEAM_BIN"]).resolve()
         home = self.root / "original-home"
@@ -149,7 +151,7 @@ class TeamTests(unittest.TestCase):
                     self.assertIn(error, result.stderr)
                     self.assertEqual(result.stdout, "")
                     self.assertEqual(manifest.read_bytes(), original)
-                    self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                    self.assertEqual(len(list(run_directories(self.root / "logs"))), 1)
         self.assertNotEqual(self.access("interrupt", receipt["run_id"], "--task", "invalid").returncode, 0)
 
     def permission_context(self) -> dict:
@@ -412,7 +414,7 @@ class TeamTests(unittest.TestCase):
         result = self.launch_inherited()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--effort", result.stderr)
-        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+        self.assertEqual(len(list(run_directories(self.root / "logs"))), 1)
         result = self.launch_inherited("--effort","low")
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -496,7 +498,7 @@ class TeamTests(unittest.TestCase):
         self.env["TEAM_CANDIDATE"] = self.candidate("[")
         result = self.launch("review")
         self.assertNotEqual(result.returncode, 0)
-        run = next((self.root / "logs").iterdir()).name
+        run = next(run_directories(self.root / "logs")).name
         self.assertIn(run, result.stderr)
         default = self.access("read", run)
         self.assertNotEqual(default.returncode, 0)
@@ -609,7 +611,7 @@ class TeamTests(unittest.TestCase):
         result = self.launch("review", "--output", "answer")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "ANSWER review")
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         manifest = json.loads((run / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "completed")
         self.assertEqual(manifest["usage"]["input_tokens"], 17)
@@ -650,7 +652,7 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, content.encode())
         self.assertIn(b"usage accounting incomplete", result.stderr)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         manifest = json.loads(self.access("read", run.name, "manifest.json").stdout)
         self.assertFalse(manifest["usage_complete"])
 
@@ -658,7 +660,7 @@ class TeamTests(unittest.TestCase):
         self, output: str, closed_streams: tuple[str, ...], *extra: str,
     ) -> tuple[subprocess.CompletedProcess[bytes], Path]:
         store = self.root / "logs"
-        before = set(store.iterdir()) if store.exists() else set()
+        before = set(run_directories(store)) if store.exists() else set()
         read_fd, write_fd = os.pipe()
         # A valid write handle with no readers produces a broken pipe on POSIX
         # and Windows. Merely closing fd 1/2 can instead make Rust discard output.
@@ -675,7 +677,7 @@ class TeamTests(unittest.TestCase):
             )
         finally:
             os.close(write_fd)
-        created = (set(store.iterdir()) if store.exists() else set()) - before
+        created = (set(run_directories(store)) if store.exists() else set()) - before
         self.assertEqual(len(created), 1, f"runs={created}; result={result}")
         return result, created.pop()
 
@@ -879,7 +881,7 @@ class TeamTests(unittest.TestCase):
                 result = self.launch(task, "--inject-review", "--inject-implement")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
-                run = max((self.root / "logs").iterdir(), key=lambda p: p.name)
+                run = max(run_directories(self.root / "logs"), key=lambda p: p.name)
                 state = json.loads((run / "manifest.json").read_text())
                 self.assertEqual(state["status"], "failed")
                 self.assertEqual(state["stage"], "review")
@@ -1009,7 +1011,7 @@ class TeamTests(unittest.TestCase):
         self.env["TEAM_NO_USAGE"] = "1"
         result = self.launch("Review and fix", "--inject-review", "--inject-implement", "--output", "answer")
         self.assertEqual(result.returncode, 0, result.stderr)
-        run, = (self.root / "logs").iterdir()
+        run, = run_directories(self.root / "logs")
         state = json.loads((run / "manifest.json").read_text())
         self.assertEqual(result.stdout, Path(state["result"]).read_text())
         self.assertNotEqual(result.stdout, Path(state["review_checkpoint"]).read_text())
@@ -1063,7 +1065,7 @@ class TeamTests(unittest.TestCase):
                 result = self.launch("Review and fix", "--inject-review", "--inject-implement")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("expected format markdown", result.stderr)
-                run = max((self.root / "logs").iterdir(), key=lambda p: p.name)
+                run = max(run_directories(self.root / "logs"), key=lambda p: p.name)
                 state = json.loads((run / "manifest.json").read_text())
                 self.assertEqual(state["status"], "failed")
                 self.assertEqual(state["stage"], "review")
@@ -1080,16 +1082,16 @@ class TeamTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 receipt = json.loads(result.stdout)
                 run = Path(receipt["run_root"])
-                prefix = (run / "policy.md").read_text()
+                prefix = (run / "policy.md").read_text(encoding="utf-8")
                 self.assertEqual("# Review\n" in prefix, "--inject-review" in flags)
                 self.assertEqual("# Implementation\n" in prefix, "--inject-implement" in flags and "--inject-review" not in flags)
-                figure = (Path(__file__).resolve().parents[4] / "modules/PUBLIC_FIGURE_STYLE.md").read_text()
+                figure = (Path(__file__).resolve().parents[4] / "modules/PUBLIC_FIGURE_STYLE.md").read_text(encoding="utf-8")
                 self.assertEqual(figure in prefix, "--inject-fig" in flags)
                 initial = self.metadata(receipt)
                 self.assertEqual(initial["inject_fig"], "--inject-fig" in flags)
                 staged = "--inject-review" in flags and "--inject-implement" in flags
                 self.assertEqual(initial.get("stage"), "implementation" if staged else None)
-                state = json.loads((run / "codex-home/fixture-state.json").read_text())
+                state = json.loads((run / "codex-home/fixture-state.json").read_text(encoding="utf-8"))
                 self.assertEqual(len(state["turn_details"]), 2 if staged else 1)
                 for index, turn in enumerate(state["turn_details"]):
                     self.assertEqual(figure in turn["policy"] + turn["phase"], "--inject-fig" in flags)
@@ -1101,8 +1103,8 @@ class TeamTests(unittest.TestCase):
                 resumed = self.access("resume", receipt["run_id"], "--inject-review", "--inject-implement", "--inject-fig")
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
                 latest = Path(json.loads(resumed.stdout)["handoff_path"]).parent.parent
-                self.assertEqual((latest / "policy.md").read_text(), prefix)
-                phase = (latest / "phase.md").read_text()
+                self.assertEqual((latest / "policy.md").read_text(encoding="utf-8"), prefix)
+                phase = (latest / "phase.md").read_text(encoding="utf-8")
                 self.assertEqual("# Review\n" in phase, "--inject-review" not in flags)
                 self.assertEqual("# Implementation\n" in phase, "--inject-implement" not in flags)
                 self.assertEqual(figure in phase, "--inject-fig" not in flags)
@@ -1111,7 +1113,7 @@ class TeamTests(unittest.TestCase):
                 self.assertEqual(updated.get("stage"), initial.get("stage"))
                 again = self.access("resume", receipt["run_id"])
                 self.assertEqual(again.returncode, 0, again.stderr)
-                phase = (Path(json.loads(again.stdout)["handoff_path"]).parent.parent / "phase.md").read_text()
+                phase = (Path(json.loads(again.stdout)["handoff_path"]).parent.parent / "phase.md").read_text(encoding="utf-8")
                 self.assertNotIn("# Review\n", phase)
                 self.assertNotIn("# Implementation\n", phase)
                 self.assertNotIn("# PUBLIC_FIGURE_STYLE\n", phase)
@@ -1398,7 +1400,7 @@ class TeamTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
                 self.assertIn("fixture native completion error", result.stderr)
-                run = max((self.root / "logs").iterdir(), key=lambda p: p.name)
+                run = max(run_directories(self.root / "logs"), key=lambda p: p.name)
                 state = json.loads((run / "manifest.json").read_text())
                 self.assertEqual(state["status"], "failed")
                 self.assertNotIn("result", state)
@@ -1411,7 +1413,7 @@ class TeamTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             results = list(pool.map(self.launch, ["one", "two"]))
         self.assertEqual([Path(json.loads(r.stdout)["handoff_path"]).read_text() for r in results], ["ANSWER one", "ANSWER two"])
-        self.assertEqual(len(list((self.root / "logs").iterdir())), 2)
+        self.assertEqual(len(list(run_directories(self.root / "logs"))), 2)
         for result, expected in zip(results, ["ANSWER one", "ANSWER two"]):
             self.assertEqual(self.access("read", json.loads(result.stdout)["run_id"]).stdout, expected)
 
@@ -1516,7 +1518,7 @@ class TeamTests(unittest.TestCase):
         self.env["TEAM_REPAIR_CRASH"] = "1"
         result = self.launch("review")
         self.assertNotEqual(result.returncode, 0)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         manifest = json.loads((run / "manifest.json").read_text())
         self.assertEqual(manifest["usage"]["input_tokens"], 17)
         self.assertFalse(manifest["usage_complete"])
@@ -1562,7 +1564,7 @@ class TeamTests(unittest.TestCase):
         result = self.launch("partial-crash")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         state = json.loads((run / "manifest.json").read_text())
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["usage"]["input_tokens"], 11)
@@ -1773,7 +1775,7 @@ class TeamTests(unittest.TestCase):
         result = self.launch("review")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not confirm workspace-write", result.stderr)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         self.assertEqual((run / "stderr.log").read_text(), "")
         requests = [json.loads(line) for line in (run / "requests.jsonl").read_text().splitlines()]
         self.assertNotIn("turn/start", [r["method"] for r in requests])
@@ -1827,7 +1829,7 @@ class TeamTests(unittest.TestCase):
             stdout, _ = proc.communicate(timeout=5)
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(stdout, "")
-            run = next((self.root / "logs").iterdir())
+            run = next(run_directories(self.root / "logs"))
             self.assertTrue((run / "codex-home").is_dir())
             self.assertFalse((run / "codex-home/auth.json").exists())
             self.assertEqual(json.loads((run / "manifest.json").read_text())["status"], "interrupted")
@@ -1886,7 +1888,7 @@ class TeamTests(unittest.TestCase):
         try:
             self.assert_worker_ready(proc, read_fd)
             import time
-            run = next((self.root / "logs").iterdir())
+            run = next(run_directories(self.root / "logs"))
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 path = run / "manifest.json"
@@ -1898,7 +1900,7 @@ class TeamTests(unittest.TestCase):
             out, err = proc.communicate(timeout=8)
             self.assertNotEqual(proc.returncode, 0)
             self.assertFalse(out)
-            run = next((self.root / "logs").iterdir())
+            run = next(run_directories(self.root / "logs"))
             self.assertEqual(json.loads((run / "manifest.json").read_text())["status"], "interrupted")
         finally:
             os.close(read_fd)
@@ -1937,7 +1939,7 @@ class TeamTests(unittest.TestCase):
         try:
             self.assert_worker_ready(proc, read_fd)
             self.wait_stderr_notice(proc, "pira_team active:")
-            run = next((self.root / "logs").iterdir())
+            run = next(run_directories(self.root / "logs"))
             control = subprocess.run([str(self.bin), "interrupt", run.name,
                 "--store", str(self.root / "logs")], env=self.env,
                 capture_output=True, text=True, timeout=10)
@@ -1945,7 +1947,7 @@ class TeamTests(unittest.TestCase):
             out, err = proc.communicate(timeout=9)
             self.assertNotEqual(proc.returncode, 0, err)
             self.assertFalse(out)
-            run = next((self.root / "logs").iterdir())
+            run = next(run_directories(self.root / "logs"))
             self.assertEqual(json.loads((run / "manifest.json").read_text())["status"], "interrupted")
             self.assertFalse((run / "control.json").exists())
             self.env.pop("TEAM_IGNORE_INTERRUPT")
@@ -2016,7 +2018,7 @@ class TeamTests(unittest.TestCase):
         result = self.launch("review")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("did not confirm workspace-write", result.stderr)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         self.assertNotIn('"method":"turn/start"', (run / "requests.jsonl").read_text())
 
     @unittest.skipUnless(os.name == "posix", "POSIX lifecycle fixture")

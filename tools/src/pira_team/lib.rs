@@ -12,6 +12,7 @@ mod native;
 mod process;
 mod profile;
 mod remote;
+mod retention;
 mod service_tier;
 mod storage;
 mod subteam;
@@ -620,6 +621,9 @@ pub fn run() -> i32 {
         println!("pira_team {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
+    if args.first().map(String::as_str) == Some("__cleanup") {
+        return retention::background(&args);
+    }
     if let Some(outcome) = remote::dispatch(&mut args) {
         return match outcome {
             Ok(()) => 0,
@@ -654,6 +658,8 @@ pub fn run() -> i32 {
         "bookmark" | "unbookmark" | "bookmarks" | "search"
     ) {
         bookmarks::command(&args)
+    } else if args[0] == "cleanup" {
+        retention::command(&args)
     } else if args[0] == "config" {
         profile::defaults::command(&args, storage::default_root)
     } else if matches!(args[0].as_str(), "resume" | "steer" | "interrupt" | "tier") {

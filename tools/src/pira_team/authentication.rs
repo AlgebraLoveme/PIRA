@@ -15,6 +15,8 @@ use std::{
 
 const BUDGET: Duration = Duration::from_secs(3);
 const HANDOFF_LIMIT: usize = 1024 * 1024;
+// PIRA: bound live handshakes, not worker runs. Raise with matching resource validation.
+const MAX_HANDOFFS: usize = 128;
 
 // No Debug/Serialize implementation: never include credential values in diagnostics.
 pub struct Secret(Vec<u8>);
@@ -329,8 +331,13 @@ pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
                 .into(),
         );
     }
-    let mut connection = local::connect(endpoint, Instant::now() + BUDGET)
-        .map_err(|_| "launcher authentication connection unavailable")?;
+    let mut connection = local::connect(endpoint, Instant::now() + BUDGET).map_err(|error| {
+        format!(
+            "launcher authentication connection unavailable ({:?}, OS {:?})",
+            error.kind(),
+            error.raw_os_error()
+        )
+    })?;
     let peer = connection
         .peer()
         .map_err(|_| "cannot verify authentication server peer")?;
@@ -341,15 +348,23 @@ pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
     }
     let request = json!({"child":run.file_name().unwrap().to_str().unwrap(), "revision":manifest["revision"],
         "epoch":manifest["subtree_epoch"], "runtime":runtime});
+    connection.deadline = Some(Instant::now() + BUDGET);
     write_frame(&mut connection, request.to_string().as_bytes())
         .map_err(|_| "launcher authentication delivery failed")?;
+    // Only the kernel-verified retained server may wait for shared admission.
+    // Completion, disconnect or interruption ends that wait, not sibling I/O.
+    connection.deadline = None;
     let mut status = [0_u8; 1];
     connection
         .read_exact(&mut status)
         .map_err(|_| "launcher authentication response unavailable")?;
+    if status == [2] {
+        return Err("launcher authentication server at capacity".into());
+    }
     if status != [1] {
         return Err("launcher authentication request rejected".into());
     }
+    connection.deadline = Some(Instant::now() + BUDGET);
     let payload = read_frame(&mut connection, HANDOFF_LIMIT).map_err(|error| {
         format!(
             "launcher authentication response invalid or closed ({:?})",
@@ -380,6 +395,82 @@ pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
     // Parent exit after delivery does not revoke this already admitted child.
     let _ = connection.write_all(&[1]);
     Ok(Authentication::Delegated(backend))
+}
+
+// Independent, bounded I/O phases keep slow clients and shared admission work
+// from consuming unrelated launchers' handshake budgets.
+fn serve(
+    mut listener: local::Listener,
+    stopped: &Arc<AtomicBool>,
+    payload: &Secret,
+    max_handoffs: usize,
+    authenticate: impl Fn(u32, &Value) -> Result<(), String> + Sync,
+) {
+    std::thread::scope(|scope| {
+        let mut workers: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
+        while !stopped.load(Ordering::SeqCst) {
+            let mut connection = match listener.accept(Instant::now() + Duration::from_millis(100))
+            {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+                Err(_) => break,
+            };
+            if stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            #[cfg(unix)]
+            connection.stop_on(stopped.clone());
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let _ = workers.swap_remove(index).join();
+                } else {
+                    index += 1;
+                }
+            }
+            if workers.len() == max_handoffs {
+                let _ = connection.write_all(&[2]);
+                continue;
+            }
+            let authenticate = &authenticate;
+            if let Ok(worker) = std::thread::Builder::new()
+                .name("team-authentication".into())
+                .spawn_scoped(scope, move || {
+                    let accepted = (|| -> Result<(), String> {
+                        let peer = connection.peer().map_err(|_| "unverified launcher peer")?;
+                        let bytes = read_frame(&mut connection, 4096)
+                            .map_err(|_| "invalid launcher request")?;
+                        let request: Value = serde_json::from_slice(&bytes)
+                            .map_err(|_| "invalid launcher request")?;
+                        if stopped.load(Ordering::SeqCst) {
+                            return Err("authentication server stopped".into());
+                        }
+                        authenticate(peer, &request)
+                    })();
+                    // Validation/lock wait is not peer I/O. Start a fresh bounded
+                    // delivery/ACK phase without charging time spent in admission.
+                    connection.deadline = Some(Instant::now() + BUDGET);
+                    if accepted.is_err() {
+                        let _ = connection.write_all(&[0]);
+                        return;
+                    }
+                    // Never log this response or attach it to control/turn events.
+                    if connection.write_all(&[1]).is_ok()
+                        && write_frame(&mut connection, &payload.0).is_ok()
+                    {
+                        let mut delivered = [0_u8; 1];
+                        let _ = connection.read_exact(&mut delivered);
+                    }
+                })
+            {
+                workers.push(worker);
+            }
+        }
+        // Scope exit joins every handler before the selected credential is erased.
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
 }
 
 pub struct Server {
@@ -440,38 +531,9 @@ impl Server {
             if ready.send(Ok(listener.endpoint())).is_err() {
                 return;
             }
-            while !stop.load(Ordering::SeqCst) {
-                let mut connection =
-                    match listener.accept(Instant::now() + Duration::from_millis(100)) {
-                        Ok(connection) => connection,
-                        Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
-                        Err(_) => break,
-                    };
-                if stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                #[cfg(unix)]
-                connection.stop_on(stop.clone());
-                let accepted = (|| -> Result<(), String> {
-                    let peer = connection.peer().map_err(|_| "unverified launcher peer")?;
-                    let bytes = read_frame(&mut connection, 4096)
-                        .map_err(|_| "invalid launcher request")?;
-                    let request: Value =
-                        serde_json::from_slice(&bytes).map_err(|_| "invalid launcher request")?;
-                    subteam::claim_authentication(&run, &revision, peer, &request)
-                })();
-                if accepted.is_err() {
-                    let _ = connection.write_all(&[0]);
-                    continue;
-                }
-                // Never log this response or attach it to control/turn events.
-                if connection.write_all(&[1]).is_ok()
-                    && write_frame(&mut connection, &payload.0).is_ok()
-                {
-                    let mut delivered = [0_u8; 1];
-                    let _ = connection.read_exact(&mut delivered);
-                }
-            }
+            serve(listener, &stop, &payload, MAX_HANDOFFS, |peer, request| {
+                subteam::claim_authentication(&run, &revision, peer, request)
+            });
         });
         let endpoint = receiver
             .recv()
@@ -537,21 +599,26 @@ mod local {
     #[cfg(unix)]
     pub struct Connection {
         stream: UnixStream,
-        deadline: Instant,
+        pub(super) deadline: Option<Instant>,
         stopped: Option<Arc<AtomicBool>>,
     }
     #[cfg(unix)]
     fn ready(
         fd: std::os::fd::RawFd,
         events: i16,
-        deadline: Instant,
+        deadline: Option<Instant>,
         stopped: Option<&AtomicBool>,
     ) -> io::Result<()> {
         loop {
             if stopped.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            if deadline.is_none() && crate::CANCELLED.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(100));
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -730,15 +797,20 @@ mod local {
         pub fn endpoint(&self) -> Value {
             self.endpoint.clone()
         }
-        pub fn accept(&self, deadline: Instant) -> io::Result<Connection> {
+        pub fn accept(&mut self, deadline: Instant) -> io::Result<Connection> {
             loop {
-                ready(self.listener.as_raw_fd(), libc::POLLIN, deadline, None)?;
+                ready(
+                    self.listener.as_raw_fd(),
+                    libc::POLLIN,
+                    Some(deadline),
+                    None,
+                )?;
                 match self.listener.accept() {
                     Ok((stream, _)) => {
                         stream.set_nonblocking(true)?;
                         return Ok(Connection {
                             stream,
-                            deadline: Instant::now() + BUDGET,
+                            deadline: Some(Instant::now() + BUDGET),
                             stopped: None,
                         });
                     }
@@ -810,7 +882,7 @@ mod local {
             match error.raw_os_error() {
                 Some(libc::EISCONN) => return Ok(stream),
                 Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
-                    ready(fd, libc::POLLOUT, deadline, None)?;
+                    ready(fd, libc::POLLOUT, Some(deadline), None)?;
                     let mut code = 0_i32;
                     let mut size = std::mem::size_of_val(&code) as libc::socklen_t;
                     if unsafe {
@@ -870,7 +942,7 @@ mod local {
         stream.set_nonblocking(true)?;
         Ok(Connection {
             stream,
-            deadline,
+            deadline: Some(deadline),
             stopped: None,
         })
     }
@@ -897,9 +969,9 @@ mod local {
         pub fn endpoint(&self) -> Value {
             self.endpoint.clone()
         }
-        pub fn accept(&self, deadline: Instant) -> io::Result<Connection> {
+        pub fn accept(&mut self, deadline: Instant) -> io::Result<Connection> {
             let mut connection = self.listener.accept(deadline)?;
-            connection.deadline = Instant::now() + BUDGET;
+            connection.deadline = Some(Instant::now() + BUDGET);
             Ok(connection)
         }
     }
@@ -930,7 +1002,7 @@ mod local {
                     .as_nanos()
             ));
             crate::private_dir(&root).unwrap();
-            let listener = Listener::bind(&root).unwrap();
+            let mut listener = Listener::bind(&root).unwrap();
             let endpoint = listener.endpoint();
             let server = std::thread::spawn(move || {
                 let mut connection = listener.accept(Instant::now() + BUDGET).unwrap();
@@ -950,6 +1022,147 @@ mod local {
             drop(connection);
             std::fs::remove_dir_all(root).unwrap();
         }
+        #[test]
+        fn concurrent_handoffs_bound_capacity_without_payload_and_join() {
+            let root = std::env::temp_dir().join(format!(
+                "team-auth-capacity-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&root).unwrap();
+            let listener = Listener::bind(&root).unwrap();
+            let endpoint = listener.endpoint();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = stopped.clone();
+            let server = std::thread::spawn(move || {
+                let payload = Secret::new(b"synthetic response".to_vec()).unwrap();
+                serve(listener, &stop, &payload, 2, |peer, request| {
+                    assert_eq!(peer, std::process::id());
+                    if request["allow"] == true {
+                        Ok(())
+                    } else {
+                        Err("denied".into())
+                    }
+                });
+            });
+            let mut status = [9];
+            // Retain replies without ACK: the second client must progress while
+            // the first is still in flight. Both then occupy the explicit bound.
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                let mut client = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+                write_frame(&mut client, br#"{"allow":true}"#).unwrap();
+                client.read_exact(&mut status).unwrap();
+                assert_eq!(status, [1]);
+                assert_eq!(read_frame(&mut client, 128).unwrap(), b"synthetic response");
+                clients.push(client);
+            }
+            let mut excess = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+            excess.read_exact(&mut status).unwrap();
+            assert_eq!(status, [2]);
+            assert!(read_frame(&mut excess, 128).is_err());
+            for mut client in clients {
+                client.write_all(&[1]).unwrap();
+            }
+            stopped.store(true, Ordering::SeqCst);
+            let _wake = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+            server.join().unwrap();
+            assert!(!root.join("credential.sock").exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn admitted_response_gets_its_own_io_budget_after_shared_wait() {
+            let root = std::env::temp_dir().join(format!(
+                "team-auth-delayed-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&root).unwrap();
+            let listener = Listener::bind(&root).unwrap();
+            let endpoint = listener.endpoint();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stop = stopped.clone();
+            let server = std::thread::spawn(move || {
+                serve(
+                    listener,
+                    &stop,
+                    &Secret::new(b"synthetic response".to_vec()).unwrap(),
+                    2,
+                    |_, _| {
+                        // Cross the former whole-handshake deadline deliberately.
+                        std::thread::sleep(BUDGET + Duration::from_millis(50));
+                        Ok(())
+                    },
+                );
+            });
+            let mut client = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+            assert_eq!(client.peer().unwrap(), std::process::id());
+            write_frame(&mut client, b"{}").unwrap();
+            client.deadline = None;
+            let mut status = [0];
+            client.read_exact(&mut status).unwrap();
+            assert_eq!(status, [1]);
+            client.deadline = Some(Instant::now() + BUDGET);
+            assert_eq!(read_frame(&mut client, 128).unwrap(), b"synthetic response");
+            client.write_all(&[1]).unwrap();
+            stopped.store(true, Ordering::SeqCst);
+            let _wake = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+            server.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn verified_response_wait_remains_interruptible() {
+            // The cancellation flag is process-global: isolate this mutation
+            // from other parallel Rust tests, just as real launchers are isolated.
+            if std::env::var_os("TEAM_AUTH_CANCEL_TEST_CHILD").is_none() {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["authentication::local::tests::verified_response_wait_remains_interruptible", "--exact"])
+                    .env("TEAM_AUTH_CANCEL_TEST_CHILD", "1").status().unwrap();
+                assert!(status.success());
+                return;
+            }
+            let root = std::env::temp_dir().join(format!(
+                "team-auth-cancel-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            crate::private_dir(&root).unwrap();
+            let mut listener = Listener::bind(&root).unwrap();
+            let endpoint = listener.endpoint();
+            let (release, released) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let _connection = listener.accept(Instant::now() + BUDGET).unwrap();
+                released.recv_timeout(BUDGET).unwrap();
+            });
+            let mut client = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+            client.deadline = None;
+            let cancel = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                crate::CANCELLED.store(true, Ordering::SeqCst);
+            });
+            let started = Instant::now();
+            assert_eq!(
+                client.read(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::ConnectionAborted
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            cancel.join().unwrap();
+            release.send(()).unwrap();
+            server.join().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
         #[test]
         fn original_file_source_survives_coordinator_hard_link_detachment() {
             let root = std::env::temp_dir().join(format!(
@@ -989,7 +1202,7 @@ mod local {
             reader.set_nonblocking(true).unwrap();
             let mut connection = Connection {
                 stream: reader,
-                deadline: Instant::now() + Duration::from_millis(20),
+                deadline: Some(Instant::now() + Duration::from_millis(20)),
                 stopped: None,
             };
             let start = Instant::now();
@@ -1006,7 +1219,7 @@ mod local {
             reader.set_nonblocking(true).unwrap();
             let mut connection = Connection {
                 stream: reader,
-                deadline: Instant::now() + BUDGET,
+                deadline: Some(Instant::now() + BUDGET),
                 stopped: None,
             };
             assert!(read_frame(&mut connection, 128).unwrap() == b"synthetic frame");

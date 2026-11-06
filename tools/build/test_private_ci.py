@@ -196,7 +196,7 @@ class PrivateCITests(unittest.TestCase):
         workflow = data['.github/workflows/private-pira-tests.yml'].decode()
         self.assertIn('os: [ubuntu-latest, windows-latest]', workflow)
         self.assertIn('- os: macos-latest\n            crate: pira_write_check', workflow)
-        self.assertEqual(workflow.count('macos-latest'), 1)
+        self.assertEqual(workflow.count('- os: macos-latest'), 2)
         self.assertNotIn('@TEST_', workflow)
         self.assertIn('cargo test --locked --no-fail-fast --manifest-path tools/Cargo.toml -p ${{ matrix.crate }}', workflow)
         step = workflow.split('- name: Native writing checker parity and release tests', 1)[1].split('\n      - name:', 1)[0]
@@ -246,9 +246,16 @@ class PrivateCITests(unittest.TestCase):
         self.assertIn('crate: ["pira_write_check"]', workflow)
         self.assertIn('macos-latest', workflow)
 
+    def test_team_native_parity_matrix(self):
+        workflow = (self.stage(('pira_team',)) / '.github/workflows/private-pira-tests.yml').read_text()
+        self.assertIn('- os: macos-latest\n            crate: pira_team', workflow)
+        self.assertIn('Native fake-backend contracts including mixed 100-launch parity', workflow)
+        self.assertIn('python -B tools/crates/pira_team/tests/native_ci.py', workflow)
+        self.assertNotIn('continue-on-error', workflow)
+
     def test_nonchecker_subset_does_not_add_macos(self):
         workflow = (self.stage(('pira_ctx',)) / '.github/workflows/private-pira-tests.yml').read_text()
-        self.assertNotIn('macos-latest', workflow)
+        self.assertNotIn('- os: macos-latest', workflow)
         self.assertNotIn('@TEST_', workflow)
 
     def test_missing_required_checker_inventory_fails_staging(self):
@@ -304,7 +311,7 @@ class PrivateCITests(unittest.TestCase):
         stage = self.stage(('pira_team',))
         workflow = (stage / '.github/workflows/private-pira-tests.yml').read_text()
         step = workflow.split('- name: Required current native Team and setup checks', 1)[1].split('\n      - name:', 1)[0]
-        self.assertIn("if: matrix.crate == 'pira_team'\n", step)
+        self.assertIn("if: matrix.crate == 'pira_team' && matrix.os != 'macos-latest'\n", step)
         self.assertNotIn('continue-on-error', step)
         code = textwrap.dedent(step.split("<<'PY_NATIVE'\n", 1)[1].split('\n          PY_NATIVE', 1)[0])
         required = [
@@ -474,9 +481,8 @@ class PrivateCITests(unittest.TestCase):
                      'retire_pira_audio.py', 'test_retire_pira_audio.py',
                      'team_store_relocation.py', 'test_team_store_relocation.py', 'team_relocation_fixture.py'):
             self.assertIn('assets/scripts/' + name, data)
-        self.assertIn("unittest discover -s tools/crates/pira_team/tests -p 'test_*.py'", workflow)
-        self.assertIn('PIRA_DEC_BIN=', workflow)
-        self.assertIn('TEAM_TEST_SLOW_PREFLIGHT=1', workflow)
+        self.assertIn("python -B tools/crates/pira_team/tests/native_ci.py", workflow)
+        self.assertIn("-p pira_team -p pira_dec -p pira_ctx", workflow)
         self.assertNotIn('@CHECKOUT@', workflow)
 
     def test_setup_job_isolates_environment_and_requires_native_success(self):

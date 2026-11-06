@@ -146,7 +146,7 @@ pub fn load(root: &Path) -> Result<Value, String> {
     })
 }
 
-fn lock(root: &Path) -> Result<File, String> {
+fn lock(root: &Path) -> Result<crate::native::FileLock, String> {
     let path = root.join("worker_defaults.lock");
     match fs::symlink_metadata(&path) {
         Ok(metadata) => inspect_file(&metadata)?,
@@ -169,7 +169,7 @@ fn lock(root: &Path) -> Result<File, String> {
     // OS-owned lock is released on process death; never delete this stable lock file.
     file.try_lock()
         .map_err(|e| format!("worker defaults are busy/unavailable: {e}; retry"))?;
-    Ok(file)
+    Ok(crate::native::FileLock(file))
 }
 
 fn persist(root: &Path, value: &Value) -> Result<(), String> {

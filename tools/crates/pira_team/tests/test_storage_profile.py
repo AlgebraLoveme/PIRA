@@ -1,6 +1,8 @@
 """Managed diagnostic and caller-home regressions; fake Codex only."""
 from __future__ import annotations
 
+from native_fixture import run_directories
+
 import os
 import json
 from pathlib import Path
@@ -37,7 +39,7 @@ class StorageProfileTests(unittest.TestCase):
         result = self.launch("backend-check")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("see backend-check.log", result.stderr)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         content = b"fixture-schema-failure\n"
         self.assertEqual((run / "backend-check.log").read_bytes(), content)
         for prefix in ("", "repair", "implementation", "implementation/repair",

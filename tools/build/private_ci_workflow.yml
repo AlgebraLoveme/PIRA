@@ -77,7 +77,7 @@ jobs:
               ], env=dict(os.environ, PIRA_WRITE_CHECK_BIN=str(binary)), check=True)
           PY_CHECKER
       - name: Required current native Team and setup checks
-        if: matrix.crate == 'pira_team'
+        if: matrix.crate == 'pira_team' && matrix.os != 'macos-latest'
         shell: bash
         run: |
           python -B - <<'PY_NATIVE'
@@ -128,15 +128,12 @@ jobs:
                   raise SystemExit('Required current native checks missing, skipped or unsuccessful')
           PY_NATIVE
       - name: Build fake-backend test binaries
-        if: matrix.crate == 'pira_team'
-        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec
-      - name: Required native Windows lifecycle and output delivery contracts
-        if: matrix.os == 'windows-latest' && matrix.crate == 'pira_team'
+        if: always() && !cancelled() && matrix.crate == 'pira_team'
+        run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec -p pira_ctx
+      - name: Native fake-backend contracts including mixed 100-launch parity
+        if: always() && !cancelled() && matrix.crate == 'pira_team'
         run: python -B tools/crates/pira_team/tests/native_ci.py
-      - name: Fake-backend contracts (no model calls; POSIX fixture)
-        if: matrix.os == 'ubuntu-latest' && matrix.crate == 'pira_team'
-        shell: bash
-        run: PIRA_TEAM_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_team" PIRA_DEC_BIN="$GITHUB_WORKSPACE/tools/target/debug/pira_dec" TEAM_TEST_SLOW_PREFLIGHT=1 python -B -m unittest discover -s tools/crates/pira_team/tests -p 'test_*.py' -v
+
   setup:
     if: github.event.repository.private == true
     strategy:

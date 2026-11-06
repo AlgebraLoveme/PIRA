@@ -6,7 +6,7 @@ use std::{
     os::windows::{ffi::OsStrExt, io::AsRawHandle},
     path::PathBuf,
     ptr,
-    time::Instant,
+    time::{Duration, Instant},
 };
 pub type Raw = *mut c_void;
 pub const CREATE_SUSPENDED: u32 = 0x00000004;
@@ -407,7 +407,7 @@ fn pipe_security() -> io::Result<LocalMemory> {
 
 fn operation(
     handle: Raw,
-    deadline: Instant,
+    deadline: Option<Instant>,
     start: impl FnOnce(*mut Overlapped) -> i32,
 ) -> io::Result<u32> {
     let event = Handle::checked(unsafe { CreateEventW(ptr::null_mut(), 1, 0, ptr::null()) })?;
@@ -418,22 +418,48 @@ fn operation(
         if error.raw_os_error() != Some(997) {
             return Err(error);
         }
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .min(u32::MAX as u128) as u32;
-        if unsafe { WaitForSingleObject(event.0, timeout) } != 0 {
-            unsafe {
-                CancelIoEx(handle, &overlapped);
+        loop {
+            let interrupted =
+                deadline.is_none() && crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst);
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if interrupted || remaining.is_some_and(|remaining| remaining.is_zero()) {
+                unsafe {
+                    CancelIoEx(handle, &overlapped);
+                }
+                let mut ignored = 0;
+                unsafe {
+                    GetOverlappedResult(handle, &mut overlapped, &mut ignored, 1);
+                }
+                return Err(io::Error::new(
+                    if interrupted {
+                        io::ErrorKind::ConnectionAborted
+                    } else {
+                        io::ErrorKind::TimedOut
+                    },
+                    "local handoff wait interrupted or deadline exceeded",
+                ));
             }
-            let mut ignored = 0;
-            unsafe {
-                GetOverlappedResult(handle, &mut overlapped, &mut ignored, 1);
+            let timeout = remaining
+                .unwrap_or(Duration::from_millis(100))
+                .as_millis()
+                .saturating_add(1)
+                .min(u32::MAX as u128) as u32;
+            match unsafe { WaitForSingleObject(event.0, timeout) } {
+                0 => break,
+                258 => continue, // WAIT_TIMEOUT; retain this same overlapped I/O.
+                _ => {
+                    let error = io::Error::last_os_error();
+                    unsafe {
+                        CancelIoEx(handle, &overlapped);
+                    }
+                    let mut ignored = 0;
+                    unsafe {
+                        GetOverlappedResult(handle, &mut overlapped, &mut ignored, 1);
+                    }
+                    return Err(error);
+                }
             }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "local handoff deadline exceeded",
-            ));
         }
     }
     let mut count = 0;
@@ -443,7 +469,7 @@ fn operation(
 
 pub struct Pipe {
     handle: std::sync::Arc<Handle>,
-    pub deadline: Instant,
+    pub deadline: Option<Instant>,
     server: bool,
 }
 impl Pipe {
@@ -501,9 +527,16 @@ impl Drop for Pipe {
 }
 pub struct Listener {
     handle: std::sync::Arc<Handle>,
+    name: String,
 }
 impl Listener {
     pub fn bind(name: &str) -> io::Result<Self> {
+        Ok(Self {
+            handle: Self::instance(name, true)?,
+            name: name.to_owned(),
+        })
+    }
+    fn instance(name: &str, first: bool) -> io::Result<std::sync::Arc<Handle>> {
         let descriptor = pipe_security()?;
         let security = Security {
             length: mem::size_of::<Security>() as u32,
@@ -513,35 +546,47 @@ impl Listener {
         let handle = Handle::checked(unsafe {
             CreateNamedPipeW(
                 wide(name).as_ptr(),
-                0x00000003 | 0x40000000 | 0x00080000,
+                0x00000003 | 0x40000000 | if first { 0x00080000 } else { 0 },
                 0x00000008,
-                1,
+                255, // PIPE_UNLIMITED_INSTANCES; authentication bounds active handlers.
                 65536,
                 65536,
                 3000,
                 &security,
             )
         })?;
-        Ok(Self {
-            handle: std::sync::Arc::new(handle),
-        })
+        Ok(std::sync::Arc::new(handle))
     }
-    pub fn accept(&self, deadline: Instant) -> io::Result<Pipe> {
-        let result = operation(self.handle.0, deadline, |ov| unsafe {
-            ConnectNamedPipe(self.handle.0, ov)
-        });
-        if let Err(error) = result
-            && error.raw_os_error() != Some(535)
-        {
-            return Err(error);
+    pub fn accept(&mut self, deadline: Instant) -> io::Result<Pipe> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let result = operation(self.handle.0, Some(deadline), |ov| unsafe {
+                ConnectNamedPipe(self.handle.0, ov)
+            });
+            match result {
+                // A client may close after connecting but before acceptance.
+                // Disconnect that stale instance, not the shared listener.
+                Err(error) if error.raw_os_error() == Some(232) => {
+                    checked(unsafe { DisconnectNamedPipe(self.handle.0) })?;
+                }
+                Err(error) if error.raw_os_error() != Some(535) => return Err(error),
+                _ => break,
+            }
         }
-        Ok(Pipe {
+        let pipe = Pipe {
             handle: self.handle.clone(),
-            deadline,
+            deadline: Some(deadline),
             server: true,
-        })
+        };
+        // Keep the name owned continuously, but never reuse/disconnect a handle
+        // whose response is still being consumed by another admitted launcher.
+        self.handle = Self::instance(&self.name, false)?;
+        Ok(pipe)
     }
 }
+
 pub fn connect(name: &str, deadline: Instant) -> io::Result<Pipe> {
     let name = wide(name);
     let handle = loop {
@@ -577,7 +622,7 @@ pub fn connect(name: &str, deadline: Instant) -> io::Result<Pipe> {
     };
     Ok(Pipe {
         handle: std::sync::Arc::new(handle),
-        deadline,
+        deadline: Some(deadline),
         server: false,
     })
 }

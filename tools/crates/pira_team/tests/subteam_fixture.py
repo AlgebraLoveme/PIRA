@@ -33,6 +33,10 @@ def start(args, state, home, complete):
             key, value = arg[len(prefix):].split("=", 1)
             shell[key] = json.loads(value)
     shell["CODEX_THREAD_ID"] = state["thread"]
+    return start_with_shell(state, home, complete, shell)
+
+
+def start_with_shell(state, home, complete, shell):
     address = str(Path(os.environ["TEAM_SOCKET_DIR"]) / (home.parent.name + ".sock"))
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))

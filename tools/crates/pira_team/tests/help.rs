@@ -66,6 +66,7 @@ fn supported_commands_have_focused_help_in_each_explicit_form() {
         "bookmarks",
         "search",
         "config",
+        "cleanup",
         "resolve",
         "remote-keygen",
         "remote-check",

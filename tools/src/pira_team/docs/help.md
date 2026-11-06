@@ -18,6 +18,7 @@ COMMANDS
   unbookmark   Remove a label, retaining its run and artifacts.
   bookmarks    List this session's labels.
   search       Search labels by case-insensitive literal keyword.
+  cleanup      Preview or execute store-wide age and storage retention.
   config       Show, set, or reset store-wide worker defaults.
   resolve      Recover an ordinary run handle from a remote request ID.
   remote-keygen | remote-check | attach

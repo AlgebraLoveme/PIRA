@@ -12,8 +12,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const LOCK_BUDGET: Duration = Duration::from_secs(5);
-
 // PIRA: honest-agent misuse prevention, not isolation from marker stripping or
 // metadata tampering. Native session and retained role checks remain mandatory.
 fn discover() -> Result<Option<Caller>, String> {
@@ -280,7 +278,7 @@ fn tree_root(run: &Path, manifest: &Value) -> Result<PathBuf, String> {
     }
 }
 
-fn read_tree(root: &Path) -> Result<Value, String> {
+pub(super) fn read_tree(root: &Path) -> Result<Value, String> {
     let tree = read_json(&root.join("tree.json"))?;
     if tree["version"] != 1
         || tree["blocked"].as_bool().is_none()
@@ -338,7 +336,7 @@ impl AttemptGate {
             epoch: manifest["subtree_epoch"].clone(),
         })
     }
-    pub(super) fn lock(&self) -> Result<File, String> {
+    pub(super) fn lock(&self) -> Result<crate::native::FileLock, String> {
         lock(&self.root)
     }
     pub(super) fn with_open<T>(
@@ -361,7 +359,7 @@ impl AttemptGate {
     }
 }
 
-pub fn lock(root: &Path) -> Result<File, String> {
+pub fn lock(root: &Path) -> Result<crate::native::FileLock, String> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -369,23 +367,25 @@ pub fn lock(root: &Path) -> Result<File, String> {
         .truncate(false)
         .open(root.join("tree.lock"))
         .map_err(|e| format!("open subtree lock: {e}"))?;
-    let deadline = Instant::now() + LOCK_BUDGET;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                #[cfg(test)]
-                {
-                    let hook = ON_LOCK_CONTENTION.with(|slot| slot.borrow_mut().take());
-                    if let Some(hook) = hook {
-                        hook();
-                    }
+    match file.try_lock() {
+        Ok(()) => return Ok(crate::native::FileLock(file)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            {
+                let hook = ON_LOCK_CONTENTION.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
                 }
-                std::thread::sleep(Duration::from_millis(10))
             }
-            Err(e) => return Err(format!("subtree lock unavailable: {e}")),
         }
+        Err(e) => return Err(format!("subtree lock unavailable: {e}")),
     }
+    // These critical sections perform bounded metadata work, never backend RPC
+    // waits or joins. Let the kernel hand off the lock instead of racing all
+    // contenders every 10 ms and expiring valid launches after five seconds.
+    file.lock()
+        .map_err(|e| format!("subtree lock unavailable: {e}"))?;
+    Ok(crate::native::FileLock(file))
 }
 
 fn id(run: &Path) -> &str {
@@ -504,6 +504,8 @@ pub(super) fn admit<'a>(
     }
     let root = tree_root(run, manifest)?;
     let _lock = lock(&root)?;
+    crate::retention::available(&root)?;
+    crate::lifecycle::private_path(run, true)?;
     let publication = if resume {
         Publication::Retained(read_json(&run.join("manifest.json"))?)
     } else {
@@ -726,7 +728,7 @@ pub fn summary(run: &Path) -> Result<Value, String> {
     )
 }
 
-fn bound_backend_alive(
+pub(super) fn bound_backend_alive(
     pid: u32,
     birth: u64,
     probe: impl FnOnce(u32) -> std::io::Result<crate::native::Identity>,
@@ -737,7 +739,7 @@ fn bound_backend_alive(
         Err(_) => Err("cannot verify orphan backend exit".into()),
     }
 }
-fn recorded_identity(runtime: &Value, role: &str) -> Result<(u32, u64), String> {
+pub(super) fn recorded_identity(runtime: &Value, role: &str) -> Result<(u32, u64), String> {
     let pid = runtime[format!("{role}_pid")]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
@@ -754,7 +756,7 @@ fn recorded_identity(runtime: &Value, role: &str) -> Result<(u32, u64), String> 
     Ok((pid, birth))
 }
 
-fn scope_empty(runtime: &Value, backend: u32) -> Result<bool, String> {
+pub(super) fn scope_empty(runtime: &Value, backend: u32) -> Result<bool, String> {
     #[cfg(unix)]
     {
         let _ = runtime;
@@ -791,7 +793,7 @@ fn scope_empty(runtime: &Value, backend: u32) -> Result<bool, String> {
     }
 }
 
-fn terminal(status: &Value) -> bool {
+pub(super) fn terminal(status: &Value) -> bool {
     matches!(
         status.as_str(),
         Some(

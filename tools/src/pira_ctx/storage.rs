@@ -2176,12 +2176,36 @@ fn update_index(store_dir: &Path, entry: &ListedEntry, current_dirty: &Path) -> 
     let indexes = store_dir.join("indexes");
     ensure_private_dir(&indexes)?;
     let _lock = StoreLock::acquire(&indexes.join(".index.lock"))?;
-    if !indexes.join(INDEX_COMPLETE).is_file() || indexes_dirty_except(&indexes, current_dirty) {
+    if !indexes.join(INDEX_COMPLETE).is_file() {
         rebuild_indexes_locked(store_dir, &indexes)?;
     } else {
         append_index(&indexes, entry)?;
     }
-    // Other publishers may not yet have published their captures. Keep their markers.
+    // Overlap is not index corruption. Reconcile only published pending results,
+    // rather than rebuilding the entire store for every overlapping publisher.
+    // Unpublished/unreadable results keep their markers and authoritative scan fallback.
+    for item in fs::read_dir(&indexes).map_err(|error| error.to_string())? {
+        let item = item.map_err(|error| error.to_string())?;
+        if item.path() == current_dirty {
+            continue;
+        }
+        let name = item.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_prefix(".dirty-")) else {
+            continue;
+        };
+        let filename = format!("{id}.piractx");
+        if !valid_capture_filename(&filename) {
+            continue;
+        }
+        let path = store_dir.join(filename);
+        if let Ok(stored) = read_result_path(&path) {
+            append_index(
+                &indexes,
+                &ListedEntry::from_metadata(&stored.metadata, path),
+            )?;
+            fs::remove_file(item.path()).map_err(|error| error.to_string())?;
+        }
+    }
     match fs::remove_file(current_dirty) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -2196,18 +2220,6 @@ fn indexes_dirty(indexes: &Path) -> bool {
                 .file_name()
                 .to_str()
                 .is_some_and(|name| name.starts_with(".dirty-"))
-        })
-    })
-}
-
-fn indexes_dirty_except(indexes: &Path, current: &Path) -> bool {
-    fs::read_dir(indexes).is_ok_and(|entries| {
-        entries.filter_map(Result::ok).any(|entry| {
-            entry.path() != current
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(".dirty-"))
         })
     })
 }
@@ -3509,6 +3521,58 @@ mod tests {
         assert!(!dir.join("other").exists());
         ensure_private_dir(&dir.join("normal/nested")).unwrap();
         assert!(dir.join("normal/nested").is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_indexes_recover_without_rebuilding_unrelated_rows() {
+        let dir = std::env::temp_dir().join(format!("ctx-index-recovery-{}", std::process::id()));
+        let command = vec!["sh".into(), "-c".into(), "printf hello".into()];
+        let capture = crate::capture::capture_command(&command, None, false, None)
+            .unwrap()
+            .unwrap();
+        let stored = store_capture(&dir, &command, &[], &capture).unwrap();
+        let indexes = dir.join("indexes");
+        // An unrelated workspace's index must not be rewritten by overlapping publishers.
+        let unrelated = indexes.join("0000000000000000.jsonl");
+        fs::write(&unrelated, b"").unwrap();
+        let pending = indexes.join(".dirty-pending");
+        fs::write(&pending, b"dirty\n").unwrap();
+        let recovered = indexes.join(".dirty-recovered");
+        fs::write(&recovered, b"dirty\n").unwrap();
+        let mut metadata = stored.metadata.clone();
+        metadata.result_id = "recovered".into();
+        metadata.filename = "recovered.piractx".into();
+        write_container(&dir.join(&metadata.filename), &metadata, &capture).unwrap();
+
+        store_capture(&dir, &command, &[], &capture).unwrap();
+        assert!(unrelated.exists(), "overlap triggered a full-store rebuild");
+        assert!(
+            !recovered.exists(),
+            "published orphan marker was not reconciled"
+        );
+        assert!(
+            pending.exists(),
+            "unpublished capture lost its safety marker"
+        );
+        let rows = read_indexes(&indexes, None).unwrap();
+        assert!(rows.iter().any(|entry| entry.id == "recovered"));
+
+        // A delayed publisher is discoverable before it gets the index lock.
+        metadata.result_id = "pending".into();
+        metadata.filename = "pending.piractx".into();
+        write_container(&dir.join(&metadata.filename), &metadata, &capture).unwrap();
+        assert!(
+            scan_store(&dir, None)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == "pending")
+        );
+        store_capture(&dir, &command, &[], &capture).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(read_indexes(&indexes, None).unwrap().len(), 5);
+        assert!(!indexes_dirty(&indexes));
         fs::remove_dir_all(dir).unwrap();
     }
 

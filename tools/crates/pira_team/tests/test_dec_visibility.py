@@ -42,6 +42,47 @@ class DecVisibilityTests(unittest.TestCase):
     def search(self, cwd: Path | None = None, *extra: str) -> list[dict]:
         return json.loads(self.main(["search", "visibility", "--json", *extra], cwd))["matches"]
 
+    def failure_diagnostics(self, stderr: str) -> str:
+        # Only this credential-free fixture's backend stderr, never auth/store files.
+        runs = [line.split(": ", 1)[1] for line in stderr.splitlines()
+                if line.startswith("pira_team run_id: ")]
+        parts = []
+        for run in runs[-1:]:
+            for path in sorted((self.root / "logs" / run).rglob("stderr.log"))[-2:]:
+                with path.open("rb") as stream:
+                    stream.seek(0, 2)
+                    stream.seek(max(0, stream.tell() - 4096))
+                    parts.append(stream.read(4096).decode("utf-8", errors="replace"))
+        text = "\n".join(parts)
+        for name, value in self.env.items():
+            if value and any(marker in name.upper() for marker in ("KEY", "TOKEN", "PASSWORD", "SECRET")):
+                text = text.replace(value, "<redacted>")
+        return text[-8192:]
+
+    def test_failed_peer_retains_exception_diagnostic(self) -> None:
+        self.env["TEAM_DEC_BIN"] = str(self.root / "missing-dec-executable")
+        with self.assertRaisesRegex(AssertionError, "FileNotFoundError"):
+            self.worker([["search", "visibility", "--json"]])
+
+    def test_failure_diagnostics_are_bounded_and_redact_secrets(self) -> None:
+        log = self.root / "logs" / "fixture-run" / "revisions" / "000001" / "stderr.log"
+        log.parent.mkdir(parents=True)
+        self.env["FIXTURE_SECRET"] = "fixture-secret-not-a-credential"
+        log.write_text("x" * 20000 + self.env["FIXTURE_SECRET"])
+        result = self.failure_diagnostics("pira_team run_id: fixture-run\n")
+        self.assertLessEqual(len(result), 4096)
+        self.assertNotIn(self.env["FIXTURE_SECRET"], result)
+        self.assertIn("<redacted>", result)
+
+    def test_failure_diagnostics_bound_redaction_expansion(self) -> None:
+        log = self.root / "logs" / "fixture-run" / "stderr.log"
+        log.parent.mkdir(parents=True)
+        self.env["FIXTURE_SECRET"] = "x"
+        log.write_text("x" * 10000)
+        result = self.failure_diagnostics("pira_team run_id: fixture-run\n")
+        self.assertLessEqual(len(result), 8192)
+        self.assertNotIn("x", result)
+
     def worker(self, commands: list[list[str] | dict], cwd: Path | None = None,
                run: str | None = None, caller: Path | None = None) -> tuple[dict, list[str]]:
         self.env["TEAM_DEC_COMMANDS"] = json.dumps(commands)
@@ -55,7 +96,9 @@ class DecVisibilityTests(unittest.TestCase):
                  "--task", "decision-probe"]
         result = subprocess.run(args, cwd=caller or self.repo, env=self.env,
                                 capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr + (
+            "\nfixture backend stderr:\n" + self.failure_diagnostics(result.stderr)
+            if result.returncode else ""))
         receipt = json.loads(result.stdout)
         outputs = json.loads(Path(receipt["handoff_path"]).read_text())
         self.assertEqual(len(outputs), len(commands))

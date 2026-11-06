@@ -16,11 +16,16 @@ def main():
         environment = {key:value for key,value in os.environ.items()
             if key.upper() in {"PATH","SYSTEMROOT","WINDIR","COMSPEC","PATHEXT"}}
         suffix = ".exe" if os.name == "nt" else ""
-        environment["PATH"] = str(root / "tools/target/debug") + os.pathsep + environment["PATH"]
+        team_binary = Path(os.environ.get("PIRA_TEAM_BIN", root / "tools/target/debug" / ("pira_team"+suffix))).resolve(strict=True)
+        dec_binary = Path(os.environ.get("PIRA_DEC_BIN", root / "tools/target/debug" / ("pira_dec"+suffix))).resolve(strict=True)
+        # Resolve rustup's selected native toolchain before replacing HOME. Tests
+        # compile tiny native peers, but must not inherit user/runner configuration.
+        compiler = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()) / "bin"
+        (compiler / ("rustc"+suffix)).resolve(strict=True)
+        environment["PATH"] = os.pathsep.join((str(team_binary.parent), str(compiler), environment["PATH"]))
         environment.update(HOME=str(home), USERPROFILE=str(home), LOCALAPPDATA=str(home),
             TMP=str(home), TEMP=str(home), TMPDIR=str(home), PYTHONDONTWRITEBYTECODE="1",
-            PIRA_TEAM_BIN=str(root / "tools/target/debug" / ("pira_team"+suffix)),
-            PIRA_DEC_BIN=str(root / "tools/target/debug" / ("pira_dec"+suffix)),
+            PIRA_TEAM_BIN=str(team_binary), PIRA_DEC_BIN=str(dec_binary),
             TEAM_TEST_SLOW_PREFLIGHT="1")
         if os.name == "nt":
             executable = home / "codex.exe"
@@ -35,6 +40,7 @@ def main():
         tempfile.tempdir = str(home)
         sys.path.insert(0,str(tests))
         loader = unittest.TestLoader()
+        requested = sys.argv[1:]
         if os.name == "nt":
             import test_subteams
             # These two non-exec shell-wrapper fixtures require POSIX. Keep the
@@ -54,6 +60,7 @@ def main():
                 for name in loader.getTestCaseNames(test_claude.ClaudeTests)
                 if name != "test_worker_context_preserves_role_when_path_changes"
             ]))
+            suite.addTests(loader.loadTestsFromName("test_retention"))
             suite.addTests(loader.loadTestsFromNames([
                 "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
                 "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",
@@ -79,8 +86,26 @@ def main():
                 )]))
         else:
             suite = loader.discover(str(tests), pattern="test_*.py")
+        if requested:
+            # Keep the normal gate's module-import context before selecting cases.
+            if loader.errors:
+                raise SystemExit("\n".join(loader.errors))
+            suite = loader.loadTestsFromNames(requested)
+        def supported(suite):
+            for case in suite:
+                if isinstance(case, unittest.TestSuite):
+                    yield from supported(case)
+                elif not (getattr(type(case), "__unittest_skip__", False)
+                          or getattr(getattr(case, case._testMethodName), "__unittest_skip__", False)):
+                    yield case
+        suite = unittest.TestSuite(supported(suite))
+        required = {"test_subteams.SubteamTests." + name for name in (
+            "test_100_simultaneous_launches_preserve_independent_lifecycle",
+            "test_100_interleaved_harnesses_preserve_sessions_and_resume")}
+        if not requested and not required.issubset({case.id() for case in suite}):
+            raise SystemExit("Required Codex/mixed 100-launch cases missing")
         result = unittest.TextTestRunner(verbosity=2).run(suite)
-        if not result.wasSuccessful() or result.testsRun < 24 or result.skipped:
+        if not result.wasSuccessful() or result.testsRun < (1 if requested else 24) or result.skipped:
             raise SystemExit("Required native Team behavior failed, skipped, or was not discovered")
 
 

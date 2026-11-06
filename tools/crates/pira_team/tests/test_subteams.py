@@ -1,7 +1,10 @@
 """Real isolated subprocesses; fake protocol peer, no model calls or live stores."""
+from native_fixture import run_directories
+
 import concurrent.futures
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import shlex
@@ -70,9 +73,9 @@ class SubteamTests(unittest.TestCase):
         self.processes.append((process, run.name))
         return process, run.name
 
-    def request(self, run, **request):
+    def request(self, run, *, response_timeout=30, **request):
         with socket.socket() as client:
-            client.settimeout(30)
+            client.settimeout(response_timeout)
             client.connect(tuple(json.loads((self.sockets / (run + ".sock")).read_text(encoding="utf-8"))))
             with client.makefile("rwb") as stream:
                 stream.write(json.dumps(request).encode() + b"\n")
@@ -130,7 +133,7 @@ class SubteamTests(unittest.TestCase):
                              "--completion-gate", "x")
         self.assertNotEqual(grant["returncode"], 0, grant)
         self.assertIn("cannot grant --allow-subteam", grant["stderr"])
-        self.assertEqual(len(list((self.root / "logs").iterdir())), 2)
+        self.assertEqual(len(list(run_directories(self.root / "logs"))), 2)
         self.finish(child["run_id"])
         self.assertEqual(self.command(coordinator, operation="wait", handle=child["handle"])["returncode"], 0)
         self.finish(coordinator)
@@ -149,7 +152,7 @@ class SubteamTests(unittest.TestCase):
                     path.write_text(json.dumps({**runtime, field: value}))
                     rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x")
                     self.assertNotEqual(rejected["returncode"], 0, rejected)
-                    self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                    self.assertEqual(len(list(run_directories(self.root / "logs"))), 1)
                 finally:
                     path.write_bytes(original)
         self.finish(coordinator)
@@ -176,7 +179,7 @@ class SubteamTests(unittest.TestCase):
                             path.write_text(json.dumps(state))
                         rejected = self.command(coordinator, "run", "--task", "x", "--completion-gate", "x")
                         self.assertNotEqual(rejected["returncode"], 0, rejected)
-                        self.assertEqual(len(list((self.root / "logs").iterdir())), 1)
+                        self.assertEqual(len(list(run_directories(self.root / "logs"))), 1)
                     finally:
                         for path, original in originals.items():
                             path.write_bytes(original)
@@ -510,7 +513,7 @@ class SubteamTests(unittest.TestCase):
                 "--store", str(self.root / "logs")], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
             self.wait_stderr_notice(process, "pira_team run_id:")
-            run, = (self.root / "logs").iterdir()
+            run, = run_directories(self.root / "logs")
             self.processes.append((process, run.name))
             boundary.reached()
             collision = run / f"runtime.{process.pid}.tmp"
@@ -548,9 +551,16 @@ class SubteamTests(unittest.TestCase):
         return key
 
     def no_credential_artifacts(self, *keys):
-        for path in (self.root / "logs").rglob("*"):
+        store = self.root / "logs"
+        for path in store.rglob("*"):
             if path.is_file() and not path.is_symlink():
-                content = path.read_bytes()
+                try:
+                    content = path.read_bytes()
+                except FileNotFoundError:
+                    # Atomic telemetry publication may rename this temporary after enumeration.
+                    if path.parent == store and re.fullmatch(r"\.cleanup-report\.[0-9]+\.tmp", path.name):
+                        continue
+                    raise
                 self.assertFalse(any(key.encode() in content for key in keys), f"credential in retained file: {path.name}")
 
     def test_api_key_handoff_is_launcher_only_and_resumes_use_current_selection(self):
@@ -716,6 +726,139 @@ class SubteamTests(unittest.TestCase):
         self.finish(coordinator)
         self.assertEqual(self.wait(process)[0], 0)
         self.no_credential_artifacts(key)
+
+
+    def test_stalled_authentication_clients_do_not_block_admitted_launcher(self):
+        from contextlib import ExitStack
+        from native_fixture import raw_authentication
+        process, coordinator = self.start()
+        endpoint = json.loads((self.root / "logs" / coordinator / "control.json").read_text(encoding="utf-8"))["authentication"]["endpoint"]
+        # Two incomplete requests occupy two full server budgets in a serial
+        # listener. The valid launcher must not wait behind either request.
+        with ExitStack() as stalled:
+            for _ in range(2):
+                stalled.enter_context(raw_authentication(endpoint))
+            child = self.child(coordinator)
+            self.assertIn("run_id", child, child)
+        self.finish(child["run_id"])
+        self.assertEqual(self.request(coordinator, operation="wait", handle=child["handle"])["returncode"], 0)
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
+    def test_100_simultaneous_launches_preserve_independent_lifecycle(self):
+        self.check_burst(["test-model"] * 100)
+
+    def test_100_interleaved_harnesses_preserve_sessions_and_resume(self):
+        from test_claude import install_claude
+        install_claude(self.root, self.env)
+        self.parent([{'sandbox_policy':{'type':'danger-full-access'}}])
+        self.check_burst(["test-model", "claude-future-family-100"] * 50)
+
+    def check_burst(self, models):
+        import threading
+        process, coordinator = self.start()
+        barrier = threading.Barrier(101)
+        def launch(index):
+            barrier.wait(timeout=20)
+            return self.command(coordinator, "run", "--model", models[index], "--effort", "low",
+                "--task", "mixed-service" if models[index].startswith("claude-") else "subteam-service",
+                "--completion-gate", f"Finish independent child {index}", operation="start", response_timeout=120,
+                env={"TEAM_CANDIDATE":json.dumps({"filename":"review.md", "format":"markdown", "content":f"child {index}"})})
+        with concurrent.futures.ThreadPoolExecutor(100) as pool:
+            pending = [pool.submit(launch, index) for index in range(100)]
+            barrier.wait(timeout=20)
+            children = [future.result() for future in pending]
+        failures = [child for child in children if "run_id" not in child]
+        self.assertEqual(failures, [], failures)
+        self.assertEqual(len({child["run_id"] for child in children}), 100)
+        runtimes = {child["run_id"]:json.loads((self.root / "logs" / child["run_id"] / "runtime.json").read_text(encoding="utf-8")) for child in children}
+        self.assertEqual(len({(runtime["backend_pid"], runtime["backend_birth"]) for runtime in runtimes.values()}), 100)
+        threads = set()
+        identities = set()
+        for index, child in enumerate(children):
+            run = child["run_id"]
+            state = self.manifest(run)
+            self.assertEqual(state["parent_run_id"], coordinator)
+            self.assertEqual(state["completion_gate"], f"Finish independent child {index}")
+            self.assertFalse(state["allow_subteam"])
+            self.assertEqual(state["model"], models[index])
+            self.assertEqual(state["transport"], "claude-stream-json" if models[index].startswith("claude-") else "app-server")
+            self.assertEqual(state["status"], "running", state)
+            threads.add(state["thread_id"])
+            runtime = runtimes[run]
+            identities.add((runtime["backend_pid"], runtime["backend_birth"]))
+            identity = self.request(run, operation="identity")
+            self.assertEqual(identity["ppid" if os.name == "nt" else "pid"], runtime["backend_pid"], identity)
+            try:
+                backend_exited = process_exit_waiter(runtime["backend_pid"])
+            except OSError as error:
+                self.fail(f"child {index} waiter: {error}; runtime={runtime}; live fixture={identity}; state={self.manifest(run)}")
+            self.finish(run)
+            self.assertEqual(self.request(coordinator, operation="wait", handle=child["handle"])["returncode"], 0)
+            backend_exited()
+            self.assertEqual(self.manifest(run)["status"], "completed")
+            handoff = self.command(coordinator, "read", run)
+            self.assertEqual(handoff["returncode"], 0, handoff["stderr"])
+            self.assertEqual(handoff["stdout"], f"child {index}")
+            self.assertFalse((self.root / "logs" / run / "control.json").exists())
+            wait_owner(self.root / "logs" / run / "run.lock")
+        self.assertEqual(len(identities), 100)
+        self.assertEqual(len(threads), 100)
+        if any(model.startswith("claude-") for model in models):
+            for index in (0, 1):
+                run = children[index]["run_id"]
+                before = self.manifest(run)
+                resumed = self.command(coordinator, "resume", run, "--task", "recall", "--completion-gate", before["completion_gate"], response_timeout=120)
+                self.assertEqual(resumed["returncode"], 0, resumed)
+                after = self.manifest(run)
+                self.assertEqual(after["thread_id"], before["thread_id"])
+                self.assertEqual(after["transport"], before["transport"])
+                self.assertEqual(after["model"], before["model"])
+                self.assertEqual(after["revision"], 2)
+                self.assertGreater(after["usage"]["input_tokens"], before["usage"]["input_tokens"])
+                answer = self.command(coordinator, "read", run)
+                expected = json.dumps(["mixed-service" if index == 1 else "subteam-service", "recall"])
+                self.assertEqual(answer["stdout"], expected)
+        tree = json.loads((self.root / "logs" / coordinator / "tree.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(tree["members"]), 101)
+        self.assertTrue(all(not member["active"] and member["credential_claimed"]
+                            for run, member in tree["members"].items() if run != coordinator))
+        self.finish(coordinator)
+        self.assertEqual(self.wait(process)[0], 0)
+
+
+class CredentialAuditTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.fixture = SubteamTests()
+        self.fixture.root = Path(temporary.name)
+        self.store = self.fixture.root / "logs"
+        self.store.mkdir()
+
+    def test_vanished_report_temporary_is_not_retained(self):
+        (self.store / ".cleanup-report.123.tmp").write_bytes(b"fixture")
+        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError("atomic rename")):
+            self.fixture.no_credential_artifacts("synthetic-key")
+
+    def test_other_disappearing_files_are_not_ignored(self):
+        for name in (".cleanup-report.json", "manifest.json", ".cleanup-report.bad.tmp",
+                     "run/.cleanup-report.123.tmp"):
+            with self.subTest(name=name):
+                path = self.store / name
+                path.parent.mkdir(exist_ok=True)
+                path.write_bytes(b"fixture")
+                try:
+                    with patch.object(Path, "read_bytes", side_effect=FileNotFoundError("missing")):
+                        with self.assertRaises(FileNotFoundError):
+                            self.fixture.no_credential_artifacts("synthetic-key")
+                finally:
+                    path.unlink()
+
+    def test_present_report_temporary_is_checked_for_credentials(self):
+        (self.store / ".cleanup-report.123.tmp").write_bytes(b"synthetic-key")
+        with self.assertRaisesRegex(AssertionError, "credential in retained file"):
+            self.fixture.no_credential_artifacts("synthetic-key")
 
 
 class FixtureCompletionTests(unittest.TestCase):

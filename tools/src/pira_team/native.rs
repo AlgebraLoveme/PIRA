@@ -4,6 +4,19 @@ use std::{io, path::PathBuf};
 #[path = "native_windows.rs"]
 pub mod windows;
 
+// Close alone does not release Unix flock while another thread's spawned child
+// still holds an inherited descriptor. Release when the logical owner returns.
+pub(crate) struct FileLock(pub(crate) std::fs::File);
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            crate::notice(format_args!(
+                "pira_team: release native metadata lock: {error}"
+            ));
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
     pub pid: u32,
@@ -202,6 +215,46 @@ pub fn current() -> Result<Identity, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_lock_owner_release_does_not_wait_for_inherited_handles() {
+        use std::fs::{File, OpenOptions, TryLockError};
+        let path = std::env::temp_dir().join(format!(
+            "team-lock-handle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        owner.lock().unwrap();
+        let inherited = owner.try_clone().unwrap();
+        drop(owner);
+        let next = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(next.try_lock(), Err(TryLockError::WouldBlock)));
+        inherited.unlock().unwrap();
+        drop(inherited);
+        next.lock().unwrap();
+        let inherited = next.try_clone().unwrap();
+        drop(FileLock(next));
+        let replacement = File::open(&path).unwrap();
+        replacement.try_lock().unwrap();
+        replacement.unlock().unwrap();
+        drop(replacement);
+        drop(inherited);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn linux_stat_metadata_does_not_require_executable_access() {

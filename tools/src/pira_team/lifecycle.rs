@@ -87,7 +87,11 @@ pub fn save_json(path: &Path, value: &Value) -> Result<(), String> {
     // Cleanup owns this path only after exclusive creation succeeds.
     let mut file = create(&temp)?;
     let result = (|| {
-        writeln!(file, "{value:#}").map_err(|e| e.to_string())?;
+        // Formatting directly into File issues thousands of tiny writes while
+        // tree.lock is held. Encode first; retain identical bytes and durability.
+        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+        bytes.push(b'\n');
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(&temp, path).map_err(|e| e.to_string())?;
         if crate::remote::delegated_context().is_some() {
@@ -140,6 +144,9 @@ pub(super) fn owner(run: &Path) -> Result<Owner, String> {
         .map_err(|e| e.to_string())?;
     file.try_lock()
         .map_err(|_| "run already has an active owner")?;
+    // Recheck after ownership: cleanup may have quarantined a previously opened path.
+    private_path(run, true)?;
+    crate::retention::available(run)?;
     Ok(Owner {
         run: run.to_owned(),
         _lock: file,
@@ -177,7 +184,10 @@ pub(super) fn launch_at(mut options: Options, run: PathBuf) -> Result<(), String
         );
     }
     manifest["allow_subteam"] = json!(options.allow_subteam);
-    admitted_revision(&mut options, &run, &mut manifest, &_owner)
+    let outcome = admitted_revision(&mut options, &run, &mut manifest, &_owner);
+    drop(_owner);
+    crate::retention::trigger(run.parent().ok_or("missing store")?);
+    outcome
 }
 
 pub fn existing(args: &[String]) -> Result<(), String> {
@@ -448,7 +458,10 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .ok_or("invalid or exhausted revision number")?
         + 1;
     manifest["revision"] = json!(next);
-    admitted_revision(&mut options, &run, &mut manifest, &_owner)
+    let outcome = admitted_revision(&mut options, &run, &mut manifest, &_owner);
+    drop(_owner);
+    crate::retention::trigger(run.parent().ok_or("missing store")?);
+    outcome
 }
 
 fn admitted_revision(
@@ -560,10 +573,14 @@ fn revision(
     if crate::remote::delegated_context().is_some() {
         manifest["execution_permissions"]["source"] = json!("launcher-signed-delegation-v2");
     }
+    crate::retention::activity(manifest)?;
     begin_revision(&snapshot, || {
         save_json(&run.join("manifest.json"), manifest)
     })?;
     admission.published();
+    if number == 1 {
+        crate::retention::trigger(run.parent().ok_or("missing store")?);
+    }
     crate::notice(format_args!(
         "pira_team run_id: {}",
         manifest["run_id"].as_str().unwrap()
@@ -611,6 +628,7 @@ fn revision(
             manifest["error"] = json!(error);
         }
     }
+    crate::retention::activity(manifest)?;
     if let Err(error) = crate::subteam::finish(run, manifest) {
         outcome = Err(error);
     }
@@ -1262,6 +1280,10 @@ mod tests {
         let complete = json!({"status":"completed","note":"Unicode λ"});
         save_json(&path, &complete).unwrap();
         assert_eq!(read_json(&path).unwrap(), complete);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            format!("{complete:#}\n").as_bytes()
+        );
         assert!(!temporary.exists());
 
         let directory = dir.0.join("directory.json");

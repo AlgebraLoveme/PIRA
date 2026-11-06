@@ -136,8 +136,8 @@ fn probe(
     if status.2 {
         return Err("probe attempt timed out".into());
     }
-    let (stdout, stdout_complete) = stdout_result?;
-    let (stderr, stderr_complete) = stderr_result?;
+    let stdout_result = stdout_result?;
+    let stderr_result = stderr_result?;
     let code = util::status_code(status.0);
     let job = if code == 0 {
         JobStatus::Succeeded
@@ -148,13 +148,35 @@ fn probe(
     } else {
         return Err(format!("probe exited with unexpected status {code}"));
     };
+    let mut detail = format!("probe exit {code}");
+    for (stream, available) in [
+        ("stdout", stdout_result.is_some()),
+        ("stderr", stderr_result.is_some()),
+    ] {
+        if !available {
+            // Pending attempts may be sampled repeatedly; do not accumulate
+            // blocked readers by treating an unclosed pipe as a retryable sample.
+            if job == JobStatus::Pending {
+                return Err(format!(
+                    "probe {stream} did not close after process-tree cleanup"
+                ));
+            }
+            detail.push_str(&format!(
+                "; {stream} output incomplete: pipe did not close after process-tree cleanup"
+            ));
+        }
+    }
+    // PIRA: An expired reader has no completed tail. Preserve the known status,
+    // but do not treat missing output as a reliable empty observation.
+    let (stdout, stdout_complete) = stdout_result.unwrap_or_default();
+    let (stderr, stderr_complete) = stderr_result.unwrap_or_default();
     let activity = !stdout.is_empty() || !stderr.is_empty();
     Ok(Sample {
         job,
         activity,
         stdout,
         stderr,
-        detail: format!("probe exit {code}"),
+        detail,
         reliable: stdout_complete && stderr_complete,
     })
 }
@@ -173,10 +195,12 @@ fn receive_reader<T>(
     receiver: mpsc::Receiver<Result<T, String>>,
     deadline: Instant,
     label: &str,
-) -> Result<T, String> {
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| format!("{label} did not close after process-tree cleanup"))?
+) -> Result<Option<T>, String> {
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result.map(Some),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!("{label} reader disconnected")),
+    }
 }
 
 fn read_tail<R: Read>(mut reader: R) -> Result<(Vec<u8>, bool), String> {
@@ -211,6 +235,33 @@ pub fn hash(parts: &[&[u8]]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_expiry_is_incomplete_but_reader_failures_remain_errors() {
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        assert_eq!(receive_reader(rx, Instant::now(), "probe stdout"), Ok(None));
+        drop(tx);
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        drop(tx);
+        assert_eq!(
+            receive_reader(rx, Instant::now(), "probe stdout"),
+            Err("probe stdout reader disconnected".into())
+        );
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        tx.send(Err("read failed".into())).unwrap();
+        assert_eq!(
+            receive_reader(rx, Instant::now(), "probe stdout"),
+            Err("read failed".into())
+        );
+    }
+
+    #[test]
+    fn probe_output_limit_remains_an_error() {
+        assert_eq!(
+            read_tail(&vec![b'x'; MAX_STREAM_OUTPUT + 1][..]),
+            Err("probe aggregate output exceeds 1 MiB".into())
+        );
+    }
 
     fn probe_state(command: Vec<String>) -> WatchState {
         let mut state: WatchState = serde_json::from_str(

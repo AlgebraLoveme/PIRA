@@ -78,6 +78,53 @@ fn completed_probe_reports_final_exit_instead_of_an_idle_attempt() {
     assert!(!report.contains("Detail: probe exit 0"));
 }
 
+fn status_probe(case: &str) {
+    let output = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/watch_status_probe.py"
+        ))
+        .args([binary(), case])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{case}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn detached_stdout_preserves_probe_success() {
+    status_probe("success");
+}
+
+#[test]
+fn detached_stderr_preserves_probe_failure() {
+    status_probe("failure");
+}
+
+#[test]
+fn detached_both_pipes_preserve_probe_success_and_both_warnings() {
+    status_probe("both");
+}
+
+#[test]
+fn detached_pending_probe_still_rejects_unclosed_pipes() {
+    status_probe("pending");
+}
+
+#[test]
+fn stopping_during_detached_probe_drain_remains_stopped() {
+    status_probe("stop");
+}
+
+#[test]
+fn ordinary_probe_statuses_remain_reliable() {
+    status_probe("ordinary");
+}
+
 fn start_pending_watch(store: &Path, extra: &[&str]) -> (Child, String) {
     let mut arguments = vec!["watch", "--store-dir", store.to_str().unwrap()];
     arguments.extend_from_slice(extra);

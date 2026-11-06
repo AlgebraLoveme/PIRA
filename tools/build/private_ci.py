@@ -359,8 +359,10 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
                   "source_file_count": len(data), "per_tool_file_counts": counts, "tested_tools": list(test_tools)}
     data["SNAPSHOT_PROVENANCE.json"] = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
     extra_tests = ""
-    if "pira_write_check" in test_tools:
-        extra_tests = "        include:\n          - os: macos-latest\n            crate: pira_write_check"
+    for tool in ("pira_write_check", "pira_team"):
+        if tool in test_tools:
+            extra_tests = (extra_tests + "\n" if extra_tests else "        include:\n") + (
+                f"          - os: macos-latest\n            crate: {tool}")
     data[".github/workflows/private-pira-tests.yml"] = workflow.replace(
         "@TEST_TOOLS@", json.dumps(list(test_tools))).replace("@TEST_EXTRA@", extra_tests).encode()
     data[".gitattributes"] = b"* -text\n"

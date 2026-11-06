@@ -368,3 +368,50 @@ settlement before resume. Control command exit success delivers a receipt; inspe
 result.status and completion_confirmed, including failed_or_unknown/unknown states.
 Remote interrupt targets only the authorized scope;
 -r/--recursive applies the native host-local subtree boundary.
+
+# cleanup
+pira_team cleanup — plan or execute store-wide automatic retention
+
+USAGE
+  pira_team cleanup [--dry-run] [--json] [--store DIR]
+
+POLICY
+  Delete inactive coordinator units older than 10 × 24 hours, then least recently
+  active inactive units until estimated storage is below 50 GB (50,000,000,000 bytes).
+  A unit includes its coordinator and all children. Its last activity is the maximum
+  execution, resume, or completion activity of its members. Bookmarks give no exemption.
+  New executions persist last_execution_activity_ms at start/resume and completion.
+  Legacy records use persisted execution times, otherwise the latest revision's
+  relevant run-log modification timestamps, including staged and repair attempts.
+  Creation, directory modification, report reads, and bookmarks do not refresh activity.
+  Missing/ambiguous timing, native liveness, relationships, or sizes protect a unit.
+  Live units and unmanaged data count toward this soft target and can prevent it.
+  Sizes estimate logical file bytes, without following symlink targets. Allocation,
+  compression, sparse files, and hard links can make actual disk usage differ.
+
+OPTIONS
+  --dry-run    Read-only same-plan preview. No deletion, activity writes, bookmark
+               edits, lock-file creation, interrupted-deletion recovery, or cleaner spawn.
+  --json       Complete plan, member IDs, millisecond Unix activity times, estimates,
+               age/storage reasons, skips, and summary. Default text shows 50 selections.
+  --store DIR  Scope to this Team store (default: normal platform store).
+
+AUTOMATIC CLEANUP
+  New Team creation and settled execution trigger a detached finite-lived process.
+  Foreground launch/return never scans, deletes, or waits for it. A nonblocking
+  store lock admits one cleaner. Other triggers skip. Resume/start ownership and
+  native backend liveness protect whole units. Interrupted payload deletion is recovered
+  by the next mutating cleaner, without touching unrelated records or bookmarks.
+  Explicit cleanup runs synchronously. Inspect outcomes for deletion errors.
+  Automatic results replace .cleanup-report.json in the scoped store.
+  OS spawn denial warns and leaves foreground work running. On Windows, an
+  enclosing job must permit breakaway; cleanup never silently stays in that job.
+
+EXAMPLES
+  pira_team cleanup --dry-run
+  pira_team cleanup --dry-run --json --store /private/team-store
+  pira_team cleanup --store /private/team-store
+
+EXIT STATUS
+  0  Plan or cleanup finished. Inspect skips, recovery, and deletion outcomes.
+  1  Invalid arguments or store inspection failed.

@@ -47,7 +47,7 @@ class SessionIsolationTests(unittest.TestCase):
 
     def snapshot(self):
         return {str(p.relative_to(self.store)): (p.stat().st_mode, p.read_bytes() if p.is_file() else None)
-                for p in self.store.rglob("*")}
+                for p in self.store.rglob("*") if not p.relative_to(self.store).parts[0].startswith(".cleanup")}
 
     def denied(self, env, *args, **kwargs):
         before = self.snapshot()

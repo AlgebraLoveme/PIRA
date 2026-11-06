@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Deterministic Claude stream-json peer; never calls a model."""
-import json, sys
+import json, sys, os, threading
 from pathlib import Path
 args=sys.argv[1:]
 def option(name): return args[args.index(name)+1]
-def send(value): print(json.dumps(value),flush=True)
+output_lock = threading.Lock()
+def send(value):
+    with output_lock:
+        print(json.dumps(value), flush=True)
 settings=json.loads(option('--settings'))
 attempt=Path(settings['env']['PIRA_TEAM_ATTEMPT'])
 assert Path(option('--system-prompt-file')).read_bytes() == (attempt/'policy.md').read_bytes()+b'\n\n'+(attempt/'phase.md').read_bytes()
@@ -27,6 +30,23 @@ for line in sys.stdin:
         send({'type':'system','subtype':'init','session_id':session,'model':option('--model'),'permissionMode':'bypassPermissions','tools':['Bash','Read','Write','Edit','Glob','Grep']})
         send(message)
         send({"type":"system","subtype":"session_state_changed","state":"running","session_id":session})
+        if task == 'mixed-service':
+            sys.path.insert(0, str(Path(os.environ['TEAM_SUBTEAM_FIXTURE']).parent))
+            import subteam_fixture
+            def complete_service(status='completed'):
+                handoff = json.loads(os.environ['TEAM_CANDIDATE'])['content']
+                Path(settings['env']['PIRA_TEAM_HANDOFF']).write_text(handoff)
+                send({'type':'result','session_id':session,'subtype':'success','is_error':False,
+                      'result':json.dumps({'status':'completed','format':'text'}),
+                      'usage':{'input_tokens':2,'cache_read_input_tokens':3,'cache_creation_input_tokens':5,'output_tokens':7}})
+                send({'type':'system','subtype':'session_state_changed','state':'idle','session_id':session})
+            shell = dict(os.environ)
+            shell.update(settings['env'])
+            shell['CLAUDE_CODE_SESSION_ID'] = session
+            shell.pop('CODEX_THREAD_ID', None)
+            service = subteam_fixture.start_with_shell({'thread':session,'cwd':str(Path.cwd())},
+                Path(settings['env']['PIRA_TEAM_CONTEXT'])/'unused-native-home', complete_service, shell)
+            continue
         if task=='hold': continue
         if task == 'delegate-probe':
             import os, subprocess

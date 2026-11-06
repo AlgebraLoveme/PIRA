@@ -16,7 +16,7 @@ fn deadline_fixture() -> PathBuf {
 #[cfg(unix)]
 fn unix_listener_accept_honors_deadline_without_peer() {
     let root = deadline_fixture();
-    let listener = Listener::bind(&root).unwrap();
+    let mut listener = Listener::bind(&root).unwrap();
     let start = Instant::now();
     assert_eq!(
         listener
@@ -50,7 +50,7 @@ fn unix_connection_stop_interrupts_wait_without_peer_or_path() {
     let stopped = Arc::new(AtomicBool::new(false));
     let mut connection = Connection {
         stream: reader,
-        deadline: Instant::now() + BUDGET,
+        deadline: Some(Instant::now() + BUDGET),
         stopped: Some(stopped.clone()),
     };
     let start = Instant::now();
@@ -116,4 +116,71 @@ fn credential_server_drop_survives_moved_socket_without_orphan_thread() {
         bounded,
         "credential listener shutdown depended on its mutable pathname"
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_busy_pipe_reports_native_admission_error() {
+    let mut listener = Listener::bind(Path::new(".")).unwrap();
+    let endpoint = listener.endpoint();
+    let _first = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+    // The first native instance is occupied until accept publishes another.
+    // Hold that state deterministically; this is queue admission, not peer I/O.
+    let error = connect(&endpoint, Instant::now() + Duration::from_millis(100))
+        .err().expect("busy instance must not admit a second connection");
+    eprintln!("named-pipe busy admission: kind={:?}, OS {:?}", error.kind(), error.raw_os_error());
+    assert!(error.raw_os_error() == Some(121) || error.kind() == io::ErrorKind::TimedOut);
+    let _accepted = listener.accept(Instant::now() + BUDGET).unwrap();
+    let _second = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_disconnected_unaccepted_peer_preserves_listener() {
+    let mut listener = Listener::bind(Path::new(".")).unwrap();
+    let endpoint = listener.endpoint();
+    // A caller can be cancelled after kernel connection but before acceptance.
+    drop(connect(&endpoint, Instant::now() + BUDGET).unwrap());
+    let error = listener.accept(Instant::now() + Duration::from_millis(100))
+        .err().expect("no live peer remains");
+    eprintln!("unaccepted peer disconnect: kind={:?}, OS {:?}", error.kind(), error.raw_os_error());
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut,
+        "an abandoned peer must not turn into a fatal listener error");
+    let _client = connect(&endpoint, Instant::now() + BUDGET).unwrap();
+    let _accepted = listener.accept(Instant::now() + BUDGET).unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_abandoned_peer_does_not_close_authentication_server() {
+    let listener = Listener::bind(Path::new(".")).unwrap();
+    let endpoint = listener.endpoint();
+    drop(connect(&endpoint, Instant::now() + BUDGET).unwrap());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stop = stopped.clone();
+    let server = std::thread::spawn(move || {
+        serve(listener, &stop, &Secret::new(b"synthetic response".to_vec()).unwrap(), 2,
+            |peer, _| {
+                assert_eq!(peer, std::process::id());
+                Ok(())
+            });
+    });
+    let received = (|| -> io::Result<Vec<u8>> {
+        let mut client = connect(&endpoint, Instant::now() + BUDGET)?;
+        if client.peer()? != std::process::id() {
+            return Err(io::Error::other("unexpected synthetic server identity"));
+        }
+        write_frame(&mut client, b"{}")?;
+        let mut status = [0];
+        client.read_exact(&mut status)?;
+        if status != [1] {
+            return Err(io::Error::other("synthetic handoff rejected"));
+        }
+        let payload = read_frame(&mut client, 128)?;
+        client.write_all(&[1])?;
+        Ok(payload)
+    })();
+    stopped.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    assert_eq!(received.unwrap(), b"synthetic response");
 }

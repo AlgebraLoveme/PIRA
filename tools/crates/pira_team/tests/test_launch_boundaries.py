@@ -1,6 +1,8 @@
 """Launch/cancellation/evidence regressions with synthetic peers and credentials only."""
 from __future__ import annotations
 
+from native_fixture import run_directories
+
 import json
 import os
 from pathlib import Path
@@ -219,7 +221,7 @@ class LaunchBoundaryTests(unittest.TestCase):
         self.assertEqual(out, "")
         self.assertIn("native schema generation failed", err)
         self.assertNotIn("unsupported Codex backend", err)
-        run = next((self.root / "logs").iterdir())
+        run = next(run_directories(self.root / "logs"))
         self.assertFalse((run / "requests.jsonl").exists())
         self.assertFalse((run / "control.json").exists())
         self.assertFalse((run / "codex-home/auth.json").is_symlink())

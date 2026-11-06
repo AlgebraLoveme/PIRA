@@ -965,7 +965,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pira_ctx"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "fs2",
  "jiff",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "pira_team"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "csv",
  "getrandom",

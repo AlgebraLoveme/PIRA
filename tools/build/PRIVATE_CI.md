@@ -83,8 +83,8 @@ The staged push workflow reuses the exact checkout pin from the source release
 workflow, disables credential persistence, checks hashes, and runs locked crate
 tests on native Linux and Windows. Rust harness cases run serially to avoid
 timestamp-named fixture collisions and Unix fork-inherited owner locks; concurrency
-assertions within individual tests remain exercised. The writing checker additionally runs on native
-macOS; only the checker receives that extra matrix entry. Each checker host runs
+assertions within individual tests remain exercised. Team and the writing checker additionally run on native
+macOS. Each checker host runs
 debug and release Rust tests (including retained lexical expectations), formatting,
 and debug/release builds. Python CLI parity runs against both executable profiles
 when the retained oracle is available; otherwise its tests explicitly skip while
@@ -123,8 +123,15 @@ on both platforms even when the selected Rust test matrix excludes Ctx.
 Its home/temp environment is disposable and stripped of runner authentication values;
 unmocked Windows registry access is blocked, so tests must supply explicit registry
 fixtures. File/path operations use the host platform, not an emulated filesystem.
-Team's matrix jobs run full fake-backend contracts on Linux and the required
-lifecycle/output-delivery suite on Windows. SVG's Linux job
+Team's matrix jobs run full fake-backend contracts on Linux/macOS and the required
+lifecycle/output-delivery suite on Windows. All three require unstaggered 100-launch
+Codex and interleaved Codex/Claude bursts, including session isolation and cleanup.
+For exact local artifact checks, `native_ci.py` accepts `PIRA_TEAM_BIN` and
+`PIRA_DEC_BIN`; otherwise it uses source-built `tools/target/debug` executables.
+Explicit unittest names after `native_ci.py` select focused diagnostics after the
+normal platform discovery/imports. With no names, its normal full platform suite still requires both 100-launch cases and
+rejects runtime skips; focused runs do not satisfy that acceptance gate.
+SVG's Linux job
 uses `apt-get download` plus `dpkg-deb --extract` into runner-local temporary storage
 for a DejaVu-only font inventory, without sudo or host-font modification. These CI
 jobs need their normal network dependencies; local helper tests do not. Actual

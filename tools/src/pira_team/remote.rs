@@ -359,7 +359,7 @@ fn write_new(path: &Path, value: &Value) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     sync_dir(path.parent().ok_or("missing record parent")?)
 }
-fn lock(path: &Path) -> Result<File, String> {
+fn lock(path: &Path) -> Result<crate::native::FileLock, String> {
     if fs::symlink_metadata(path).is_ok() {
         existing(path, false)?;
     }
@@ -373,7 +373,7 @@ fn lock(path: &Path) -> Result<File, String> {
     let file = options.open(path).map_err(|e| e.to_string())?;
     file.try_lock()
         .map_err(|_| "remote request has a live owner; retry reconciliation")?;
-    Ok(file)
+    Ok(crate::native::FileLock(file))
 }
 fn strings(value: &Value) -> Result<Vec<String>, String> {
     let array = value

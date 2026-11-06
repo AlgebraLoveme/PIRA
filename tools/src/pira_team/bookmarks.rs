@@ -293,6 +293,30 @@ pub fn assign(root: &Path, reference: &str, label: &str) -> Result<Value, String
     )
 }
 
+/// Check index integrity without locking, creating files, or exposing labels.
+pub(super) fn validate_cleanup(root: &Path) -> Result<(), String> {
+    load(root).map(|_| ())
+}
+
+/// Hold the index across the admission fence, then prune only retired run IDs.
+/// A racing assignment rechecks its target under this same lock.
+pub(super) fn retire(
+    root: &Path,
+    ids: &[String],
+    fence: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let _lock = lock(root)?;
+    let mut index = load(root)?;
+    fence()?;
+    let before = index.scoped.len() + index.legacy.len();
+    index.scoped.retain(|_, id| !ids.contains(id));
+    index.legacy.retain(|_, id| !ids.contains(id));
+    if before != index.scoped.len() + index.legacy.len() {
+        persist(root, &index)?;
+    }
+    Ok(())
+}
+
 fn remove(root: &Path, label: &str) -> Result<Value, String> {
     let session = crate::profile::caller_session()?;
     validate_label(label)?;
