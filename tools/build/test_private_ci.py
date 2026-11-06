@@ -761,6 +761,15 @@ class PrivateCITests(unittest.TestCase):
         self.assertEqual(workflow.count(f'github.event.repository.id == {ci.PUBLIC_VALIDATION_ID}'), 3)
         self.assertNotIn(str(self.root), data['SNAPSHOT_PROVENANCE.json'].decode())
 
+    def test_always_diagnostics_require_verified_hashes(self):
+        workflow = ci.verify(self.stage())[ci.WORKFLOW].decode()
+        self.assertEqual(workflow.count('id: snapshot'), 3)
+        for name in ('Build fake-backend test binaries',
+                     'Native fake-backend contracts including mixed 100-launch parity'):
+            step = workflow.split('- name: ' + name, 1)[1].split('\n      - name:', 1)[0]
+            self.assertIn("if: always() && !cancelled() && steps.snapshot.outcome == 'success' "
+                          "&& matrix.crate == 'pira_team'", step)
+
     def test_public_stage_rejects_dirty_and_untracked_before_network(self):
         for name in ('tools/src/pira_ctx/lib.rs', 'untracked.txt'):
             with self.subTest(name=name):

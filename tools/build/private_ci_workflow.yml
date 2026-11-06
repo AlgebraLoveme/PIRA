@@ -22,6 +22,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify snapshot hashes
+        id: snapshot
         shell: bash
         run: sha256sum --check SOURCE_SHA256SUMS
       - name: Toolchain prerequisites
@@ -129,10 +130,10 @@ jobs:
                   raise SystemExit('Required current native checks missing, skipped or unsuccessful')
           PY_NATIVE
       - name: Build fake-backend test binaries
-        if: always() && !cancelled() && matrix.crate == 'pira_team'
+        if: always() && !cancelled() && steps.snapshot.outcome == 'success' && matrix.crate == 'pira_team'
         run: cargo build --locked --manifest-path tools/Cargo.toml -p pira_team -p pira_dec -p pira_ctx
       - name: Native fake-backend contracts including mixed 100-launch parity
-        if: always() && !cancelled() && matrix.crate == 'pira_team'
+        if: always() && !cancelled() && steps.snapshot.outcome == 'success' && matrix.crate == 'pira_team'
         run: python -B tools/crates/pira_team/tests/native_ci.py
 
   setup:
@@ -150,6 +151,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify snapshot hashes
+        id: snapshot
         shell: bash
         run: sha256sum --check SOURCE_SHA256SUMS
       - name: Build source Ctx for required native migration regression
@@ -209,6 +211,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify snapshot hashes
+        id: snapshot
         shell: bash
         run: sha256sum --check SOURCE_SHA256SUMS
       - name: Provision hash-pinned Codex 0.161.0 in runner-local storage
