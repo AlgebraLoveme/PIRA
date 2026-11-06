@@ -1,10 +1,11 @@
-name: Private PIRA snapshot tests
-on: [push]
+name: PIRA native snapshot tests
+on:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   test:
-    if: github.event.repository.private == true
+    if: @DESTINATION_GUARD@
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +136,7 @@ jobs:
         run: python -B tools/crates/pira_team/tests/native_ci.py
 
   setup:
-    if: github.event.repository.private == true
+    if: @DESTINATION_GUARD@
     strategy:
       fail-fast: false
       matrix:
@@ -194,7 +195,7 @@ jobs:
                   raise SystemExit(1)
           PY
   native_relocation:
-    if: github.event.repository.private == true
+    if: @DESTINATION_GUARD@
     strategy:
       fail-fast: false
       matrix:

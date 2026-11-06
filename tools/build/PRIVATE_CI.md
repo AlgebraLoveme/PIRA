@@ -1,85 +1,111 @@
-# Private native CI snapshots
+# Manual native CI snapshots
 
+Cloud standard-hosted validation is the normal route: native Linux and Windows,
+plus the existing macOS Team/writing-checker checks. Use focused selected-tool
+snapshots while iterating; retain full required platform/x86-64 and reproducibility
+coverage for final release acceptance. This is not a local-first or Windows-only
+policy. The historical filename `private_ci.py` remains for compatibility.
 
-Requires Python 3.11+ and Git locally; publishing additionally requires authenticated
-`gh` and Git HTTPS access to an **existing private GitHub repository** with Actions
-enabled. No repository is created and no release workflow is changed or invoked.
-The repository must remain private throughout validation; visibility checks cannot
-prevent an administrator from changing visibility concurrently or later.
+Requires Python 3.11+, Git, authenticated `gh` and Git HTTPS access. The supported
+public destination is **AlgebraLoveme/PIRA-validation**, numeric ID **1448640591**.
+The old private repository, ID **1409367001**, is now
+**AlgebraLoveme/PIRA-validation-archive**. It remains private evidence; the helper
+refuses new publication to that identity. Never mirror its commits, snapshots or
+logs into the public repository. A name redirect is not an evidence identity.
 
-Run offline regression tests (temporary fixtures and a local bare remote; no model
-calls, network, installation, or production binary required):
+## Offline checks
 
 ```bash
 python3 -B -m unittest discover -s tools/build -p test_private_ci.py -v
 ```
 
-After source workers finish, stage the current working tree (including uncommitted
-and eligible untracked source changes), then inspect the reported stage directory:
+Tests use synthetic source, mocked APIs and temporary local bare Git remotes; they
+do not dispatch workflows, compile production tools, install packages or use models.
+
+## Public snapshots: current published source only
+
+Finish source edits and commit/push the intended public PIRA changes first, under
+normal review and CI holds. Then use the clean canonical PIRA checkout:
 
 ```bash
-python3 -B tools/build/private_ci.py stage
-# Optional CI subset (repeat --test-tool); default tests all six tools:
-python3 -B tools/build/private_ci.py stage --test-tool pira_ctx --test-tool pira_team
+python3 -B tools/build/private_ci.py stage-public --test-tool pira_ctx --test-tool pira_team
+# Omit --test-tool only when all six tools actually need this validation.
 ```
 
-Staging is local-only and prints JSON including `stage`, `original_head`, dirty
-state/status fingerprint, counts, and tested tools. `--root PATH` selects another
-source checkout. All six workspace members are staged even with a test subset,
-because Cargo workspace resolution and setup tests need shared inputs. The independent
-Linux/Windows setup job always runs, including when Team is excluded from the crate subset.
+The helper requires a clean tracked checkout at the current public PIRA `master`.
+Dirty/untracked files, ignored allowlisted files and unpublished commits fail;
+there is no implicit upload of a working tree. Public source identity/visibility
+is authenticated through GitHub. Every payload Git blob must match the public
+master tree. The exact allowed inventory, source SHA, selected tools, checkout pin
+and generated manual workflow are checked again before publication. Provenance
+contains no local paths or dirty-status data. If public master advances, restage
+rather than silently publishing stale or locally edited inputs.
 
-Only crate manifests, Cargo workspace/lockfile, Rust source, Rust/Python/SVG tests,
-explicit Team runtime policies, policy-mirror test inputs, the SVG font configuration,
-and setup regression dependencies are copied. Hidden/cache/store/auth/profile/debug/
-generated directories, live smoke tests and benchmark artifacts are excluded; there
-is no recursive copy of `tools/`. Team's `help.md`, `help_commands.md` and
-`help_manual.md` are explicitly retained alongside its runtime policies.
-The allowlist lives in `selected()`; maintain it
-when production/test dependencies change. The exact retained Team dependency
-`tools/src/pira_team/tier_fixture.py` is explicitly selected; other runtime Python
-files are not recursively selected. Literal Rust `include!`, `include_str!`
-and `include_bytes!` dependencies must be selected; dynamic includes and arbitrary
-runtime file dependencies are not inferred. Source bytes are copied unchanged.
+Only the existing `selected()` source/test/dependency allowlist is staged; all six
+workspace members remain present for Cargo resolution even with a test subset.
+It excludes stores, credentials, logs, caches, development output and unrelated
+files. Literal Rust includes must resolve inside the snapshot. The SHA-256 manifest
+is integrity evidence, not permission to upload arbitrary files: recomputing it
+does not bypass public-source proof or workflow checks.
 
-`SOURCE_SHA256SUMS` hashes every source and generated metadata/workflow file except
-itself. Staging rereads the source inventory, bytes, HEAD and dirty status to reject
-ordinary concurrent changes. This is not a hostile-filesystem sandbox or signed
-attestation. Freeze source edits while staging. Review the stage before publishing;
-hashes detect corruption, not deliberate edits accompanied by regenerated hashes.
-
-For the actual smoke, explicitly enter the reviewed stage path, private `OWNER/REPO`,
-and an unused branch. This shell block has no personal/repository defaults:
+Inspect the reported stage, then explicitly publish an unused snapshot branch:
 
 ```bash
-printf 'Reviewed stage path: '; read -r STAGE
-printf 'Private OWNER/REPO: '; read -r PRIVATE_REPO
-printf 'New validation branch: '; read -r NEW_BRANCH
-python3 -B tools/build/private_ci.py verify --stage "$STAGE" &&
-python3 -B tools/build/private_ci.py publish --stage "$STAGE" --repo "$PRIVATE_REPO" --branch "$NEW_BRANCH"
-# Read-only follow-up:
-gh run list --repo "$PRIVATE_REPO" --branch "$NEW_BRANCH"
+python3 -B tools/build/private_ci.py verify --stage REVIEWED_STAGE
+python3 -B tools/build/private_ci.py publish-public --stage REVIEWED_STAGE --repo AlgebraLoveme/PIRA-validation --branch validation-UNUSED_NAME
 ```
 
-Publishing rejects malformed/duplicate/traversing manifest entries, symlinks,
-extraneous files, hashes that differ, nonprivate/mismatched destinations, and
-existing branches. It verifies visibility again just before pushing. Git runs in a
-separate disposable repository with hooks disabled and inherited Git repository/index
-overrides removed; neither the source checkout nor reviewed stage is initialized,
-indexed, committed or changed. An empty expected-value push lease prevents a racing
-publisher from replacing an existing branch. No tags, releases or default-branch
-updates are performed. The helper never force-replaces an existing branch.
+Publication creates an independent root commit containing only the verified
+snapshot, never source Git history. It authenticates the pinned public repository
+ID/visibility before work and immediately before pushing, refuses the seed/default
+branch and existing branches, and uses an empty expected-value push lease. Source,
+stage, tags, releases and existing branches are not rewritten. Git ignores inherited
+repository/index overrides and disables hooks. The archive is untouched.
 
-If a push fails, its diagnostic includes the intended commit and exact read-only
-`git ls-remote` recovery command. If the remote contains that commit, inspect Actions
-instead of republishing. If absent, retry the unchanged stage with the same command.
-If another commit exists, choose a new branch; do not delete/reset the existing one.
-The stage remains reusable even after partial publication. Other pre-push failures
-leave the stage unchanged too; fix authentication/visibility/input errors and retry.
-Temporary publishing checkouts are automatically removed; staged snapshots remain
-for review until the maintainer explicitly removes them.
+## Dispatch once, separately, only with approval
 
-The staged push workflow reuses the exact checkout pin from the source release
+Every generated workflow is **workflow_dispatch only**: neither seed nor snapshot
+pushes start jobs. The clean seed contains reviewed tooling/docs and the manual
+workflow, not source snapshots; dispatching its default branch fails the initial
+manifest check before compiling. Choose the reviewed snapshot branch instead.
+The workflow's public jobs also require the dedicated name and numeric ID.
+
+First inspect runs for that exact branch/source and reuse already sufficient
+results. After approval, dispatch **once** for the intended subset:
+
+```bash
+gh run list --repo AlgebraLoveme/PIRA-validation --branch validation-UNUSED_NAME
+gh workflow run private-pira-tests.yml --repo AlgebraLoveme/PIRA-validation --ref validation-UNUSED_NAME
+```
+
+Do not dispatch while setup/user holds apply. A push is not a request for another
+run. For a genuine failed job on unchanged source, inspect its evidence and rerun
+only failed jobs after approval; do not repeat an entire successful matrix. Changed
+source requires a new reviewed snapshot, not reuse of stale acceptance. Focused
+Team test names are diagnostic evidence, not a replacement for the full required
+100-launch acceptance suite. Final reproducibility/release builds remain in PIRA's
+separate release workflow, unchanged by this helper.
+
+If a push response is lost, the error reports the intended commit and exact
+read-only `git ls-remote` recovery command. If that commit exists, do not republish
+or dispatch twice. If absent, retry unchanged publication; if another commit exists,
+choose a new branch. Never delete/force a branch. No automatic retry or dispatch is
+performed, and reviewed stages remain available after errors.
+
+## Private compatibility
+
+`stage` still stages allowlisted working-tree bytes, including uncommitted inputs,
+for local review or an explicitly chosen **private** compatibility destination.
+`publish --stage PATH --repo OWNER/REPO --branch NEW_BRANCH` still fails closed on
+nonprivate/mismatched destinations and now rejects the historical archive ID.
+These snapshots are also manual-only. Never pass a private snapshot to the public
+route; public publication rejects its provenance and nonpublic bytes. Public
+staging/publication intentionally require authenticated read-only API checks;
+`stage` and `verify` themselves remain local-only.
+
+## Retained native coverage
+
+The staged manual workflow reuses the exact checkout pin from the source release
 workflow, disables credential persistence, checks hashes, and runs locked crate
 tests on native Linux and Windows. Rust harness cases run serially to avoid
 timestamp-named fixture collisions and Unix fork-inherited owner locks; concurrency
@@ -135,7 +161,7 @@ SVG's Linux job
 uses `apt-get download` plus `dpkg-deb --extract` into runner-local temporary storage
 for a DejaVu-only font inventory, without sudo or host-font modification. These CI
 jobs need their normal network dependencies; local helper tests do not. Actual
-private Actions execution is a separate maintainer-approved smoke, not part of the
+Actions execution is a separate maintainer-approved smoke, not part of the
 offline test suite.
 
 The setup snapshot explicitly selects `setup_pira.py`, `setup_pira_tools.py`,
@@ -186,7 +212,7 @@ the job. Runtime checks use a disposable allowlisted HOME/CODEX_HOME/environment
 Windows exposes a task-local `codex.exe` copy beside the intact official layout,
 while Linux already has the `codex` entrypoint. No installation, login or model
 calls occur. Local helper regressions mock executables; actual native host passes
-require the separate private Actions run.
+require the separate approved Actions run.
 
 ## Pinned historical native relocation job
 
@@ -241,7 +267,7 @@ separately. A passing job does not change the production platform/format allowli
 or migrate user data; `verified_fixture_only` describes this test boundary.
 
 Synthetic command output, result.json, repair/failure journals and native.stderr
-are retained under `RUNNER_TEMP/pira-relocation-evidence` and replayed in private
+are retained under `RUNNER_TEMP/pira-relocation-evidence` and replayed in
 Actions logs (JSON-escaped lines), including on failure. No home/auth files or
 rollout records are uploaded. Runner-local files expire with the runner; the job
 logs preserve these diagnostics. Forced job cancellation can prevent final replay.

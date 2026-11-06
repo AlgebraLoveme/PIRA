@@ -1,5 +1,6 @@
 """Offline contract tests: synthetic source trees, mocked visibility, local bare Git."""
 import io
+import base64
 import json
 import tarfile
 import zipfile
@@ -716,6 +717,168 @@ class PrivateCITests(unittest.TestCase):
 
     def test_branch_race_refuses_overwrite(self):
         self.publication(race=True)
+
+    def public_source_fixture(self):
+        template = Path(ci.__file__).with_name('private_ci_workflow.yml').read_bytes()
+        return {'sha': ci.git(self.root, 'rev-parse', 'HEAD').stdout.decode().strip(),
+                'template': template,
+                'blobs': {name: ci.git_blob(content) for name, content in self.files.items()}}
+
+    def public_release_fixture(self):
+        return {'content': base64.b64encode(
+            self.files['.github/workflows/build-pira-tool-bundles.yml']).decode()}
+
+    def public_stage(self, name='public-stage'):
+        destination = self.base / name
+        destination.mkdir()
+        source = self.public_source_fixture()
+        with patch.object(ci, 'public_source', return_value=source), \
+                patch.object(ci, 'github_json', return_value=self.public_release_fixture()), \
+                patch.object(ci.tempfile, 'mkdtemp', return_value=str(destination)):
+            ci.stage_public(self.root, ('pira_ctx',))
+        return destination, source
+
+    def rehash(self, stage):
+        paths = sorted(p for p in stage.rglob('*') if p.is_file() and p.name != 'SOURCE_SHA256SUMS')
+        (stage / 'SOURCE_SHA256SUMS').write_text(''.join(
+            f'{ci.digest(p.read_bytes())}  {p.relative_to(stage).as_posix()}\n' for p in paths))
+
+    def public_destination(self):
+        return {'id': ci.PUBLIC_VALIDATION_ID, 'private': False, 'visibility': 'public',
+                'full_name': ci.PUBLIC_VALIDATION, 'archived': False, 'default_branch': 'main'}
+
+    def test_public_stage_is_clean_proven_manual_only_and_path_free(self):
+        stage, source = self.public_stage()
+        with patch.object(ci, 'github_json', return_value=self.public_release_fixture()):
+            data = ci.verify_public(stage, source)
+        self.assertEqual(json.loads(data['SNAPSHOT_PROVENANCE.json']), {
+            'source_repository': ci.PUBLIC_SOURCE, 'source_sha': source['sha'],
+            'tested_tools': ['pira_ctx']})
+        workflow = data[ci.WORKFLOW].decode()
+        self.assertIn('on:\n  workflow_dispatch:\npermissions:', workflow)
+        self.assertNotIn('on: [push]', workflow)
+        self.assertNotIn('@DESTINATION_GUARD@', workflow)
+        self.assertEqual(workflow.count(f'github.event.repository.id == {ci.PUBLIC_VALIDATION_ID}'), 3)
+        self.assertNotIn(str(self.root), data['SNAPSHOT_PROVENANCE.json'].decode())
+
+    def test_public_stage_rejects_dirty_and_untracked_before_network(self):
+        for name in ('tools/src/pira_ctx/lib.rs', 'untracked.txt'):
+            with self.subTest(name=name):
+                original = (self.root / name).read_bytes() if (self.root / name).exists() else None
+                self.write(name, b'private local change')
+                with patch.object(ci, 'public_source') as network:
+                    with self.assertRaisesRegex(ValueError, 'clean committed'):
+                        ci.stage_public(self.root)
+                    network.assert_not_called()
+                if original is None:
+                    (self.root / name).unlink()
+                else:
+                    self.write(name, original)
+
+    def test_public_stage_rejects_ignored_allowlisted_input(self):
+        name = 'tools/crates/pira_ctx/tests/private.py'
+        (self.root / '.git/info').mkdir()
+        (self.root / '.git/info/exclude').write_text(name + '\n')
+        self.write(name, b'private ignored data')
+        self.assertFalse(ci.git(self.root, 'status', '--porcelain').stdout)
+        with patch.object(ci, 'public_source', return_value=self.public_source_fixture()):
+            with self.assertRaisesRegex(ValueError, 'ignored or untracked'):
+                ci.stage_public(self.root)
+
+    def test_public_stage_rejects_unpublished_commit(self):
+        source = self.public_source_fixture()
+        source['sha'] = 'a' * 40
+        with patch.object(ci, 'public_source', return_value=source):
+            with self.assertRaisesRegex(ValueError, 'current published'):
+                ci.stage_public(self.root)
+
+    def test_public_publish_rejects_rehashed_private_inputs_and_forged_metadata(self):
+        changes = {
+            'changed-source': ('tools/src/pira_ctx/lib.rs', b'private changed source'),
+            'new-private-test': ('tools/crates/pira_ctx/tests/private.py', b'private test'),
+            'extra-notes': ('private-notes.txt', b'private notes'),
+            'push-workflow': (ci.WORKFLOW, b'on: [push]\n'),
+            'private-provenance': ('SNAPSHOT_PROVENANCE.json', b'{"private_path":"not-public"}'),
+            'non-object-provenance': ('SNAPSHOT_PROVENANCE.json', b'[]'),
+        }
+        for name, (path, content) in changes.items():
+            with self.subTest(name=name):
+                stage, source = self.public_stage(name)
+                (stage / path).write_bytes(content)
+                self.rehash(stage)
+                with patch.object(ci, 'public_source', return_value=source), \
+                        patch.object(ci, 'github_json', return_value=self.public_release_fixture()), \
+                        patch.object(ci, 'require_public_target', return_value=self.public_destination()), \
+                        patch.object(ci, 'git') as git:
+                    with self.assertRaises(ValueError):
+                        ci.publish_public(stage, ci.PUBLIC_VALIDATION, 'validation/new')
+                    git.assert_not_called()
+
+    def test_public_source_identity_visibility_and_manual_template_fail_closed(self):
+        valid = {'id': ci.PUBLIC_SOURCE_ID, 'private': False, 'visibility': 'public',
+                 'full_name': ci.PUBLIC_SOURCE}
+        for field, value in [('id', 1), ('private', True), ('full_name', 'private/source')]:
+            with self.subTest(field=field), patch.object(ci, 'github_json', return_value={**valid, field:value}):
+                with self.assertRaisesRegex(ValueError, 'source identity'):
+                    ci.public_source()
+        template = b'name: old\non: [push]\n'
+        for tree in [{'truncated': True, 'tree': []}, {'truncated': False, 'tree': [
+                {'path': 'tools/build/private_ci_workflow.yml', 'sha': ci.git_blob(template),
+                 'mode':'100644', 'type':'blob'}]}]:
+            with self.subTest(tree=tree), patch.object(ci, 'github_json', side_effect=[valid,
+                    {'object':{'sha':'a'*40}}, tree,
+                    {'encoding':'base64', 'content':base64.b64encode(template).decode()}]):
+                with self.assertRaisesRegex(ValueError, 'incomplete|manual-only'):
+                    ci.public_source()
+
+    def test_public_destination_and_default_branch_are_protected(self):
+        valid = self.public_destination()
+        for field, value in [('id', ci.PRIVATE_ARCHIVE_ID), ('private', True),
+                             ('full_name', 'other/repo'), ('archived', True)]:
+            with self.subTest(field=field), patch.object(ci, 'github_json', return_value={**valid, field:value}):
+                with self.assertRaisesRegex(ValueError, 'destination identity'):
+                    ci.require_public_target(ci.PUBLIC_VALIDATION)
+        with self.assertRaisesRegex(ValueError, 'restricted'):
+            ci.require_public_target('other/repo')
+        with patch.object(ci, 'require_public_target', return_value=valid), patch.object(ci, 'verify_public') as verify:
+            with self.assertRaisesRegex(ValueError, 'default seed branch'):
+                ci.publish_public(self.base, ci.PUBLIC_VALIDATION, 'main')
+            verify.assert_not_called()
+
+    def test_private_archive_is_never_a_publication_destination(self):
+        info = {'private':True, 'id':ci.PRIVATE_ARCHIVE_ID,
+                'full_name':'AlgebraLoveme/PIRA-validation-archive'}
+        with patch.object(ci.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(info))):
+            with self.assertRaisesRegex(ValueError, 'evidence-only'):
+                ci.require_private(info['full_name'])
+
+    def test_public_publish_uses_new_root_commit_and_rechecks_identity(self):
+        stage, source = self.public_stage()
+        remote = self.base / 'public.git'
+        real_git = ci.git
+        real_git(self.base, 'init', '--bare', '--template=', str(remote))
+        def local_git(root, *args):
+            args = tuple(str(remote) if a == f'https://github.com/{ci.PUBLIC_VALIDATION}.git' else a for a in args)
+            return real_git(root, *args)
+        with patch.object(ci, 'public_source', return_value=source), \
+                patch.object(ci, 'github_json', return_value=self.public_release_fixture()), \
+                patch.object(ci, 'require_public_target', return_value=self.public_destination()) as target, \
+                patch.object(ci, 'git', side_effect=local_git):
+            result = ci.publish_public(stage, ci.PUBLIC_VALIDATION, 'validation/new')
+            self.assertEqual(real_git(remote, 'rev-list', '--count', result['commit']).stdout.strip(), b'1')
+            self.assertGreaterEqual(target.call_count, 3)
+            with self.assertRaisesRegex(ValueError, 'already exists'):
+                ci.publish_public(stage, ci.PUBLIC_VALIDATION, 'validation/new')
+        with patch.object(ci, 'public_source', return_value=source), \
+                patch.object(ci, 'github_json', return_value=self.public_release_fixture()), \
+                patch.object(ci, 'require_public_target', side_effect=[self.public_destination(),
+                    self.public_destination(), ValueError('destination identity changed')]), \
+                patch.object(ci, 'git', side_effect=local_git):
+            with self.assertRaisesRegex(ValueError, 'identity changed'):
+                ci.publish_public(stage, ci.PUBLIC_VALIDATION, 'validation/other')
+        self.assertFalse(real_git(self.base, 'ls-remote', '--heads', str(remote),
+                                  'refs/heads/validation/other').stdout)
 
 
 class NativeCodexProvisionTests(unittest.TestCase):

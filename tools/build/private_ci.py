@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Stage, verify, or publish a private native CI snapshot (Python 3.11+)."""
+"""Stage or publish manual native CI snapshots, with explicit public-source proof."""
 from __future__ import annotations
 
 import argparse
+import base64
+from collections.abc import Callable
 from contextlib import ExitStack
 import hashlib
 import json
@@ -20,6 +22,12 @@ import tempfile
 import sys
 
 TOOLS = ("pira_ctx", "pira_dec", "pira_nav", "pira_svg_check", "pira_team", "pira_write_check")
+PUBLIC_SOURCE = "AlgebraLoveme/PIRA"
+PUBLIC_SOURCE_ID = 1193634683
+PUBLIC_VALIDATION = "AlgebraLoveme/PIRA-validation"
+PUBLIC_VALIDATION_ID = 1448640591
+PRIVATE_ARCHIVE_ID = 1409367001
+WORKFLOW = ".github/workflows/private-pira-tests.yml"
 POLICIES = ("docs/main.md", "docs/coordinator.md", "docs/implementation.md", "docs/review.md",
             "docs/assignment_contract.md", "docs/continue_task.md", "docs/edit_authority.md", "docs/fix_task.md",
             "docs/handoff.md", "docs/help.md", "docs/help_commands.md", "docs/help_manual.md",
@@ -322,7 +330,8 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
     if len(pins) != 1:
         raise ValueError("expected one pinned checkout revision in release workflow")
     workflow = Path(__file__).with_name("private_ci_workflow.yml").read_text().replace(
-        "@CHECKOUT@", pins.pop())
+        "@CHECKOUT@", pins.pop()).replace(
+        "@DESTINATION_GUARD@", "github.event.repository.private == true")
 
     def dirty() -> bytes:
         return git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
@@ -375,6 +384,120 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
         target.write_bytes(content)
     verify(destination)
     return {"stage": str(destination), **provenance, "total_files": len(data)}
+
+
+def github_json(path: str) -> dict:
+    result = subprocess.run(['gh', 'api', '--hostname', 'github.com', path],
+                            check=True, stdout=subprocess.PIPE, text=True)
+    return json.loads(result.stdout)
+
+
+def git_blob(content: bytes) -> str:
+    return hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()
+
+
+def public_source() -> dict:
+    """Authenticate the current public master tree, never a local/private commit."""
+    info = github_json(f'repos/{PUBLIC_SOURCE}')
+    if (info.get('id') != PUBLIC_SOURCE_ID or info.get('private') is not False
+            or info.get('visibility') != 'public' or info.get('full_name') != PUBLIC_SOURCE):
+        raise ValueError('public PIRA source identity/visibility mismatch')
+    ref = github_json(f'repos/{PUBLIC_SOURCE}/git/ref/heads/master')
+    sha = ref.get('object', {}).get('sha', '')
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise ValueError('invalid public master SHA')
+    tree = github_json(f'repos/{PUBLIC_SOURCE}/git/trees/{sha}?recursive=1')
+    if tree.get('truncated') is not False or not isinstance(tree.get('tree'), list):
+        raise ValueError('incomplete public source tree')
+    blobs = {item['path']: item['sha'] for item in tree['tree']
+             if item.get('type') == 'blob' and item.get('mode') in ('100644', '100755')}
+    template_sha = blobs['tools/build/private_ci_workflow.yml']
+    blob = github_json(f'repos/{PUBLIC_SOURCE}/git/blobs/{template_sha}')
+    if blob.get('encoding') != 'base64':
+        raise ValueError('invalid public workflow encoding')
+    template = base64.b64decode(blob['content'])
+    if git_blob(template) != template_sha:
+        raise ValueError('public workflow blob mismatch')
+    if not re.search(rb'^on:\n  workflow_dispatch:\npermissions:', template, re.MULTILINE):
+        raise ValueError('published validation template must be manual-only')
+    return {'sha': sha, 'blobs': blobs, 'template': template}
+
+
+def public_workflow(template: bytes, tools: list[str], checkout: str) -> bytes:
+    extra = ''
+    for tool in ('pira_write_check', 'pira_team'):
+        if tool in tools:
+            extra += ('\n' if extra else '        include:\n') + (
+                f'          - os: macos-latest\n            crate: {tool}')
+    guard = (f"github.repository == '{PUBLIC_VALIDATION}' && "
+             f"github.event.repository.id == {PUBLIC_VALIDATION_ID} && "
+             "github.event.repository.private == false")
+    return (template.decode().replace('@CHECKOUT@', checkout)
+            .replace('@TEST_TOOLS@', json.dumps(tools)).replace('@TEST_EXTRA@', extra)
+            .replace('@DESTINATION_GUARD@', guard)).encode()
+
+
+def public_provenance(sha: str, tools: list[str]) -> bytes:
+    return (json.dumps({'source_repository': PUBLIC_SOURCE, 'source_sha': sha,
+                        'tested_tools': tools}, indent=2, sort_keys=True) + '\n').encode()
+
+
+def verify_public(stage: Path, source: dict | None = None) -> dict[str, bytes]:
+    """Require every payload byte to be already public and workflow to be canonical."""
+    data = verify(stage)
+    source = source if source is not None else public_source()
+    provenance = json.loads(data['SNAPSHOT_PROVENANCE.json'])
+    if not isinstance(provenance, dict):
+        raise ValueError('expected public provenance object')
+    tools = provenance.get('tested_tools')
+    if (not isinstance(tools, list) or not tools or any(t not in TOOLS for t in tools)
+            or len(set(tools)) != len(tools)
+            or data['SNAPSHOT_PROVENANCE.json'] != public_provenance(source['sha'], tools)):
+        raise ValueError('public provenance must identify current public master and selected tools only')
+    payload = {path.as_posix() for path in selected(stage)}
+    generated = {WORKFLOW, 'SNAPSHOT_PROVENANCE.json', '.gitattributes', 'SOURCE_SHA256SUMS'}
+    if set(data) != payload | generated or data['.gitattributes'] != b'* -text\n':
+        raise ValueError('unexpected public snapshot inventory')
+    for name in payload:
+        if source['blobs'].get(name) != git_blob(data[name]):
+            raise ValueError(f'payload is not the published PIRA source: {name}')
+    # The checkout pin is itself from the authenticated public release workflow.
+    release = github_json(f"repos/{PUBLIC_SOURCE}/contents/.github/workflows/build-pira-tool-bundles.yml?ref={source['sha']}")
+    release_bytes = base64.b64decode(release['content'])
+    if git_blob(release_bytes) != source['blobs'].get('.github/workflows/build-pira-tool-bundles.yml'):
+        raise ValueError('public release workflow blob mismatch')
+    pins = set(re.findall(rb'actions/checkout@([0-9a-f]{40})', release_bytes))
+    if len(pins) != 1 or data[WORKFLOW] != public_workflow(source['template'], tools, pins.pop().decode()):
+        raise ValueError('public workflow differs from the manual-only public template')
+    return data
+
+
+def stage_public(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
+    """Stage only clean tracked source at the current public PIRA master commit."""
+    root = root.resolve()
+    if git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all').stdout:
+        raise ValueError('public staging requires a clean committed checkout; no dirty/untracked inputs')
+    source = public_source()
+    if git(root, 'rev-parse', 'HEAD').stdout.decode().strip() != source['sha']:
+        raise ValueError('public staging requires current published PIRA master')
+    tracked = set(git(root, 'ls-files', '-z').stdout.decode().split('\0'))
+    if not {p.as_posix() for p in selected(root)} <= tracked:
+        raise ValueError('public staging rejects ignored or untracked payload files')
+    result = stage(root, test_tools)
+    destination = Path(result['stage'])
+    data = verify(destination)
+    data.pop('SOURCE_SHA256SUMS')
+    tools = list(test_tools)
+    pins = set(re.findall(r'actions/checkout@([0-9a-f]{40})',
+                         (root / '.github/workflows/build-pira-tool-bundles.yml').read_text()))
+    data[WORKFLOW] = public_workflow(source['template'], tools, pins.pop())
+    data['SNAPSHOT_PROVENANCE.json'] = public_provenance(source['sha'], tools)
+    for name in (WORKFLOW, 'SNAPSHOT_PROVENANCE.json'):
+        (destination / name).write_bytes(data[name])
+    (destination / 'SOURCE_SHA256SUMS').write_text(
+        ''.join(f'{digest(content)}  {name}\n' for name, content in sorted(data.items())))
+    verify_public(destination, source)
+    return {'stage': str(destination), 'source_sha': source['sha'], 'tested_tools': tools}
 
 
 def git(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -437,15 +560,42 @@ def require_private(repo: str) -> None:
     info = json.loads(result.stdout)
     if info.get('private') is not True or info.get('full_name', '').lower() != repo.lower():
         raise ValueError('refusing non-private or mismatched destination')
+    if info.get('id') == PRIVATE_ARCHIVE_ID:
+        raise ValueError('historical validation archive is evidence-only; never publish new snapshots there')
+
+
+def require_public_target(repo: str) -> dict:
+    if repo != PUBLIC_VALIDATION:
+        raise ValueError('public publication is restricted to the dedicated PIRA-validation repository')
+    info = github_json(f'repos/{repo}')
+    if (info.get('id') != PUBLIC_VALIDATION_ID or info.get('private') is not False
+            or info.get('visibility') != 'public' or info.get('full_name') != repo
+            or info.get('archived') is not False):
+        raise ValueError('public validation destination identity/visibility mismatch')
+    return info
 
 def publish(stage: Path, repo: str, branch: str) -> dict:
-    """Publish verified bytes to a new private branch, without modifying the stage."""
+    """Publish to a private compatibility destination; never the historical archive."""
+    return publish_bytes(verify(stage), repo, branch, stage, lambda: require_private(repo))
+
+
+def publish_public(stage: Path, repo: str, branch: str) -> dict:
+    """Publish authenticated public source without dispatching or replacing a branch."""
+    def destination():
+        info = require_public_target(repo)
+        if branch == info.get('default_branch'):
+            raise ValueError('snapshot publication cannot replace the default seed branch')
+    destination()
+    return publish_bytes(verify_public(stage), repo, branch, stage, destination)
+
+
+def publish_bytes(data: dict[str, bytes], repo: str, branch: str, stage: Path,
+                  destination: Callable[[], object]) -> dict:
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*', repo):
         raise ValueError('expected explicit OWNER/REPO on github.com')
     if branch.startswith('-') or branch == 'HEAD':
         raise ValueError('expected a new branch name')
-    data = verify(stage)
-    require_private(repo)
+    destination()
     remote = f'https://github.com/{repo}.git'
     ref = f'refs/heads/{branch}'
     # PIRA: publication is GitHub-only; supporting other hosts requires explicit visibility APIs.
@@ -460,11 +610,11 @@ def publish(stage: Path, repo: str, branch: str) -> dict:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
         git(work, 'add', '--force', '--', '.')
-        git(work, '-c', 'user.name=Private CI snapshot', '-c',
+        git(work, '-c', 'user.name=PIRA CI snapshot', '-c',
             'user.email=private-ci@users.noreply.github.com', '-c', 'commit.gpgSign=false',
-            'commit', '-m', 'Validate private native-platform snapshot')
+            'commit', '-m', 'Prepare manual native-platform validation snapshot')
         commit = git(work, 'rev-parse', 'HEAD').stdout.decode().strip()
-        require_private(repo)
+        destination()
         try:
             # Empty lease requires nonexistence even if another publisher won the race.
             git(work, 'push', f'--force-with-lease={ref}:', remote, f'HEAD:{ref}')
@@ -473,7 +623,7 @@ def publish(stage: Path, repo: str, branch: str) -> dict:
             raise RuntimeError(
                 f'Publish failed or outcome is uncertain; stage is unchanged: {stage}. '
                 f'Expected commit {commit}. Inspect `{inspect_command}` '
-                'and GitHub Actions. If that commit exists, do not republish; if absent, '
+                'and GitHub Actions. If that commit exists, do not republish; dispatch is separate. If absent, '
                 'retry the same command; if a different commit exists, choose a new branch. '
                 f'Never delete/force an existing branch. Git: {(error.stderr or b"").decode(errors="replace")}') from error
     return {'repo': repo, 'branch': branch, 'commit': commit}
@@ -539,12 +689,19 @@ def main() -> None:
     staging.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
     staging.add_argument('--test-tool', choices=TOOLS, action='append',
                          help='repeat for a CI subset; all workspace sources are still staged')
+    public_staging = commands.add_parser('stage-public', help='stage clean current public PIRA master only')
+    public_staging.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[2])
+    public_staging.add_argument('--test-tool', choices=TOOLS, action='append')
     checking = commands.add_parser('verify', help='check exact inventory and hashes; no network')
     checking.add_argument('--stage', type=Path, required=True)
     publishing = commands.add_parser('publish', help='create a new branch in an explicit private repo')
     publishing.add_argument('--stage', type=Path, required=True)
     publishing.add_argument('--repo', required=True)
     publishing.add_argument('--branch', required=True)
+    public_publishing = commands.add_parser('publish-public', help='publish a new manual-only snapshot; no dispatch')
+    public_publishing.add_argument('--stage', type=Path, required=True)
+    public_publishing.add_argument('--repo', required=True)
+    public_publishing.add_argument('--branch', required=True)
     provisioning = commands.add_parser('provision-codex', help='download hash-pinned CI Codex into a new task-local directory')
     provisioning.add_argument('--directory', type=Path, required=True)
     native = commands.add_parser('native-relocation', help='run required isolated completed-turn fixture')
@@ -554,6 +711,10 @@ def main() -> None:
     try:
         if args.command == 'stage':
             result = stage(args.root, tuple(dict.fromkeys(args.test_tool or TOOLS)))
+        elif args.command == 'stage-public':
+            result = stage_public(args.root, tuple(dict.fromkeys(args.test_tool or TOOLS)))
+        elif args.command == 'publish-public':
+            result = publish_public(args.stage, args.repo, args.branch)
         elif args.command == 'provision-codex':
             result = {'codex': str(provision_codex(args.directory))}
         elif args.command == 'native-relocation':
