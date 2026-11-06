@@ -33,13 +33,19 @@ python3 -B tools/build/private_ci.py stage-public --test-tool pira_ctx --test-to
 ```
 
 The helper requires a clean tracked checkout at the current public PIRA `master`.
-Dirty/untracked files, ignored allowlisted files and unpublished commits fail;
+Dirty/untracked files, ignored required allowlisted files and unpublished commits fail;
 there is no implicit upload of a working tree. Public source identity/visibility
 is authenticated through GitHub. Every payload Git blob must match the public
 master tree. The exact allowed inventory, source SHA, selected tools, checkout pin
 and generated manual workflow are checked again before publication. Provenance
 contains no local paths or dirty-status data. If public master advances, restage
 rather than silently publishing stale or locally edited inputs.
+
+The two optional retained writing-checker oracle inputs (`check.py` and its
+development lexicon) are omitted without reading them when untracked. The public
+Rust lexical fixtures remain required; existing optional Python parity tests may
+explicitly skip without that oracle. Required ignored inputs still fail. This does
+not authorize adding private development files to public source or publication.
 
 Only the existing `selected()` source/test/dependency allowlist is staged; all six
 workspace members remain present for Cargo resolution even with a test subset.

@@ -28,6 +28,7 @@ PUBLIC_VALIDATION = "AlgebraLoveme/PIRA-validation"
 PUBLIC_VALIDATION_ID = 1448640591
 PRIVATE_ARCHIVE_ID = 1409367001
 WORKFLOW = ".github/workflows/private-pira-tests.yml"
+OPTIONAL_ORACLE = ("tools/dev/pira_write_check/check.py", "tools/dev/pira_write_check/lexicon.json")
 POLICIES = ("docs/main.md", "docs/coordinator.md", "docs/implementation.md", "docs/review.md",
             "docs/assignment_contract.md", "docs/continue_task.md", "docs/edit_authority.md", "docs/fix_task.md",
             "docs/handoff.md", "docs/help.md", "docs/help_commands.md", "docs/help_manual.md",
@@ -314,7 +315,7 @@ def selected(root: Path) -> list[Path]:
         "tools/dev/pira_write_check/test_benchmark.py",
     ))
     # Optional retained development oracle; Rust lexical fixtures are self-contained.
-    for name in ("tools/dev/pira_write_check/check.py", "tools/dev/pira_write_check/lexicon.json"):
+    for name in OPTIONAL_ORACLE:
         path = root / name
         if path.exists() or path.is_symlink():
             paths.append(Path(name))
@@ -322,9 +323,11 @@ def selected(root: Path) -> list[Path]:
     paths.extend(Path(name) for name in NATIVE_RELOCATION_INPUTS)
     return sorted(set(paths))
 
-def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
+def stage(root: Path, test_tools: tuple[str, ...] = TOOLS,
+          select: Callable[[Path], list[Path]] | None = None) -> dict:
     """Copy allowlisted working-tree bytes to a fresh temporary snapshot."""
     root = root.resolve()
+    select = select if select is not None else selected
     release = root / ".github/workflows/build-pira-tool-bundles.yml"
     pins = set(re.findall(r"actions/checkout@([0-9a-f]{40})", release.read_text()))
     if len(pins) != 1:
@@ -343,7 +346,7 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
         raise ValueError("select at least one known test tool")
     original_head = head()
     original_status = dirty()
-    paths = selected(root)
+    paths = select(root)
     data = {}
     for path in paths:
         if any(part.is_symlink() for part in (root / path, *(root / path).parents)):
@@ -359,7 +362,7 @@ def stage(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
             if relative not in data:
                 raise RuntimeError(f"unselected include dependency: {name}: {dependency}")
     # Catch concurrent changes, including newly added/removed eligible files.
-    if paths != selected(root) or original_head != head() or original_status != dirty() or any(
+    if paths != select(root) or original_head != head() or original_status != dirty() or any(
             (root / name).read_bytes() != content for name, content in data.items()):
         raise RuntimeError("source changed during staging; rerun after workers finish")
     counts = {tool: sum(f"/{tool}/" in name for name in data) for tool in TOOLS}
@@ -481,9 +484,9 @@ def stage_public(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
     if git(root, 'rev-parse', 'HEAD').stdout.decode().strip() != source['sha']:
         raise ValueError('public staging requires current published PIRA master')
     tracked = set(git(root, 'ls-files', '-z').stdout.decode().split('\0'))
-    if not {p.as_posix() for p in selected(root)} <= tracked:
+    if not {p.as_posix() for p in public_selected(root)} <= tracked:
         raise ValueError('public staging rejects ignored or untracked payload files')
-    result = stage(root, test_tools)
+    result = stage(root, test_tools, public_selected)
     destination = Path(result['stage'])
     data = verify(destination)
     data.pop('SOURCE_SHA256SUMS')
@@ -498,6 +501,13 @@ def stage_public(root: Path, test_tools: tuple[str, ...] = TOOLS) -> dict:
         ''.join(f'{digest(content)}  {name}\n' for name, content in sorted(data.items())))
     verify_public(destination, source)
     return {'stage': str(destination), 'source_sha': source['sha'], 'tested_tools': tools}
+
+
+def public_selected(root: Path) -> list[Path]:
+    """Do not read/upload the optional retained oracle unless it is tracked."""
+    tracked = set(git(root, 'ls-files', '-z').stdout.decode().split('\0'))
+    return [path for path in selected(root)
+            if path.as_posix() not in OPTIONAL_ORACLE or path.as_posix() in tracked]
 
 
 def git(root: Path, *args: str) -> subprocess.CompletedProcess:

@@ -794,6 +794,33 @@ class PrivateCITests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'ignored or untracked'):
                 ci.stage_public(self.root)
 
+    def test_public_stage_omits_untracked_optional_oracle_without_reading_it(self):
+        ci.git(self.root, 'rm', '--cached', '--', *ci.OPTIONAL_ORACLE)
+        ci.git(self.root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+               '-c', 'commit.gpgSign=false', 'commit', '-m', 'public source without retained oracle')
+        (self.root / '.git/info').mkdir()
+        (self.root / '.git/info/exclude').write_text('\n'.join(ci.OPTIONAL_ORACLE) + '\n')
+        for name in ci.OPTIONAL_ORACLE:
+            self.write(name, b'private optional development data')
+        source = self.public_source_fixture()
+        for name in ci.OPTIONAL_ORACLE:
+            source['blobs'].pop(name)
+        destination = self.base / 'public-stage'
+        destination.mkdir()
+        read_bytes = Path.read_bytes
+        def read_public_only(path):
+            self.assertNotIn(path, {self.root / name for name in ci.OPTIONAL_ORACLE})
+            return read_bytes(path)
+        with patch.object(ci, 'public_source', return_value=source), \
+                patch.object(ci, 'github_json', return_value=self.public_release_fixture()), \
+                patch.object(ci.tempfile, 'mkdtemp', return_value=str(destination)), \
+                patch.object(Path, 'read_bytes', read_public_only):
+            ci.stage_public(self.root, ('pira_write_check',))
+        data = ci.verify(destination)
+        for name in ci.OPTIONAL_ORACLE:
+            self.assertNotIn(name, data)
+        self.assertIn('tools/crates/pira_write_check/tests/evaluation.json', data)
+
     def test_public_stage_rejects_unpublished_commit(self):
         source = self.public_source_fixture()
         source['sha'] = 'a' * 40
