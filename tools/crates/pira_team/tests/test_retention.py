@@ -15,11 +15,6 @@ import test_subteams
 
 class RetentionTests(unittest.TestCase):
     setUp = test_subteams.SubteamTests.setUp
-    parent = test_subteams.SubteamTests.parent
-    permission_context = test_subteams.SubteamTests.permission_context
-    fail_startup = test_subteams.SubteamTests.fail_startup
-    wait_stderr_notice = test_subteams.SubteamTests.wait_stderr_notice
-    launch = test_subteams.SubteamTests.launch
     stop_processes = test_subteams.SubteamTests.stop_processes
     root_command = test_subteams.SubteamTests.root_command
     start = test_subteams.SubteamTests.start
@@ -34,7 +29,7 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def expired(self):
+    def expired(self, days=31):
         store = self.root / "logs"
         store.mkdir(exist_ok=True)
         old = store / "expired"
@@ -42,8 +37,43 @@ class RetentionTests(unittest.TestCase):
         (old / "run.lock").touch(mode=0o600)
         (old / "manifest.json").write_text(json.dumps({
             "run_id": "expired", "revision": 1, "status": "failed", "parent_run_id": None,
-            "last_execution_activity_ms": time.time_ns() // 1_000_000 - 864_000_001}))
+            "last_execution_activity_ms": time.time_ns() // 1_000_000 - (days * 86_400_000 + 1)}))
         return old
+
+    def test_configuration_and_manual_background_cleanup_resolve_same_policy(self):
+        old = self.expired(days=8)
+        configured = self.root_command("config", "retention", "set", "--max-age-days", "7", "--target-gb", "2")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        effective = json.loads(configured.stdout)["effective"]
+        self.assertEqual(effective, {"max_age_days":7, "target_gb":2,
+                                    "max_age_ms":7 * 86_400_000, "target_bytes":2_000_000_000})
+        self.assertTrue(old.exists())
+        self.assertFalse((old.parent / ".cleanup-report.json").exists())
+        preview = self.preview()
+        self.assertEqual(preview["effective_policy"], effective)
+        self.assertEqual(preview["summary"]["selected_units"], 1)
+        text = self.root_command("cleanup", "--dry-run")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("target 2 decimal GB = 2000000000 bytes; age > 7", text.stdout)
+        background = self.root_command("__cleanup")
+        self.assertEqual(background.returncode, 0, background.stderr)
+        report = json.loads((old.parent / ".cleanup-report.json").read_text())
+        self.assertEqual(report["effective_policy"], preview["effective_policy"])
+        self.assertEqual(report["execution_summary"]["deleted_units"], 1)
+        self.assertFalse(old.exists())
+        reset = self.root_command("config", "retention", "reset")
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        self.assertEqual(json.loads(reset.stdout)["effective"]["max_age_days"], 30)
+        self.assertEqual(json.loads(reset.stdout)["effective"]["target_gb"], 50)
+
+    def test_show_and_missing_store_dry_run_expose_defaults_without_mutation(self):
+        shown = self.root_command("config", "retention", "show")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        effective = json.loads(shown.stdout)["effective"]
+        self.assertEqual(effective["max_age_days"], 30)
+        self.assertEqual(effective["target_bytes"], 50_000_000_000)
+        self.assertEqual(self.preview()["effective_policy"], effective)
+        self.assertFalse((self.root / "logs").exists())
 
     def test_resume_refreshes_execution_reads_and_previews_do_not(self):
         first = self.launch("initial")
@@ -106,7 +136,9 @@ class RetentionTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "host suspension timing check uses SIGSTOP and native flock")
     def test_stalled_automatic_cleaner_never_blocks_creation_or_return_and_outlives_origin(self):
         import fcntl
-        old = self.expired()
+        old = self.expired(days=8)
+        configured = self.root_command("config", "retention", "set", "--max-age-days", "7", "--target-gb", "2")
+        self.assertEqual(configured.returncode, 0, configured.stderr)
         store = old.parent
         bookmark_lock = (store / "bookmarks.lock").open("w+")
         fcntl.flock(bookmark_lock, fcntl.LOCK_EX)
@@ -143,7 +175,7 @@ class RetentionTests(unittest.TestCase):
             replies = list(pool.map(lambda _: self.root_command("cleanup", "--json"), range(4)))
         for reply in replies:
             self.assertEqual(reply.returncode, 0, reply.stderr)
-            self.assertEqual(json.loads(reply.stdout), {"skipped": "cleaner_already_active"})
+            self.assertEqual(json.loads(reply.stdout)["skipped"], "cleaner_already_active")
         candidate = self.bin
         baseline = Path(os.environ.get("PIRA_TEAM_BASELINE_BIN", str(candidate)))
         times = {"baseline": [], "candidate_stalled": []}
@@ -174,6 +206,8 @@ class RetentionTests(unittest.TestCase):
             exited()
         self.assertFalse(old.exists(), "released cleaner did not finish its synthetic deletion")
         self.assertTrue((store / ".cleanup-report.json").exists())
+        report = json.loads((store / ".cleanup-report.json").read_text())
+        self.assertEqual(report["effective_policy"], json.loads(configured.stdout)["effective"])
 
     @unittest.skipUnless(os.name == "posix", "controlled abandoned cleaner uses a native bookmark lock")
     def test_abandoned_automatic_cleaner_releases_store_lock_and_next_trigger_recovers(self):

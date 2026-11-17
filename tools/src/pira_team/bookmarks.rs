@@ -1,5 +1,5 @@
 //! Main-session-scoped management pointers; never part of worker inputs or configuration.
-use crate::{profile::defaults, storage};
+use crate::storage::{self, managed};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -41,7 +41,7 @@ fn serializable_root(root: PathBuf) -> Result<PathBuf, String> {
 }
 
 fn root_if_present(root: &Path) -> Result<Option<PathBuf>, String> {
-    defaults::root_if_present(root)?
+    managed::root_if_present(root)?
         .map(serializable_root)
         .transpose()
 }
@@ -59,14 +59,14 @@ fn open(path: &Path, write: bool) -> Result<File, String> {
     let file = options
         .open(path)
         .map_err(|e| format!("open bookmark metadata: {e}"))?;
-    defaults::inspect_managed_file(&file.metadata().map_err(|e| e.to_string())?, "bookmarks")?;
+    managed::inspect_managed_file(&file.metadata().map_err(|e| e.to_string())?, "bookmarks")?;
     Ok(file)
 }
 
 fn inspect_if_present(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            defaults::inspect_managed_file(&metadata, "bookmarks")?;
+            managed::inspect_managed_file(&metadata, "bookmarks")?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -342,7 +342,12 @@ fn remove(root: &Path, label: &str) -> Result<Value, String> {
     )
 }
 
-fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, String> {
+fn browse(
+    root: &Path,
+    query: Option<&str>,
+    limit: usize,
+    after: Option<&str>,
+) -> Result<Value, String> {
     let session = crate::profile::caller_session()?;
     let Some(root) = root_if_present(root)? else {
         return Ok(json!({"matches":[],"has_more":false}));
@@ -353,7 +358,7 @@ fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, Strin
     let mut matches = Vec::new();
     let mut has_more = false;
     for ((owner, label), id) in index.scoped {
-        if owner != session {
+        if owner != session || after.is_some_and(|cursor| label.as_str() <= cursor) {
             continue;
         }
         let Some(reference) = visible_reference(&root, &id, &session) else {
@@ -371,13 +376,18 @@ fn browse(root: &Path, query: Option<&str>, limit: usize) -> Result<Value, Strin
         }
         matches.push(json!({"label":label,"run_id":id,"run_root":reference["run_root"]}));
     }
-    Ok(json!({"matches":matches,"has_more":has_more}))
+    let mut result = json!({"matches":matches,"has_more":has_more});
+    if has_more {
+        result["next_after"] =
+            result["matches"].as_array().unwrap().last().unwrap()["label"].clone();
+    }
+    Ok(result)
 }
 
 /// Session-scoped bookmark management; no worker launch or authentication lookup.
 pub fn command(args: &[String]) -> Result<(), String> {
     let action = args[0].as_str();
-    let (mut store, mut label, mut limit, mut target) = (None, None, None, None);
+    let (mut store, mut label, mut limit, mut target, mut after) = (None, None, None, None, None);
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         if arg == "--" {
@@ -399,6 +409,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
             "--store" => &mut store,
             "--label" if action == "bookmark" => &mut label,
             "--limit" if matches!(action, "search" | "bookmarks") => &mut limit,
+            "--after" if matches!(action, "search" | "bookmarks") => &mut after,
             _ => return Err(format!("unknown {action} option {arg}")),
         };
         crate::set_once(
@@ -411,6 +422,9 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }
     if store.as_deref() == Some("") {
         return Err("--store must not be empty".into());
+    }
+    if let Some(after) = &after {
+        validate_label(after)?;
     }
     let limit = limit
         .map(|s| s.parse::<usize>())
@@ -453,8 +467,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let result = match action {
         "bookmark" => assign(&root, target.as_deref().unwrap(), label.as_deref().unwrap())?,
         "unbookmark" => remove(&root, target.as_deref().unwrap())?,
-        "bookmarks" => browse(&root, None, limit)?,
-        "search" => browse(&root, target.as_deref(), limit)?,
+        "bookmarks" => browse(&root, None, limit, after.as_deref())?,
+        "search" => browse(&root, target.as_deref(), limit, after.as_deref())?,
         _ => unreachable!(),
     };
     println!("{result}");

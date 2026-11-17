@@ -6,15 +6,12 @@ from pathlib import Path
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class WriteTests(unittest.TestCase):
     def setUp(self) -> None:
-        # Composition reuses the fake backend without discovering TeamTests again.
-        self.fixture = test_team.TeamTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.env = self.fixture.env
         self.env["TEAM_ASSERT_PREFIX"] = "1"
@@ -44,12 +41,18 @@ class WriteTests(unittest.TestCase):
         self.assertEqual(text.count(self.writing), count)
         self.assertEqual(text.count("# SCIENTIFIC_WRITING\n"), count)
 
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def test_fresh_write_only_and_composed_guidance(self) -> None:
         for other in ((), ("--inject-review",), ("--inject-implement",),
                       ("--inject-fig",), ("--inject-implement", "--inject-fig")):
             with self.subTest(other=other):
                 receipt = self.launch("--inject-write", *other)
-                manifest = self.fixture.metadata(receipt)
+                manifest = self.metadata(receipt)
                 self.assertTrue(manifest["inject_write"])
                 self.assertIsNone(manifest.get("stage"))
                 turn, = self.state(receipt)["turn_details"]
@@ -65,7 +68,7 @@ class WriteTests(unittest.TestCase):
                       ("--inject-review", "--inject-implement")):
             with self.subTest(flags=flags):
                 receipt = self.launch(*flags)
-                self.assertFalse(self.fixture.metadata(receipt)["inject_write"])
+                self.assertFalse(self.metadata(receipt)["inject_write"])
                 for turn in self.state(receipt)["turn_details"]:
                     self.assert_writing(turn["policy"] + turn["phase"], 0)
 
@@ -74,7 +77,7 @@ class WriteTests(unittest.TestCase):
         run = Path(first["run_root"])
         prefix = (run / "policy.md").read_bytes()
         handoff = Path(first["handoff_path"]).read_bytes()
-        first_thread = self.fixture.metadata(first)["thread_id"]
+        first_thread = self.metadata(first)["thread_id"]
         added = self.resume(first, "--inject-write", "--inject-review", "--inject-implement")
         phase = self.phase(added)
         self.assert_writing(phase, 1)
@@ -87,7 +90,7 @@ class WriteTests(unittest.TestCase):
                 self.assert_writing(self.phase(again), 0)
                 latest = Path(again["handoff_path"]).parent.parent
                 self.assertEqual((latest / "policy.md").read_bytes(), prefix)
-                manifest = self.fixture.metadata(again)
+                manifest = self.metadata(again)
                 self.assertTrue(manifest["inject_write"])
                 self.assertEqual(manifest["thread_id"], first_thread)
                 self.assertIsNone(manifest.get("stage"))
@@ -101,7 +104,7 @@ class WriteTests(unittest.TestCase):
         for flags in ((), ("--inject-write",)):
             with self.subTest(flags=flags):
                 resumed = self.resume(first, *flags)
-                self.assertTrue(self.fixture.metadata(resumed)["inject_write"])
+                self.assertTrue(self.metadata(resumed)["inject_write"])
                 turn = self.state(resumed)["turn_details"][-1]
                 self.assertEqual(turn["policy"], prefix)
                 self.assert_writing(turn["policy"] + turn["phase"], 1)
@@ -120,7 +123,7 @@ class WriteTests(unittest.TestCase):
                 prefix = (run / "policy.md").read_bytes()
                 for flags, selected in (((), False), (("--inject-write",), True), ((), True)):
                     resumed = self.resume(first, *flags)
-                    self.assertEqual(self.fixture.metadata(resumed)["inject_write"], selected)
+                    self.assertEqual(self.metadata(resumed)["inject_write"], selected)
                     self.assert_writing(self.phase(resumed), int(bool(flags)))
                     latest = Path(resumed["handoff_path"]).parent.parent
                     self.assertEqual((latest / "policy.md").read_bytes(), prefix)
@@ -134,7 +137,7 @@ class WriteTests(unittest.TestCase):
                 first = self.launch("--allow-subteam", "--inject-review")
                 run = Path(first["run_root"])
                 path = run / "manifest.json"
-                initial = self.fixture.metadata(first)
+                initial = self.metadata(first)
                 current = initial["coordinator_policy_version"]
                 self.assertGreater(current, 21)
                 prefix = (run / "policy.md").read_bytes()
@@ -142,7 +145,7 @@ class WriteTests(unittest.TestCase):
                 path.write_text(json.dumps(retained))
                 for refreshed in (True, False):
                     resumed = self.resume(first, *(flags if refreshed else ()))
-                    manifest = self.fixture.metadata(resumed)
+                    manifest = self.metadata(resumed)
                     self.assertEqual(manifest["coordinator_policy_version"], current)
                     self.assertEqual(manifest["worker_policy_version"], initial["worker_policy_version"])
                     self.assertTrue(manifest["allow_subteam"])
@@ -160,7 +163,7 @@ class WriteTests(unittest.TestCase):
 
     def test_staged_review_implementation_keeps_writing_once_in_each_turn(self) -> None:
         first = self.launch("--inject-review", "--inject-implement", "--inject-fig", "--inject-write")
-        manifest = self.fixture.metadata(first)
+        manifest = self.metadata(first)
         self.assertTrue(manifest["inject_write"])
         self.assertEqual([attempt["stage"] for attempt in manifest["attempts"]], ["review", "implementation"])
         self.assertEqual(manifest["stage"], "implementation")
@@ -175,7 +178,7 @@ class WriteTests(unittest.TestCase):
         self.assertIn("# Implementation\n", implementation["phase"])
         checkpoint = Path(manifest["review_checkpoint"]).read_bytes()
         resumed = self.resume(first, "--inject-write")
-        self.assertEqual(self.fixture.metadata(resumed)["stage"], "implementation")
+        self.assertEqual(self.metadata(resumed)["stage"], "implementation")
         self.assertEqual(self.state(resumed)["turns"], 3)
         self.assert_writing(self.phase(resumed), 0)
         self.assertEqual(Path(manifest["review_checkpoint"]).read_bytes(), checkpoint)
@@ -187,14 +190,14 @@ class WriteTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(failed.stdout, "")
         self.assertIn("Codex did not confirm", failed.stderr)
-        self.assertFalse(self.fixture.metadata(first)["inject_write"])
+        self.assertFalse(self.metadata(first)["inject_write"])
         self.env.pop("TEAM_BAD_PERMISSION")
         resumed = self.resume(first)
         self.assert_writing(self.phase(resumed), 0)
-        self.assertFalse(self.fixture.metadata(resumed)["inject_write"])
+        self.assertFalse(self.metadata(resumed)["inject_write"])
         retried = self.resume(first, "--inject-write")
         self.assert_writing(self.phase(retried), 1)
-        self.assertTrue(self.fixture.metadata(retried)["inject_write"])
+        self.assertTrue(self.metadata(retried)["inject_write"])
 
     def test_acknowledged_writing_survives_failed_turn_without_duplicate(self) -> None:
         first = self.launch()
@@ -203,13 +206,13 @@ class WriteTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(failed.stdout, "")
         self.assertIn("fixture turn/start error", failed.stderr)
-        manifest = self.fixture.metadata(first)
+        manifest = self.metadata(first)
         self.assertTrue(manifest["inject_write"])
         self.assert_writing(manifest["phase_instructions"], 1)
         self.env.pop("TEAM_PARTIAL_FAILURE")
         resumed = self.resume(first)
         self.assert_writing(self.phase(resumed), 0)
-        self.assertTrue(self.fixture.metadata(resumed)["inject_write"])
+        self.assertTrue(self.metadata(resumed)["inject_write"])
         self.assert_writing("\n".join(self.state(resumed)["phases"]), 1)
 
     def test_format_repair_retains_added_writing_and_cached_prefix(self) -> None:
@@ -219,7 +222,7 @@ class WriteTests(unittest.TestCase):
         self.env["TEAM_CANDIDATE"] = self.fixture.candidate('{"ok":')
         self.env["TEAM_REPAIRED"] = self.fixture.candidate('{"ok":true}')
         repaired = self.resume(first, "--inject-write")
-        manifest = self.fixture.metadata(repaired)
+        manifest = self.metadata(repaired)
         self.assertTrue(manifest["inject_write"])
         self.assertEqual(manifest["repairs"], 1)
         self.assertEqual([attempt["status"] for attempt in manifest["attempts"]], ["invalid", "validated"])
@@ -235,7 +238,7 @@ class WriteTests(unittest.TestCase):
         self.env["TEAM_CANDIDATE"] = self.fixture.candidate('{"ok":true}')
         self.env.pop("TEAM_REPAIRED")
         resumed = self.resume(first)
-        self.assertTrue(self.fixture.metadata(resumed)["inject_write"])
+        self.assertTrue(self.metadata(resumed)["inject_write"])
         self.assert_writing(self.phase(resumed), 0)
 
 

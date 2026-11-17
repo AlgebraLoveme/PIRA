@@ -1,13 +1,17 @@
-const OVERVIEW: &str = include_str!("docs/help.md");
-const COMMANDS: &str = include_str!("docs/help_commands.md");
-const MANUAL: &str = include_str!("docs/help_manual.md");
+const OVERVIEW: &str = include_str!("../docs/help.md");
+const COMMANDS: &str = include_str!("../docs/help_commands.md");
+const MANUAL: &str = include_str!("../docs/help_manual.md");
 
-pub(super) fn topic(name: &str) -> Option<&'static str> {
+pub(crate) fn topic(name: &str) -> Option<&'static str> {
     let name = match name {
         "help" | "-h" | "--help" => return Some(OVERVIEW),
         "all" | "manual" | "--all" => return Some(MANUAL),
         "remote-keygen" | "remote-check" | "attach" => "remote",
         "config show" | "config set" | "config reset" => "config",
+        "config retention"
+        | "config retention show"
+        | "config retention set"
+        | "config retention reset" => "config-retention",
         _ => name,
     };
     section(COMMANDS, name)
@@ -25,7 +29,7 @@ fn section<'a>(commands: &'a str, name: &str) -> Option<&'a str> {
 
 // Only explicit help shapes are intercepted. Runtime operands and option values,
 // including help-looking task text and everything after --, stay with their parser.
-pub(super) fn dispatch(args: &[String]) -> Option<Result<&'static str, String>> {
+pub(crate) fn dispatch(args: &[String]) -> Option<Result<&'static str, String>> {
     let first = match args.first() {
         None => return Some(Ok(OVERVIEW)),
         Some(first) => first.as_str(),
@@ -40,6 +44,9 @@ pub(super) fn dispatch(args: &[String]) -> Option<Result<&'static str, String>> 
         });
     } else if matches!(args, [_, flag] if matches!(flag.as_str(), "--help" | "-h")) {
         &args[..1]
+    } else if matches!(args, [command, category, _, flag] if command == "config" && category == "retention" && matches!(flag.as_str(), "--help" | "-h"))
+    {
+        &args[..3]
     } else if matches!(args, [command, _, flag] if command == "config" && matches!(flag.as_str(), "--help" | "-h"))
     {
         &args[..2]
@@ -50,6 +57,9 @@ pub(super) fn dispatch(args: &[String]) -> Option<Result<&'static str, String>> 
         [] => return Some(Ok(OVERVIEW)),
         [name] => name.clone(),
         [command, action] if command == "config" => format!("config {action}"),
+        [command, category, action] if command == "config" && category == "retention" => {
+            format!("config retention {action}")
+        }
         _ => {
             return Some(Err(
                 "help accepts one topic or config subcommand; use pira_team --help".into(),

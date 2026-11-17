@@ -19,7 +19,7 @@ COMMANDS
   bookmarks    List this session's labels.
   search       Search labels by case-insensitive literal keyword.
   cleanup      Preview or execute store-wide age and storage retention.
-  config       Show, set, or reset store-wide worker defaults.
+  config       Show, set, or reset worker defaults and retention thresholds.
   resolve      Recover an ordinary run handle from a remote request ID.
   remote-keygen | remote-check | attach
                Remote trust setup, availability check, compatibility observation.
@@ -30,7 +30,7 @@ OPTIONS
   --version    Print the package version.
 
 TOPICS
-  Command names above, config show|set|reset, and:
+  Command names above, config show|set|reset, config retention, and:
   safety       Execution permissions, ownership, guidance, and subteams.
   recovery     Interrupt, uncertain delivery, abandoned attempts, and resume.
   sessions     Run ownership, stores, labels, and legacy access.

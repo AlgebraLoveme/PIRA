@@ -13,15 +13,13 @@ import subprocess
 import time
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fake-peer lifecycle fixtures")
 class LaunchBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.env = self.fixture.env
         source = self.root / "original-home/auth.json"
@@ -89,6 +87,12 @@ class LaunchBoundaryTests(unittest.TestCase):
         self.assertNotIn("unsupported Codex backend", err)
         self.assertNotIn("update Codex/Team", err)
         return state
+
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def test_run_id_interrupt_covers_schema_and_each_startup_rpc(self):
         for stage in ("schema", "initialize", "thread/start", "thread/inject_items", "turn/start"):
@@ -173,7 +177,7 @@ class LaunchBoundaryTests(unittest.TestCase):
         self.env.pop("TEAM_PAUSE_AT")
         resumed = self.fixture.access("resume", run.name, "recall")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.fixture.metadata(json.loads(resumed.stdout))["revision"], 3)
+        self.assertEqual(self.metadata(json.loads(resumed.stdout))["revision"], 3)
 
     def test_startup_interrupt_during_repair_and_implementation_retains_totals(self):
         for directory in ("repair", "implementation"):

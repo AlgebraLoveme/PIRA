@@ -31,7 +31,7 @@ OPTIONS
   --navigation nav|shell Default nav; shell is deprecated. Ctx/Nav/Dec stay injected.
   --code-review, --allow-fix
                          Deprecated compatibility flags; task instructions prevail.
-  --host HOST            Opt-in remote launch; see help remote for required options.
+  --host HOST            Automatic SSH setup and remote launch; see help remote.
 
 Task and gate must be nonempty. -- ends option parsing and requires exactly one
 following task. Only the task, gate, and label support local --name=VALUE forms.
@@ -39,6 +39,11 @@ Model/effort defaults use exact caller-model mappings and store overrides; see
 help config. Canonical claude-* models launch Claude Code; other model identifiers
 retain the Codex route. The selected CLI must already work on the execution host. Native
 CLI errors are retained and returned; Team does not install or authenticate them.
+Codex inherits only an allowlisted selected provider/file-or-environment auth projection
+from persistent pira-team-worker.toml (or config.toml), not parent CLI/runtime overrides,
+hooks, tools, prompts or permissions. Native file-login repair runs only during PIRA
+setup/install; launch never logs in. Unsupported helpers/catalogs fail explicitly.
+See help manual for setup selection, resume-route validation and private state.
 Claude accepts low|medium|high|xhigh|max and standard service tier only. Native
 sessions cannot switch backend family on resume. Execution permissions always
 require verified caller context; Claude requires a current bypassPermissions turn
@@ -201,7 +206,8 @@ log references. A coordinator manifest includes descendant summaries, not conten
 Safe relative managed files are allowed; backend credentials/state are excluded.
 Verified session ownership is required. Local reads launch no worker and require
 no backend authentication. Normal remote reads use the retained route and return
-raw UTF-8 file content up to 2 MiB; see help remote for compatibility views.
+raw UTF-8 handoffs up to 8 MiB, including retained historical revision handoffs;
+other managed files remain limited to 2 MiB. See help remote for compatibility views.
 
 EXAMPLES
   pira_team read @parser
@@ -305,15 +311,17 @@ EXIT STATUS
 pira_team bookmarks — list this main session's labels
 
 USAGE
-  pira_team bookmarks [--limit N] [--store DIR]
+  pira_team bookmarks [--limit N] [--after LABEL] [--store DIR]
 
 OPTIONS
   --limit N    Integer 1..1000 (default 20).
+  --after LABEL  Continue strictly after this exact label (use next_after).
   --store DIR  Team store.
 
 Returns JSON matches (label, run_id, run_root) and has_more, sorted by exact label
-ascending. Inaccessible pointers are hidden. Malformed/unreadable metadata fails
-visibly. Runs/logs are not searched. See help sessions for ownership and stores.
+ascending. When has_more is true, pass next_after as --after to continue.
+Each page uses current metadata, not a pinned snapshot. Inaccessible pointers are
+hidden. Malformed/unreadable metadata fails visibly. Runs/logs are not searched. See help sessions for ownership and stores.
 
 EXAMPLES
   pira_team bookmarks --limit 10
@@ -326,16 +334,17 @@ EXIT STATUS
 pira_team search — search this main session's labels
 
 USAGE
-  pira_team search QUERY [--limit N] [--store DIR]
+  pira_team search QUERY [--limit N] [--after LABEL] [--store DIR]
 
 OPTIONS
   --limit N    Integer 1..1000 (default 20).
+  --after LABEL  Continue strictly after this exact label (use next_after).
   --store DIR  Team store.
   --           End options; exactly one query follows.
 
 QUERY is a nonblank case-insensitive literal keyword, at most 128 UTF-8 bytes,
-without control characters. Only labels are searched. JSON matches and has_more
-follow the same ordering and visibility rules as bookmarks. See help sessions.
+without control characters. Only labels are searched. Results follow the same
+pagination, ordering and visibility rules as bookmarks. See help sessions.
 
 EXAMPLES
   pira_team search parser --limit 10
@@ -345,25 +354,30 @@ EXIT STATUS
   1  Invalid arguments or operation failure; inspect stderr and retained diagnostics.
 
 # config
-pira_team config — manage store-wide worker defaults
+pira_team config — manage store-wide worker defaults and retention
 
 USAGE
   pira_team config show [--store DIR]
   pira_team config set --main MODEL --model WORKER --effort EFFORT [--store DIR]
-  pira_team config reset --main MODEL [--store DIR]
+  pira_team config reset (--main MODEL | --all) [--store DIR]
+  pira_team config retention show|set|reset [OPTIONS]  (see help config retention)
 
 OPTIONS
-  --main MODEL    Exact caller model to override/reset; required for set/reset.
+  --main MODEL    Exact caller model to override/reset; required unless reset --all.
+  --all           Reset every override; mutually exclusive with --main. Saves a backup.
   --model WORKER  Worker model; required for set.
   --effort EFFORT Worker effort; required for set.
   --store DIR     Team store (see help sessions).
 
 Show prints JSON with bundled policy, overrides, and path. Set requires both model
-and effort. Reset removes only the selected caller override. Effort accepts
+and effort. Reset --main removes only that caller override. Reset --all recovers
+malformed contents of a safe regular managed file, preserving the old file at the
+backup path reported in JSON, then atomically restoring empty overrides. Effort accepts
 none|minimal|low|medium|high|xhigh|max|ultra. Options take separate values and each
 may appear once. Uses worker_defaults.json, needs no agent session or backend
-authentication, and launches no worker. Invalid config fails visibly
-without overwriting it; fix/restore the reported file before retrying.
+authentication, and launches no worker. Backend-specific effort restrictions are
+validated on set. Invalid config fails visibly without overwriting it; use explicit
+reset --all recovery or restore the file. Fully explicit run profiles do not read defaults.
 
 For new runs, gpt-6-astra maps to gpt-6.1-sol/high. Recognized gpt-6.1-sol,
 gpt-6-sol, gpt-6-luna, gpt-5.6-sol, and all claude-* callers inherit model/effort. Unknown or missing
@@ -380,6 +394,30 @@ EXAMPLES
 EXIT STATUS
   0  Config shown, set, or reset.
   1  Invalid arguments or operation failure; inspect stderr and retained diagnostics.
+
+# config-retention
+pira_team config retention — manage store-wide cleanup thresholds
+
+USAGE
+  pira_team config retention show [--store DIR]
+  pira_team config retention set [--max-age-days DAYS] [--target-gb GB] [--store DIR]
+  pira_team config retention reset [--store DIR]
+
+DAYS is an integer in 1..36500, each day exactly 24 hours. GB is an integer in
+1..1000000, each GB exactly 1,000,000,000 bytes (not GiB). Bundled defaults are
+30 days and a 50 GB soft target. Set requires at least one threshold and preserves
+the other. Reset restores both bundled defaults, including recovery from malformed
+contents of a safe regular config file. Store in retention_policy.json is managed
+by this CLI; no hand-editing is required. Options take separate values, once each.
+
+All actions print JSON with path, bundled policy, and effective policy, including
+millisecond/byte conversions. Show is read-only and does not create a store.
+Changes are locked and atomic, require no backend/session, and NEVER trigger cleanup.
+Automatic cleanup and explicit cleanup (including --dry-run) snapshot the same saved
+policy at startup; changes apply to subsequent cleanups, not an in-progress plan.
+Cleanup text/JSON and automatic reports expose effective thresholds. Invalid config
+blocks all cleanup before mutation; use reset to restore defaults. Pending retirement
+journals retain their existing recovery semantics. See help cleanup for safety rules.
 
 # resolve
 pira_team resolve — recover an ordinary handle from a remote request ID
@@ -407,11 +445,12 @@ EXIT STATUS
 pira_team — execution, guidance, and subteam safety
 
 Execution inherits the matching caller session's latest verified context, including
-on resume. Supported launches require verified full access with approval-never.
-Missing, malformed, ambiguous, or unrepresentable permissions fail closed.
-Workspace-write, read-only, and fine-grained restricted permission profiles are
-unsupported. Team does not broaden caller permissions. Full access does not expand
-task ownership. No rollback/merge is automatic.
+on resume. Local Codex supports verified full access or representable legacy
+workspace-write policies, both with approval-never. Required Team writes must fit
+the caller's writable scope. Claude requires verified full access; see help remote
+for remote requirements. Missing, malformed, ambiguous, read-only, or fine-grained
+unrepresentable permissions fail closed. Team does not broaden caller permissions.
+Full access does not expand task ownership. No rollback/merge is automatic.
 
 Workers always receive main Ctx/Nav/Dec guidance. Optional review, implementation,
 figure, and writing guidance are independent; inject only what the task requires.
@@ -492,21 +531,19 @@ budget. Invalid metadata fails visibly. See help manual for durability details.
 pira_team — opt-in remote execution and retained routes
 
 USAGE
-  pira_team run --host HOST --remote-user USER --remote-endpoint-id PUBLIC_NONCE \
-    --remote-exe ABS --remote-backend ABS --remote-store ABS --remote-cwd ABS \
-    --authority-key LOCAL_ABS --task TASK --completion-gate TEXT [OPTIONS]
+  pira_team run --host HOST --task TASK --completion-gate TEXT [OPTIONS]
   pira_team remote-keygen --authority-key LOCAL_ABS
   pira_team resolve REQUEST_ID [--store LOCAL_TEAM_STORE]
 
 OPTIONS
   --host HOST              SSH alias/hostname, not shell syntax. Root main only.
-  --remote-user USER       Explicit SSH account.
+  --remote-user USER       Optional actual-account assertion in automatic mode.
   --remote-endpoint-id PUBLIC_NONCE
                            Independently provisioned 64-hex public endpoint ID.
-  --remote-exe ABS         Actual canonical Linux candidate binary, not a wrapper.
-  --remote-backend ABS     Existing canonical server-side Codex executable.
+  --remote-exe ABS         Optional installed server Team executable; never copied/updated.
+  --remote-backend ABS     Optional server Codex selection (default PATH/setup-managed).
   --remote-store ABS       Canonical absolute server store.
-  --remote-cwd ABS         Canonical absolute server workspace; only for run.
+  --remote-cwd ABS         Server workspace (default actual account home); run only.
   --authority-key LOCAL_ABS Local private authority key; never sent to the server.
   --remote-state LOCAL_ABS Optional private controller location for normal launch.
   --store LOCAL_TEAM_STORE Local route/bookmark store for normal launch/followups.
@@ -516,8 +553,18 @@ OPTIONS
   --service-tier standard|fast
                            New runs default standard; resumes retain selection.
 
-Provision trust separately before submission. OpenSSH ssh/ssh-keygen with signing
-support and strict host-key checks are required. remote-keygen requires verified
+With working SSH, an installed compatible PIRA Team and logged-in server Codex,
+automatic mode discovers Team on PATH or ~/.local/bin, then uses installed Rust
+Team to resolve the actual account/backend and create private control metadata.
+It never installs, downloads or updates binaries and requires no server Python.
+Missing/incompatible Team yields setup/update guidance. Linux, OpenSSH signing,
+and strict known host keys are required. Only PUBLIC enrollment data is sent;
+server Codex login stays server-side. Setup-managed Codex is found without sourcing
+interactive shell startup; setup checks OpenSSH -Y signing readiness on both hosts.
+Control metadata uses the server's configured Team store or absolute XDG data root,
+falling back to the actual account home. Existing public trust files are not changed.
+Supplying --remote-endpoint-id selects the fully explicit pre-enrolled interface.
+OpenSSH ssh/ssh-keygen with signing support is required. remote-keygen requires verified
 root identity and full-access/approval-never. It generates a local key and prints
 the PUBLIC allowed-signers enrollment line. Protect the private key locally. See
 help manual for fixed trust files, endpoint descriptor, permissions, and enrollment.
@@ -525,14 +572,16 @@ Run/resume/steer require fresh full-access/approval-never. Remote paths grant no
 local scope. Server paths exclude . and .. components. Server authentication remains server-side. All children stay on the
 selected host; workers cannot make remote hops.
 
-Normal launch durably retains an ordinary run_id before contacting the server.
+After setup, normal launch durably retains an ordinary run_id before submission.
 Follow with ordinary read/resume/steer/interrupt/wait RUN_ID (or @LABEL), in the
 same local store/session, without endpoint/key/controller options. Remote read
-returns raw content up to 2 MiB; receipt paths are null. Remote path, live tier,
+returns raw handoffs up to 8 MiB (bounded revision-pinned chunks); other files
+are limited to 2 MiB. Receipt paths are null. Remote path, live tier,
 and schema files are unsupported. --task-file is local input sent as task text.
 Use --remote-cwd instead of --cwd. --service-tier on launch/resume stays supported.
 After network loss use read/wait: observation never implicitly creates a model
-turn. Inspect unknown delivery before explicit resume. See help recovery.
+turn. If the initial submission was not accepted, explicit resume RUN_ID without
+changed task/options retries that same retained initial request. See help recovery.
 
 LEGACY REQUEST-ID TRANSPORT
 Explicit --request-id selects compatibility mode. Every invocation supplies all
@@ -569,8 +618,9 @@ USAGE
   pira_team cleanup [--dry-run] [--json] [--store DIR]
 
 POLICY
-  Delete inactive coordinator units older than 10 × 24 hours, then least recently
-  active inactive units until estimated storage is below 50 GB (50,000,000,000 bytes).
+  Delete inactive coordinator units older than 30 × 24 hours by default, then least recently
+  active inactive units until estimated storage is below the configured soft target
+  (default 50 decimal GB = 50,000,000,000 bytes). See help config retention.
   A unit includes its coordinator and all children. Its last activity is the maximum
   execution, resume, or completion activity of its members. Bookmarks give no exemption.
   New executions persist last_execution_activity_ms at start/resume and completion.
@@ -586,7 +636,7 @@ OPTIONS
   --dry-run    Read-only same-plan preview. No deletion, activity writes, bookmark
                edits, lock-file creation, interrupted-deletion recovery, or cleaner spawn.
   --json       Complete plan, member IDs, millisecond Unix activity times, estimates,
-               age/storage reasons, skips, and summary. Default text shows 50 selections.
+               effective age/size thresholds, age/storage reasons, skips, and summary. Default text shows 50 selections.
   --store DIR  Scope to this Team store (default: normal platform store).
 
 AUTOMATIC CLEANUP

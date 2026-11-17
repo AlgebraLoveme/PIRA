@@ -659,8 +659,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-codex", action="store_true", help="Do not edit Codex configuration.")
     parser.add_argument("--skip-tools", action="store_true", help="Do not install or refresh bundled PIRA tools.")
     parser.add_argument("--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
-                        help="Missing Team authentication: auto selects browser or device flow; "
-                             "skip disables login. Verify/dry-run never start login.")
+                        help="Setup-only native file login: reuse an accepted Team login; otherwise auto offers "
+                             "browser login only in a terminal. browser/device explicitly select a flow; "
+                             "skip/verify/dry-run never log in and report missing auth incomplete.")
     parser.add_argument("--tools-install-dir", default=None, help="Override the per-user PIRA tools PATH directory.")
     parser.add_argument(
         "--tools-version",

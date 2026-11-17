@@ -1,8 +1,47 @@
+pub(crate) mod managed;
+
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+
+/// Synchronize an already-published directory entry where supported. Callers
+/// retain their own commit/error semantics; Windows keeps the existing no-op.
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+pub(crate) fn allocate_run(root: &Path) -> Result<PathBuf, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Each run is exclusively created, even with concurrent callers; never reuse a prior log.
+    if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| format!("create store parent: {e}"))?;
+    }
+    match crate::private_dir(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create store: {e}")),
+    }
+    let root = managed::root_if_present(root)?.ok_or("Team store disappeared")?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    for attempt in 0..100 {
+        let dir = root.join(format!("{timestamp}-{}-{attempt}", std::process::id()));
+        match crate::private_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("create run: {e}")),
+        }
+    }
+    Err("cannot allocate unique run directory".into())
+}
 
 pub fn default_root() -> Result<PathBuf, String> {
     crate::subteam::default_store()?
@@ -13,6 +52,14 @@ pub fn default_root() -> Result<PathBuf, String> {
 pub fn configured_root(key: &str, leaf: &str) -> Result<PathBuf, String> {
     resolve_root(std::env::consts::OS, key, leaf, |name| {
         std::env::var_os(name)
+    })
+}
+
+pub(super) fn platform_team_root() -> Result<PathBuf, String> {
+    resolve_root(std::env::consts::OS, "PIRA_TEAM_DIR", "team", |name| {
+        (name != "PIRA_TEAM_DIR")
+            .then(|| std::env::var_os(name))
+            .flatten()
     })
 }
 

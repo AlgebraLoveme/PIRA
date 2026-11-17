@@ -8,14 +8,12 @@ import json
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class WorkerDefaultsTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.env = self.fixture.env
         self.store = self.root / "logs"
@@ -41,8 +39,14 @@ class WorkerDefaultsTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def profile(self, receipt: dict) -> tuple[str, str, dict]:
-        manifest = self.fixture.metadata(receipt)
+        manifest = self.metadata(receipt)
         return manifest["model"], manifest["effort"], manifest["profile_sources"]
+
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def test_show_without_session_is_read_only_and_store_selection_is_isolated(self) -> None:
         self.env.pop("CODEX_THREAD_ID")
@@ -118,7 +122,7 @@ class WorkerDefaultsTests(unittest.TestCase):
                 self.assertTrue(result.stderr)
                 self.assertEqual(path.read_bytes(), before)
 
-    def test_malformed_file_blocks_show_set_reset_and_new_launch_visibly(self) -> None:
+    def test_malformed_file_blocks_show_set_reset_and_profile_consuming_launch(self) -> None:
         self.set_profile("main", "worker", "high")
         path = self.store / "worker_defaults.json"
         path.write_text('{"main":{"model":"worker"}}')
@@ -128,7 +132,7 @@ class WorkerDefaultsTests(unittest.TestCase):
             ["config", "set", "--main", "other", "--model", "worker", "--effort", "low"],
             ["config", "reset", "--main", "main"],
             ["run", "--store", str(self.store), "--cwd", str(self.root), "--task", "defaults-check",
-             "--completion-gate", "Fixture complete", "--model", "explicit", "--effort", "high"],
+             "--completion-gate", "Fixture complete", "--model", "explicit"],
         ]:
             with self.subTest(args=args):
                 result = self.cli(*args)

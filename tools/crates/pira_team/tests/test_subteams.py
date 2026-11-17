@@ -14,19 +14,17 @@ import tempfile
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 import subteam_fixture
-import test_team
+from team_fixture import TeamFixture
 from native_fixture import Boundary, process_exit_waiter, wait_owner
 
 
 class SubteamTests(unittest.TestCase):
-    parent = test_team.TeamTests.parent
-    permission_context = test_team.TeamTests.permission_context
-    fail_startup = test_team.TeamTests.fail_startup
-    wait_stderr_notice = test_team.TeamTests.wait_stderr_notice
-    launch = test_team.TeamTests.launch
-
     def setUp(self):
-        test_team.TeamTests.setUp(self)
+        fixture = TeamFixture(self.addCleanup)
+        self.root, self.bin, self.env = fixture.root, fixture.bin, fixture.env
+        self.parent, self.permission_context = fixture.parent, fixture.permission_context
+        self.fail_startup, self.wait_stderr_notice = fixture.fail_startup, fixture.wait_stderr_notice
+        self.launch = fixture.launch
         for name in list(self.env):
             backend_setting = name.upper().startswith(("OPENAI_", "AZURE_OPENAI_", "CODEX_")) or name.upper() in {
                 "HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","SSL_CERT_FILE","SSL_CERT_DIR","CURL_CA_BUNDLE",

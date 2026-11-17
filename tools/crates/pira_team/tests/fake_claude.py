@@ -10,6 +10,12 @@ def send(value):
         print(json.dumps(value), flush=True)
 settings=json.loads(option('--settings'))
 attempt=Path(settings['env']['PIRA_TEAM_ATTEMPT'])
+temporary = Path(settings['env']['TMPDIR'])
+assert temporary.is_dir()
+assert Path(settings['env']['PIRA_TEAM_CONTEXT']) not in temporary.parents
+for key in ('TMPDIR', 'TMP', 'TEMP', 'TMPPREFIX'):
+    expected = str(temporary / 'zsh' if key == 'TMPPREFIX' else temporary)
+    assert settings['env'][key] == os.environ[key] == expected
 assert Path(option('--system-prompt-file')).read_bytes() == (attempt/'policy.md').read_bytes()+b'\n\n'+(attempt/'phase.md').read_bytes()
 assert '--system-prompt' not in args
 session=option('--resume') if '--resume' in args else option('--session-id')

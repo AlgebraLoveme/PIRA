@@ -8,14 +8,12 @@ from pathlib import Path
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class SessionIsolationTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.store = self.root / "logs"
         self.a = dict(self.fixture.env, PIRA_TEAM_DIR=str(self.store))
@@ -137,7 +135,6 @@ class SessionIsolationTests(unittest.TestCase):
         no_turn = self.session("no-turn")
         (Path(no_turn["CODEX_HOME"]) / "sessions/rollout-test-no-turn.jsonl").write_text(
             json.dumps({"type":"session_meta", "payload":{"id":"no-turn"}}) + "\n")
-        invalid.append(no_turn)
         for env in invalid:
             self.foreign_attempts(env, run["run_id"])
             self.foreign_attempts(env, "@shared")
@@ -148,6 +145,17 @@ class SessionIsolationTests(unittest.TestCase):
             self.denied(env, "bookmarks", "--store", str(absent), explicit=False)
             self.denied(env, "unbookmark", "missing", "--store", str(absent), explicit=False)
             self.assertFalse(absent.exists())
+        # Identity-only commands need no current turn, but ownership and execution
+        # policy remain separate mandatory gates.
+        self.foreign_attempts(no_turn, run["run_id"])
+        self.foreign_attempts(no_turn, "@shared")
+        before = self.snapshot()
+        self.assertEqual(self.success(no_turn, "bookmarks"), {"matches": [], "has_more": False})
+        self.assertEqual(self.success(no_turn, "search", "shared"), {"matches": [], "has_more": False})
+        self.assertFalse(self.success(no_turn, "unbookmark", "shared")["changed"])
+        self.denied(no_turn, "run", "--task", "review", "--completion-gate", "report",
+                    "--model", "test-model", "--effort", "high")
+        self.assertEqual(self.snapshot(), before)
 
     def test_legacy_original_evidence_not_latest_execution_and_ambiguous_preservation(self):
         receipt = self.launch(self.a, "shared")

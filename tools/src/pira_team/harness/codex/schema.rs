@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-pub const CONTRACT: &str = include_str!("backend_contract.json");
+pub const CONTRACT: &str = include_str!("../../backend_contract.json");
 const GUIDE: &str = "Install/update the native Codex CLI on this execution host (https://developers.openai.com/codex/app-server/); Team requires the published app-server API and strict-config support. No model call was started by this preflight.";
 
 pub fn contract() -> Value {
@@ -34,10 +34,13 @@ pub fn preflight(
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(create(&dir.join("backend-check.log"))?);
+    if options.temp_workspace.is_some() {
+        cmd.envs(crate::worker_temp_environment(options));
+    }
     if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("interrupted before native schema generation".into());
     }
-    let (mut child, scope) = crate::process::spawn(&mut cmd)
+    let (mut child, scope) = crate::native::process::spawn(&mut cmd)
         .map_err(|e| format!("generate native Codex schema: {e}"))?;
     let status = loop {
         let result = if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -64,17 +67,22 @@ pub fn preflight(
         ));
     }
     let check = || -> Result<jsonschema::Validator, String> {
-        let schemas = contract()["schemas"].as_object().unwrap().clone();
+        let mut schemas = contract()["schemas"].as_object().unwrap().clone();
+        let tier_response = schemas
+            .remove("v2/TurnSettingsUpdateResponse.json")
+            .unwrap();
+        let tier_method = schemas["ClientRequest.json"]["methods"]["turn/settings/update"].clone();
+        schemas.get_mut("ClientRequest.json").unwrap()["methods"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turn/settings/update");
+        let live_tier_response = read_schema(&output.join("v2/TurnSettingsUpdateResponse.json"))
+            .and_then(|schema| inventory(&schema, &tier_response))
+            .is_ok();
         let mut request = None;
         for (file, expected) in schemas {
             let path = output.join(&file);
-            let meta = fs::symlink_metadata(&path).map_err(|e| format!("{file}: {e}"))?;
-            if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {
-                return Err(format!("{file}: expected a regular schema file <=16 MiB"));
-            }
-            let mut schema: Value =
-                serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("{file}: invalid schema JSON: {e}"))?;
+            let mut schema = read_schema(&path).map_err(|e| format!("{file}: {e}"))?;
             inventory(&schema, &expected).map_err(|e| format!("{file}: {e}"))?;
             if file == "ClientNotification.json" {
                 let validator = jsonschema::validator_for(&schema)
@@ -82,6 +90,23 @@ pub fn preflight(
                 validate_request(&validator, &json!({"method":"initialized"}))?;
             }
             if file == "ClientRequest.json" {
+                let live_tier_request = inventory(
+                    &schema,
+                    &json!({"methods":{"turn/settings/update":tier_method}}),
+                )
+                .is_ok();
+                if !live_tier_response || !live_tier_request {
+                    // Keep ordinary work available; outgoing live controls fail validation.
+                    if let Some(variants) = schema["oneOf"].as_array_mut() {
+                        variants.retain(|variant| {
+                            !variant["properties"]["method"]["enum"]
+                                .as_array()
+                                .is_some_and(|methods| {
+                                    methods.contains(&json!("turn/settings/update"))
+                                })
+                        });
+                    }
+                }
                 published_fields_only(&mut schema);
                 request = Some(
                     jsonschema::options()
@@ -97,6 +122,15 @@ pub fn preflight(
     check().map_err(|e| format!("unsupported Codex backend: {e}. {GUIDE}"))
 }
 
+fn read_schema(path: &Path) -> Result<Value, String> {
+    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {
+        return Err("expected a regular schema file <=16 MiB".into());
+    }
+    serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+        .map_err(|_| "invalid schema JSON".into())
+}
+
 pub fn validate_request(validator: &jsonschema::Validator, request: &Value) -> Result<(), String> {
     validator.validate(request).map_err(|error| format!(
         "unsupported Codex {} request at {} (native schema {}); update Codex/Team to compatible builds",
@@ -106,7 +140,7 @@ pub fn validate_request(validator: &jsonschema::Validator, request: &Value) -> R
 
 fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Result<(), String> {
     let id = "00000000-0000-0000-0000-000000000001";
-    let mut thread = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
+    let mut thread = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":super::execution_config(&options.execution),
         "approvalPolicy":"never","baseInstructions":"probe","developerInstructions":""});
     let text = json!([{"type":"text","text":"probe"}]);
     let mut examples = vec![
@@ -128,7 +162,6 @@ fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Re
             json!({"threadId":id,"expectedTurnId":id,"input":text}),
         ),
         ("turn/interrupt", json!({"threadId":id,"turnId":id})),
-        ("turn/settings/update", options.service_tier.update(id, id)),
     ];
     thread["ephemeral"] = json!(false);
     examples.push(("thread/start", thread.clone()));
@@ -229,11 +262,10 @@ fn published_fields_only(schema: &mut Value) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    #[test]
-    #[ignore = "requires the installed native Codex CLI; no auth or model calls"]
-    fn installed_native_schema_supports_team_requests() {
+    // The registered test keeps its historical native-CI name in lib.rs.
+    pub(crate) fn installed_native_schema_supports_team_requests() {
         let root = std::env::temp_dir().join(format!(
             "team-native-schema-{}-{}",
             std::process::id(),
@@ -255,8 +287,8 @@ mod tests {
             }))
             .unwrap();
             for tier in [
-                crate::service_tier::Tier::Standard,
-                crate::service_tier::Tier::Fast,
+                crate::profile::service_tier::Tier::Standard,
+                crate::profile::service_tier::Tier::Fast,
             ] {
                 options.service_tier = tier;
                 validate_examples(&validator, &options).unwrap();

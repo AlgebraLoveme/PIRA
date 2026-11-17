@@ -25,6 +25,13 @@ SPEC.loader.exec_module(setup)
 
 
 class HarnessSelectionTests(unittest.TestCase):
+    def test_codex_login_help_describes_setup_only_reuse_and_terminal_fallback(self) -> None:
+        parser = setup.build_parser()
+        help_text = next(action.help for action in parser._actions if action.dest == "codex_login")
+        for text in ("Setup-only", "reuse", "native file", "only in a terminal",
+                     "skip/verify/dry-run", "incomplete"):
+            self.assertIn(text, help_text)
+
     def test_codex_config_defaults_to_selected_home_without_changing_auth_home(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "codex-profile"

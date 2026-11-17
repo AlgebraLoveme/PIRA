@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const AGE_MS: u64 = 10 * 24 * 60 * 60 * 1000;
-const BUDGET: u64 = 50_000_000_000;
+pub(super) mod policy;
+#[cfg(test)]
+const AGE_MS: u64 = policy::DEFAULT_MAX_AGE_DAYS * policy::DAY_MS;
+#[cfg(test)]
+const BUDGET: u64 = policy::DEFAULT_TARGET_GB * policy::GB;
 const PREFIX: &str = ".retiring-";
 
 fn now_ms() -> Result<u64, String> {
@@ -411,7 +414,7 @@ fn inactive_runtime(runtime: &Value, revision: &Value) -> Result<(), String> {
     }
     for role in ["launcher", "backend"] {
         let (pid, birth) =
-            subteam::recorded_identity(&runtime, role).map_err(|_| "unknown_native_identity")?;
+            subteam::recorded_identity(runtime, role).map_err(|_| "unknown_native_identity")?;
         if subteam::bound_backend_alive(pid, birth, crate::native::identity)
             .map_err(|_| "unknown_native_identity")?
         {
@@ -419,8 +422,8 @@ fn inactive_runtime(runtime: &Value, revision: &Value) -> Result<(), String> {
         }
     }
     let (pid, _) =
-        subteam::recorded_identity(&runtime, "backend").map_err(|_| "unknown_native_identity")?;
-    if !subteam::scope_empty(&runtime, pid).map_err(|_| "unknown_backend_scope")? {
+        subteam::recorded_identity(runtime, "backend").map_err(|_| "unknown_native_identity")?;
+    if !subteam::scope_empty(runtime, pid).map_err(|_| "unknown_backend_scope")? {
         return Err("live_backend_scope".into());
     }
     Ok(())
@@ -542,7 +545,7 @@ fn snapshot(root: &Path, unit: &Unit, now: u64) -> Result<u64, String> {
     Ok(latest)
 }
 
-fn select(units: &mut [Unit], total: u64, now: u64, budget: u64) -> u64 {
+fn select(units: &mut [Unit], total: u64, now: u64, max_age_ms: u64, budget: u64) -> u64 {
     units.sort_by(|a, b| a.last.cmp(&b.last).then(a.id.cmp(&b.id)));
     let mut remaining = total.saturating_sub(
         units
@@ -557,7 +560,7 @@ fn select(units: &mut [Unit], total: u64, now: u64, budget: u64) -> u64 {
         }
         if unit
             .last
-            .is_some_and(|time| now.saturating_sub(time) > AGE_MS)
+            .is_some_and(|time| now.saturating_sub(time) > max_age_ms)
         {
             unit.reasons.push("age");
         } else if remaining >= budget {
@@ -571,6 +574,7 @@ fn select(units: &mut [Unit], total: u64, now: u64, budget: u64) -> u64 {
 }
 
 struct Plan {
+    policy: policy::Policy,
     units: Vec<Unit>,
     total: Size,
     overhead: Size,
@@ -584,20 +588,20 @@ impl Plan {
         for unit in &skipped {
             *counts.entry(unit.skip.as_deref().unwrap()).or_default() += 1;
         }
-        json!({"as_of_ms":now,"max_age_ms":AGE_MS,"target_bytes":BUDGET,"size_basis":"logical file bytes; no symlink targets",
+        json!({"as_of_ms":now,"max_age_ms":self.policy.max_age_ms(),"target_bytes":self.policy.target_bytes(),"effective_policy":self.policy.value(),"size_basis":"logical file bytes; no symlink targets",
             "summary":{"total_estimated_bytes":self.total.bytes,"total_size_unknown":self.total.unknown,
                 "reclaim_estimated_bytes":self.reclaim,"remaining_estimated_bytes":self.total.bytes.saturating_sub(self.reclaim),
                 "selected_units":self.units.iter().filter(|u| !u.reasons.is_empty()).count(),
                 "selected_members":self.units.iter().filter(|u| !u.reasons.is_empty()).map(|u|u.members.len()).sum::<usize>(),
                 "skipped_units":skipped.len(),"protected_estimated_bytes":skipped.iter().fold(0_u64,|sum,u|sum.saturating_add(u.size.bytes)),
-                "target_reached":!self.total.unknown && self.total.bytes.saturating_sub(self.reclaim)<BUDGET,
+                "target_reached":!self.total.unknown && self.total.bytes.saturating_sub(self.reclaim)<self.policy.target_bytes(),
                 "unknown_size_units":self.units.iter().filter(|u|u.size.unknown).count(),
                 "unmanaged_estimated_bytes":self.overhead.bytes,"unmanaged_size_unknown":self.overhead.unknown,"skip_reasons":counts},
             "recovery_issues":self.recovery_issues,"units":self.units.iter().map(Unit::value).collect::<Vec<_>>()})
     }
 }
 
-fn plan(root: &Path, now: u64) -> Result<Plan, String> {
+fn plan(root: &Path, now: u64, policy: policy::Policy) -> Result<Plan, String> {
     let entries: Vec<_> = fs::read_dir(root)
         .map_err(|_| "cannot enumerate Team store")?
         .collect::<Result<_, _>>()
@@ -708,7 +712,13 @@ fn plan(root: &Path, now: u64) -> Result<Plan, String> {
                 unit.reasons.clear();
             }
         }
-        let reclaim = select(&mut units, total.bytes, now, BUDGET);
+        let reclaim = select(
+            &mut units,
+            total.bytes,
+            now,
+            policy.max_age_ms(),
+            policy.target_bytes(),
+        );
         let mut rejected = false;
         for unit in units
             .iter_mut()
@@ -733,6 +743,7 @@ fn plan(root: &Path, now: u64) -> Result<Plan, String> {
         }
     };
     Ok(Plan {
+        policy,
         units,
         total,
         overhead,
@@ -742,13 +753,7 @@ fn plan(root: &Path, now: u64) -> Result<Plan, String> {
 }
 
 fn sync_dir(root: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    File::open(root)
-        .and_then(|f| f.sync_all())
-        .map_err(|_| "retirement_directory_sync_failed")?;
-    #[cfg(windows)]
-    let _ = root;
-    Ok(())
+    storage::sync_directory(root).map_err(|_| "retirement_directory_sync_failed".into())
 }
 
 fn retirement_guard(root: &Path, unit: &Unit) -> Result<Vec<FileLock>, String> {
@@ -788,10 +793,10 @@ fn retirement_guard(root: &Path, unit: &Unit) -> Result<Vec<FileLock>, String> {
             if last_activity(&run, &manifest, now_ms()?)? > unit.last.unwrap() {
                 return Err("activity_changed_after_retirement".into());
             }
-        } else if exists(&run.join("runtime.json"))? {
-            if runtime_proof(&read(&run.join("runtime.json"))?) != proof["runtime"] {
-                return Err("retirement_runtime_changed".into());
-            }
+        } else if exists(&run.join("runtime.json"))?
+            && runtime_proof(&read(&run.join("runtime.json"))?) != proof["runtime"]
+        {
+            return Err("retirement_runtime_changed".into());
         }
     }
     Ok(locks)
@@ -981,9 +986,11 @@ fn execute(root: &Path, dry: bool) -> Result<Value, String> {
     if exists(root)? {
         real(root, true)?;
     }
-    let Some(root) = crate::profile::defaults::root_if_present(root)? else {
+    // Resolve once before any mutation, including retirement recovery and lock creation.
+    let policy = policy::load(root)?;
+    let Some(root) = crate::storage::managed::root_if_present(root)? else {
         return Ok(
-            json!({"dry_run":dry,"summary":{"total_estimated_bytes":0,"selected_units":0,"selected_members":0,"reclaim_estimated_bytes":0},"units":[]}),
+            json!({"effective_policy":policy.value(),"max_age_ms":policy.max_age_ms(),"target_bytes":policy.target_bytes(),"dry_run":dry,"summary":{"total_estimated_bytes":0,"selected_units":0,"selected_members":0,"reclaim_estimated_bytes":0},"units":[]}),
         );
     };
     real(&root, true)?;
@@ -993,14 +1000,16 @@ fn execute(root: &Path, dry: bool) -> Result<Value, String> {
         match lock(&root.join(".cleanup.lock"), true) {
             Ok(lock) => Some(lock),
             Err(error) if error == "live_owner_or_busy_lock" => {
-                return Ok(json!({"skipped":"cleaner_already_active"}));
+                return Ok(
+                    json!({"skipped":"cleaner_already_active","effective_policy":policy.value(),"max_age_ms":policy.max_age_ms(),"target_bytes":policy.target_bytes()}),
+                );
             }
             Err(error) => return Err(error),
         }
     };
     crate::bookmarks::validate_cleanup(&root)?;
     let now = now_ms()?;
-    let plan = plan(&root, now)?;
+    let plan = plan(&root, now, policy)?;
     let mut result = plan.value(now);
     result["dry_run"] = json!(dry);
     if !dry {
@@ -1035,18 +1044,21 @@ fn execute(root: &Path, dry: bool) -> Result<Value, String> {
 }
 
 fn render(result: &Value) {
-    if let Some(skip) = result["skipped"].as_str() {
-        println!("cleanup skipped: {skip}");
-        return;
-    }
     println!(
-        "Team cleanup {} (50 GB = {BUDGET} bytes; age > 10 × 24 h)",
+        "Team cleanup {} (target {} decimal GB = {} bytes; age > {} × 24 h)",
         if result["dry_run"] == true {
             "dry-run"
         } else {
             "plan/outcomes"
-        }
+        },
+        result["effective_policy"]["target_gb"],
+        result["target_bytes"],
+        result["effective_policy"]["max_age_days"]
     );
+    if let Some(skip) = result["skipped"].as_str() {
+        println!("cleanup skipped: {skip}");
+        return;
+    }
     if let Some(units) = result["units"].as_array() {
         let mut shown = 0;
         for unit in units
@@ -1188,5 +1200,5 @@ pub(super) fn background(args: &[String]) -> i32 {
 }
 
 #[cfg(test)]
-#[path = "retention_tests.rs"]
+#[path = "retention/tests/cleanup.rs"]
 mod tests;

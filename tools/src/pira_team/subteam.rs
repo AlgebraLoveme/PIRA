@@ -109,10 +109,16 @@ pub fn authorize(args: &[String]) -> Result<(), String> {
         return Ok(());
     };
     let manifest = current_caller(&run)?;
-    let context = profile::load()?;
-    if !profile::matches_native_session(&manifest, &context)
-        || manifest["allow_subteam"] != true
-        || !manifest["parent_run_id"].is_null()
+    let matches_session = if matches!(
+        args[0].as_str(),
+        "read" | "path" | "wait" | "interrupt" | "bookmarks" | "search" | "bookmark" | "unbookmark"
+    ) {
+        profile::native_caller_identity(&manifest).as_deref()
+            == Some(profile::caller_session()?.as_str())
+    } else {
+        profile::matches_native_session(&manifest, &profile::load()?)
+    };
+    if !matches_session || manifest["allow_subteam"] != true || !manifest["parent_run_id"].is_null()
     {
         return Err(
             "nested delegation is forbidden: caller is not an authorized coordinator".into(),
@@ -133,33 +139,22 @@ pub fn authorize(args: &[String]) -> Result<(), String> {
 
 // Skip option values and task literals; data that names a flag is not a grant.
 fn invocation_options(args: &[String], store: &Path) -> Result<(), String> {
-    let mut rest = args[1..].iter();
-    while let Some(arg) = rest.next() {
+    for token in crate::cli::tokens(&args[1..]) {
+        let arg = token.raw;
         if arg == "--" {
             break;
         }
         if !arg.starts_with('-') || arg.contains('=') {
             continue;
         }
-        if arg == "--allow-subteam" {
+        if token.flag == Some(crate::cli::Flag::AllowSubteam) {
             return Err("coordinators cannot grant --allow-subteam".into());
         }
-        if [
-            "--inject-review",
-            "--inject-implement",
-            "--inject-fig",
-            "--inject-write",
-            "--allow-fix",
-            "--code-review",
-            "-r",
-            "--recursive",
-        ]
-        .contains(&arg.as_str())
-        {
+        if token.flag.is_some() {
             continue;
         }
-        let value = rest
-            .next()
+        let value = token
+            .value
             .ok_or_else(|| format!("missing value for {arg}"))?;
         if arg == "--store"
             && Path::new(value)
@@ -180,7 +175,7 @@ pub fn default_store() -> Result<Option<PathBuf>, String> {
 pub fn bind(
     run: &Path,
     revision: &Value,
-    scope: &crate::process::Scope,
+    scope: &crate::native::process::Scope,
     attempt_dir: &Path,
 ) -> Result<(), String> {
     let backend =
@@ -760,7 +755,7 @@ pub(super) fn scope_empty(runtime: &Value, backend: u32) -> Result<bool, String>
     #[cfg(unix)]
     {
         let _ = runtime;
-        // process::spawn establishes a separate session/group led by the backend.
+        // native::process::spawn establishes a separate session/group led by the backend.
         // A dead leader can leave live members. Probe only; never terminate a
         // persisted group (its numeric ID may have been reused).
         let group = i32::try_from(backend)
@@ -935,10 +930,8 @@ fn interrupt_expected(
     let manifest = read_json(&run.join("manifest.json"))?;
     if !recursive {
         let attempt = match target {
-            Some(expected) => {
-                crate::app_server::control_bound(run, "interrupt", "", None, expected)
-            }
-            None => crate::app_server::control(run, "interrupt", "", None),
+            Some(expected) => crate::runtime::control_bound(run, "interrupt", "", None, expected),
+            None => crate::runtime::control(run, "interrupt", "", None),
         };
         let mut receipt = match attempt {
             Ok(receipt) => receipt,
@@ -951,7 +944,7 @@ fn interrupt_expected(
                         .try_lock()
                         .map_err(|e| format!("owner lock unavailable: {e}"))?;
                     if let Some(expected) = target {
-                        crate::app_server::require_control_target(run, expected)?;
+                        crate::runtime::require_control_target(run, expected)?;
                     }
                     settle_stopped(run, &manifest["revision"], &owner)
                 })();
@@ -982,7 +975,7 @@ fn interrupt_expected(
         let result = (|| -> Result<Value, String> {
             let file = owner_file(&child)?;
             if root != run {
-                let _ = crate::app_server::control(&child, "interrupt", "", None);
+                let _ = crate::runtime::control(&child, "interrupt", "", None);
             }
             loop {
                 match file.try_lock() {
@@ -1025,7 +1018,7 @@ fn close_gate(
         json!({"version":1,"blocked":false,"epoch":0,"members":{}})
     };
     if let Some(expected) = target {
-        crate::app_server::require_control_target(run, expected)?;
+        crate::runtime::require_control_target(run, expected)?;
         if tree["epoch"] != expected["subtree_epoch"]
             || tree["members"][id(run)]["revision"] != expected["revision"]
         {
@@ -1082,7 +1075,7 @@ pub const POLICY: &str = include_str!("docs/coordinator.md");
 #[cfg(test)]
 mod tests {
     use super::*;
-    include!("native_boundary_tests.rs");
+    include!("subteam/tests/native_boundary.rs");
 
     #[test]
     fn child_admission_undo_preserves_coordinator_and_child_interruption_gate() {

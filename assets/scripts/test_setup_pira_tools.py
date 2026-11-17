@@ -26,6 +26,41 @@ sys.modules[SPEC.name] = setup
 SPEC.loader.exec_module(setup)
 
 
+class TeamRemoteSigningTests(unittest.TestCase):
+    def result(self, usage):
+        return subprocess.CompletedProcess([],1,"",usage)
+
+    def test_unrelated_tools_do_not_probe_signing(self):
+        with patch.object(setup.subprocess,"run") as run:
+            setup.check_team_remote_signing(["pira_nav"])
+            run.assert_not_called()
+
+    def test_existing_system_signing_is_checked_without_real_keys_or_writes(self):
+        with patch.object(setup.shutil,"which",return_value=None), \
+             patch.object(setup.Path,"is_file",return_value=True), \
+             patch.object(setup.subprocess,"run",return_value=self.result("-Y sign\n-Y verify")) as run, \
+             patch.object(setup,"IS_WINDOWS",False):
+            setup.check_team_remote_signing(["pira_team"])
+            self.assertEqual(run.call_args.args[0],["/usr/bin/ssh-keygen","-?"])
+
+    def test_windows_system_openssh_location_is_supported(self):
+        with patch.object(setup,"IS_WINDOWS",True), patch.dict(os.environ,{"SystemRoot":"C:/Windows"}), \
+             patch.object(setup.shutil,"which",return_value=None),patch.object(setup.Path,"is_file",return_value=True), \
+             patch.object(setup.subprocess,"run",return_value=self.result("-Y sign\n-Y verify")) as run:
+            setup.check_team_remote_signing(["pira_team"])
+            self.assertEqual(Path(run.call_args.args[0][0]),Path("C:/Windows/System32/OpenSSH/ssh-keygen.exe"))
+
+    def test_missing_or_old_signer_is_actionable_and_never_installed(self):
+        with patch.object(setup.shutil,"which",return_value=None),patch.object(setup.Path,"is_file",return_value=False):
+            with self.assertRaisesRegex(RuntimeError,"OS OpenSSH client"):
+                setup.check_team_remote_signing(["pira_team"])
+        with patch.object(setup.shutil,"which",return_value="/fixture/ssh-keygen"), \
+             patch.object(setup.Path,"is_file",return_value=True), \
+             patch.object(setup.subprocess,"run",return_value=self.result("usage: ssh-keygen -t rsa")):
+            with self.assertRaisesRegex(RuntimeError,"-Y sign/verify"):
+                setup.check_team_remote_signing(["pira_team"])
+
+
 class WindowsCodexSearchTests(unittest.TestCase):
     def test_searchpath_uses_exact_native_image_name_and_preserves_errors(self):
         import ctypes
@@ -273,23 +308,21 @@ sys.stdin.read()
 
 class TeamAuthTests(unittest.TestCase):
     def setUp(self) -> None:
-        search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
-        search.start()
-        self.addCleanup(search.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.home = self.root / "home"; self.home.mkdir()
+        self.root = Path(self.tmp.name).resolve()
+        self.home = self.root / "native-home"; self.home.mkdir()
         self.auth = self.home / "auth.json"
-        self.env = patch.dict(setup.os.environ, {"CODEX_HOME": str(self.home), "CODEX_API_KEY": "",
-                                                "OPENAI_API_KEY": "synthetic-other-key",
-                                                "CODEX_ACCESS_TOKEN": "synthetic-other-token"})
-        self.env.start(); self.addCleanup(self.env.stop)
-        self.which = patch.object(setup.shutil, "which", return_value="/test/codex")
-        self.which.start(); self.addCleanup(self.which.stop)
-        self.executable = str(self.root / ("codex.exe" if setup.IS_WINDOWS else "codex"))
+        self.marker = self.home / "pira-team-auth.json"
+        self.fallback = self.home / "pira-team-auth"
+        environment = patch.dict(setup.os.environ, {"CODEX_HOME": str(self.home),
+            "CODEX_API_KEY": "", "OPENAI_API_KEY": "synthetic-other-key", "CODEX_ACCESS_TOKEN": "synthetic-other-token"}, clear=True)
+        environment.start(); self.addCleanup(environment.stop)
+        self.executable = str(self.root / "codex")
         selection = patch.object(setup, "selected_codex_binary", return_value=self.executable)
         selection.start(); self.addCleanup(selection.stop)
+        terminal = patch.object(setup.sys.stdin, "isatty", return_value=True)
+        terminal.start(); self.addCleanup(terminal.stop)
 
     def ensure(self, **kwargs) -> None:
         options = dict(verify=False, dry_run=False, login="auto")
@@ -299,141 +332,263 @@ class TeamAuthTests(unittest.TestCase):
     def result(self, code=0, stderr=""):
         return subprocess.CompletedProcess([], code, "", stderr)
 
-    def test_no_auth_actions_for_other_tools_dry_run_or_explicit_api_key(self) -> None:
+    def native(self, command, **kwargs):
+        if command[2] == 'cli_auth_credentials_store="keyring"':
+            self.assertEqual(command[-2:], ["login", "status"])
+            return self.result()  # Synthetic keyring present; a main file may be stale.
+        cache = Path(kwargs["env"]["CODEX_HOME"]) / "auth.json"
+        self.assertTrue(cache.is_symlink())
+        self.assertEqual(command[:3], [self.executable, "-c", 'cli_auth_credentials_store="file"'])
+        self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+        self.assertNotIn("CODEX_ACCESS_TOKEN", kwargs["env"])
+        if command[-1] == "status":
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            return self.result() if cache.exists() else self.result(1, "Not logged in")
+        self.assertNotIn("capture_output", kwargs)
+        self.assertEqual(kwargs["timeout"], 300)
+        cache.write_text("synthetic-native-login")
+        return self.result()
+
+    def write_marker(self, home: Path) -> None:
+        self.marker.write_text(json.dumps({"version": 1, "home": str(home)}))
+        self.marker.chmod(0o600)
+
+    def test_other_tools_dry_run_api_key_and_anonymous_provider_need_no_login(self):
         with patch.object(setup.subprocess, "run") as run:
             setup.ensure_team_auth(["pira_nav"], self.root, verify=False, dry_run=False, login="auto")
             self.ensure(dry_run=True)
-            with patch.dict(setup.os.environ, {"CODEX_API_KEY": "synthetic-configured"}):
-                self.ensure(verify=True)
+            with patch.dict(setup.os.environ, {"CODEX_API_KEY": "synthetic-key"}): self.ensure(verify=True)
+            (self.home / "config.toml").write_text('model_provider="local"\n[model_providers.local]\nrequires_openai_auth=false\n')
+            self.ensure()
             run.assert_not_called()
-        self.assertEqual(list(self.home.iterdir()), [])
 
-    def test_verify_and_skip_fail_missing_login_without_starting_flow(self) -> None:
-        with patch.object(setup.subprocess, "run", return_value=self.result(1, "Not logged in")) as run:
-            for options in (dict(verify=True), dict(login="skip"), dict(verify=True, dry_run=True)):
-                with self.assertRaisesRegex(RuntimeError, "login is missing"):
-                    self.ensure(**options)
-            self.assertEqual(run.call_count, 3)
-            self.assertTrue(all(call.args[0][-2:] == ["login", "status"] for call in run.call_args_list))
-        self.assertFalse(self.auth.exists())
-
-    def test_existing_file_cache_reused_without_leaking_status_output(self) -> None:
-        self.auth.write_text("synthetic-cache")
+    def test_existing_valid_file_reused_without_user_login_and_private_status_output(self):
+        self.auth.write_text("synthetic-existing-login")
         output = io.StringIO()
-        with patch.object(setup.subprocess, "run", return_value=self.result(stderr="private-status")) as run, \
+        with patch.object(setup.subprocess, "run", return_value=self.result(stderr="private-account")) as run, \
              patch.object(setup.sys, "stdout", output):
             self.ensure()
             run.assert_called_once()
-            call = run.call_args
-            self.assertEqual(call.args[0], [self.executable, "login", "status"])
-            self.assertEqual(call.kwargs["env"]["OPENAI_API_KEY"], "synthetic-other-key")
-            self.assertEqual(call.kwargs["env"]["CODEX_ACCESS_TOKEN"], "synthetic-other-token")
-            self.assertNotIn("private-status", output.getvalue())
-        self.assertEqual(self.auth.read_text(), "synthetic-cache")
+            self.assertEqual(run.call_args.args[0][-2:], ["login", "status"])
+            self.assertNotEqual(run.call_args.kwargs["env"]["CODEX_HOME"], str(self.home))
+        self.assertNotIn("private-account", output.getvalue())
+        self.assertEqual(json.loads(self.marker.read_text()), {"version": 1, "home": str(self.home)})
+        self.assertEqual(self.auth.read_text(), "synthetic-existing-login")
 
-    def test_browser_device_auto_and_managed_binary_recheck_login(self) -> None:
-        for login, tty, device in [("auto", True, False), ("auto", False, True),
-                                   ("browser", False, False), ("device", True, True)]:
-            with self.subTest(login=login, tty=tty):
+    def test_keyring_and_auto_ignore_leftover_main_file_and_prepare_native_fallback(self):
+        for mode in ("keyring", "auto", "ephemeral"):
+            with self.subTest(mode=mode):
+                self.marker.unlink(missing_ok=True)
+                (self.fallback / "auth.json").unlink(missing_ok=True)
+                config = f'cli_auth_credentials_store="{mode}"\n'
+                (self.home / "config.toml").write_text(config)
+                self.auth.write_text("synthetic-stale-main-file")
+                with patch.object(setup.subprocess, "run", side_effect=self.native) as run:
+                    self.ensure(login="device")
+                    self.assertEqual(sum(c.args[0][-1] != "status" for c in run.call_args_list), 1)
+                self.assertEqual(json.loads(self.marker.read_text()), {"version": 1, "home": str(self.fallback)})
+                self.assertEqual((self.fallback / "auth.json").read_text(), "synthetic-native-login")
+                self.assertEqual(self.auth.read_text(), "synthetic-stale-main-file")
+                self.assertEqual((self.home / "config.toml").read_text(), config)
+
+    def test_skip_verify_and_noninteractive_auto_never_start_login_or_claim_ready(self):
+        for mode in ("file", "auto", "keyring"):
+            (self.home / "config.toml").write_text(f'cli_auth_credentials_store="{mode}"\n')
+            for options in ({"verify": True}, {"login": "skip"}, {"verify": True, "dry_run": True}, {}):
+                with self.subTest(mode=mode, options=options), \
+                     patch.object(setup.sys.stdin, "isatty", return_value=False), \
+                     patch.object(setup.subprocess, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, "authentication incomplete"):
+                        self.ensure(**options)
+                    run.assert_not_called()
+        self.assertFalse(self.marker.exists())
+
+    def test_auto_using_verified_file_needs_no_user_login(self):
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="auto"\n')
+        self.auth.write_text("synthetic-native-auto-file")
+        def native(command, **kwargs):
+            if command[2] == 'cli_auth_credentials_store="keyring"':
+                return self.result(1, "Not logged in")
+            return self.native(command, **kwargs)
+        with patch.object(setup.subprocess, "run", side_effect=native) as run:
+            self.ensure(login="skip")
+            self.assertEqual(run.call_count, 2)
+            self.assertTrue(all(call.args[0][-1] == "status" for call in run.call_args_list))
+        self.assertEqual(json.loads(self.marker.read_text())["home"], str(self.home))
+
+    def test_auto_keyring_uncertainty_never_selects_leftover_main_file(self):
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="auto"\n')
+        self.auth.write_text("synthetic-stale-file")
+        with patch.object(setup.subprocess, "run", return_value=self.result(1, "private-keyring-error")) as run:
+            with self.assertRaisesRegex(RuntimeError, "authentication incomplete") as error:
+                self.ensure(login="skip")
+            run.assert_called_once()
+            self.assertNotIn("private-keyring-error", str(error.exception))
+        self.assertFalse(self.marker.exists())
+
+    def test_auto_file_verify_needs_a_recorded_runtime_selection(self):
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="auto"\n')
+        self.auth.write_text("synthetic-native-auto-file")
+        def native(command, **kwargs):
+            return self.result(1, "Not logged in") if command[2] == 'cli_auth_credentials_store="keyring"' else self.native(command, **kwargs)
+        with patch.object(setup.subprocess, "run", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "selection is not recorded"): self.ensure(verify=True)
+        self.assertFalse(self.marker.exists())
+
+    def test_explicit_browser_device_and_terminal_auto_use_only_setup_native_flow(self):
+        for mode, device in (("browser", False), ("device", True), ("auto", False)):
+            with self.subTest(mode=mode), patch.object(setup.subprocess, "run", side_effect=self.native) as run:
                 self.auth.unlink(missing_ok=True)
-                def run(command, **kwargs):
-                    if command[-1] != "status":
-                        self.assertNotIn("capture_output", kwargs)
-                        self.assertEqual(kwargs["timeout"], 300)
-                        self.assertEqual("--device-auth" in command, device)
-                        self.auth.write_text("synthetic-cache")
-                    return self.result() if self.auth.exists() else self.result(1, "Not logged in")
-                managed = str(setup.executable_path(self.root / setup.CODEX_PACKAGE_DIR / "bin", "codex"))
-                with patch.object(setup, "selected_codex_binary", return_value=managed), \
-                     patch.object(setup.subprocess, "run", side_effect=run) as calls, \
-                     patch.object(setup.sys.stdin, "isatty", return_value=tty), \
-                     patch.object(setup.shutil, "which", return_value=None):
-                    self.ensure(login=login)
-                    self.assertEqual(calls.call_count, 3)
-                    self.assertEqual(calls.call_args_list[0].args[0][0],
-                                     str(setup.executable_path(self.root / setup.CODEX_PACKAGE_DIR / "bin", "codex")))
+                self.ensure(login=mode)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual("--device-auth" in run.call_args_list[0].args[0], device)
+                self.assertEqual(run.call_args_list[-1].args[0][-1], "status")
 
-    def test_login_failures_cancellation_and_missing_cache_are_not_success(self) -> None:
-        for response, message in [(self.result(1), "did not complete"),
-                                  (subprocess.TimeoutExpired("codex", 300), "timed out"),
-                                  (KeyboardInterrupt(), "cancelled"),
-                                  (OSError("unavailable"), "Could not launch"),
+    def test_login_failure_timeout_cancel_and_missing_cache_are_visible(self):
+        for response, message in [(self.result(1), "did not complete"), (subprocess.TimeoutExpired("native", 300), "timed out"),
+                                  (KeyboardInterrupt(), "cancelled"), (OSError("private-error"), "Could not launch"),
                                   (self.result(), "without a Team-compatible")]:
             with self.subTest(message=message), patch.object(setup.subprocess, "run") as run:
-                run.side_effect = [self.result(1, "Not logged in"), response]
-                with self.assertRaisesRegex(RuntimeError, message):
-                    self.ensure(login="device")
-                self.assertEqual(run.call_count, 2)
-
-    def test_status_configuration_errors_never_trigger_login_or_echo_details(self) -> None:
-        self.auth.write_text("synthetic-cache")
-        for response in (self.result(1, "private-error"), subprocess.TimeoutExpired("status", 15)):
-            with patch.object(setup.subprocess, "run") as run:
                 if isinstance(response, BaseException): run.side_effect = response
                 else: run.return_value = response
-                with self.assertRaises(RuntimeError) as error:
-                    self.ensure()
+                with self.assertRaisesRegex(RuntimeError, message) as error: self.ensure(login="device")
                 self.assertNotIn("private-error", str(error.exception))
                 self.assertEqual(run.call_count, 1)
+        self.assertFalse(self.marker.exists())
 
-    def test_existing_signed_out_cache_is_never_overwritten(self) -> None:
-        self.auth.write_text("synthetic-expired-cache")
-        with patch.object(setup.subprocess, "run", return_value=self.result(1, "Not logged in")) as run:
-            with self.assertRaisesRegex(RuntimeError, "preserved without overwrite"):
-                self.ensure(login="browser")
-            run.assert_called_once()
-        self.assertEqual(self.auth.read_text(), "synthetic-expired-cache")
-
-    def test_native_keyring_or_environment_auth_is_preserved_including_skip(self) -> None:
-        for options in ({}, {"login": "skip"}, {"verify": True}, {"verify": True, "dry_run": True}):
-            output = io.StringIO()
-            with self.subTest(options=options), \
-                 patch.object(setup.subprocess, "run", return_value=self.result(stderr="private-account")) as run, \
-                 patch.object(setup.sys, "stdout", output):
-                self.ensure(**options)
+    def test_unexpected_status_error_never_triggers_login_or_exposes_details(self):
+        self.auth.write_text("synthetic-cache")
+        for response in (self.result(1, "private-error"), subprocess.TimeoutExpired("status", 15)):
+            with self.subTest(response=type(response)), patch.object(setup.subprocess, "run") as run:
+                if isinstance(response, BaseException): run.side_effect = response
+                else: run.return_value = response
+                with self.assertRaises(RuntimeError) as error: self.ensure()
+                self.assertNotIn("private-error", str(error.exception))
                 run.assert_called_once()
-                self.assertEqual(run.call_args.args[0], [self.executable, "login", "status"])
-                self.assertIn("LIMITATION", output.getvalue())
-                self.assertIn("not keyring-only", output.getvalue())
-                self.assertNotIn("private-account", output.getvalue())
-                self.assertFalse(self.auth.exists())
 
-    def test_authentication_cache_is_not_opened_by_setup(self) -> None:
+    def test_unaccepted_file_is_preserved_in_skip_mode(self):
+        self.auth.write_text("synthetic-cache")
+        with patch.object(setup.subprocess, "run", return_value=self.result(1, "Not logged in")) as run:
+            with self.assertRaisesRegex(RuntimeError, "authentication incomplete"): self.ensure(login="skip")
+            run.assert_called_once()
+        self.assertEqual(self.auth.read_text(), "synthetic-cache")
+
+    def test_credential_contents_are_never_opened_by_setup(self):
         self.auth.write_text("synthetic-do-not-read")
         native_open = Path.open
-        def reject_credentials(path, *args, **kwargs):
-            if path == self.auth:
-                raise AssertionError("setup must not read credential contents")
+        def guard(path, *args, **kwargs):
+            if path == self.auth: raise AssertionError("must not read credentials")
             return native_open(path, *args, **kwargs)
-        with patch.object(Path, "open", reject_credentials), \
-             patch.object(setup.subprocess, "run", return_value=self.result()):
-            self.ensure()
+        with patch.object(Path, "open", guard), patch.object(setup.subprocess, "run", return_value=self.result()): self.ensure()
 
-    @unittest.skipUnless(os.name == "posix", "credential-link fixture without Windows privileges")
-    def test_existing_credential_link_is_reused_without_open_or_relogin(self):
-        target = self.home / "private-cache"; target.write_bytes(b"synthetic-cache")
+    @unittest.skipUnless(os.name == "posix", "POSIX synthetic alias fixture")
+    def test_existing_alias_retains_native_atomic_replacement_target(self):
+        target = self.home / "private-native-cache"; target.write_text("synthetic-cache")
         self.auth.symlink_to(target)
-        with patch.object(setup.subprocess, "run", return_value=self.result()) as run:
-            self.ensure(login="skip")
-            run.assert_called_once()
+        with patch.object(setup.subprocess, "run", side_effect=self.native): self.ensure(login="skip")
         self.assertTrue(self.auth.is_symlink())
-        self.assertEqual(target.read_bytes(), b"synthetic-cache")
+        self.assertEqual(target.read_text(), "synthetic-cache")
 
-    def test_fresh_signed_out_auth_logs_in_once_then_checks_file_source(self) -> None:
+    def test_missing_symlink_privilege_fails_before_any_login(self):
+        self.auth.write_text("synthetic-cache")
+        with patch.object(Path, "symlink_to", side_effect=OSError(1314, "synthetic privilege")), \
+             patch.object(setup, "IS_WINDOWS", True), patch.object(setup.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "Another login alone cannot fix"): self.ensure(login="browser")
+            run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "synthetic hard-link fixture")
+    def test_windows_multi_link_source_is_rejected_not_used_as_workaround(self):
+        self.auth.write_text("synthetic-cache")
+        os.link(self.auth, self.home / "second-link")
+        with patch.object(setup, "IS_WINDOWS", True), patch.object(setup.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "no copy/hard-link fallback"): self.ensure()
+            run.assert_not_called()
+
+    def test_selected_marker_reused_and_verified_without_prompt(self):
+        self.fallback.mkdir(); (self.fallback / "auth.json").write_text("synthetic-selected-file")
+        self.write_marker(self.fallback)
+        before = self.marker.read_bytes()
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="auto"\n')
+        with patch.object(setup.subprocess, "run", side_effect=self.native) as run:
+            self.ensure(verify=True)
+            run.assert_called_once()
+        self.assertEqual(self.marker.read_bytes(), before)
+
+    def test_existing_fallback_requires_persisted_selection_for_verify(self):
+        self.fallback.mkdir(); (self.fallback / "auth.json").write_text("synthetic-existing-fallback")
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="keyring"\n')
+        with patch.object(setup.subprocess, "run", side_effect=self.native):
+            with self.assertRaisesRegex(RuntimeError, "selection is not recorded"): self.ensure(verify=True)
+            self.ensure(login="skip")
+        self.assertTrue(self.marker.exists())
+
+    def test_worker_config_selection_and_auth_constraints_match_probe(self):
+        (self.home / "config.toml").write_text('cli_auth_credentials_store="keyring"\n')
+        worker = 'cli_auth_credentials_store="file"\nforced_login_method="api"\nforced_chatgpt_workspace_id=["synthetic-workspace"]\n'
+        (self.home / "pira-team-worker.toml").write_text(worker)
+        self.auth.write_text("synthetic-cache")
+        import tomllib
         def native(command, **kwargs):
-            if command[-1] == "status":
-                return self.result() if self.auth.exists() else self.result(1, "Not logged in")
-            self.auth.write_text("synthetic-fresh-cache")
-            self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
-            self.assertNotIn("CODEX_ACCESS_TOKEN", kwargs["env"])
-            return self.result()
+            config = Path(kwargs["env"]["CODEX_HOME"]) / "config.toml"
+            self.assertEqual(tomllib.loads(config.read_text()), tomllib.loads(worker))
+            return self.native(command, **kwargs)
         with patch.object(setup.subprocess, "run", side_effect=native) as run:
-            self.ensure(login="browser")
-            self.assertEqual(run.call_count, 3)
-            self.assertEqual(run.call_args_list[0].args[0], [self.executable, "login", "status"])
-            self.assertEqual(run.call_args_list[-1].args[0],
-                [self.executable, "-c", 'cli_auth_credentials_store="file"', "login", "status"])
+            self.ensure(); run.assert_called_once()
 
+    def test_unsupported_helpers_and_catalogs_fail_before_login_without_values(self):
+        for source in ('model_catalog_json="PRIVATE_SENTINEL"\n',
+                       'model_provider="vendor"\n[model_providers.vendor]\nauth={command="PRIVATE_SENTINEL"}\n',
+                       'model_provider="vendor"\n[model_providers.vendor]\nmodel_catalog_url="https://example.invalid/PRIVATE_SENTINEL"\n'):
+            with self.subTest(source=source), patch.object(setup.subprocess, "run") as run:
+                (self.home / "config.toml").write_text(source)
+                with self.assertRaisesRegex(RuntimeError, "unsupported") as error: self.ensure()
+                self.assertNotIn("PRIVATE_SENTINEL", str(error.exception)); run.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX broken config alias")
+    def test_broken_explicit_worker_config_never_falls_back_to_main(self):
+        (self.home / "pira-team-worker.toml").symlink_to(self.root / "missing-config")
+        with patch.object(setup.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "persistent Team provider/auth config"): self.ensure()
+            run.assert_not_called()
+
+    def test_malformed_private_selection_is_not_overwritten(self):
+        self.marker.write_text('{"version":1,"home":"PRIVATE_SENTINEL","extra":true}')
+        self.marker.chmod(0o600)
+        with patch.object(setup.subprocess, "run") as run:
+            with self.assertRaises(RuntimeError) as error: self.ensure()
+            self.assertNotIn("PRIVATE_SENTINEL", str(error.exception)); run.assert_not_called()
+
+    def test_selection_publish_failure_is_not_ready_and_cleans_temporary_marker(self):
+        self.auth.write_text("synthetic-existing-file")
+        replace = os.replace
+        def publish(source, target):
+            if Path(target) == self.marker: raise PermissionError("synthetic marker publication failure")
+            return replace(source, target)
+        with patch.object(setup.subprocess, "run", side_effect=self.native), patch.object(setup.os, "replace", side_effect=publish):
+            with self.assertRaises(PermissionError): self.ensure(login="skip")
+        self.assertFalse(self.marker.exists())
+        self.assertFalse(list(self.home.glob(".pira-team-auth-*")))
+        self.assertEqual(self.auth.read_text(), "synthetic-existing-file")
+
+    def test_explicit_setup_renewal_replaces_rejected_cache_through_native_login(self):
+        self.auth.write_text("synthetic-rejected-cache-with-successful-offline-status")
+        with patch.object(setup.subprocess, "run", side_effect=self.native) as run:
+            self.ensure(login="browser", reauth=True)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][-1], "login")
+            self.assertEqual(run.call_args_list[-1].args[0][-1], "status")
+        self.assertEqual(self.auth.read_text(), "synthetic-native-login")
+
+    def test_renewal_never_bypasses_verify_skip_or_explicit_api_key_selection(self):
+        for options in ({"verify": True}, {"login": "skip"}):
+            with self.subTest(options=options), patch.object(setup.subprocess, "run") as run:
+                with self.assertRaisesRegex(RuntimeError, "normal setup login"):
+                    self.ensure(reauth=True, **options)
+                run.assert_not_called()
+        with patch.dict(setup.os.environ, {"CODEX_API_KEY": "synthetic-explicit-key"}), patch.object(setup.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "overrides native file login"):
+                self.ensure(reauth=True, login="browser")
+            run.assert_not_called()
 
 class SetupPiraToolsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -468,6 +623,31 @@ class SetupPiraToolsTests(unittest.TestCase):
         network = patch.object(setup, "urlopen", side_effect=AssertionError("unmocked setup network request"))
         network.start()
         self.addCleanup(network.stop)
+
+    def test_auth_only_prepares_installed_native_login_without_release_or_install_work(self):
+        root = Path(setup.os.environ["HOME"])
+        with patch.object(setup, "selected_codex_binary", return_value="/synthetic/codex"), \
+             patch.object(setup, "check_team_runtime") as check, \
+             patch.object(setup, "ensure_team_auth") as auth, \
+             patch.object(setup, "release_index", side_effect=AssertionError("no release lookup")), \
+             patch.object(setup, "ensure_path", side_effect=AssertionError("no PATH changes")):
+            self.assertEqual(setup.main(["--auth-only", "--codex-login", "skip", "--install-dir", str(root)]), 0)
+            check.assert_called_once_with(["pira_team"], "/synthetic/codex")
+            self.assertEqual(auth.call_args.kwargs["login"], "skip")
+            self.assertFalse(auth.call_args.kwargs["verify"])
+
+    def test_auth_only_dry_run_does_not_probe_or_prepare_native_login(self):
+        with patch.object(setup, "check_team_runtime") as check, patch.object(setup, "ensure_team_auth") as auth:
+            self.assertEqual(setup.main(["--auth-only", "--dry-run"]), 0)
+            check.assert_not_called()
+            self.assertTrue(auth.call_args.kwargs["dry_run"])
+
+    def test_auth_only_rejects_unrelated_harness_or_tool_selection(self):
+        for flags in (["--harness", "claude"], ["--tool", "pira_nav"]):
+            with self.subTest(flags=flags), patch.object(setup, "ensure_team_auth") as auth:
+                with self.assertRaisesRegex(RuntimeError, "prepares Codex login"):
+                    setup.main(["--auth-only", *flags])
+                auth.assert_not_called()
 
     def test_include_selection_controls_existing_codex_preflight(self) -> None:
         for names, use_codex in [([], True), (["Codex"], True),
@@ -789,21 +969,26 @@ class SetupPiraToolsTests(unittest.TestCase):
     def test_team_protocol_checks_native_inventory_before_direct_initialize(self):
         contract = json.loads((setup.REPO_ROOT / "tools/src/pira_team/backend_contract.json").read_text())
         fixture = runpy.run_path(str(setup.REPO_ROOT / "tools/crates/pira_team/tests/backend_fixture.py"))
-        for fault in ("", "method", "field", "live_method", "live_response"):
+        for fault in ("", "method", "field", "steer_method", "steer_response",
+                      "interrupt_response", "live_method", "live_response"):
             def run(command, **kwargs):
                 self.assertEqual(kwargs["timeout"], 10)
                 self.assertNotIn("--strict-config", command)
                 self.assertEqual(command[:4], ["/fixture/codex", "app-server", "generate-json-schema", "--experimental"])
                 directory = Path(command[command.index("--out") + 1])
                 fixture["write_schemas"](directory, contract, fault)
-                if fault == "live_method":
+                if fault in ("live_method", "steer_method"):
+                    missing = "turn/settings/update" if fault == "live_method" else "turn/steer"
                     path = directory / "ClientRequest.json"
                     schema = json.loads(path.read_text())
                     schema["oneOf"] = [item for item in schema["oneOf"]
-                                       if item["properties"]["method"]["enum"] != ["turn/settings/update"]]
+                                       if item["properties"]["method"]["enum"] != [missing]]
                     path.write_text(json.dumps(schema))
-                elif fault == "live_response":
-                    (directory / "v2/TurnSettingsUpdateResponse.json").unlink()
+                elif fault in ("live_response", "steer_response", "interrupt_response"):
+                    response = {"live_response": "TurnSettingsUpdateResponse",
+                                "steer_response": "TurnSteerResponse",
+                                "interrupt_response": "TurnInterruptResponse"}[fault]
+                    (directory / f"v2/{response}.json").unlink()
                 return subprocess.CompletedProcess(command, 0, "", "")
             def initialize(command, env, *, project):
                 self.assertIn(".path with spaces", project)
@@ -817,7 +1002,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                 self.assertNotIn("CODEX_API_KEY", env)
             with self.subTest(fault=fault), patch.object(setup.subprocess, "run", side_effect=run), \
                  patch.object(setup, "check_team_initialize", side_effect=initialize) as probe:
-                if fault:
+                if fault not in ("", "live_method", "live_response"):
                     with self.assertRaises(ValueError): setup.check_team_protocol("/fixture/codex")
                     probe.assert_not_called()
                 else:
@@ -859,7 +1044,7 @@ class SetupPiraToolsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "login missing"):
                 setup.main(["--tool", "pira_team", "--codex-login", "device"])
             self.assertEqual(auth.call_args.args[0], ["pira_team"])
-            self.assertEqual(auth.call_args.kwargs, dict(verify=False, dry_run=False, login="device"))
+            self.assertEqual(auth.call_args.kwargs, dict(verify=False, dry_run=False, login="device", store_root=str(Path(setup.os.environ["PIRA_TEAM_DIR"]).resolve()), reauth=False))
             download.assert_not_called()
 
     def test_missing_codex_install_modes_and_existing_runtime_preservation(self) -> None:
@@ -1544,6 +1729,7 @@ class CodexPreparationTests(unittest.TestCase):
              patch.object(setup, "load_selector", return_value=selector), \
              patch.object(selector, "current_platform", return_value=self.platform), \
              patch.object(setup, "ensure_team_auth") as auth, \
+             patch.object(setup, "check_team_remote_signing") as signing, \
              patch.object(setup, "download_binary", side_effect=download) as fetch, \
              patch.object(setup, "direct_version", return_value="pira_team 0.2.0"), \
              patch.object(setup, "ensure_path") as persist:
@@ -1557,6 +1743,7 @@ class CodexPreparationTests(unittest.TestCase):
             self.assertEqual(setup.main([*args, "--verify"]), 0)
             install.assert_called_once(); fetch.assert_called_once(); persist.assert_not_called()
             self.assertEqual(auth.call_count, 3)
+            self.assertEqual(signing.call_count, 3)
         self.assertEqual(adjacent.read_bytes(), b"old-external")
         self.assertEqual(original_team.read_bytes(), b"old-team")
 

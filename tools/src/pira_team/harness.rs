@@ -1,9 +1,25 @@
 //! Native CLI adaptation boundary. Shared ownership, supervision and artifacts stay
 //! outside this module; protocol loops remain native rather than emulating Codex.
 //! Add a harness here, its native launch/caller adapter, and its protocol loop.
-use crate::{Options, app_server, authentication};
+pub(crate) mod claude;
+pub(crate) mod codex;
+
+use crate::{Options, authentication, runtime};
 use serde_json::Value;
 use std::{path::Path, process::Command};
+
+// Launcher-first worker shell PATH is shared by both native adapters.
+fn worker_path(launcher: &Path, inherited: Option<&std::ffi::OsStr>) -> Result<String, String> {
+    let directory = launcher.parent().ok_or("Team launcher has no directory")?;
+    let mut paths = vec![directory.to_path_buf()];
+    if let Some(inherited) = inherited {
+        paths.extend(std::env::split_paths(inherited).filter(|path| path != directory));
+    }
+    std::env::join_paths(paths)
+        .map_err(|_| "cannot represent Team launcher directory in worker PATH")?
+        .into_string()
+        .map_err(|_| "worker PATH must be UTF-8 for native shell configuration".into())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PolicyDelivery {
@@ -45,9 +61,28 @@ impl Harness {
     pub(crate) fn caller_context() -> Result<Value, String> {
         // Keep native identity precedence; environment hints alone grant no authority.
         if let Ok(session) = std::env::var("CLAUDE_CODE_SESSION_ID") {
-            return crate::claude::caller_context(&session);
+            return claude::caller_context(&session);
         }
-        crate::profile::codex_context()
+        codex::caller_context()
+    }
+
+    pub(crate) fn caller_session() -> Result<String, String> {
+        if let Ok(session) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+            claude::caller_identity(&session)
+        } else {
+            codex::caller_identity()
+        }
+    }
+
+    pub(crate) fn shell_entry() -> Option<i32> {
+        claude::shell_entry()
+    }
+
+    pub(crate) fn validate_codex_request(
+        schema: &jsonschema::Validator,
+        request: &Value,
+    ) -> Result<(), String> {
+        codex::validate_request(schema, request)
     }
 
     pub(crate) fn policy_delivery(self) -> PolicyDelivery {
@@ -61,9 +96,9 @@ impl Harness {
         self,
         run: &Path,
         authentication: &authentication::Authentication,
-    ) -> Result<Option<crate::IsolatedHome>, String> {
+    ) -> Result<Option<codex::IsolatedHome>, String> {
         match self {
-            Self::Codex => crate::IsolatedHome::new(run, authentication).map(Some),
+            Self::Codex => codex::IsolatedHome::new(run, authentication).map(Some),
             Self::Claude => Ok(None), // Native CLI owns its authentication store.
         }
     }
@@ -76,7 +111,7 @@ impl Harness {
         handoff: &Path,
     ) -> Result<Launch, String> {
         let request_schema = match self {
-            Self::Codex => Some(crate::backend::preflight(options, run, dir)?),
+            Self::Codex => Some(codex::preflight(options, run, dir)?),
             Self::Claude => None,
         };
         if crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -84,11 +119,11 @@ impl Harness {
         }
         let command = match self {
             Self::Codex => {
-                let mut command = crate::command(options, run, dir, handoff);
-                crate::set_worker_launcher(&mut command)?;
+                let mut command = codex::command(options, run, dir, handoff);
+                codex::set_worker_launcher(&mut command)?;
                 command
             }
-            Self::Claude => crate::claude::command(options, run, dir, handoff)?,
+            Self::Claude => claude::command(options, run, dir, handoff)?,
         };
         Ok(Launch {
             command,
@@ -98,28 +133,15 @@ impl Harness {
 
     pub(crate) fn relevant_event(self, value: &Value) -> bool {
         match self {
-            Self::Codex => app_server::codex_relevant_event(value),
-            Self::Claude => crate::claude::relevant_event(value),
+            Self::Codex => codex::relevant_event(value),
+            Self::Claude => claude::relevant_event(value),
         }
     }
 
-    pub(crate) fn turn(
-        self,
-        options: &Options,
-        run: &Path,
-        dir: &Path,
-        task: &str,
-        manifest: &mut Value,
-        handoff: &Path,
-        guidance: (bool, bool, bool, bool),
-    ) -> Result<app_server::Turn, String> {
+    pub(crate) fn turn(self, request: runtime::TurnRequest<'_>) -> Result<runtime::Turn, String> {
         match self {
-            Self::Codex => {
-                app_server::codex_turn::turn(options, run, dir, task, manifest, handoff, guidance)
-            }
-            Self::Claude => {
-                app_server::claude_turn::turn(options, run, dir, task, manifest, handoff, guidance)
-            }
+            Self::Codex => runtime::codex::turn(request),
+            Self::Claude => runtime::claude::turn(request),
         }
     }
 
@@ -159,7 +181,44 @@ impl Harness {
 
 #[cfg(test)]
 mod tests {
-    use super::Harness;
+    use super::{Harness, worker_path};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn worker_path_prefers_parent_launcher_and_preserves_ambient_order() {
+        let launcher = Path::new("/staged team/bin/pira_team");
+        let inherited = std::env::join_paths([
+            Path::new("/ambient/bin"),
+            Path::new("/other tools/bin"),
+            Path::new("/staged team/bin"),
+        ])
+        .unwrap();
+        let path = worker_path(launcher, Some(&inherited)).unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).collect::<Vec<_>>(),
+            [
+                PathBuf::from("/staged team/bin"),
+                PathBuf::from("/ambient/bin"),
+                PathBuf::from("/other tools/bin"),
+            ]
+        );
+        assert_eq!(
+            std::env::split_paths(&worker_path(launcher, None).unwrap()).collect::<Vec<_>>(),
+            [PathBuf::from("/staged team/bin")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_path_rejects_unrepresentable_native_shell_environment() {
+        use std::os::unix::ffi::OsStringExt;
+        let inherited = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        assert!(
+            worker_path(Path::new("/staged/pira_team"), Some(&inherited))
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+    }
 
     #[test]
     fn adapters_keep_native_protocols_and_owner_namespaces_separate() {

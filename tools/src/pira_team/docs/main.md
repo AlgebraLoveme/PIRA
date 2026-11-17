@@ -55,7 +55,7 @@ Keep the primary handoff concise: per-issue disposition, decisive evidence, actu
 
 ## Execution
 
-Use the lightest reliable tool and deterministic, non-interactive commands. Set cwd through the execution tool rather than an in-command directory change. Keep temporary artifacts in the assigned scratch or platform temporary directory.
+Use the lightest reliable tool and deterministic, non-interactive commands. Set cwd through the execution tool rather than an in-command directory change. Keep downloads, extracted sources and disposable work in platform temporary storage, outside Team records. Retain downloads or extracted sources only when explicitly requested, in a designated project location outside Team records. Managed artifacts are for handoffs and useful supporting evidence, not downloaded files, source trees, build outputs or temporary environments.
 
 ### Concurrency
 

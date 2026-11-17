@@ -67,7 +67,19 @@ pub(crate) fn shell_entry() -> Option<i32> {
     if args.len() != 2 {
         return Some(2);
     }
+    let provider_environment: Vec<String> = match std::env::var("PIRA_TEAM_PROVIDER_ENV") {
+        Ok(value) => match serde_json::from_str(&value) {
+            Ok(names) => names,
+            Err(_) => return Some(2),
+        },
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(_) => return Some(2),
+    };
     let mut command = Command::new("bash");
+    command.env_remove("PIRA_TEAM_PROVIDER_ENV");
+    for name in provider_environment {
+        command.env_remove(name);
+    }
     command.args([std::ffi::OsStr::new("-c"), &args[1]]);
     for (key, _) in std::env::vars_os() {
         if excluded_shell_variable(&key.to_string_lossy()) {
@@ -122,7 +134,7 @@ pub(crate) fn command(
     if options.execution.mode != "danger-full-access" {
         return Err("Claude workers require verified full-access permission; workspace-write cannot be represented by Claude's tool permissions".into());
     }
-    if options.service_tier != crate::service_tier::Tier::Standard {
+    if options.service_tier != crate::profile::service_tier::Tier::Standard {
         return Err(
             "Claude service-tier selection is not supported; use --service-tier standard".into(),
         );
@@ -147,7 +159,7 @@ pub(crate) fn command(
         fs::hard_link(source, destination)
     })
     .map_err(|e| format!("create Claude shell filter: {e}"))?;
-    let path = crate::worker_path(&launcher, std::env::var_os("PATH").as_deref())?;
+    let path = super::worker_path(&launcher, std::env::var_os("PATH").as_deref())?;
     let mut environment = json!({
         "PIRA_TEAM_CHILD":"1",
         "PATH":path,"CLAUDE_CODE_SHELL_PREFIX":wrapper,
@@ -159,10 +171,14 @@ pub(crate) fn command(
     });
     for (key, value) in crate::worker_context_environment(options, run, dir, handoff)
         .into_iter()
-        .chain(crate::worker_temp_environment(run))
+        .chain(crate::worker_temp_environment(options))
     {
         environment[key] = json!(value);
     }
+    environment["PIRA_TEAM_PROVIDER_ENV"] = json!(
+        serde_json::to_string(options.authentication.provider_environment())
+            .map_err(|_| "encode provider environment exclusions")?
+    );
     let settings = json!({"env":environment,"sandbox":{"enabled":false},"fastMode":false});
     let mut command = Command::new(options.authentication.program());
     options.authentication.apply(&mut command);
@@ -382,6 +398,27 @@ pub(crate) fn caller_context(session: &str) -> Result<Value, String> {
             "cwd":manifest["cwd"],"approval_policy":"never","sandbox_policy":{"type":"danger-full-access"}}),
         );
     }
+    read_context(&caller_log(session)?, session)
+}
+
+pub(crate) fn caller_identity(session: &str) -> Result<String, String> {
+    crate::profile::validate_session_id(session)?;
+    if let Some(run) = crate::subteam::caller_run()? {
+        let manifest = lifecycle::read_json(&run.join("manifest.json"))?;
+        if manifest["transport"] != "claude-stream-json" || manifest["thread_id"] != session {
+            return Err("Claude caller differs from retained native worker identity".into());
+        }
+    } else {
+        let id =
+            crate::profile::read_identity(&caller_log(session)?, |record| record.get("sessionId"))?;
+        if id != session {
+            return Err("Claude transcript session mismatch".into());
+        }
+    }
+    Ok(format!("claude-{session}"))
+}
+
+fn caller_log(session: &str) -> Result<PathBuf, String> {
     let home = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -419,8 +456,7 @@ pub(crate) fn caller_context(session: &str) -> Result<Value, String> {
             Err(_) => return Err("cannot inspect Claude transcript".into()),
         }
     }
-    let path = found.ok_or("native Claude session transcript unavailable")?;
-    read_context(&path, session)
+    found.ok_or_else(|| "native Claude session transcript unavailable".into())
 }
 
 fn read_context(path: &Path, session: &str) -> Result<Value, String> {

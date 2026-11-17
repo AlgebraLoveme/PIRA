@@ -9,11 +9,12 @@ Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inj
        pira_team resolve REQUEST_ID [--store DIR]
        pira_team bookmark RUN_REF --label LABEL [--store DIR]
        pira_team unbookmark LABEL [--store DIR]
-       pira_team bookmarks [--limit N] [--store DIR]
-       pira_team search QUERY [--limit N] [--store DIR]
+       pira_team bookmarks [--limit N] [--after LABEL] [--store DIR]
+       pira_team search QUERY [--limit N] [--after LABEL] [--store DIR]
        pira_team config show [--store DIR]
        pira_team config set --main MODEL --model WORKER --effort EFFORT [--store DIR]
-       pira_team config reset --main MODEL [--store DIR]
+       pira_team config reset (--main MODEL | --all) [--store DIR]
+       pira_team config retention show|set|reset [OPTIONS]
 
 Use one quoted --task (also --task=TEXT) or --task-file FILE; the file is INPUT.
 Root-only --allow-subteam on run/resume authorizes one coordinator level; children cannot delegate.
@@ -90,7 +91,9 @@ previous/current run references and changed. Same-target assignment is a no-writ
 unbookmark LABEL removes only the mapping, never runs/artifacts; absence is a no-op.
 bookmarks lists labels; search performs case-insensitive literal keyword matching on
 labels only. Both return JSON matches (label, run_id, run_root) and has_more, ordered
-by exact label ascending, with --limit 1..1000 (default 20). Invalid/unreadable metadata
+by exact label ascending, with --limit 1..1000 (default 20). When has_more is true,
+pass next_after as --after LABEL to continue strictly after the last returned label.
+Pages reflect current metadata, not a pinned snapshot. Invalid/unreadable metadata
 fails visibly, never resets or reports partial results. Run ownership is verified before
 listing; logs are not searched. Inaccessible pointers are hidden from listings and
 previous/current receipts, but own dangling mappings may still be removed.
@@ -101,6 +104,13 @@ IDs and explicit stores. A run belongs to its creating main session, not workspa
 worker native thread. Resume preserves that creator. Same labels in different sessions
 are independent; no global fallback. Read/path and metadata operations launch no workers
 and require no backend authentication. Config remains store-wide and session-free.
+Codex caller lookup first queries its native v5 thread index (CODEX_SQLITE_HOME, or
+CODEX_HOME), selecting only the current thread's rollout path. The pinned regular file
+must match its recorded identity; ambiguous/inconsistent metadata fails closed. If the
+index is unavailable, a bounded native YYYY/MM/DD fallback ignores unrelated subtrees.
+Only the selected home/session root or indexed transcript's parent alias is resolved;
+directory discovery never follows links in unrelated subtrees or matching transcript
+files, and never reads other conversations. The pinned native identity is still verified.
 Legacy global bookmarks are preserved but hidden. Legacy runs require immutable creator
 metadata or an original first revision snapshot; an actively locked initial revision is
 also recognized. Ambiguous historical runs remain intact but inaccessible. Ownership
@@ -136,20 +146,28 @@ migration, and current handoff/gate are supplied each turn. Cache hits are not g
 
 Execution permissions always inherit the matching caller session's latest recorded context,
 including on resume; explicit model/effort do not bypass permission verification. Missing,
-malformed or unrepresentable policies fail closed. Supported launches require verified
-full access with approval-never; Team cannot handle interactive approvals. Workspace-write,
-read-only and fine-grained restricted permission profiles are unsupported. Team does not
-add filesystem/network authority. Full access does not expand task ownership.
+malformed or unrepresentable policies fail closed. Local Codex supports verified full
+access and representable legacy workspace-write policies with approval-never. All required
+Team writes must fit caller writable scope; no roots are added. Claude requires full access;
+remote requirements are described separately. Read-only, interactive approvals and
+unrepresentable fine-grained profiles are unsupported. Team does not add filesystem/network
+authority. Full access does not expand task ownership.
 On new runs, caller model exactly gpt-6-astra (at any effort) maps to gpt-6.1-sol/high.
 Recognized callers gpt-6.1-sol, gpt-6-sol, gpt-6-luna and gpt-5.6-sol inherit model/effort
 unchanged. Unknown or missing caller model identity falls back to gpt-6.1-sol/high, not the
 caller's effort. These bundled defaults apply unless config supplies an exact caller-model
 override; no aliases or network discovery are used. Config show displays bundled policy,
 overrides and their file path. Set requires both fields; reset removes only that caller's
-override. Config uses worker_defaults.json in the selected Team store, needs no agent
+override. Explicit reset --all instead resets every override, including malformed contents
+of a safe regular file, preserving the old file at the backup path reported in JSON.
+Config uses worker_defaults.json in the selected Team store, needs no agent
 session, and launches no worker. Invalid config fails visibly without being overwritten;
-fix/restore the reported file before retrying. Caller discovery requires a matching native Codex or Claude session and verified
-execution context. Claude identities are namespaced separately from Codex IDs.
+use reset --all recovery or restore the file. Fully explicit profiles do not read defaults.
+Backend-specific effort restrictions are validated on set. Caller discovery for execution
+requires a matching native Codex or Claude session and verified execution context.
+Observation and interrupt require verified session identity and ownership, not a fully
+flushed current turn; run/resume/steer and tier changes retain fresh-policy checks.
+Claude identities are namespaced separately from Codex IDs.
 Claude mains must have a current bypassPermissions turn and verified non-sandboxed
 execution. The current shell is checked directly; no prior tool-result record is
 required. Unsupported or missing permission evidence fails without elevation.
@@ -170,23 +188,100 @@ and low|medium|high|xhigh|max effort. Resuming across backend families is reject
 
 The Codex transport requires native Codex app-server with the published Team protocol and strict-config support,
 plus existing local file auth or CODEX_API_KEY. Preflight generates native schemas without an execution deadline;
-missing API fields/methods fail before model work. Sent requests are schema-validated.
+missing required API fields/methods fail before model work. Live tier updates are optional:
+backends without their request/response contract can run tasks, but live tier controls
+are rejected without changing the active workload. Sent requests are schema-validated.
 Direct stdio is separate from the interactive shared daemon; its version/features are not
 Team compatibility evidence. This checks published API inventory and outgoing request shapes,
 not model access, notification semantics or actual shell sandbox behavior. Authentication
 is launcher-managed and detached after each invocation. All raw logs remain tool-managed.
+For Codex, Team selects persistent CODEX_HOME/pira-team-worker.toml when present;
+otherwise it uses CODEX_HOME/config.toml (default ~/.codex/config.toml). The worker file
+is a complete selected route, not a merge with the main config. Only the selected
+provider/connection/auth fields and typed capability metadata are projected; models,
+effort, prompts, hooks, tools, permissions and other providers are not imported.
+A legacy in-file profile is supported. Team's projection does not discover parent
+CLI/runtime overrides, separate native profile overlays or project/system layers. Use the explicit worker
+file when workers need a different supported provider. Missing/invalid selected files
+fail closed instead of silently choosing OpenAI. Source config is bounded to 1 MiB.
+Provider configuration is digest-bound in private launcher state at launch; resume rejects changed connection
+settings (restore them or start a new run). Credentials may rotate in place. Legacy
+runs bind the currently selected persistent route once, with a diagnostic; their old
+connection settings were not retained.
+
+The isolated app-server reuses a persistent native file login or explicit CODEX_API_KEY;
+it never launches login. Run PIRA setup/install to repair missing/unusable authentication.
+Setup verifies native file login through an isolated credential symlink and checks target
+refresh-write access on the selected Team store. It does not claim model access.
+Existing valid selected file login needs no new user login. Native keyring/auto/process-only
+login cannot be directly reused by this isolated transport. Setup may instead run native
+Codex file-storage login into CODEX_HOME/pira-team-auth, recording the non-secret private
+selection in CODEX_HOME/pira-team-auth.json. Main config and keyring remain unchanged;
+an auto/keyring selector never silently chooses a leftover main auth.json. Auto file
+reuse requires native keyring status to report no login, followed by isolated file
+verification and an explicit recorded Team file selection.
+Use setup_pira_tools.py --auth-only --codex-login browser (or device) for auth repair
+without release lookup, tool installation, PATH changes or store migration; --verify
+--codex-login skip checks prepared auth without user login. This auth-only mode checks
+the installed native protocol, not installed PIRA tool versions. If upstream rejects a
+cached login despite successful offline status, explicitly use --auth-only --reauth
+--codex-login browser/device to renew through native login. Normal setup still reuses
+accepted file login without prompting; verify/skip never renew. Explicit API-key/custom
+provider selection must be repaired in its own launcher configuration, not overwritten
+by native file login. Deploy matching Team
+runtime/setup changes together; older Team binaries do not read the new selection.
+All user login is setup-only: auto offers browser login only in a terminal; explicit
+--codex-login browser/device permits the chosen official flow; skip/verify/dry-run never
+start login and missing auth is reported incomplete. Setup passes auth constraints to
+the isolated native login, never copies/parses credential contents, and withholds status
+output. Native refresh owns file replacement; the temporary credential alias is detached
+on completion/failure. Windows uses a file symlink, never a hard link or token copy.
+Missing symlink privilege/filesystem support is an access-mode limitation: enable the
+required support and rerun setup; another login alone does not fix it. Different runtime
+--store filesystems can still reject links even after setup's configured-store check.
+
+Capability metadata does not enable Team-disabled tools or broaden caller permissions.
+Executable/AWS/gateway helpers, additional credential loaders and selected model catalogs
+(including local/profile catalogs and provider catalog URLs) fail explicitly before model
+work; no alternate provider or catalog is silently substituted. Custom environment/header
+auth continues to use the selected safe projection, not this native-login fallback.
+The projected config is private backend state (mode 600 on Unix), never a public artifact
+or read/path target. It may contain sensitive provider values: do not read it as worker
+input. Team detaches it on normal completion and handled failure; abrupt process death
+can leave private backend state for guarded recovery. Team does not serialize provider
+values into tasks, argv, manifests or RPC/control logs. Referenced credential variables
+also stay out of worker shells, including arbitrary env_key/env_http_headers names.
+Child provider configuration and referenced environment values are coordinator-selected
+through the existing private peer-verified handoff; child environment overrides cannot
+replace them. A root resume rereads and validates its persistent worker route.
 Worker shells inherit the invoking environment on launch/resume, except session/store identity,
 authentication sockets and named credential patterns. Team supplies its own handoff/guard/stores.
 Worker shell PATH starts with the canonical invoking Team launcher's directory, so bare
 pira_team child commands use that same launcher, including staged local coordinators.
 Other inherited PATH entries retain their order. Backend process PATH and the selected
 backend executable/provider remain unchanged; executable-equality authentication is retained.
+Temporary work and disposable downloads use a private per-run directory under the invoking host's
+platform temp directory, never Team records. TMPDIR, TMP, TEMP, zsh TMPPREFIX, and the assignment's
+scratch path agree for both backend and worker shells, including resume and repair. Temp paths
+inside the active/configured/default Team store or an identifiable retained run are rejected,
+including physical aliases. If inherited temp points there, Team tries /tmp on Unix or
+LOCALAPPDATA/Temp on Windows; an unavailable or unauthorized outside location fails with setup guidance.
+Caller sandbox roots, temp-exclusion flags, network policy and credential exclusions are unchanged;
+Team grants no extra write roots. Restricted callers must already permit the selected temporary
+workspace explicitly or through their existing implicit temp grants.
+The per-run name is stable for the same launcher, run and temp base. Missing directories are
+recreated on resume; changed temp configuration or launcher hashing can select a fresh workspace.
+Temporary contents are not durable inputs. Team does not delete or migrate existing scratch/records,
+and its record retention does not manage these external temp directories. Explicitly retained
+downloads must be written to a designated project location outside Team records; managed handoffs
+and supporting evidence remain separate retained artifacts.
 Unknown variables pass through; this is not a secret detector. Existing absolute directories in
 CARGO_HOME, CARGO_TARGET_DIR, PIP_CACHE_DIR, UV_CACHE_DIR, PYTHONPYCACHEPREFIX, MYPY_CACHE_DIR,
 npm_config_cache, NPM_CONFIG_CACHE, YARN_CACHE_FOLDER, GOCACHE, GOMODCACHE, GRADLE_USER_HOME,
 CCACHE_DIR, SCCACHE_DIR and XDG_CACHE_HOME are used for build/cache writes only within caller writable scope.
 PIRA_TEAM_BUILD_ROOTS adds a JSON array of existing absolute directories for other build systems.
-Invalid explicit roots fail; unusable ambient roots grant nothing. Filesystem roots are excluded;
+Invalid or out-of-scope explicit roots fail; unusable or out-of-scope ambient roots
+are omitted without widening the sandbox. Filesystem roots are excluded;
 physical paths are deduplicated. Run/resume/repair use current invoking configuration and record
 build_roots in manifests. Other inherited variables grant no extra writes. No cache deletion is
 authorized; task/ownership constraints still apply. Unix cancellation excludes detached descendants.
@@ -226,12 +321,34 @@ Default local commands, stores and old runs keep their existing semantics; no
 local run is automatically migrated. Remote filesystem paths grant no local scope.
 
 Normal remote launch selects the endpoint ONCE:
-  pira_team run --host HOST --remote-user USER --remote-endpoint-id PUBLIC_NONCE \
-    --remote-exe ABS --remote-backend ABS --remote-store ABS --remote-cwd ABS \
-    --authority-key LOCAL_ABS --task TASK --completion-gate TEXT [--allow-subteam] \
-    [--store LOCAL_TEAM_STORE] [--label LABEL] [--detach]
-The launcher durably retains a signed request and ordinary run_id before contacting
-the server; stderr prints that ID before submission. Request IDs are automatic.
+  pira_team run --host HOST --task TASK --completion-gate TEXT [--allow-subteam] \
+    [--remote-cwd ABS] [--store LOCAL_TEAM_STORE] [--label LABEL] [--detach]
+The existing SSH alias must work with known host keys. Supported servers are Linux
+with compatible installed PIRA Team, OpenSSH signing tools and logged-in Codex.
+Minimal shell discovery checks PATH and ~/.local/bin; installed Rust Team resolves
+the actual UID/account (including native NSS/domain names), canonical account home
+and Codex backend. PATH and setup's ~/.local/bin/.pira-codex/bin/codex selection are
+checked without sourcing interactive startup. PIRA setup prechecks existing OpenSSH
+ssh-keygen -Y signing/verification; launch never provisions signing dependencies.
+Only private control metadata and PUBLIC key enrollment are provisioned over SSH.
+No Team binary is installed, copied, updated or downloaded; no server Python is
+required. Missing/incompatible Team gives actionable setup/update guidance.
+An explicit --remote-exe selects an installed canonical Team executable. Existing
+public launcher trust and other root enrollments remain untouched. Private enrolled
+endpoints retain fixed nonces, exact executable/account binding and signature checks.
+No local credentials are forwarded; no separate server Codex parent is needed.
+Default workspace is the actual remote account home; --remote-cwd selects another.
+Default remote store and controller metadata are managed automatically. Server
+PIRA_TEAM_DIR selects private .remote-control-v2 metadata; otherwise absolute
+XDG_DATA_HOME selects pira-team-control-v2, then the actual account home is the
+fallback. Setup and signed lookup validate the same root; older account-home
+metadata remains readable. Existing owner/ancestor checks and private modes apply.
+Authentication
+remains server-side; no separate server Codex parent is needed. Native credential
+stores unsupported by Team still require a Team-compatible server login.
+Supplying --remote-endpoint-id retains the fully explicit pre-enrolled interface.
+After setup, the launcher durably retains a signed request and ordinary run_id before
+submission; stderr prints that ID before submission. Request IDs are automatic.
 After launch use ordinary read/resume/steer/interrupt/wait RUN_ID (or @LABEL),
 without endpoint, key or controller options. Use the same local Team store as at
 launch. Explicit --remote-state remains a private transport controller location;
@@ -240,7 +357,8 @@ Bookmarks/list/search use the same main-session-scoped local index as local runs
 
 read RUN_ID returns raw handoff bytes; read RUN_ID manifest.json returns the raw
 manifest, including descendant summaries; read RUN_ID artifacts/report.md returns
-that raw UTF-8 file. Remote file reads are limited to 2 MiB. wait RUN_ID waits for
+that raw UTF-8 file. Ordinary reads retrieve accepted UTF-8 handoffs up to 8 MiB in revision-pinned
+chunks; other remote file reads remain limited to 2 MiB. wait RUN_ID waits for
 retained settlement without starting a model turn, for local or remote runs.
 Normal remote receipts have run_id/status/run_root/handoff_path; the two path
 fields are null because server files are not local filesystem paths. Remote path
@@ -249,9 +367,10 @@ schema files are unsupported; launch/resume --service-tier remains supported.
 
 After network loss, use ordinary read RUN_ID manifest.json or wait RUN_ID.
 The server worker continues independently, stops normally and retains results.
-An accepted operation is observed, not replayed. An absent initial submission may
-be reconciled with its exact retained allocation/request and current equivalent
-execution authority. An absent pending resume is NOT submitted by read/wait;
+An accepted operation is observed, not replayed. Reads/waits never submit work.
+For an absent initial submission, explicit resume RUN_ID [--detach] without changed
+task/options retries its exact retained allocation/request under current equivalent
+execution authority; this is the initial turn, not an additional resume turn. An absent pending resume is NOT submitted by read/wait;
 only an explicit matching resume may submit it. Pending controls/resumes bind
 stable IDs, payload and target epoch before transport; changed uncertain intent
 fails closed. A successful full-access observation settles accepted uncertain
@@ -300,7 +419,8 @@ workspace paths. --task-file is local input sent as task text; -- TASK is suppor
 Lower-level --cwd/--store/--schema/--label are rejected. Remote run/resume accept --service-tier standard|fast with the same default/retention
 rules as local runs. Live tier changes via --host are unsupported; no remote tier
 control operation is defined. Endpoint-side bookmarks, config and path are unsupported. Lower-level read defaults to a structured manifest view; --artifact or --file
-adds UTF-8 content up to 2 MiB, never credentials/backend state. --operation-id reads
+adds UTF-8 content up to 2 MiB; larger accepted handoffs return a chunk descriptor.
+Use ordinary read RUN_ID to retrieve these fully. Never credentials/backend state. --operation-id reads
 a retained control receipt instead. Root cannot read grandchildren's
 content; a coordinator's root-visible manifest retains descendant summaries only.
 
@@ -376,8 +496,9 @@ USAGE
   pira_team cleanup [--dry-run] [--json] [--store DIR]
 
 POLICY
-  Delete inactive coordinator units older than 10 × 24 hours, then least recently
-  active inactive units until estimated storage is below 50 GB (50,000,000,000 bytes).
+  Delete inactive coordinator units older than 30 × 24 hours by default, then least recently
+  active inactive units until estimated storage is below the configured soft target
+  (default 50 decimal GB = 50,000,000,000 bytes). See help config retention.
   A unit includes its coordinator and all children. Its last activity is the maximum
   execution, resume, or completion activity of its members. Bookmarks give no exemption.
   New executions persist last_execution_activity_ms at start/resume and completion.
@@ -393,7 +514,7 @@ OPTIONS
   --dry-run    Read-only same-plan preview. No deletion, activity writes, bookmark
                edits, lock-file creation, interrupted-deletion recovery, or cleaner spawn.
   --json       Complete plan, member IDs, millisecond Unix activity times, estimates,
-               age/storage reasons, skips, and summary. Default text shows 50 selections.
+               effective age/size thresholds, age/storage reasons, skips, and summary. Default text shows 50 selections.
   --store DIR  Scope to this Team store (default: normal platform store).
 
 AUTOMATIC CLEANUP
@@ -415,3 +536,26 @@ EXAMPLES
 EXIT STATUS
   0  Plan or cleanup finished. Inspect skips, recovery, and deletion outcomes.
   1  Invalid arguments or store inspection failed.
+
+pira_team config retention — manage store-wide cleanup thresholds
+
+USAGE
+  pira_team config retention show [--store DIR]
+  pira_team config retention set [--max-age-days DAYS] [--target-gb GB] [--store DIR]
+  pira_team config retention reset [--store DIR]
+
+DAYS is an integer in 1..36500, each day exactly 24 hours. GB is an integer in
+1..1000000, each GB exactly 1,000,000,000 bytes (not GiB). Bundled defaults are
+30 days and a 50 GB soft target. Set requires at least one threshold and preserves
+the other. Reset restores both bundled defaults, including recovery from malformed
+contents of a safe regular config file. Store in retention_policy.json is managed
+by this CLI; no hand-editing is required. Options take separate values, once each.
+
+All actions print JSON with path, bundled policy, and effective policy, including
+millisecond/byte conversions. Show is read-only and does not create a store.
+Changes are locked and atomic, require no backend/session, and NEVER trigger cleanup.
+Automatic cleanup and explicit cleanup (including --dry-run) snapshot the same saved
+policy at startup; changes apply to subsequent cleanups, not an in-progress plan.
+Cleanup text/JSON and automatic reports expose effective thresholds. Invalid config
+blocks all cleanup before mutation; use reset to restore defaults. Pending retirement
+journals retain their existing recovery semantics. See help cleanup for safety rules.

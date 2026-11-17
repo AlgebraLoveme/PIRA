@@ -1,6 +1,9 @@
 //! Selected backend credentials stay in launcher memory and backend environments.
 //! The ordinary control capability cannot redeem a key: the OS peer must be the
 //! admitted Team launcher, still beneath this coordinator's current backend.
+pub(crate) mod provider;
+pub(crate) mod selection;
+
 use crate::{lifecycle::read_json, native, subteam};
 use serde_json::{Value, json};
 use std::{
@@ -93,17 +96,32 @@ fn file_at(home: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     };
     match home.join("auth.json").canonicalize() {
-        Ok(path) => Ok(Some(path)),
+        Ok(path) if path.is_file() => Ok(Some(path)),
+        Ok(_) => Err(format!(
+            "selected native auth path is not a regular file; {}",
+            crate::authentication::selection::REPAIR
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("cannot resolve selected file authentication location".into()),
+        Err(_) => Err(format!(
+            "cannot resolve selected file authentication location; {}",
+            crate::authentication::selection::REPAIR
+        )),
     }
 }
 
+fn caller_uses_api_key() -> bool {
+    std::env::var_os("CODEX_API_KEY").is_some_and(|key| !key.is_empty())
+}
+
 pub fn caller_file() -> Result<Option<PathBuf>, String> {
-    if std::env::var_os("CODEX_API_KEY").is_some_and(|key| !key.is_empty()) {
+    if caller_uses_api_key() {
         return Ok(None);
     }
-    let home = std::env::var_os("CODEX_HOME")
+    file_at(caller_home())
+}
+
+pub(crate) fn caller_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
@@ -111,21 +129,23 @@ pub fn caller_file() -> Result<Option<PathBuf>, String> {
                 .filter(|s| !s.is_empty())
                 .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
                 .map(|path| PathBuf::from(path).join(".codex"))
-        });
-    file_at(home)
+        })
 }
 
 pub struct Backend {
     program: PathBuf,
     environment: Vec<(String, String)>,
     file: Option<PathBuf>,
+    provider: crate::authentication::provider::Config,
 }
 impl Backend {
-    fn capture(program: PathBuf) -> Result<Self, String> {
+    fn capture(program: PathBuf, config: &str, file: Option<PathBuf>) -> Result<Self, String> {
+        let provider = crate::authentication::provider::Config::parse(config)?;
         let environment = std::env::vars_os()
             .filter_map(|(name, value)| {
                 let name = name.into_string().ok()?;
-                backend_variable(&name).then_some((name, value))
+                (backend_variable(&name) || provider.uses_environment(&name))
+                    .then_some((name, value))
             })
             .map(|(name, value)| {
                 value
@@ -134,19 +154,18 @@ impl Backend {
                     .map_err(|_| "backend selector must be UTF-8".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Windows hard links do not canonicalize to their original source. Retain
-        // the caller-selected path, never the coordinator's disposable home link.
-        let file = caller_file()?;
+        // Retain the selected native target, never the disposable worker alias.
         Ok(Self {
             program,
             environment,
             file,
+            provider,
         })
     }
     fn encode(&self) -> Result<Secret, String> {
         Secret::new(
             serde_json::to_vec(
-                &json!({"program":self.program,"environment":self.environment,"file":self.file}),
+                &json!({"program":self.program,"environment":self.environment,"file":self.file,"provider_config":self.provider.text()}),
             )
             .map_err(|_| "cannot encode selected backend")?,
         )
@@ -162,9 +181,15 @@ impl Backend {
         let environment: Vec<(String, String)> =
             serde_json::from_value(value["environment"].clone())
                 .map_err(|_| "invalid selected backend selectors")?;
+        let provider =
+            crate::authentication::provider::Config::parse(match value.get("provider_config") {
+                None | Some(Value::Null) => "", // Legacy peers carried only environment/file auth.
+                Some(Value::String(text)) => text,
+                _ => return Err("invalid selected provider configuration handoff".into()),
+            })?;
         let mut names = std::collections::HashSet::new();
         if environment.iter().any(|(name, value)| {
-            !backend_variable(name)
+            (!backend_variable(name) && !provider.uses_environment(name))
                 || !names.insert(name.clone())
                 || name.contains(['\0', '='])
                 || value.contains('\0')
@@ -180,6 +205,7 @@ impl Backend {
             program,
             environment,
             file,
+            provider,
         })
     }
     fn uses_api_key(&self) -> bool {
@@ -202,35 +228,108 @@ impl Drop for Backend {
 }
 pub enum Authentication {
     Caller,
-    SelectedCaller(PathBuf),
+    SelectedCaller(
+        PathBuf,
+        crate::authentication::provider::Config,
+        Option<PathBuf>,
+    ),
     Delegated(Backend),
 }
 impl Authentication {
+    fn bind_route(&self, run: &Path, manifest: &Value) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        let mut route: toml::Table = self
+            .provider_config()
+            .parse()
+            .map_err(|_| "invalid private provider route")?;
+        route
+            .entry("cli_auth_credentials_store")
+            .or_insert(toml::Value::String("file".into()));
+        route
+            .entry("model_provider")
+            .or_insert(toml::Value::String("openai".into()));
+        let text = toml::to_string(&route).map_err(|_| "cannot retain private provider route")?;
+        let digest: String = Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // A credential-bearing route's digest is private too: no offline oracle
+        // in manifests or managed read/path surfaces, and no credential copies.
+        let path = run.join("codex-route.sha256");
+        if path
+            .try_exists()
+            .map_err(|_| "cannot inspect private provider route")?
+        {
+            crate::lifecycle::private_path(&path, false)?;
+            let file =
+                std::fs::File::open(&path).map_err(|_| "cannot read private provider route")?;
+            let mut retained = String::new();
+            file.take(65)
+                .read_to_string(&mut retained)
+                .map_err(|_| "invalid private provider route")?;
+            if retained != digest {
+                return Err("selected persistent Codex worker route changed; restore its provider/connection configuration to resume, or start a new run (values withheld)".into());
+            }
+        } else {
+            if manifest["thread_id"].is_string() {
+                crate::notice(format_args!(
+                    "pira_team: binding legacy run to its currently selected persistent worker route; historical connection settings were not retained"
+                ));
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(path)
+                .and_then(|mut file| file.write_all(digest.as_bytes()))
+                .map_err(|_| "cannot retain private provider route")?;
+        }
+        Ok(())
+    }
     pub fn uses_api_key(&self) -> bool {
         match self {
-            Self::Caller | Self::SelectedCaller(_) => {
-                std::env::var_os("CODEX_API_KEY").is_some_and(|key| !key.is_empty())
-            }
+            Self::Caller | Self::SelectedCaller(_, _, _) => caller_uses_api_key(),
             Self::Delegated(backend) => backend.uses_api_key(),
         }
     }
     pub fn program(&self) -> &std::ffi::OsStr {
         match self {
             Self::Caller => std::ffi::OsStr::new("codex"),
-            Self::SelectedCaller(program) => program.as_os_str(),
+            Self::SelectedCaller(program, _, _) => program.as_os_str(),
             Self::Delegated(backend) => backend.program.as_os_str(),
         }
     }
     pub fn file_source(&self) -> Option<&Path> {
         match self {
             Self::Delegated(backend) => backend.file.as_deref(),
+            Self::SelectedCaller(_, _, file) => file.as_deref(),
             _ => None,
+        }
+    }
+    pub(crate) fn provider_config(&self) -> &str {
+        match self {
+            Self::Caller => "",
+            Self::SelectedCaller(_, provider, _) => provider.text(),
+            Self::Delegated(backend) => backend.provider.text(),
+        }
+    }
+    pub(crate) fn provider_environment(&self) -> &[String] {
+        match self {
+            Self::Caller => &[],
+            Self::SelectedCaller(_, provider, _) => provider.environment(),
+            Self::Delegated(backend) => backend.provider.environment(),
         }
     }
     pub fn apply(&self, command: &mut std::process::Command) {
         if let Self::Delegated(backend) = self {
             for (name, _) in std::env::vars_os() {
-                if backend_variable(&name.to_string_lossy()) {
+                if backend_variable(&name.to_string_lossy())
+                    || backend.provider.uses_environment(&name.to_string_lossy())
+                {
                     command.env_remove(name);
                 }
             }
@@ -310,11 +409,41 @@ fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 
 pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
     let Some(parent) = subteam::caller_run()? else {
-        return Ok(Authentication::SelectedCaller(resolve_program_for(
-            crate::harness::Harness::for_model(
-                manifest["model"].as_str().ok_or("missing worker model")?,
-            ),
-        )?));
+        let harness = crate::harness::Harness::for_model(
+            manifest["model"].as_str().ok_or("missing worker model")?,
+        );
+        let provider =
+            if harness == crate::harness::Harness::Codex || manifest["allow_subteam"] == true {
+                crate::authentication::provider::Config::load(
+                    caller_home().as_deref(),
+                    caller_uses_api_key(),
+                )?
+            } else {
+                crate::authentication::provider::Config::default()
+            };
+        let file =
+            if provider.requires_file_auth(caller_uses_api_key()) && provider.uses_file_store() {
+                let home = provider
+                    .auth_home()
+                    .map(Path::to_owned)
+                    .or_else(caller_home);
+                file_at(home)?
+            } else {
+                None
+            };
+        if harness == crate::harness::Harness::Codex {
+            crate::authentication::selection::require_file(
+                &provider,
+                caller_uses_api_key(),
+                file.as_deref(),
+            )?;
+        }
+        let selected =
+            Authentication::SelectedCaller(resolve_program_for(harness)?, provider, file);
+        if harness == crate::harness::Harness::Codex || manifest["allow_subteam"] == true {
+            selected.bind_route(run, manifest)?;
+        }
+        return Ok(selected);
     };
     let runtime = subteam::caller_runtime()?.ok_or("missing coordinator runtime")?;
     let control = read_json(&parent.join("control.json"))?;
@@ -391,10 +520,21 @@ pub fn inherit(run: &Path, manifest: &Value) -> Result<Authentication, String> {
     let selected =
         Secret::new(serde_json::to_vec(&selection).map_err(|_| "invalid backend selection")?)?;
     let backend = Backend::decode(&selected.0)?;
+    if provider == crate::harness::Harness::Codex {
+        crate::authentication::selection::require_file(
+            &backend.provider,
+            backend.uses_api_key(),
+            backend.file.as_deref(),
+        )?;
+    }
     // Keep a Windows pipe connected until its buffered response has been read.
     // Parent exit after delivery does not revoke this already admitted child.
     let _ = connection.write_all(&[1]);
-    Ok(Authentication::Delegated(backend))
+    let selected = Authentication::Delegated(backend);
+    if provider == crate::harness::Harness::Codex || manifest["allow_subteam"] == true {
+        selected.bind_route(run, manifest)?;
+    }
+    Ok(selected)
 }
 
 // Independent, bounded I/O phases keep slow clients and shared admission work
@@ -488,7 +628,12 @@ impl Server {
         if !program.is_absolute() {
             return Err("coordinator backend selection is not retained".into());
         }
-        let payload = Backend::capture(program)?.encode()?;
+        let payload = Backend::capture(
+            program,
+            authentication.provider_config(),
+            authentication.file_source().map(Path::to_owned),
+        )?
+        .encode()?;
         let mut value: Value =
             serde_json::from_slice(&payload.0).map_err(|_| "cannot encode backend selection")?;
         let manifest = read_json(&run.join("manifest.json"))?;
@@ -990,7 +1135,7 @@ mod local {
     #[cfg(test)]
     mod tests {
         use super::*;
-        include!("authentication_deadline_tests.rs");
+        include!("authentication/tests/deadline.rs");
         #[test]
         fn native_local_transport_verifies_peer_and_delivers_before_close() {
             let root = std::env::temp_dir().join(format!(

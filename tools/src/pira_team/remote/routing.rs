@@ -23,7 +23,7 @@ fn present(path: &Path) -> Result<bool, String> {
 impl Route {
     fn load(root: &Path, id: &str, issuer: &str) -> Result<Option<Self>, String> {
         storage::validate_run_id(id)?;
-        let Some(root) = profile::defaults::root_if_present(root)? else {
+        let Some(root) = storage::managed::root_if_present(root)? else {
             return Ok(None);
         };
         let routes = root.join(ROUTES);
@@ -89,6 +89,7 @@ impl Route {
 
     fn cli(&self, grant: &Value) -> Result<Client, String> {
         Ok(Client {
+            diagnostics: RefCell::default(),
             endpoint: self.envelope["grant"]["endpoint"].clone(),
             authority: self.authority.clone(),
             state: self.dir.clone(),
@@ -198,7 +199,7 @@ pub(crate) fn reference_for(root: &Path, id: &str, issuer: &str) -> Result<Optio
 // Compatibility submissions with explicit request IDs use the same ordinary
 // route index, irrespective of their explicit transport controller directory.
 pub(super) fn retain_transport(cli: &Client, envelope: &Value) -> Result<(), String> {
-    let root = profile::defaults::create_root(&storage::default_root()?)?;
+    let root = storage::managed::create_root(&storage::default_root()?)?;
     let route = retain_at(&root, cli, envelope)?;
     eprintln!("pira_team run_id: {}", route.id);
     Ok(())
@@ -210,7 +211,7 @@ fn retain_at(root: &Path, cli: &Client, envelope: &Value) -> Result<Route, Strin
     directory(&routes)?;
     let issuer = text(&envelope["grant"], "issuer")?;
     let id = format!("remote-{}", text(&envelope["grant"], "nonce")?);
-    if let Some(route) = Route::load(&root, &id, issuer)? {
+    if let Some(route) = Route::load(root, &id, issuer)? {
         if logical(&route.envelope["grant"]) != logical(&envelope["grant"])
             || route.authority != cli.authority
         {
@@ -233,7 +234,7 @@ fn retain_at(root: &Path, cli: &Client, envelope: &Value) -> Result<Route, Strin
 }
 
 pub(super) fn resolve(args: &[String]) -> Result<(), String> {
-    let context = verified_root(args)?;
+    let context = verified_caller(args)?;
     let (root, target) = selection(args)?;
     if args.iter().enumerate().skip(1).any(|(i, arg)| {
         i != target
@@ -244,7 +245,7 @@ pub(super) fn resolve(args: &[String]) -> Result<(), String> {
     }
     key(&args[target])?;
     let issuer = text(&context, "caller_thread_id")?;
-    let root = profile::defaults::root_if_present(&root)?
+    let root = storage::managed::root_if_present(&root)?
         .ok_or("request unavailable to this main session")?;
     let routes = root.join(ROUTES);
     existing(&routes, true)?;
@@ -305,17 +306,15 @@ pub(super) fn launch(args: &[String]) -> Result<(), String> {
     execute_policy(&context, issuer)?;
     let mut forwarded = vec!["run".into()];
     let (mut store, mut label) = (None, None);
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        let name = arg.split('=').next().unwrap();
+    let mut rest = cli::tokens(args.get(1..).unwrap_or_default());
+    while let Some(token) = rest.next() {
+        let arg = token.raw;
+        let name = token.name;
         if matches!(name, "--store" | "--label") {
-            let value = match arg.split_once('=') {
-                Some((_, value)) => value.to_owned(),
-                None => rest
-                    .next()
-                    .ok_or_else(|| format!("missing {name}"))?
-                    .clone(),
-            };
+            let value = token
+                .value
+                .ok_or_else(|| format!("missing {name}"))?
+                .to_owned();
             crate::set_once(
                 if name == "--store" {
                     &mut store
@@ -326,13 +325,13 @@ pub(super) fn launch(args: &[String]) -> Result<(), String> {
                 name,
             )?;
         } else {
-            forwarded.push(arg.clone());
+            forwarded.extend(token.words.iter().cloned());
             if arg == "--" {
-                forwarded.extend(rest.cloned());
+                forwarded.extend(rest.flat_map(|token| token.words.iter().cloned()));
                 break;
             }
-            if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-                forwarded.push(rest.next().ok_or_else(|| format!("missing {arg}"))?.clone());
+            if arg.starts_with('-') && token.flag.is_none() && token.value.is_none() {
+                return Err(format!("missing {arg}"));
             }
         }
     }
@@ -346,13 +345,14 @@ pub(super) fn launch(args: &[String]) -> Result<(), String> {
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(storage::default_root)?;
-    let root = profile::defaults::create_root(&root)?;
+    let root = storage::managed::create_root(&root)?;
     let routes = root.join(ROUTES);
     directory(&routes)?;
     let request = random()?;
     // Legacy explicit request-ID transport remains available. Normal launch IDs
     // and their location are generated and retained by the launcher, not MAIN.
     set_launch_identity(&mut forwarded, &root, request);
+    bootstrap::prepare(&mut forwarded, &root, &context)?;
     let cli = Client::parse(&forwarded)?;
     let grant = cli.grant("submit", issuer, Some(&execution(&context)))?;
     validate_grant(&grant)?;
@@ -400,22 +400,17 @@ fn recovery_error(route: &Route, error: String) -> String {
 fn selection(args: &[String]) -> Result<(PathBuf, usize), String> {
     let mut root = None;
     let mut target = None;
-    let mut index = 1;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--" {
+    for token in cli::tokens(args.get(1..).unwrap_or_default()) {
+        let index = token.index + 1;
+        if token.raw == "--" {
             target.get_or_insert(index + 1);
             break;
         }
-        if arg == "--store" {
-            index += 1;
-            root = Some(PathBuf::from(args.get(index).ok_or("missing --store")?));
-        } else if !arg.starts_with('-') {
+        if token.raw == "--store" {
+            root = Some(PathBuf::from(token.value.ok_or("missing --store")?));
+        } else if !token.raw.starts_with('-') {
             target.get_or_insert(index);
-        } else if !arg.contains('=') && !flag(arg) {
-            index += 1;
         }
-        index += 1;
     }
     let target = target.filter(|i| *i < args.len()).ok_or("missing RUN_ID")?;
     Ok((root.map(Ok).unwrap_or_else(storage::default_root)?, target))
@@ -475,7 +470,24 @@ fn validate_view(route: &Route, view: &Value, request: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn observe(
+fn observe(route: &Route, cli: &Client, context: &Value) -> Result<Value, String> {
+    let result = cli
+        .observe(text(context, "caller_thread_id")?)
+        .map_err(|e| recovery_error(route, e))?;
+    if result["accepted"] == false
+        && result["status"] == "not_found"
+        && result["request_id"] == cli.id
+    {
+        return Err(format!(
+            "remote submission not accepted; read/wait never starts work; use explicit resume {} to retry the retained initial request",
+            route.id
+        ));
+    }
+    validate_view(route, &result, &cli.id)?;
+    Ok(result)
+}
+
+fn reconcile_submission(
     route: &Route,
     cli: &Client,
     context: &Value,
@@ -546,15 +558,12 @@ fn wait(route: &Route, cli: &Client, issuer: &str, mut result: Value) -> Result<
 
 fn output_mode(args: &[String], default: &str) -> Result<String, String> {
     let mut result = default.to_owned();
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
+    for token in cli::tokens(args.get(1..).unwrap_or_default()) {
+        if token.raw == "--" {
             break;
         }
-        if arg == "--output" {
-            result = rest.next().ok_or("missing --output")?.clone();
-        } else if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-            rest.next();
+        if token.raw == "--output" {
+            result = token.value.ok_or("missing --output")?.to_owned();
         }
     }
     if !["artifact", "answer"].contains(&result.as_str()) {
@@ -578,7 +587,39 @@ fn file_content(
     request["file"] = json!(relative);
     let result = cli.exchange(&sign(&request, &route.authority)?)?;
     validate_view(route, &result, &cli.id)?;
-    Ok(text(&result, "content")?.to_owned())
+    if result["chunked"] != true {
+        return Ok(text(&result, "content")?.to_owned());
+    }
+    let total = result["total_bytes"]
+        .as_u64()
+        .filter(|size| *size <= HANDOFF_LIMIT)
+        .ok_or("invalid handoff length")? as usize;
+    let revision = result["revision"]
+        .as_u64()
+        .filter(|r| *r > 0)
+        .ok_or("invalid handoff revision")?;
+    let mut content = String::with_capacity(total);
+    while content.len() < total {
+        request["args"] = json!([
+            "read-chunk",
+            content.len().to_string(),
+            revision.to_string()
+        ]);
+        let chunk = cli.exchange(&sign(&request, &route.authority)?)?;
+        validate_view(route, &chunk, &cli.id)?;
+        let bytes = text(&chunk, "content")?;
+        if chunk["revision"] != revision
+            || chunk["total_bytes"] != total
+            || bytes.is_empty()
+            || bytes.len() > CONTENT_CHUNK
+            || content.len() + bytes.len() > total
+            || chunk["next_offset"] != content.len() + bytes.len()
+        {
+            return Err("inconsistent handoff chunk; retry observation".into());
+        }
+        content.push_str(bytes);
+    }
+    Ok(content)
 }
 
 fn print_bytes(content: &str) -> Result<(), String> {
@@ -618,25 +659,23 @@ fn forwarded_args(args: &[String], target: usize) -> Result<(Vec<String>, bool),
     let op = args[0].as_str();
     let mut forwarded = vec![op.into()];
     let mut detach = false;
-    let mut index = 1;
-    while index < args.len() {
+    let mut rest = cli::tokens(args.get(1..).unwrap_or_default());
+    while let Some(token) = rest.next() {
+        let index = token.index + 1;
         if index == target {
-            index += 1;
             continue;
         }
-        if args[index] == "--store" {
-            index += 2;
+        if token.raw == "--store" {
             continue;
         }
-        let arg = &args[index];
+        let arg = token.raw;
         if arg == "--detach" && op == "resume" {
             if detach {
                 return Err("duplicate --detach".into());
             }
             detach = true;
         } else if arg == "--task-file" {
-            index += 1;
-            let path = args.get(index).ok_or("missing --task-file")?;
+            let path = token.value.ok_or("missing --task-file")?;
             let mut bytes = Vec::new();
             File::open(path)
                 .and_then(|f| f.take(LIMIT + 1).read_to_end(&mut bytes))
@@ -649,33 +688,24 @@ fn forwarded_args(args: &[String], target: usize) -> Result<(Vec<String>, bool),
                 String::from_utf8(bytes).map_err(|_| "task requires UTF-8")?,
             ]);
         } else {
-            forwarded.push(arg.clone());
+            forwarded.extend(token.words.iter().cloned());
             if arg == "--" {
                 forwarded.extend(
-                    args[index + 1..]
-                        .iter()
-                        .enumerate()
-                        .filter(|(offset, _)| index + 1 + offset != target)
-                        .map(|(_, arg)| arg.clone()),
+                    rest.filter(|token| token.index + 1 != target)
+                        .flat_map(|token| token.words.iter().cloned()),
                 );
                 break;
             }
-            if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-                index += 1;
-                forwarded.push(
-                    args.get(index)
-                        .ok_or_else(|| format!("missing {arg}"))?
-                        .clone(),
-                );
+            if arg.starts_with('-') && token.flag.is_none() && token.value.is_none() {
+                return Err(format!("missing {arg}"));
             }
         }
-        index += 1;
     }
     Ok((forwarded, detach))
 }
 
 fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String> {
-    let context = verified_root(args)?;
+    let context = verified_caller(args)?;
     let issuer = text(&context, "caller_thread_id")?;
     let op = args[0].as_str();
     if op == "path" {
@@ -708,14 +738,14 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
                 // Ordinary observation cannot create even a previously intended
                 // resume turn. Only a repeated explicit resume submits it.
                 cli = route.cli(&route.envelope["grant"])?;
-                observe(route, &cli, &context, &route.envelope)?
+                observe(route, &cli, &context)?
             } else {
                 validate_view(route, &observed, &cli.id)?;
                 pending_accepted = true;
                 observed
             }
         } else {
-            observe(route, &cli, &context, envelope)?
+            observe(route, &cli, &context)?
         };
         if op == "wait" {
             result = wait(route, &cli, issuer, result)?;
@@ -738,7 +768,10 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         // A successful ordinary observation settles an uncertain resume for a
         // full-access caller. Tightened-policy reads remain state-write-free.
         std::io::stdout().flush().map_err(|e| e.to_string())?;
-        if execute_policy(&context, issuer).is_ok() {
+        if let Ok(fresh) = profile::load()
+            && fresh["caller_thread_id"] == issuer
+            && execute_policy(&fresh, issuer).is_ok()
+        {
             let _lock = lock(&route.dir.join("controller.lock"))?;
             if let Some(envelope) = pending
                 && pending_accepted
@@ -758,6 +791,31 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         execute_policy(&context, issuer)?;
     }
     let _lock = lock(&route.dir.join("controller.lock"))?;
+    let initial = route.cli(&route.envelope["grant"])?;
+    let initial_view = initial.observe(issuer)?;
+    if initial_view["accepted"] == false
+        && initial_view["status"] == "not_found"
+        && initial_view["request_id"] == initial.id
+    {
+        if op != "resume" || forwarded.len() != 1 {
+            return Err("unaccepted initial run; use resume RUN_ID [--detach] without changed task/options to retry its original signed operation".into());
+        }
+        let mut initial = initial;
+        initial.detach = detach;
+        let result = reconcile_submission(route, &initial, &context, &route.envelope)?;
+        let result = if detach {
+            result
+        } else {
+            wait(route, &initial, issuer, result)?
+        };
+        return output(
+            route,
+            &initial,
+            issuer,
+            &result,
+            output_mode(&forwarded, "artifact")?,
+        );
+    }
     let pending = route.pending(op, issuer)?;
     let mut base = route.cli(&route.envelope["grant"])?;
     base.args = forwarded.clone();
@@ -794,7 +852,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         if op == "resume" {
             grant["request_id"] = json!(random()?);
             let metadata = base.metadata(issuer)?;
-            let retained = observe(route, &base, &context, &route.envelope)?;
+            let retained = observe(route, &base, &context)?;
             require_resume_capabilities(
                 &metadata,
                 &retained,
@@ -820,7 +878,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
     cli.detach = base.detach;
     let result = if op == "resume" {
         // Retained pending submit is observed before any possible resubmission.
-        observe(route, &cli, &context, &envelope)?
+        reconcile_submission(route, &cli, &context, &envelope)?
     } else {
         let receipt = cli.operation_receipt(issuer)?;
         if receipt["status"] == "not_found" {
@@ -872,6 +930,37 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn route_selection_and_forwarding_keep_option_values_literal() {
+        let args = [
+            "resume",
+            "--inject-write",
+            "--inject-fig",
+            "--task",
+            "--output",
+            "--output",
+            "answer",
+            "run-id",
+            "--store",
+            "/synthetic/store",
+        ]
+        .map(str::to_owned);
+        let (root, target) = super::selection(&args).unwrap();
+        assert_eq!(root, std::path::Path::new("/synthetic/store"));
+        assert_eq!(target, 7);
+        let (forwarded, detached) = super::forwarded_args(&args, target).unwrap();
+        assert_eq!(forwarded, args[..7]);
+        assert!(!detached);
+        assert_eq!(super::output_mode(&args, "artifact").unwrap(), "answer");
+        let literal =
+            ["resume", "--task=--host", "--", "run-id", "--inject-write"].map(str::to_owned);
+        let (forwarded, _) = super::forwarded_args(&literal, 3).unwrap();
+        assert_eq!(
+            forwarded,
+            ["resume", "--task=--host", "--", "--inject-write"]
+        );
+    }
+
     use super::*;
 
     fn strings(values: &[&str]) -> Vec<String> {
@@ -933,6 +1022,7 @@ mod tests {
             )
             .unwrap();
             let cli = Client {
+                diagnostics: RefCell::default(),
                 endpoint: json!({"host":"fixture","user":"fixture","endpoint_id":"a".repeat(64),
                     "exe":"/opt/pira_team","backend":"/opt/codex","store":"/srv/team"}),
                 authority,

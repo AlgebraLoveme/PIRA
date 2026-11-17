@@ -109,6 +109,18 @@ fn config_subcommands_share_the_exact_config_contract() {
 }
 
 #[test]
+fn retention_config_has_focused_help_without_model_options() {
+    let help = success(&["config", "retention", "--help"]);
+    for action in ["show", "set", "reset"] {
+        assert_eq!(success(&["config", "retention", action, "--help"]), help);
+        assert_eq!(success(&["help", "config", "retention", action]), help);
+    }
+    assert!(help.contains("--max-age-days"));
+    assert!(help.contains("--target-gb"));
+    assert!(!help.contains("--main"));
+}
+
+#[test]
 fn unknown_topics_and_extra_help_arguments_fail_without_normal_dispatch() {
     for (args, expected) in [
         (vec!["help", "no-such-topic"], "unknown help topic"),
@@ -216,4 +228,12 @@ fn documented_defaults_and_key_error_contracts_are_visible() {
     assert!(success(&["bookmarks", "--help"]).contains("1..1000 (default 20)"));
     assert!(success(&["search", "--help"]).contains("Only labels are searched"));
     assert!(success(&["tier", "--help"]).contains("Remote live tier is unsupported"));
+}
+
+#[test]
+fn remote_read_help_distinguishes_retained_handoff_and_diagnostic_bounds() {
+    let help = success(&["help", "read"]);
+    assert!(help.contains("handoffs up to 8 MiB"));
+    assert!(help.contains("retained historical revision handoffs"));
+    assert!(help.contains("other managed files remain limited to 2 MiB"));
 }

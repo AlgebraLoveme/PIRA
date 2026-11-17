@@ -18,7 +18,7 @@ jobs:
     env:
       TOOL: ${{ inputs.tool }}
       BUILD_SCRIPT: tools/build/build_${{ inputs.tool }}_platform_bins.py
-      NEEDS_ZIG: ${{ inputs.tool == 'pira_nav' }}
+      NEEDS_ZIG: ${{ inputs.tool == 'pira_nav' || inputs.tool == 'pira_team' }}
 
     steps:
       - name: Check out source

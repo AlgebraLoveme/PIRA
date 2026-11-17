@@ -1,8 +1,6 @@
-#[path = "claude_turn.rs"]
-pub(crate) mod claude_turn;
-#[path = "codex_turn.rs"]
-pub(crate) mod codex_turn;
-// Shared process supervision and native backend transports.
+//! Shared worker process supervision, authenticated controls and native transports.
+pub(crate) mod claude;
+pub(crate) mod codex;
 use crate::{Options, create, lifecycle};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -68,8 +66,7 @@ fn start_attempt(
         dir,
         handoff,
         endpoint.attempt_gate.clone(),
-        sender,
-        events,
+        (sender, events),
         control_events,
     )?;
     // Server owns cleanup before the fallible binding write; no separate spawn rollback.
@@ -90,19 +87,6 @@ fn acknowledge_guidance(
     manifest["inject_implement"] = json!(guidance.1);
     manifest["inject_fig"] = json!(guidance.2);
     manifest["inject_write"] = json!(guidance.3);
-}
-
-pub(crate) fn codex_relevant_event(value: &Value) -> bool {
-    value.get("id").is_some()
-        || match value["method"].as_str() {
-            Some("turn/completed" | "thread/tokenUsage/updated") => true,
-            Some("item/completed") => {
-                let item = &value["params"]["item"];
-                item["type"] == "agentMessage"
-                    && (item["phase"].is_null() || item["phase"] == "final_answer")
-            }
-            _ => false,
-        }
 }
 
 fn deliver_event(
@@ -147,7 +131,7 @@ fn logged_event(
         range.start = frame.end;
         let value: Value =
             serde_json::from_slice(&line).map_err(|_| "invalid retained app-server event")?;
-        if codex_relevant_event(&value) {
+        if crate::harness::Harness::Codex.relevant_event(&value) {
             return Ok(Some(Event::Protocol(value, frame)));
         }
     }
@@ -318,12 +302,11 @@ impl Drop for Endpoint {
         self.stop.store(true, Ordering::SeqCst);
         // A blocked attempt must still clean up, but never erase a newer endpoint.
         // Release the tree lock before waking/joining listener threads.
-        if let Ok(_lock) = self.attempt_gate.lock() {
-            if lifecycle::read_json(&self.path)
+        if let Ok(_lock) = self.attempt_gate.lock()
+            && lifecycle::read_json(&self.path)
                 .is_ok_and(|endpoint| endpoint["remote_epoch"] == self.epoch)
-            {
-                let _ = fs::remove_file(&self.path);
-            }
+        {
+            let _ = fs::remove_file(&self.path);
         }
         let _ = TcpStream::connect_timeout(&self.address, Duration::from_secs(1));
         if let Some(thread) = self.thread.take() {
@@ -561,6 +544,16 @@ pub(super) fn control_bound(
     send_control(&endpoint, operation, task, gate)
 }
 
+pub(crate) struct TurnRequest<'a> {
+    pub options: &'a Options,
+    pub run: &'a Path,
+    pub dir: &'a Path,
+    pub task: &'a str,
+    pub manifest: &'a mut Value,
+    pub handoff: &'a Path,
+    pub guidance: (bool, bool, bool, bool),
+}
+
 pub struct Turn {
     pub status: String,
     pub text: Option<String>,
@@ -571,7 +564,7 @@ pub struct Turn {
 struct Server {
     attempt_gate: crate::subteam::AttemptGate,
     child: Child,
-    scope: crate::process::Scope,
+    scope: crate::native::process::Scope,
     writer: Option<mpsc::SyncSender<WriteRequest>>,
     writer_thread: Option<std::thread::JoinHandle<()>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -600,8 +593,7 @@ impl Server {
         dir: &Path,
         handoff: &Path,
         attempt_gate: crate::subteam::AttemptGate,
-        sender: mpsc::SyncSender<Event>,
-        events: mpsc::Receiver<Event>,
+        (sender, events): (mpsc::SyncSender<Event>, mpsc::Receiver<Event>),
         controls: mpsc::Receiver<Event>,
     ) -> Result<Self, String> {
         // A revision can contain multiple staged/repair attempts. Never let recovery
@@ -622,7 +614,7 @@ impl Server {
         let event_log =
             BufReader::new(File::open(dir.join("events.jsonl")).map_err(|e| e.to_string())?);
         let requests = create(&dir.join("requests.jsonl"))?;
-        let (mut child, scope) = crate::process::spawn(&mut cmd)
+        let (mut child, scope) = crate::native::process::spawn(&mut cmd)
             .map_err(|e| format!("launch {}: {e}", harness.executable()))?;
         let pipe_stop = Arc::new(AtomicBool::new(false));
         let pipes = (|| {
@@ -761,7 +753,7 @@ impl Server {
             .request_schema
             .as_ref()
             .ok_or("native harness does not support Codex RPC")?;
-        crate::backend::validate_request(schema, &request)?;
+        crate::harness::Harness::validate_codex_request(schema, &request)?;
         self.send(request)?;
         Ok(id)
     }
@@ -1697,9 +1689,10 @@ mod tests {
             else {
                 panic!("not a control")
             };
-            let (_, params) =
-                crate::service_tier::active_update(&request, "thread", "active", false, false)
-                    .unwrap();
+            let (_, params) = crate::profile::service_tier::active_update(
+                &request, "thread", "active", false, false,
+            )
+            .unwrap();
             assert_eq!(
                 params,
                 json!({"threadId":"thread","turnId":"active","serviceTier":"fast"})
@@ -1713,7 +1706,8 @@ mod tests {
             panic!("not a control")
         };
         assert!(
-            crate::service_tier::active_update(&request, "thread", "active", false, false).is_err()
+            crate::profile::service_tier::active_update(&request, "thread", "active", false, false)
+                .is_err()
         );
         reply
             .send(json!({"status":"rejected","error":"stale turn"}))
@@ -1727,5 +1721,5 @@ mod tests {
 }
 
 #[cfg(all(test, unix))]
-#[path = "tier_control_tests.rs"]
+#[path = "runtime/tests/tier_control.rs"]
 mod tier_control_tests;

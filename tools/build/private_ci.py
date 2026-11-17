@@ -290,7 +290,7 @@ def selected(root: Path) -> list[Path]:
                         continue
                     paths.append((Path(parent) / name).relative_to(root))
     paths.extend(Path("tools/src/pira_team") / name for name in POLICIES)
-    paths.append(Path("tools/src/pira_team/tier_fixture.py"))
+    paths.append(Path("tools/src/pira_team/runtime/tests/fixtures/tier.py"))
     paths.append(Path("tools/crates/pira_svg_check/tests/fixtures/linux-dejavu-fonts.conf"))
     paths.extend(Path(name) for name in (
         "assets/scripts/setup_pira.py", "assets/scripts/test_setup_pira.py",

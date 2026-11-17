@@ -7,6 +7,55 @@ import tempfile
 import unittest
 
 
+def windows_suite(loader: unittest.TestLoader) -> unittest.TestSuite:
+    """Select native Windows contracts; the runner removes POSIX-only fixtures."""
+    import test_subteams
+    # These two non-exec shell-wrapper fixtures require POSIX. Keep the
+    # remaining suite's no-skips gate, including newly added tests.
+    posix_wrappers = {
+        "test_wrapped_backend_rejects_malformed_runtime_and_stale_revision",
+        "test_wrapped_backend_preserves_context_and_delegation_limits",
+    }
+    suite = loader.loadTestsFromNames([
+        "test_subteams.SubteamTests." + name
+        for name in loader.getTestCaseNames(test_subteams.SubteamTests)
+        if name not in posix_wrappers
+    ])
+    import test_claude
+    suite.addTests(loader.loadTestsFromNames([
+        "test_claude.ClaudeTests." + name
+        for name in loader.getTestCaseNames(test_claude.ClaudeTests)
+        if name != "test_worker_context_preserves_role_when_path_changes"
+    ]))
+    suite.addTests(loader.loadTestsFromName("test_retention"))
+    suite.addTests(loader.loadTestsFromNames([
+        "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
+        "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",
+        "test_team.TeamTests.test_explicit_api_auth_does_not_link_file_auth",
+        "test_team.TeamTests.test_final_output_closed_stdout",
+        "test_team.TeamTests.test_postpublication_usage_warning_closed_stderr",
+        "test_team.TeamTests.test_postpublication_repair_warning_closed_stderr",
+        "test_team.TeamTests.test_final_answer_and_full_logs",
+        "test_team.TeamTests.test_artifact_receipt_hides_answer_and_preserves_report"]))
+    suite.addTests(loader.loadTestsFromNames([
+        "test_orphan_recovery.OrphanRecoveryTests." + name for name in (
+            "test_target_only_abandoned_owner_retains_artifacts_and_explicit_resume",
+            "test_missing_control_does_not_authorize_live_owner_settlement",
+            "test_missing_or_mismatched_identity_evidence_fails_closed",
+            "test_live_backend_and_reused_scope_refused_without_signaling",
+            "test_existing_snapshot_republished_without_overwrite_or_duplicate_history",
+            "test_stale_control_failure_cannot_settle_a_resumed_revision",
+            "test_concurrent_recovery_and_resume_preserve_single_attempt_admission",
+            "test_resume_preflight_missing_or_stale_revision_runtime_refused",
+            "test_same_revision_repair_preflight_rejects_previous_and_legacy_bindings",
+            "test_legacy_single_attempt_binding_remains_supported",
+            "test_abandoned_resume_preserves_prior_history_and_cumulative_usage",
+        )]))
+    for module in ("test_native_auth", "test_provider_config", "test_prerequisite_local", "test_local_usability"):
+        suite.addTests(loader.loadTestsFromName(module))
+    return suite
+
+
 def main():
     root = Path(__file__).resolve().parents[4]
     tests = Path(__file__).resolve().parent
@@ -42,48 +91,7 @@ def main():
         loader = unittest.TestLoader()
         requested = sys.argv[1:]
         if os.name == "nt":
-            import test_subteams
-            # These two non-exec shell-wrapper fixtures require POSIX. Keep the
-            # remaining suite's no-skips gate, including newly added tests.
-            posix_wrappers = {
-                "test_wrapped_backend_rejects_malformed_runtime_and_stale_revision",
-                "test_wrapped_backend_preserves_context_and_delegation_limits",
-            }
-            suite = loader.loadTestsFromNames([
-                "test_subteams.SubteamTests." + name
-                for name in loader.getTestCaseNames(test_subteams.SubteamTests)
-                if name not in posix_wrappers
-            ])
-            import test_claude
-            suite.addTests(loader.loadTestsFromNames([
-                "test_claude.ClaudeTests." + name
-                for name in loader.getTestCaseNames(test_claude.ClaudeTests)
-                if name != "test_worker_context_preserves_role_when_path_changes"
-            ]))
-            suite.addTests(loader.loadTestsFromName("test_retention"))
-            suite.addTests(loader.loadTestsFromNames([
-                "test_team.TeamTests.test_file_auth_reused_and_detached_on_run_and_resume",
-                "test_team.TeamTests.test_empty_codex_home_uses_home_auth_and_detaches_on_startup_failure",
-                "test_team.TeamTests.test_explicit_api_auth_does_not_link_file_auth",
-                "test_team.TeamTests.test_final_output_closed_stdout",
-                "test_team.TeamTests.test_postpublication_usage_warning_closed_stderr",
-                "test_team.TeamTests.test_postpublication_repair_warning_closed_stderr",
-                "test_team.TeamTests.test_final_answer_and_full_logs",
-                "test_team.TeamTests.test_artifact_receipt_hides_answer_and_preserves_report"]))
-            suite.addTests(loader.loadTestsFromNames([
-                "test_orphan_recovery.OrphanRecoveryTests." + name for name in (
-                    "test_target_only_abandoned_owner_retains_artifacts_and_explicit_resume",
-                    "test_missing_control_does_not_authorize_live_owner_settlement",
-                    "test_missing_or_mismatched_identity_evidence_fails_closed",
-                    "test_live_backend_and_reused_scope_refused_without_signaling",
-                    "test_existing_snapshot_republished_without_overwrite_or_duplicate_history",
-                    "test_stale_control_failure_cannot_settle_a_resumed_revision",
-                    "test_concurrent_recovery_and_resume_preserve_single_attempt_admission",
-                    "test_resume_preflight_missing_or_stale_revision_runtime_refused",
-                    "test_same_revision_repair_preflight_rejects_previous_and_legacy_bindings",
-                    "test_legacy_single_attempt_binding_remains_supported",
-                    "test_abandoned_resume_preserves_prior_history_and_cumulative_usage",
-                )]))
+            suite = windows_suite(loader)
         else:
             suite = loader.discover(str(tests), pattern="test_*.py")
         if requested:

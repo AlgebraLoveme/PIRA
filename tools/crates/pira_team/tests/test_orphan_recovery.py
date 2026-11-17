@@ -14,11 +14,6 @@ from native_fixture import Boundary, process_exit_waiter
 class OrphanRecoveryTests(unittest.TestCase):
     # Reuse the service fixture without inheriting its unrelated test cases.
     setUp = test_subteams.SubteamTests.setUp
-    parent = test_subteams.SubteamTests.parent
-    permission_context = test_subteams.SubteamTests.permission_context
-    fail_startup = test_subteams.SubteamTests.fail_startup
-    wait_stderr_notice = test_subteams.SubteamTests.wait_stderr_notice
-    launch = test_subteams.SubteamTests.launch
     stop_processes = test_subteams.SubteamTests.stop_processes
     root_command = test_subteams.SubteamTests.root_command
     start = test_subteams.SubteamTests.start

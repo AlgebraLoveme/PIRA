@@ -148,6 +148,74 @@ class RemoteEndpointTests(unittest.TestCase):
                 self.assertIn(option, rejected["error"])
                 self.assertFalse(self.f.store.exists())
 
+    def completed_handoff(self, content):
+        _,_,run=self.f.retained()
+        manifest=run/"manifest.json"
+        value=json.loads(manifest.read_text())
+        value.update(status="completed",artifact="artifacts/handoff")
+        manifest.write_text(json.dumps(value))
+        artifact=run/"artifacts/handoff"; artifact.parent.mkdir(mode=0o700)
+        artifact.write_text(content); artifact.chmod(0o600)
+        return artifact
+
+    def test_handoff_chunk_is_revision_pinned_and_utf8_boundary_checked(self):
+        self.completed_handoff("a"*(1024*1024-1)+"λ"+"b"*(1024*1024))
+        first=self.reply(self.f.envelope(self.f.grant(artifact=True)))
+        self.assertTrue(first["result"]["chunked"])
+        self.assertNotIn("content",first["result"])
+        for args,error in ((["read-chunk",str(1024*1024),"1"],"byte boundary"),
+                           (["read-chunk","0","2"],"revision changed")):
+            with self.subTest(args=args):
+                rejected=self.rejected(self.f.envelope(self.f.grant(artifact=True,args=args)))
+                self.assertIn(error,rejected["error"])
+        chunk=self.reply(self.f.envelope(self.f.grant(artifact=True,args=["read-chunk","0","1"])))
+        self.assertEqual(chunk["result"]["next_offset"],1024*1024-1)
+        self.assertLess(len(json.dumps(chunk).encode()),16*1024*1024)
+
+    def archive_initial_handoff(self):
+        artifact=self.completed_handoff("historical λ\n"+"x"*(2*1024*1024))
+        run=artifact.parent.parent
+        manifest=run/"manifest.json"; original=json.loads(manifest.read_text())
+        snapshot=run/"revisions/000001/manifest.json";snapshot.parent.mkdir(parents=True,mode=0o700)
+        snapshot.parent.parent.chmod(0o700)
+        snapshot.write_text(json.dumps(original));snapshot.chmod(0o600)
+        current={**original,"revision":2,"artifact":"revisions/000002/artifacts/handoff"}
+        manifest.write_text(json.dumps(current))
+        return run,snapshot
+
+    def test_historical_chunk_uses_owning_revision_not_latest_run_epoch(self):
+        run,_=self.archive_initial_handoff()
+        selected={"file":"artifacts/handoff"}
+        descriptor=self.reply(self.f.envelope(self.f.grant(**selected)))["result"]
+        self.assertEqual(descriptor["revision"],1)
+        manifest=run/"manifest.json";current=json.loads(manifest.read_text());current["revision"]=3
+        manifest.write_text(json.dumps(current))
+        chunk=self.reply(self.f.envelope(self.f.grant(**selected,args=["read-chunk","0","1"])))
+        self.assertTrue(chunk["ok"])
+        rejected=self.rejected(self.f.envelope(self.f.grant(**selected,args=["read-chunk","0","3"])))
+        self.assertIn("revision changed",rejected["error"])
+
+    def test_historical_manifest_does_not_promote_unselected_diagnostic_or_wrong_creator(self):
+        run,snapshot=self.archive_initial_handoff()
+        diagnostic=run/"artifacts/diagnostic.txt";diagnostic.write_text("x"*(2*1024*1024+1));diagnostic.chmod(0o600)
+        rejected=self.rejected(self.f.envelope(self.f.grant(file="artifacts/diagnostic.txt")))
+        self.assertIn("2 MiB",rejected["error"])
+        retained=json.loads(snapshot.read_text());retained["creator_main_session_id"]="another-root"
+        snapshot.write_text(json.dumps(retained))
+        rejected=self.rejected(self.f.envelope(self.f.grant(file="artifacts/handoff")))
+        self.assertIn("2 MiB",rejected["error"])
+
+    def test_handoff_above_accepted_limit_is_rejected(self):
+        self.completed_handoff("x"*(8*1024*1024+1))
+        rejected=self.rejected(self.f.envelope(self.f.grant(artifact=True)))
+        self.assertIn("8 MiB",rejected["error"])
+
+    def test_nonhandoff_files_keep_two_mib_limit(self):
+        artifact=self.completed_handoff("small handoff")
+        diagnostic=artifact.parent/"diagnostic.txt"; diagnostic.write_text("x"*(2*1024*1024+1)); diagnostic.chmod(0o600)
+        rejected=self.rejected(self.f.envelope(self.f.grant(file="artifacts/diagnostic.txt")))
+        self.assertIn("2 MiB",rejected["error"])
+
     def test_owner_key_endpoint_and_request_binding_protect_retained_read(self):
         _, request, run = self.f.retained()
         self.assertIs(self.reply(self.f.envelope(self.f.grant()))["ok"], True)

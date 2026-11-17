@@ -7,14 +7,18 @@ from pathlib import Path
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class NotificationBurstTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
+
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def test_required_burst_and_paced_notifications_before_and_after_start_ack(self):
         for stage, delay in (("before-ack", "0"), ("after-ack", "0"), ("after-ack", ".001")):
@@ -24,7 +28,7 @@ class NotificationBurstTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 receipt = json.loads(result.stdout)
                 self.assertEqual(Path(receipt["handoff_path"]).read_text(), "ANSWER burst")
-                manifest = self.fixture.metadata(receipt)
+                manifest = self.metadata(receipt)
                 self.assertEqual(manifest["status"], "completed")
                 self.assertEqual(manifest["usage"]["input_tokens"], 128 + 17)
                 self.assertEqual(manifest["usage"]["output_tokens"], 128 + 5)

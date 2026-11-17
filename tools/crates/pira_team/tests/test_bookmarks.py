@@ -10,14 +10,12 @@ import threading
 import time
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class BookmarkTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.store = self.root / "logs"
         self.index = self.store / "bookmarks.json"
@@ -102,7 +100,7 @@ class BookmarkTests(unittest.TestCase):
             self.assign(run.name, label)
         result = self.success("search", "[x].* λ", "--limit", "1")
         self.assertEqual(result, {"matches": [{"label": "ALPHA [X].* Λ", **self.reference(run)}],
-                                  "has_more": True})
+                                  "has_more": True, "next_after": "ALPHA [X].* Λ"})
         self.assertFalse(self.success("search", "[x].* λ", "--limit", "2")["has_more"])
         self.assertEqual([r["label"] for r in self.success("search", "alpha")["matches"]],
                          ["ALPHA [X].* Λ", "Alpha [x].* λ", "alpha ordinary"])

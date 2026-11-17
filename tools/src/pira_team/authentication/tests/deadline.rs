@@ -1,13 +1,6 @@
 #[cfg(unix)]
 fn deadline_fixture() -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "team-auth-deadline-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::tests::temp_path("team-auth-deadline");
     crate::private_dir(&path).unwrap();
     path
 }

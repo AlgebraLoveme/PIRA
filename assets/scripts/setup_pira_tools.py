@@ -656,10 +656,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--install-dir", type=Path, default=None, help="Per-user PATH directory.")
     add_harness_arguments(parser)
     parser.add_argument("--dry-run", action="store_true", help="Describe changes without writing.")
+    parser.add_argument("--auth-only", action="store_true",
+                        help="Prepare/verify Codex file auth for Team only; no tool install, release lookup, PATH change or store migration.")
+    parser.add_argument("--reauth", action="store_true",
+                        help="Explicitly renew native file login during setup, even if offline status accepts the cache; not with verify or login skip.")
     parser.add_argument(
         "--codex-login", choices=["auto", "browser", "device", "skip"], default="auto",
-        help="Missing Team login: auto uses browser in a terminal, otherwise device link/code; "
-             "skip fails without signing in. Verify/dry-run never start login.",
+        help="Missing Team file login: auto offers browser login only in a terminal; "
+             "browser/device explicitly allow setup login, skip/verify/dry-run never sign in.",
     )
     parser.add_argument(
         "--verify", action="store_true", help="Verify installed tools without changing them."
@@ -946,6 +950,9 @@ def check_team_protocol(executable: str) -> None:
     """Probe direct stdio, not the interactive shared daemon; no auth or model turn."""
     contract_path = REPO_ROOT / "tools/src/pira_team/backend_contract.json"
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    # Match runtime: live tier updates are optional; steering/interrupt remain core.
+    del contract["schemas"]["v2/TurnSettingsUpdateResponse.json"]
+    del contract["schemas"]["ClientRequest.json"]["methods"]["turn/settings/update"]
     with tempfile.TemporaryDirectory(prefix="pira-team-backend-") as temporary:
         root = Path(temporary)
         home = root / "home"
@@ -1296,103 +1303,259 @@ def prepare_team_runtime(tools: list[str], install_dir: Path, platform_key: str,
     return version
 
 
+def team_auth_selection(home: Path) -> Path | None:
+    """Read only Team's non-secret selection, never credential contents."""
+    path = home / "pira-team-auth.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if (not path.is_file() or path.is_symlink() or metadata.st_size > 65536
+            or (os.name != "nt" and (metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077))):
+        raise RuntimeError("Invalid/private Team auth selection; preserved without login")
+    try:
+        selection = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(selection, dict) or set(selection) != {"version", "home"}
+                or type(selection["version"]) is not int or selection["version"] != 1
+                or not isinstance(selection["home"], str) or "\0" in selection["home"]
+                or not Path(selection["home"]).is_absolute()):
+            raise ValueError()
+        return Path(selection["home"])
+    except (OSError, ValueError, TypeError) as error:
+        raise RuntimeError("Invalid Team auth selection; preserved without login (values withheld)") from error
+
+
+def team_auth_configuration(home: Path) -> tuple[str, bool, dict]:
+    """Select the same supported persistent worker config as Team, not CLI overrides."""
+    worker = home / "pira-team-worker.toml"
+    source = worker if worker.exists() or worker.is_symlink() else home / "config.toml"
+    try:
+        if source.exists() or source.is_symlink():
+            if not source.is_file() or source.stat().st_size > 1024 * 1024:
+                raise ValueError()
+            with source.open("rb") as stream:
+                text = stream.read(1024 * 1024 + 1)
+            if len(text) > 1024 * 1024:
+                raise ValueError()
+            data = stores.configuration_toml().loads(text.decode("utf-8"))
+        else:
+            data = {}
+        if "profile" in data:
+            profile = data["profiles"][data["profile"]]
+            if not isinstance(profile, dict): raise ValueError()
+        else:
+            profile = {}
+        provider = profile.get("model_provider", data.get("model_provider", "openai"))
+        definition = data.get("model_providers", {}).get(provider, {})
+        if ("model_catalog_json" in profile or "model_catalog_json" in data
+                or "model_catalog_url" in definition
+                or any(key in definition for key in ("auth", "aws", "credential_file", "gateway_oauth"))):
+            raise RuntimeError("Selected Team catalog/native-helper mode is unsupported by the isolated app-server auth adapter; select an explicit supported worker route. No login or model request was started (values withheld)")
+        mode = data.get("cli_auth_credentials_store", "file")
+        if mode not in {"file", "keyring", "auto", "ephemeral"}:
+            raise ValueError()
+        constraints = {key: data[key] for key in ("forced_login_method", "forced_chatgpt_workspace_id") if key in data}
+        if "forced_login_method" in constraints and constraints["forced_login_method"] not in ("api", "chatgpt"):
+            raise ValueError()
+        if any(not isinstance(value, str) and not (isinstance(value, list) and all(isinstance(v, str) for v in value))
+               for value in constraints.values()):
+            raise ValueError()
+        return mode, provider == "openai" or definition.get("requires_openai_auth", False) is True, constraints
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError("Cannot select persistent Team provider/auth config; inspect pira-team-worker.toml/config.toml privately (values withheld)") from None
+
+
 def ensure_team_auth(tools: list[str], install_dir: Path, *, verify: bool,
-                     dry_run: bool, login: str) -> None:
-    """Check Team's auth source, initiating official login only during normal setup."""
+                     dry_run: bool, login: str, store_root: str | None = None,
+                     reauth: bool = False) -> None:
+    """Verify the actual isolated file-auth mode; user login is setup-only."""
     if "pira_team" not in tools:
         return
+    if reauth and (verify or login == "skip"):
+        raise RuntimeError("--reauth needs normal setup login, not --verify or --codex-login skip")
     if dry_run and not verify:
-        print("DRY-RUN: would check Team-compatible Codex authentication and offer login if missing")
+        print("DRY-RUN: would verify isolated Team file-auth access and prepare setup-only login if needed")
         return
     if os.environ.get("CODEX_API_KEY"):
-        print("OK: CODEX_API_KEY is configured for Team (not remotely validated)")
+        if reauth:
+            raise RuntimeError("Explicit CODEX_API_KEY overrides native file login; repair the selected launcher API-key configuration privately. No login was started.")
+        print("OK: CODEX_API_KEY is configured for Team (model access not remotely validated)")
         return
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
+    mode, needs_login, constraints = team_auth_configuration(home)
+    if not needs_login:
+        if reauth:
+            raise RuntimeError("Selected worker provider does not use native OpenAI login; repair its selected provider authentication privately. No native login was started.")
+        print("OK: persistent worker provider does not use native OpenAI login; Team validates selected connection/auth settings at launch")
+        return
+    selected = team_auth_selection(home)
     executable = selected_codex_binary(install_dir)
     if executable is None:
-        raise RuntimeError("Cannot check authentication without the selected Codex executable")
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    auth_file = home / "auth.json"
-    if (auth_file.exists() or auth_file.is_symlink()) and not auth_file.is_file():
-        raise RuntimeError("Existing Codex credential path is not a regular file; preserved without login")
-    existing_file = auth_file.exists()
-    native_command = [executable, "login", "status"]
-
-    def status(command: list[str], environment: dict[str, str]) -> bool:
+        raise RuntimeError("Cannot verify Team authentication without selected Codex")
+    guidance = "Rerun PIRA setup/install auth repair with --codex-login browser or device; Team launch never starts login."
+    environment = dict(os.environ)
+    for key in ("CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
+        environment.pop(key, None)
+    auto_file = False
+    if selected is None and mode == "auto" and (home / "auth.json").is_file():
+        # Native auto prefers keyring. Reuse the known file only when native
+        # keyring status explicitly reports no login; uncertainty is not absence.
         try:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=15, check=False, env=environment)
+            result = subprocess.run([executable, "-c", 'cli_auth_credentials_store="keyring"', "login", "status"],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=15, check=False, env=dict(environment, CODEX_HOME=str(home)))
+            auto_file = result.returncode == 1 and "Not logged in" in (result.stdout + result.stderr).splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # Explicit separate Team file fallback, never an arbitrary stale file.
+    # Auto/keyring may prefer a different account than a leftover auth.json. Never
+    # treat that unselected file as Team's login. No credential search/export.
+    source_home = selected or (home if mode == "file" or auto_file else home / "pira-team-auth")
+    source = source_home / "auth.json"
+    if (source.exists() or source.is_symlink()) and not source.is_file():
+        raise RuntimeError("Selected credential path is not a regular file; preserved without login. " + guidance)
+    if store_root:
+        root = Path(store_root)
+        if not root.exists() and verify:
+            raise RuntimeError("Team store is not prepared; cannot verify credential alias mode. " + guidance)
+        if not verify:
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    else:
+        root = None
+    def status(probe: Path) -> bool:
+        env = dict(environment, CODEX_HOME=str(probe))
+        try:
+            result = subprocess.run([executable, "-c", 'cli_auth_credentials_store="file"', "login", "status"],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=15, check=False, env=env)
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise RuntimeError("Could not check Codex login status; fix the runtime/configuration "
-                               "and rerun setup. No login was started.") from error
+            raise RuntimeError("Could not verify isolated Team file login; no automatic re-login attempted. " + guidance) from error
         if result.returncode == 0:
             return True
         if result.returncode == 1 and "Not logged in" in (result.stdout + result.stderr).splitlines():
             return False
-        raise RuntimeError("Codex login status failed unexpectedly; inspect Codex configuration "
-                           "or run codex login status privately. No automatic re-login was attempted.")
+        raise RuntimeError("Native file login status/configuration failed; values withheld and credentials preserved. " + guidance)
 
-    if status(native_command, dict(os.environ)):
-        if existing_file:
-            print("OK: existing native Codex authentication preserved. LIMITATION: Team uses CODEX_HOME/auth.json "
-                  "or CODEX_API_KEY, not the native keyring; confirm the existing file is the intended "
-                  "Team account. File/native account equivalence and model access were not validated.")
-        else:
-            print("LIMITATION: native Codex is authenticated but no Team file cache exists. "
-                  "Current Team supports CODEX_API_KEY or CODEX_HOME/auth.json, not keyring-only "
-                  "or other native-only authentication. CLI preparation is complete; existing auth "
-                  "is unchanged. Explicitly configure supported Team authentication and rerun setup, "
-                  "or request runtime keyring support. No conversion, export or login was attempted.")
+    def writable_alias(probe: Path) -> None:
+        # Resolve only the selected location. Native refresh replaces the target
+        # atomically beside itself; copying or hard-linking is not refresh-safe.
+        target = source.resolve()
+        try:
+            (probe / "auth.json").symlink_to(target)
+            with tempfile.TemporaryDirectory(prefix=".pira-auth-write-check-", dir=target.parent) as temporary:
+                a, b = Path(temporary) / "a", Path(temporary) / "b"
+                a.write_bytes(b"synthetic-write-check")
+                b.write_bytes(b"synthetic-replacement")
+                os.replace(a, b)
+            if source.exists() and not os.access(target, os.R_OK | os.W_OK):
+                raise OSError("credential target is not readable/writable")
+            if IS_WINDOWS and source.exists() and target.stat().st_nlink > 1:
+                raise OSError("native Windows replacement rejects multi-link files")
+        except OSError as error:
+            raise RuntimeError("Team requires a refresh-safe credential symlink and writable native target; check filesystem support, Windows Developer Mode/symlink privilege and permissions. Another login alone cannot fix this access mode; no copy/hard-link fallback was attempted.") from error
+
+    if not source_home.exists():
+        if verify or login == "skip" or (login == "auto" and not sys.stdin.isatty()):
+            raise RuntimeError("Team-compatible persistent file login is missing; authentication incomplete. " + guidance)
+        source_home.mkdir(parents=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix=".pira-team-auth-check-", dir=root) as temporary:
+        probe = Path(temporary)
+        (probe / "config.toml").write_text('cli_auth_credentials_store="file"\n' + "".join(
+            f"{key} = {json.dumps(value)}\n" for key, value in constraints.items()), encoding="utf-8")
+        writable_alias(probe)  # Check platform access before asking the user to login.
+        # Offline status cannot detect provider-side revocation. Only an explicit
+        # setup renewal request may replace an otherwise accepted cached login.
+        ready = source.exists() and not reauth and status(probe)
+        if not ready:
+            if verify or login == "skip" or (login == "auto" and not sys.stdin.isatty()):
+                raise RuntimeError("Team-compatible persistent file login is missing; authentication incomplete. " + guidance)
+            command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
+            if login == "device":
+                command.append("--device-auth")
+            print("Team's isolated app-server needs a native file login. The official login flow saves it in the selected Team auth home; main config and keyring are unchanged. Protect the file like a password.", flush=True)
+            print("Complete Codex's browser/link-code flow; waiting up to five minutes. Ctrl-C cancels setup.", flush=True)
+            try:
+                result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                        env=dict(environment, CODEX_HOME=str(probe)), timeout=300, check=False)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("Codex login timed out; authentication incomplete. " + guidance) from error
+            except KeyboardInterrupt as error:
+                raise RuntimeError("Codex login cancelled; authentication incomplete.") from error
+            except OSError as error:
+                raise RuntimeError("Could not launch native Codex login; authentication incomplete. " + guidance) from error
+            if result.returncode != 0:
+                raise RuntimeError("Codex login did not complete; authentication incomplete. " + guidance)
+            if not source.is_file() or not status(probe):
+                raise RuntimeError("Login returned without a Team-compatible native file cache. " + guidance)
+        # File auth is explicitly selected only after the isolated access check.
+        if selected is None:
+            if (verify or dry_run) and (source_home != home or mode != "file"):
+                raise RuntimeError("Team file-auth selection is not recorded; authentication incomplete. " + guidance)
+        if selected is None and not verify and not dry_run:
+            marker = home / "pira-team-auth.json"
+            descriptor, name = tempfile.mkstemp(dir=home, prefix=".pira-team-auth-")
+            temporary = Path(name)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "home": str(source_home.resolve())}, stream)
+                    stream.write("\n")
+                if marker.exists() or marker.is_symlink():
+                    raise RuntimeError("Team auth selection appeared concurrently; preserved. Rerun setup.")
+                os.replace(temporary, marker)
+            finally:
+                temporary.unlink(missing_ok=True)
+        print("OK: native file login accepted; credential alias and target-directory replacement checks passed (live refresh/model access not tested)")
+
+
+def check_team_remote_signing(tools: list[str]) -> None:
+    """Check the existing OpenSSH client; never install it or read a real key."""
+    if "pira_team" not in tools:
         return
-    guidance = ("Rerun setup with --codex-login browser for local browser login, or "
-                "--codex-login device for a link/code. Device login must be enabled in "
-                "ChatGPT security/workspace settings. Admin-enforced storage rules are not bypassed.")
-    if existing_file:
-        raise RuntimeError("Existing Codex authentication was not accepted; preserved without overwrite. "
-                           "Check or renew the intended account privately, then rerun setup.")
-    if verify or login == "skip":
-        raise RuntimeError("Team-compatible Codex login is missing. " + guidance)
-    command = [executable, "-c", 'cli_auth_credentials_store="file"', "login"]
-    env = dict(os.environ)
-    for key in ("OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"):
-        env.pop(key, None)
-    if auth_file.exists() or auth_file.is_symlink():
-        raise RuntimeError("Codex credential path appeared during preparation; preserved without login")
-    mode = login
-    if mode == "auto":
-        mode = "browser" if sys.stdin.isatty() else "device"
-    print("Team needs a file-backed Codex login. The official flow will save credentials in "
-          "CODEX_HOME/auth.json (default ~/.codex/auth.json); protect this file like a password. "
-          "Global credential-storage configuration is unchanged.", flush=True)
-    if mode == "device":
-        command.append("--device-auth")
-        print("Open Codex's displayed link and enter its code. Device login must be enabled "
-              "in ChatGPT security/workspace settings.", flush=True)
+    candidates = [shutil.which("ssh-keygen")]
+    if IS_WINDOWS:
+        root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+        if root:
+            candidates.append(str(Path(root) / "System32/OpenSSH/ssh-keygen.exe"))
     else:
-        print("Complete login in the browser Codex opens, or use the URL it displays.", flush=True)
-    print("Waiting up to 5 minutes; Ctrl-C cancels. Run setup directly in a terminal "
-          "if your agent hides subprocess output.", flush=True)
+        candidates.extend(["/usr/bin/ssh-keygen", "/bin/ssh-keygen"])
+    executable = next((p for p in candidates if p and Path(p).is_file()), None)
+    guidance = ("Remote Team requires OpenSSH ssh-keygen with -Y sign/verify. "
+                "Install/update the OS OpenSSH client package and rerun PIRA setup on both hosts; "
+                "ordinary launch never installs signing dependencies.")
+    if executable is None:
+        raise RuntimeError(guidance)
     try:
-        # Inherit output so the official URL/code reaches the user immediately.
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, env=env,
-                                timeout=300, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("Codex login timed out. " + guidance) from error
-    except KeyboardInterrupt as error:
-        raise RuntimeError("Codex login cancelled; setup is incomplete.") from error
-    except OSError as error:
-        raise RuntimeError("Could not launch Codex login. " + guidance) from error
-    if result.returncode != 0:
-        raise RuntimeError("Codex login did not complete. " + guidance)
-    if not auth_file.is_file() or not status([executable, "-c", 'cli_auth_credentials_store="file"', "login", "status"], env):
-        raise RuntimeError("Login returned without a Team-compatible file cache. "
-                           "Check enforced credential-storage requirements. " + guidance)
-    print("OK: Team-compatible Codex login is ready (model access not remotely validated)")
+        result = subprocess.run([executable, "-?"], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(guidance) from error
+    usage = result.stdout + result.stderr
+    if "-Y sign" not in usage or "-Y verify" not in usage:
+        raise RuntimeError(guidance)
+    print("OK: OpenSSH ssh-keygen signing/verification available for Team remote control")
+
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.reauth and (args.verify or args.codex_login == "skip"):
+        raise RuntimeError("--reauth needs normal setup login, not --verify or --codex-login skip")
     use_codex = args.harness != "claude"
     initial_path = os.environ.get("PATH", "")
     install_dir = (args.install_dir or default_install_dir()).expanduser().resolve(strict=False)
+    if args.auth_only:
+        if not use_codex or args.tools not in (None, ["pira_team"]):
+            raise RuntimeError("--auth-only prepares Codex login for pira_team; use --harness codex and --tool pira_team (or omit --tool)")
+        if not args.dry_run or args.verify:
+            executable = selected_codex_binary(install_dir)
+            if executable is None:
+                raise RuntimeError("Codex is missing; run normal PIRA setup/install first")
+            check_team_runtime(["pira_team"], executable)
+        ensure_team_auth(["pira_team"], install_dir, verify=args.verify, dry_run=args.dry_run,
+                         login=args.codex_login,
+                         store_root=stores.selected_store_paths(["pira_team"])["PIRA_TEAM_DIR"],
+                         reauth=args.reauth)
+        print("Auth preparation only: no PIRA tool installation, PATH update or store migration was performed")
+        return 0
     if args.harness in ("claude", "both"):
         runtime = prepare_claude_runtime(verify=args.verify, dry_run=args.dry_run, install_dir=install_dir)
         if runtime:
@@ -1406,6 +1569,7 @@ def main(argv: list[str] | None = None) -> int:
     index = release_index()
     platform_key = selector.current_platform()
     tools = selected_tools(index, args.tools)
+    check_team_remote_signing(tools)
     requested_versions = parse_versions(args.version)
     unselected_versions = sorted(set(requested_versions) - set(tools))
     if unselected_versions:
@@ -1427,7 +1591,8 @@ def main(argv: list[str] | None = None) -> int:
                   if not args.no_path else stores.StorePlan())
     if "pira_team" in tools and use_codex:
         ensure_team_auth(tools, install_dir, verify=args.verify, dry_run=args.dry_run,
-                         login=args.codex_login)
+                         login=args.codex_login, store_root=store_plan.stores.get("PIRA_TEAM_DIR"),
+                         reauth=args.reauth)
     indexes = {tool_name: index for tool_name in index["tools"]}
     historical_versions: dict[str, str] = {}
     for tool_name, version in requested_versions.items():

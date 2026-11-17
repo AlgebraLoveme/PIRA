@@ -13,12 +13,13 @@ import subprocess
 import sys
 import time
 
-import test_team
+from team_fixture import TeamFixture
 
 
 def isolate_environment(environment, root):
     """Retain fixture settings, not caller credentials, profiles or proxy settings."""
     names = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "CODEX_HOME", "CODEX_THREAD_ID",
+             "TMPDIR", "TMP", "TEMP",
              "PIRA_CTX_STORE_DIR", "PIRA_DEC_STORE_DIR", "PIRA_TEAM_BIN", "PIRA_TEAM_TEST_CODEX",
              "TEAM_TEST_BACKEND_CONTRACT", "TEAM_TEST_BACKEND_FIXTURE", "TEAM_SOCKET_DIR",
              "TEAM_SUBTEAM_BIN", "TEAM_SUBTEAM_FIXTURE", "TEAM_FIXTURE_PYTHON", "TEAM_FIXTURE_CODEX"}
@@ -136,12 +137,10 @@ print(json.dumps(reply))
 
 
 class RemoteFixture:
-    """Composition avoids rediscovering the existing TeamTests suite."""
+    """Isolated local environment and synthetic remote transport."""
 
     def __init__(self, case):
-        self.local = test_team.TeamTests()
-        case.addCleanup(self.local.doCleanups)
-        self.local.setUp()
+        self.local = TeamFixture(case.addCleanup)
         self.root = self.local.root
         self.bin = self.local.bin
         self.env = self.local.env

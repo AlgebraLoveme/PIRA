@@ -35,6 +35,14 @@ class RemoteClientTests(unittest.TestCase):
         return {str(p.relative_to(self.f.state)):(p.read_bytes(), p.stat().st_mtime_ns)
                 for p in self.f.state.rglob("*") if p.is_file()}
 
+    def test_domain_and_unicode_account_names_remain_single_ssh_arguments(self):
+        for index,user in enumerate(("user@example.org",r"DOMAIN\user","user+tag","研究者")):
+            with self.subTest(user=user):
+                self.require_success(self.run_remote(request_id=f"domain-{index}",**{"remote-user":user}))
+                argv=self.f.exchanges()[-1]["argv"]
+                self.assertEqual(argv[argv.index("-l")+1],user)
+                self.assertEqual(self.f.grants("submit")[-1]["endpoint"]["user"],user)
+
     def test_shell_metacharacters_remain_literal_structured_data(self):
         task = "--host=not-a-host; $(touch NEVER) 'quoted'\nλ"
         executable = "/opt/pira candidate 'quoted';$(NEVER)/pira_team"

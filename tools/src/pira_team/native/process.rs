@@ -273,7 +273,7 @@ mod tests {
         command
             .args([
                 "--exact",
-                "process::tests::windows_breakaway_helper",
+                "native::process::tests::windows_breakaway_helper",
                 "--nocapture",
             ])
             .env("TEAM_TEST_JOB_HELPER", "1")
@@ -419,7 +419,7 @@ mod unix_tests {
             command
                 .args([
                     "--exact",
-                    "process::unix_tests::launcher_helper",
+                    "native::process::unix_tests::launcher_helper",
                     "--nocapture",
                 ])
                 .env("TEAM_TEST_LAUNCHER_FIXTURE", &path)
@@ -532,7 +532,7 @@ mod unix_tests {
         let child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "process::unix_tests::launcher_helper",
+                "native::process::unix_tests::launcher_helper",
                 "--nocapture",
             ])
             .env("TEAM_TEST_LAUNCHER_FIXTURE", &path)
@@ -583,7 +583,7 @@ mod unix_tests {
         command
             .args([
                 "--exact",
-                "process::unix_tests::inherited_group_parent_helper",
+                "native::process::unix_tests::inherited_group_parent_helper",
                 "--nocapture",
             ])
             .env("TEAM_TEST_INHERITED_GROUP_FIXTURE", &path)

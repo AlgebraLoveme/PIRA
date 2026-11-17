@@ -1,21 +1,19 @@
 //! Claude stream-json lifecycle; shared process supervision and control endpoint.
 use super::*;
-use crate::claude;
+use crate::harness::claude;
 
-pub(crate) fn turn(
-    options: &Options,
-    run: &Path,
-    dir: &Path,
-    task: &str,
-    manifest: &mut Value,
-    handoff: &Path,
-    guidance: (bool, bool, bool, bool),
-) -> Result<Turn, String> {
+pub(crate) fn turn(request: TurnRequest<'_>) -> Result<Turn, String> {
+    let TurnRequest {
+        options,
+        run,
+        dir,
+        task,
+        manifest,
+        handoff,
+        guidance,
+    } = request;
     options.execution.require_writable(handoff)?;
-    let roots = crate::build_roots::configured()?;
-    for root in &roots {
-        options.execution.require_writable(root)?;
-    }
+    let roots = crate::profile::build_roots::configured(&options.execution)?;
     manifest["build_roots"] = json!(roots);
     if manifest["thread_id"].is_null() {
         manifest["thread_id"] = json!(claude::uuid()?);

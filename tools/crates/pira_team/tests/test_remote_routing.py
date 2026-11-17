@@ -316,7 +316,12 @@ class RemoteRoutingTests(unittest.TestCase):
                 initial = next(g for g in self.submissions() if g["request_id"] == request)
                 self.assertEqual(run, "remote-" + initial["nonce"])
                 self.assertTrue(self.route_path(run).is_file())
-                self.ordinary("read", run, "manifest.json")
+                observation = self.ordinary("read", run, "manifest.json")
+                if drop == "submit-before":
+                    self.assertNotEqual(observation.returncode,0)
+                    self.assertIn("never starts work",observation.stderr)
+                    self.assertEqual(len([g for g in self.submissions() if g["request_id"]==request]),1)
+                    self.receipt(self.ordinary("resume",run,"--detach"))
                 self.settled(request)
                 raw = self.ordinary("read", run)
                 self.assertEqual(raw.returncode, 0, raw.stderr)
@@ -424,6 +429,45 @@ class RemoteRoutingTests(unittest.TestCase):
         self.assertEqual(len(self.submissions()), before)
         self.assertEqual(self.success(self.ordinary("read", run, "manifest.json"))["revision"], 1)
 
+    def test_repeated_ssh_diagnostics_are_concise_but_failures_remain_visible(self):
+        self.f.env["TEAM_ROUTING_MODE"] = "fake"
+        transport = self.f.root / "ssh"
+        source = transport.read_text(encoding="utf-8")
+        injection = r'''
+sys.stderr.write("synthetic SSH banner\n")
+reply = json.loads(stdout)
+result = reply["result"]
+if result.get("manifest"):
+    observations = sum(
+        json.loads(entry["wire"])["grant"]["request_id"] == grant["request_id"]
+        and json.loads(entry["wire"])["grant"]["args"] == ["read"]
+        for entry in map(json.loads, trace.read_text().splitlines())
+    )
+    if observations < 2:
+        result["manifest"]["status"] = "running"
+        result["operation_result"] = None
+        result["supervisor"] = "live"
+    elif os.environ.get("TEAM_DIAGNOSTIC_FAILURE"):
+        sys.stderr.write("synthetic SSH connection failure\n")
+        sys.exit(255)
+stdout = json.dumps(reply)
+'''
+        transport.write_text(source.replace("sys.stdout.write(stdout)", injection + "\nsys.stdout.write(stdout)"),
+                             encoding="utf-8")
+        for fail in (False, True):
+            with self.subTest(failed_exchange=fail):
+                self.f.env["TEAM_DIAGNOSTIC_FAILURE"] = "1" if fail else ""
+                result = self.f.invoke("run", *self.options(), "--store", self.local_store,
+                    "--remote-cwd", self.f.cwd, "--model", "test-model", "--effort", "high",
+                    "--task", "diagnostic fixture", "--completion-gate", "Report fixture result")
+                if fail:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("synthetic SSH connection failure", result.stderr)
+                    self.assertIn("remote worker was not interrupted", result.stderr)
+                else:
+                    self.assertEqual(self.receipt(result)["status"], "completed")
+                self.assertEqual(result.stderr.count("synthetic SSH banner\n"), 2 if fail else 1)
+
     def test_local_bookmark_routes_read_resume_steer_and_interrupt(self):
         run = self.started("steerable", "--label", "remote λ")
         self.assertEqual(self.success(self.ordinary("read", "@remote λ", "manifest.json"))["run_id"], run)
@@ -459,7 +503,94 @@ class RemoteRoutingTests(unittest.TestCase):
         self.assertEqual(self.success(self.ordinary("read", run, "manifest.json"))["revision"], 1)
         self.assertEqual(len(self.submissions()), before)
 
-    def test_unaccepted_launch_read_retries_exact_retained_initial_operation(self):
+    def incomplete_parent_tail(self):
+        parent=self.f.local.parent([{"sandbox_policy":{"type":"danger-full-access"}}])
+        with parent.open("a") as stream:
+            stream.write('{"type":')
+
+    def test_incomplete_transcript_allows_remote_read_wait_and_legacy_read_not_execution(self):
+        run=self.started("identity-only observation")
+        request=self.submissions()[0]["request_id"]
+        self.incomplete_parent_tail()
+        for operation in ("read","wait"):
+            result=self.ordinary(operation,run,*(["manifest.json"] if operation=="read" else []))
+            self.assertEqual(result.returncode,0,result.stderr)
+        legacy=self.f.invoke("read",*self.options(request))
+        self.assertEqual(legacy.returncode,0,legacy.stderr)
+        for operation in ("resume","steer"):
+            before=len(self.f.exchanges())
+            result=self.ordinary(operation,run,"--task","not authorized by partial log","--completion-gate","No launch")
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn("incomplete record",result.stderr)
+            self.assertEqual(len(self.f.exchanges()),before)
+
+    def test_incomplete_transcript_does_not_block_remote_interrupt(self):
+        run=self.started("steerable")
+        self.incomplete_parent_tail()
+        result=self.ordinary("interrupt",run)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.settled(self.submissions()[0]["request_id"])
+        manifest=self.success(self.ordinary("read",run,"manifest.json"))
+        self.assertEqual(manifest["status"],"interrupted")
+
+    @unittest.skipUnless(sys.platform == "linux", "native immutable handoff snapshots")
+    def test_large_initial_and_later_handoffs_remain_readable_after_resume(self):
+        run=self.started("initial large handoff")
+        root=self.f.store/run
+        first=json.loads((root/"manifest.json").read_text())
+        original="initial λ\n"+"x"*(2*1024*1024)
+        (root/first["artifact"]).write_text(original)
+        self.receipt(self.ordinary("resume",run,"--task","second handoff","--completion-gate","Return fixture","--detach"))
+        self.settled(self.submissions()[-1]["request_id"])
+        second=json.loads((root/"manifest.json").read_text())
+        later="second λ\n"+"y"*(2*1024*1024)
+        (root/second["artifact"]).write_text(later)
+        self.receipt(self.ordinary("resume",run,"--task","third handoff","--completion-gate","Return fixture","--detach"))
+        self.settled(self.submissions()[-1]["request_id"])
+        before=len(self.submissions())
+        for artifact,expected in ((first["artifact"],original),(second["artifact"],later)):
+            result=self.ordinary("read",run,artifact)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(result.stdout,expected)
+        self.assertEqual(len(self.submissions()),before)
+
+    def test_read_never_submits_initial_request_rejected_by_capability_negotiation(self):
+        ssh=self.f.root/"ssh"
+        original=ssh.read_text()
+        marker='accepted = code == 0 and json.loads(stdout).get("ok") is True'
+        rejection='if op == "read" and grant["args"] == ["capabilities"]:\n    reply=json.loads(stdout)\n    reply["result"]["capabilities"]=[c for c in reply["result"]["capabilities"] if c != "durable-submit"]\n    stdout=json.dumps(reply)\n'
+        self.assertIn(marker,original)
+        ssh.write_text(original.replace(marker,rejection+marker))
+        failed=self.launch("definitively not submitted")
+        self.assertNotEqual(failed.returncode,0)
+        self.assertIn("no operation submitted",failed.stderr)
+        self.assertEqual(self.submissions(),[])
+        run=re.search(r"remote-[a-f0-9]{64}",failed.stderr).group()
+        ssh.write_text(original)
+        for operation in ("read","wait"):
+            observed=self.ordinary(operation,run,*(["manifest.json"] if operation=="read" else []))
+            self.assertNotEqual(observed.returncode,0)
+            self.assertIn("never starts work",observed.stderr)
+        self.assertEqual(self.submissions(),[])
+
+    @unittest.skipUnless(sys.platform == "linux", "native chunk endpoint")
+    def test_accepted_large_handoff_is_retrieved_without_another_submission(self):
+        run=self.started("large handoff fixture")
+        manifest=json.loads((self.f.store/run/"manifest.json").read_text())
+        artifact=self.f.store/run/manifest["artifact"]
+        content="a"*(1024*1024-1)+"λ"+"\x01"*(8*1024*1024-1024*1024-1)
+        self.assertEqual(len(content.encode()),8*1024*1024)
+        artifact.write_text(content)
+        before=len(self.submissions())
+        result=self.ordinary("read",run)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,content)
+        self.assertEqual(len(self.submissions()),before)
+        chunks=[g for g in self.f.grants("read") if g["args"][0]=="read-chunk"]
+        self.assertGreater(len(chunks),1)
+        self.assertEqual(chunks[1]["args"][1],str(1024*1024-1))
+
+    def test_unaccepted_launch_read_is_inert_and_explicit_resume_retries_exact_initial_operation(self):
         self.f.env["TEAM_ROUTING_DROP"] = "submit-before"
         first = self.launch("not accepted yet")
         self.assertNotEqual(first.returncode, 0)
@@ -470,7 +601,12 @@ class RemoteRoutingTests(unittest.TestCase):
         self.assertIn(run, first.stderr)
         # Recovery can precede creation of the remote manifest. Validate the
         # retained submission now, then the read result after endpoint settlement.
-        self.ordinary("read", run, "manifest.json")
+        for operation in ("read","wait"):
+            observed = self.ordinary(operation,run,*(["manifest.json"] if operation=="read" else []))
+            self.assertNotEqual(observed.returncode,0)
+            self.assertIn("never starts work", observed.stderr)
+        self.assertEqual(len(self.submissions()),1)
+        self.receipt(self.ordinary("resume",run,"--detach"))
         wires = [e["wire"] for e in self.f.exchanges()
                  if json.loads(e["wire"])["grant"]["op"] == "submit"]
         self.assertEqual(len(wires), 2)

@@ -110,7 +110,8 @@ if os.environ.get("TEAM_ASSERT_BUILD_ENV"):
     assert shell["PIRA_TEAM_HANDOFF"] != "stale-parent-handoff"
 assert "agents.enabled=false" in args
 assert "features.multi_agent=false" in args
-scratch = Path(os.environ["CODEX_HOME"]).parent / "scratch"
+scratch = Path(os.environ["TMPDIR"])
+assert Path(os.environ["CODEX_HOME"]).parent not in scratch.parents
 for key in ("TMPDIR", "TMP", "TEMP", "TMPPREFIX"):
     prefix = f"shell_environment_policy.set.{key}="
     expected = str(scratch / "zsh" if key == "TMPPREFIX" else scratch)
@@ -122,7 +123,7 @@ if os.environ.get("TEAM_ASSERT_TEMP"):
     assert Path(tempfile.gettempdir()) == scratch
     with tempfile.NamedTemporaryFile() as file:
         assert Path(file.name).parent == scratch
-        file.write(b"scratch write")
+        file.write(b"temporary write")
         file.flush()
     # Large heredoc exercises shell temporary storage on shells that spill to disk.
     for shell in ("/bin/sh", "/bin/zsh"):
@@ -390,7 +391,9 @@ while True:
             assert within_roots(params["cwd"])
             assert within_roots(handoff.parent)
             assert str(home) not in roots
-            assert within_roots(scratch)
+            assert (within_roots(scratch) or not params["sandboxPolicy"]["excludeTmpdirEnvVar"]
+                    or (not params["sandboxPolicy"]["excludeSlashTmp"]
+                        and Path("/tmp").resolve() in scratch.parents))
             for expected in json.loads(os.environ.get("TEAM_EXPECT_BUILD_ROOTS", "[]")):
                 assert within_roots(expected), (expected, roots)
             for forbidden in json.loads(os.environ.get("TEAM_FORBIDDEN_BUILD_ROOTS", "[]")):

@@ -20,11 +20,22 @@ const CACHE_KEYS: &[&str] = &[
     "XDG_CACHE_HOME",
 ];
 
-pub fn configured() -> Result<Vec<PathBuf>, String> {
-    resolve(|key| std::env::var_os(key))
+pub fn configured(execution: &crate::profile::Execution) -> Result<Vec<PathBuf>, String> {
+    resolve_writable(
+        |key| std::env::var_os(key),
+        |path| execution.require_writable(path),
+    )
 }
 
+#[cfg(test)]
 fn resolve(get: impl Fn(&str) -> Option<OsString>) -> Result<Vec<PathBuf>, String> {
+    resolve_writable(get, |_| Ok(()))
+}
+
+fn resolve_writable(
+    get: impl Fn(&str) -> Option<OsString>,
+    writable: impl Fn(&std::path::Path) -> Result<(), String>,
+) -> Result<Vec<PathBuf>, String> {
     let mut roots = Vec::new();
     let directory = |value: OsString| -> Result<PathBuf, String> {
         let path = PathBuf::from(value);
@@ -40,6 +51,7 @@ fn resolve(get: impl Fn(&str) -> Option<OsString>) -> Result<Vec<PathBuf>, Strin
     for key in CACHE_KEYS {
         // PIRA: preserve the ambient Cargo contract: unusable configured roots grant nothing.
         if let Some(path) = get(key).and_then(|value| directory(value).ok())
+            && writable(&path).is_ok()
             && !roots.contains(&path)
         {
             roots.push(path);
@@ -55,6 +67,7 @@ fn resolve(get: impl Fn(&str) -> Option<OsString>) -> Result<Vec<PathBuf>, Strin
         for value in values {
             let path =
                 directory(value.into()).map_err(|e| format!("PIRA_TEAM_BUILD_ROOTS: {e}"))?;
+            writable(&path)?;
             if !roots.contains(&path) {
                 roots.push(path);
             }

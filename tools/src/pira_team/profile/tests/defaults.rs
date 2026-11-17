@@ -166,7 +166,7 @@ fn invalid_fields_never_replace_prior_valid_config() {
 }
 
 #[test]
-fn malformed_or_oversized_config_fails_all_new_reads_and_edits_without_replacement() {
+fn malformed_or_oversized_config_blocks_consumers_but_not_explicit_profiles() {
     let store = Store::new();
     create_root(&store.0).unwrap();
     for bytes in [
@@ -176,20 +176,25 @@ fn malformed_or_oversized_config_fails_all_new_reads_and_edits_without_replaceme
         br#"{"main":{"model":"worker","effort":"high","extra":true}}"#.to_vec(),
         br#"{"main":{"model":1,"effort":"high"}}"#.to_vec(),
         br#"{"main":{"model":"worker","effort":"invalid"}}"#.to_vec(),
-        vec![b' '; MAX_BYTES as usize + 1],
+        vec![b' '; 64 * 1024 + 1],
     ] {
         fs::write(store.0.join(FILE_NAME), &bytes).unwrap();
         assert!(load(&store.0).is_err());
         assert!(set(&store.0, "other", "worker", "low").is_err());
         assert!(reset(&store.0, "main").is_err());
-        assert!(
-            resolve_with_store(
-                Some("explicit".into()),
-                Some("high".into()),
-                caller("main"),
-                &store.0
-            )
-            .is_err()
+        for (model, effort) in [(Some("explicit".into()), None), (None, Some("high".into()))] {
+            assert!(resolve_with_store(model, effort, caller("main"), &store.0).is_err());
+        }
+        let explicit = resolve_with_store(
+            Some("explicit".into()),
+            Some("high".into()),
+            caller("main"),
+            &store.0,
+        )
+        .unwrap();
+        assert_eq!(
+            (explicit.0.as_str(), explicit.1.as_str()),
+            ("explicit", "high")
         );
         assert_eq!(fs::read(store.0.join(FILE_NAME)).unwrap(), bytes);
         // Lifecycle's retained-field resolver deliberately never reads current config.

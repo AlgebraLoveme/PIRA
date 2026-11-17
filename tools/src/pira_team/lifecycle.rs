@@ -1,5 +1,6 @@
 //! Durable run ownership and immutable revision outputs.
-use crate::{Options, app_server, artifact, create, private_dir, profile, storage};
+mod temp;
+use crate::{Options, artifact, create, private_dir, profile, runtime, storage};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -13,16 +14,48 @@ pub(crate) fn decision_workspace(cwd: &Path) -> Result<PathBuf, String> {
     if !cwd.is_dir() {
         return Err("Dec workspace must be a directory".into());
     }
-    let workspace = cwd
-        .ancestors()
-        .find(|path| path.join(".git").exists())
-        .unwrap_or(&cwd);
+    let anchor = std::env::var_os("PIRA_DEC_WORKSPACE_DIR").map(PathBuf::from);
+    let workspace = decision_workspace_for(&cwd, anchor.as_deref())?;
     if workspace.to_str().is_none() {
         return Err(
             "Team Dec workspace must be UTF-8 for retained metadata and shell configuration".into(),
         );
     }
-    Ok(workspace.to_path_buf())
+    Ok(workspace)
+}
+
+// Match Dec's physical ancestry and nearest-Git boundary semantics.
+fn decision_workspace_for(cwd: &Path, anchor: Option<&Path>) -> Result<PathBuf, String> {
+    let nearest_git = |path: &Path| {
+        path.ancestors()
+            .find(|p| p.join(".git").exists())
+            .map(Path::to_path_buf)
+    };
+    let anchor = anchor
+        .map(|path| -> Result<PathBuf, String> {
+            if !path.is_absolute() {
+                return Err("PIRA_DEC_WORKSPACE_DIR must be an absolute directory".into());
+            }
+            let physical = path
+                .canonicalize()
+                .map_err(|e| format!("PIRA_DEC_WORKSPACE_DIR: {e}"))?;
+            if physical != path {
+                return Err("PIRA_DEC_WORKSPACE_DIR must remain a canonical directory".into());
+            }
+            if !physical.is_dir() {
+                return Err("PIRA_DEC_WORKSPACE_DIR must be a directory".into());
+            }
+            Ok(physical)
+        })
+        .transpose()?;
+    let git = nearest_git(cwd);
+    if let Some(anchor) = anchor
+        && cwd.starts_with(&anchor)
+        && nearest_git(&anchor) == git
+    {
+        return Ok(git.unwrap_or(anchor));
+    }
+    Ok(git.unwrap_or_else(|| cwd.to_path_buf()))
 }
 
 fn retained_dec_workspace(manifest: &Value) -> Result<Option<PathBuf>, String> {
@@ -95,7 +128,8 @@ pub fn save_json(path: &Path, value: &Value) -> Result<(), String> {
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(&temp, path).map_err(|e| e.to_string())?;
         if crate::remote::delegated_context().is_some() {
-            crate::remote::sync_dir(path.parent().ok_or("missing remote metadata parent")?)?;
+            storage::sync_directory(path.parent().ok_or("missing remote metadata parent")?)
+                .map_err(|e| format!("sync remote directory: {e}"))?;
         }
         Ok(())
     })();
@@ -164,7 +198,7 @@ pub fn launch(options: Options) -> Result<(), String> {
     ] {
         options.execution.require_writable(path)?;
     }
-    let run = crate::prepare_store(&options.store)?;
+    let run = storage::allocate_run(&options.store)?;
     launch_at(options, run)
 }
 
@@ -205,10 +239,11 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     let mut gate = None;
     let (mut model, mut effort, mut output, mut task_file, mut task) =
         (None, None, None, None, None);
-    let mut rest = args[1..].iter();
-    while let Some(arg) = rest.next() {
+    let mut rest = crate::cli::tokens(&args[1..]);
+    while let Some(token) = rest.next() {
+        let arg = token.raw;
         if arg == "--" {
-            positional.extend(rest.cloned());
+            positional.extend(rest.flat_map(|token| token.words.iter().cloned()));
             break;
         }
         if !arg.starts_with('-') {
@@ -227,57 +262,59 @@ pub fn existing(args: &[String]) -> Result<(), String> {
             crate::set_once(&mut gate, value.to_owned(), "--completion-gate")?;
             continue;
         }
-        if op == "interrupt" && matches!(arg.as_str(), "-r" | "--recursive") {
+        if op == "interrupt" && token.flag == Some(crate::cli::Flag::Recursive) {
             recursive = true;
             continue;
         }
-        if op == "resume" && arg == "--allow-subteam" {
-            crate::set_once(&mut allow_subteam, true, "--allow-subteam")?;
-            continue;
+        if op == "resume" {
+            let boolean = match token.flag {
+                Some(crate::cli::Flag::AllowSubteam) => {
+                    Some((&mut allow_subteam, "--allow-subteam"))
+                }
+                Some(crate::cli::Flag::InjectReview) => {
+                    Some((&mut inject_review, "--inject-review"))
+                }
+                Some(crate::cli::Flag::InjectImplement) => {
+                    Some((&mut inject_implement, "--inject-implement"))
+                }
+                Some(crate::cli::Flag::InjectWrite) => Some((&mut inject_write, "--inject-write")),
+                Some(crate::cli::Flag::InjectFig) => Some((&mut inject_fig, "--inject-fig")),
+                Some(crate::cli::Flag::AllowFix) => Some((&mut allow_fix, "--allow-fix")),
+                _ => None,
+            };
+            if let Some((slot, name)) = boolean {
+                crate::set_once(slot, true, name)?;
+                if token.flag == Some(crate::cli::Flag::AllowFix) {
+                    eprintln!(
+                        "pira_team: --allow-fix is deprecated; use an implementation task and completion gate"
+                    );
+                }
+                continue;
+            }
         }
-        if op == "resume" && arg == "--inject-review" {
-            crate::set_once(&mut inject_review, true, "--inject-review")?;
-            continue;
+        if token.flag.is_some() {
+            return Err(format!("unsupported {op} option {arg}"));
         }
-        if op == "resume" && arg == "--inject-implement" {
-            crate::set_once(&mut inject_implement, true, "--inject-implement")?;
-            continue;
-        }
-        if op == "resume" && arg == "--inject-write" {
-            crate::set_once(&mut inject_write, true, "--inject-write")?;
-            continue;
-        }
-        if op == "resume" && arg == "--inject-fig" {
-            crate::set_once(&mut inject_fig, true, "--inject-fig")?;
-            continue;
-        }
-        if op == "resume" && arg == "--allow-fix" {
-            crate::set_once(&mut allow_fix, true, "--allow-fix")?;
-            eprintln!(
-                "pira_team: --allow-fix is deprecated; use an implementation task and completion gate"
-            );
-            continue;
-        }
-        let value = rest
-            .next()
+        let value = token
+            .value
             .ok_or_else(|| format!("missing value for {arg}"))?;
         match arg.as_str() {
             "--store" => root = Some(PathBuf::from(value)),
             "--completion-gate" if op != "interrupt" => {
-                crate::set_once(&mut gate, value.clone(), "--completion-gate")?
+                crate::set_once(&mut gate, value.to_owned(), "--completion-gate")?
             }
-            "--model" if op == "resume" => model = Some(value.clone()),
-            "--effort" if op == "resume" => effort = Some(value.clone()),
+            "--model" if op == "resume" => model = Some(value.to_owned()),
+            "--effort" if op == "resume" => effort = Some(value.to_owned()),
             "--service-tier" if op == "resume" => crate::set_once(
                 &mut service_tier,
-                crate::service_tier::Tier::parse(value)?,
+                crate::profile::service_tier::Tier::parse(value)?,
                 "--service-tier",
             )?,
             "--timeout" if op == "resume" => {
                 return Err("--timeout is no longer supported; use interrupt to stop a run".into());
             }
-            "--output" if op == "resume" => output = Some(value.clone()),
-            "--task" if op != "interrupt" => crate::set_once(&mut task, value.clone(), "task")?,
+            "--output" if op == "resume" => output = Some(value.to_owned()),
+            "--task" if op != "interrupt" => crate::set_once(&mut task, value.to_owned(), "task")?,
             "--task-file" if op != "interrupt" => {
                 crate::set_once(&mut task_file, PathBuf::from(value), "--task-file")?
             }
@@ -292,12 +329,12 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         if positional.len() != 2 || task.is_some() || task_file.is_some() || gate.is_some() {
             return Err("expected tier RUN standard|fast [--store DIR]".into());
         }
-        let tier = crate::service_tier::Tier::parse(&positional[1])?;
+        let tier = crate::profile::service_tier::Tier::parse(&positional[1])?;
         let root = root.map(Ok).unwrap_or_else(storage::default_root)?;
         let session = profile::caller_session()?;
         let run = storage::locate_for(&root, &positional[0], &session)?;
         private_path(&run, true)?;
-        let mut receipt = app_server::control(&run, "tier", tier.name(), None)?;
+        let mut receipt = runtime::control(&run, "tier", tier.name(), None)?;
         receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
         println!("{receipt}");
         return if receipt["status"] == "accepted" {
@@ -336,7 +373,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         let mut receipt = if op == "interrupt" {
             crate::subteam::interrupt(&run, recursive)?
         } else {
-            app_server::control(&run, op, &task, gate.as_deref())?
+            runtime::control(&run, op, &task, gate.as_deref())?
         };
         receipt["run_id"] = json!(run.file_name().unwrap().to_string_lossy());
         println!("{receipt}");
@@ -411,17 +448,18 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         .as_str()
         .map(PathBuf::from)
         .map(Ok)
-        .unwrap_or_else(|| crate::tool_store("ctx", &cwd))?;
+        .unwrap_or_else(|| crate::tool_store("ctx"))?;
     let dec_store = manifest["dec_store"]
         .as_str()
         .map(PathBuf::from)
         .map(Ok)
-        .unwrap_or_else(|| crate::tool_store("dec", &cwd))?;
+        .unwrap_or_else(|| crate::tool_store("dec"))?;
     let dec_workspace = retained_dec_workspace(&manifest)?;
     for path in [&run, &cwd, &ctx_store, &dec_store] {
         execution.require_writable(path)?;
     }
     let mut options = Options {
+        temp_workspace: None,
         cwd,
         store: root,
         model,
@@ -429,7 +467,7 @@ pub fn existing(args: &[String]) -> Result<(), String> {
         profile_sources: sources,
         service_tier: service_tier
             .map(Ok)
-            .unwrap_or_else(|| crate::service_tier::Tier::retained(&manifest))?,
+            .unwrap_or_else(|| crate::profile::service_tier::Tier::retained(&manifest))?,
         execution,
         task,
         label: None,
@@ -609,6 +647,7 @@ fn revision(
             crate::notice(format_args!("pira_team bookmark: {receipt}"));
         }
         options.authentication = crate::authentication::inherit(run, manifest)?;
+        options.temp_workspace = Some(temp::prepare(options, run)?);
         generate_artifact(options, run, &dir, manifest, &baseline)
     });
     manifest["elapsed_seconds"] = json!(start.elapsed().as_secs_f64());
@@ -811,11 +850,10 @@ fn generate_stage(
     for store in [&options.ctx_store, &options.dec_store] {
         fs::create_dir_all(store).map_err(|e| format!("create tool store: {e}"))?;
     }
-    let scratch = run.join("scratch");
-    if !scratch.exists() {
-        private_dir(&scratch).map_err(|e| e.to_string())?;
-    }
-    private_path(&scratch, true)?;
+    let scratch = options
+        .temp_workspace
+        .as_ref()
+        .ok_or("missing worker temp workspace")?;
     let (bundle, guidance) = policy_bundle(options, manifest, review_stage);
     let mut task = if manifest["stage"] == "implementation" && !review_stage {
         format!(
@@ -892,15 +930,15 @@ fn generate_stage(
         let record = json!({"logs":attempt_dir,"status":"running","stage":manifest["stage"]});
         manifest["attempts"].as_array_mut().unwrap().push(record);
         save_json(&run.join("manifest.json"), manifest)?;
-        let turn = match harness.turn(
+        let turn = match harness.turn(runtime::TurnRequest {
             options,
             run,
-            &attempt_dir,
-            &task,
+            dir: &attempt_dir,
+            task: &task,
             manifest,
             handoff,
             guidance,
-        ) {
+        }) {
             Ok(turn) => turn,
             Err(error) => {
                 manifest["attempts"][attempt]["status"] = json!(if crate::CANCELLED
@@ -1002,7 +1040,7 @@ fn generate_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    include!("admission_tests.rs");
+    include!("lifecycle/tests/admission.rs");
 
     #[test]
     fn policy_bundle_composes_each_selection_without_changing_default_scope() {
@@ -1055,7 +1093,7 @@ mod tests {
                 crate::WRITING_POLICY
             )
         );
-        // app_server records acknowledgement before turn/start; repair and failed
+        // runtime records acknowledgement before turn/start; repair and failed
         // turns therefore use this state, not the eventual worker outcome.
         manifest["inject_write"] = json!(true);
         for requested_again in [true, false] {

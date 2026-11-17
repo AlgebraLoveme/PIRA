@@ -1,8 +1,9 @@
-//! Kernel process identity. Birth times distinguish recycled process identifiers.
-use std::{io, path::PathBuf};
+//! Native process identity, owned execution scopes and metadata locks.
+//! Birth times distinguish recycled process identifiers.
+pub(crate) mod process;
 #[cfg(windows)]
-#[path = "native_windows.rs"]
 pub mod windows;
+use std::{io, path::PathBuf};
 
 // Close alone does not release Unix flock while another thread's spawned child
 // still holds an inherited descriptor. Release when the logical owner returns.

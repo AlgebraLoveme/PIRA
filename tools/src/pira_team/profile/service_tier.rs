@@ -190,7 +190,7 @@ mod tests {
         for (name, expected) in [("standard", Tier::Standard), ("fast", Tier::Fast)] {
             let options = crate::tests::options(&["task", "--service-tier", name]).unwrap();
             assert_eq!(options.service_tier, expected);
-            let args: Vec<_> = crate::command(
+            let args: Vec<_> = crate::harness::codex::command(
                 &options,
                 std::path::Path::new("/fixture/run"),
                 std::path::Path::new("/fixture/revision"),

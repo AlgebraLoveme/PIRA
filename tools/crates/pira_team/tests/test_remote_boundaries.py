@@ -11,16 +11,20 @@ from pathlib import Path
 import unittest
 
 import test_subteams
-import test_team
+from team_fixture import TeamFixture
 from test_remote_fixture import isolate_environment
 
 
 class LocalRemoteLiteralTests(unittest.TestCase):
     def setUp(self):
-        self.local = test_team.TeamTests()
-        self.addCleanup(self.local.doCleanups)
-        self.local.setUp()
+        self.local = TeamFixture(self.addCleanup)
         isolate_environment(self.local.env, self.local.root)
+
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.local.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def test_tier_default_and_resume_retention_with_remote_dispatch_enabled(self):
         self.local.parent([{"service_tier":"fast"}])
@@ -29,7 +33,7 @@ class LocalRemoteLiteralTests(unittest.TestCase):
         receipt = json.loads(first.stdout)
 
         def assert_tier(tier, backend):
-            manifest = self.local.metadata(receipt)
+            manifest = self.metadata(receipt)
             self.assertEqual(manifest["service_tier"], tier)
             requests = [json.loads(line) for line in
                         (Path(manifest["logs"]) / "requests.jsonl").read_text().splitlines()]
@@ -54,7 +58,7 @@ class LocalRemoteLiteralTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
         self.assertEqual(Path(receipt["handoff_path"]).read_text(encoding="utf-8"), "ANSWER " + task)
-        self.assertEqual(self.local.metadata(receipt)["task"], task)
+        self.assertEqual(self.metadata(receipt)["task"], task)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX subprocess ancestry and fake SSH fixture")

@@ -11,7 +11,7 @@ import build_pira_ctx_platform_bins as builder
 
 if __name__ == "__main__":
     try:
-        builder.configure_tool("pira_team")
+        builder.configure_tool("pira_team", uses_c_compiler=True)
         raise SystemExit(builder.main())
     except (builder.BuildError, subprocess.CalledProcessError) as error:
         print(f"build_pira_team_platform_bins.py: {error}", file=sys.stderr)

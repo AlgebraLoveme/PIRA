@@ -10,14 +10,12 @@ import shutil
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class StorageProfileTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
 
     def launch(self, task: str) -> subprocess.CompletedProcess[str]:
@@ -104,6 +102,8 @@ class StorageProfileTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"must-not-read\n")
 
     def test_caller_home_skips_empty_values_without_changing_precedence(self) -> None:
+        # Caller-log discovery is independent of persistent file-login provisioning.
+        self.fixture.env["CODEX_API_KEY"] = "synthetic-home-discovery-key"
         user = self.root / "user-profile"
         home = self.root / "user-home"
         for directory in (user, home):

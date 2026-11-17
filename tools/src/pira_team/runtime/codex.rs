@@ -1,19 +1,17 @@
 //! Codex native app-server turn protocol.
 use super::*;
 
-pub(crate) fn turn(
-    options: &Options,
-    run: &Path,
-    dir: &Path,
-    task: &str,
-    manifest: &mut Value,
-    handoff: &Path,
-    guidance: (bool, bool, bool, bool),
-) -> Result<Turn, String> {
-    let build_roots = crate::build_roots::configured()?;
-    for root in &build_roots {
-        options.execution.require_writable(root)?;
-    }
+pub(crate) fn turn(request: TurnRequest<'_>) -> Result<Turn, String> {
+    let TurnRequest {
+        options,
+        run,
+        dir,
+        task,
+        manifest,
+        handoff,
+        guidance,
+    } = request;
+    let build_roots = crate::profile::build_roots::configured(&options.execution)?;
     options.execution.require_writable(handoff)?;
     manifest["build_roots"] = json!(build_roots);
     let repair = manifest["repairs"].as_u64().ok_or("missing repair state")? > 0;
@@ -24,7 +22,7 @@ pub(crate) fn turn(
         .map_err(|e| if crate::CANCELLED.load(Ordering::SeqCst) { e } else { format!("native Codex strict-config stdio initialization failed: {e}; inspect stderr.log and update Codex/Team to compatible builds. This is separate from the interactive shared daemon") })?;
         server.send(json!({"method":"initialized"}))?;
         let policy = fs::read_to_string(dir.join("policy.md")).map_err(|e| e.to_string())?;
-        let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":options.execution.config(),
+        let mut params = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":crate::harness::codex::execution_config(&options.execution),
         "approvalPolicy":"never","baseInstructions":policy,"developerInstructions":""});
         let thread = if let Some(id) = manifest["thread_id"].as_str() {
             params["threadId"] = json!(id);
@@ -64,7 +62,7 @@ pub(crate) fn turn(
         // Persist acknowledged guidance even if the subsequent turn is interrupted or fails.
         acknowledge_guidance(options, manifest, guidance);
         lifecycle::save_json(&run.join("manifest.json"), manifest)?;
-        let tier = crate::service_tier::Tier::retained(manifest)?;
+        let tier = crate::profile::service_tier::Tier::retained(manifest)?;
         let started = server.request(
             "turn/start",
             json!({"threadId":thread_id,"input":[{"type":"text","text":task}],
@@ -87,7 +85,11 @@ pub(crate) fn turn(
 
         let mut pending_controls: HashMap<u64, (String, String, String, mpsc::Sender<Value>)> =
             HashMap::new();
-        let mut pending_tier: Option<(u64, crate::service_tier::Tier, mpsc::Sender<Value>)> = None;
+        let mut pending_tier: Option<(
+            u64,
+            crate::profile::service_tier::Tier,
+            mpsc::Sender<Value>,
+        )> = None;
         loop {
             if stopping.is_none() && crate::CANCELLED.load(Ordering::SeqCst) {
                 let status = "interrupted";
@@ -150,7 +152,7 @@ pub(crate) fn turn(
                 Event::Control(request, reply) => {
                     let op = request["operation"].as_str().unwrap_or("");
                     if op == "tier" {
-                        let update = crate::service_tier::active_update(
+                        let update = crate::profile::service_tier::active_update(
                             &request,
                             &thread_id,
                             &turn_id,
@@ -221,7 +223,7 @@ pub(crate) fn turn(
                     if let Some(id) = value["id"].as_u64() {
                         if pending_tier.as_ref().is_some_and(|pending| pending.0 == id) {
                             let (_, tier, reply) = pending_tier.take().unwrap();
-                            let mut response = crate::service_tier::publication(
+                            let mut response = crate::profile::service_tier::publication(
                                 tier,
                                 &turn_id,
                                 &value,
@@ -306,6 +308,14 @@ pub(crate) fn turn(
             (status.to_owned(), Some(error))
         }
     };
+    if status == "failed" {
+        // Preserve native error JSON for capacity/control consumers; auth repair
+        // is setup-only, including revocation that offline status cannot detect.
+        crate::notice(format_args!(
+            "pira_team: for authentication failures, {}",
+            crate::authentication::selection::REPAIR
+        ));
+    }
     if error.is_some()
         && let Err(retain_error) = server.retain_pending_evidence()
     {

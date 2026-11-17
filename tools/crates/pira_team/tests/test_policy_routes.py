@@ -10,15 +10,12 @@ from pathlib import Path
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class PolicyRouteTests(unittest.TestCase):
     def setUp(self) -> None:
-        # Composition keeps unittest from rediscovering the entire TeamTests suite.
-        self.fixture = test_team.TeamTests()
-        self.addCleanup(self.fixture.doCleanups)
-        self.fixture.setUp()
+        self.fixture = TeamFixture(self.addCleanup)
         self.env = self.fixture.env
         self.env["TEAM_ASSERT_PREFIX"] = "1"
         repo = Path(__file__).resolve().parents[4]
@@ -44,6 +41,12 @@ class PolicyRouteTests(unittest.TestCase):
             "codex-home/fixture-state.json",
         )}
 
+    def metadata(self, receipt: dict) -> dict:
+        self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
     def test_optional_guidance_rule_is_consistent_across_usage_sources(self) -> None:
         repo = Path(__file__).resolve().parents[4]
         rule = ("Select only optional guidance directly required by the assigned task; "
@@ -57,7 +60,7 @@ class PolicyRouteTests(unittest.TestCase):
         run = Path(first["run_root"])
         prefix = (run / "policy.md").read_bytes()
         handoff = Path(first["handoff_path"]).read_bytes()
-        thread = self.fixture.metadata(first)["thread_id"]
+        thread = self.metadata(first)["thread_id"]
         self.assert_additions(self.state(run)["base_policy"], 0)
         for flags, count in (
             (("--inject-fig", "--inject-write"), 1),
@@ -69,7 +72,7 @@ class PolicyRouteTests(unittest.TestCase):
                 latest = Path(resumed["handoff_path"]).parent.parent
                 self.assert_additions((latest / "phase.md").read_text(), count)
                 self.assertEqual((latest / "policy.md").read_bytes(), prefix)
-                manifest = self.fixture.metadata(resumed)
+                manifest = self.metadata(resumed)
                 self.assertTrue(manifest["inject_fig"])
                 self.assertTrue(manifest["inject_write"])
                 self.assertFalse(manifest["inject_review"])
@@ -83,7 +86,8 @@ class PolicyRouteTests(unittest.TestCase):
     def test_active_steer_rejects_policy_flags_before_control_or_guidance_changes(self) -> None:
         proc, run, _ = self.fixture.start_control_fixture()
         before = self.guidance_snapshot(run)
-        for flag in ("--inject-review", "--inject-implement", "--inject-fig", "--inject-write"):
+        for flag in ("--inject-review", "--inject-implement", "--inject-fig", "--inject-write",
+                     "--allow-subteam", "--artifact", "--detach", "--recursive"):
             with self.subTest(flag=flag):
                 rejected = self.fixture.access("steer", run.name, flag, "--task", "Revised scope",
                                                "--completion-gate", "Revised checks")
@@ -114,7 +118,7 @@ class PolicyRouteTests(unittest.TestCase):
                 stdout, stderr = proc.communicate(timeout=8)
                 self.assertEqual(proc.returncode, 0, stderr)
                 receipt = json.loads(stdout)
-                after = fixture.metadata(receipt)
+                after = self.metadata(receipt)
                 self.assertEqual(after["task"], task)
                 self.assertEqual(after["completion_gate"], gate)
                 for key in ("inject_review", "inject_implement", "inject_fig", "inject_write"):
@@ -158,7 +162,7 @@ class PolicyRouteTests(unittest.TestCase):
                 latest = Path(resumed["handoff_path"]).parent.parent
                 self.assertEqual((latest / "policy.md").read_bytes(), prefix)
                 self.assert_additions((latest / "phase.md").read_text(), count)
-                manifest = self.fixture.metadata(resumed)
+                manifest = self.metadata(resumed)
                 self.assertTrue(manifest["inject_fig"])
                 self.assertTrue(manifest["inject_write"])
         self.assert_additions("\n".join(self.state(run)["phases"]), 1)

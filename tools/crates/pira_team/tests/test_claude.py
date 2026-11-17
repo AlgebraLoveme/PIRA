@@ -1,7 +1,7 @@
 """Native Claude wire and provider-family tests, without inference or credentials."""
 import json, os, shutil, subprocess, sys, unittest
 from pathlib import Path
-import test_team
+from team_fixture import TeamFixture
 
 def install_claude(root, environment):
     peer = Path(__file__).with_name('fake_claude.py')
@@ -14,7 +14,7 @@ def install_claude(root, environment):
 
 class ClaudeTests(unittest.TestCase):
     def setUp(self):
-        self.f=test_team.TeamTests(); self.f.setUp(); self.addCleanup(self.f.doCleanups)
+        self.f = TeamFixture(self.addCleanup)
         self.f.parent([{'sandbox_policy':{'type':'danger-full-access'}}])
         self.f.env.pop('CLAUDE_CODE_SESSION_ID',None)
         self.f.env['PYTHONPYCACHEPREFIX']=str(self.f.root/'pycache')
@@ -120,7 +120,7 @@ class ClaudeTests(unittest.TestCase):
 
     def test_codex_coordinator_launches_claude_child(self):
         import test_subteams
-        f=test_subteams.SubteamTests();f.setUp();self.addCleanup(f.doCleanups)
+        f=test_subteams.SubteamTests();self.addCleanup(f.doCleanups);f.setUp()
         f.parent([{'sandbox_policy':{'type':'danger-full-access'}}])
         f.env['PYTHONPYCACHEPREFIX']=str(f.root/'pycache')
         install_claude(f.root, f.env)

@@ -13,9 +13,9 @@ class FakeCodexPolicyTests(unittest.TestCase):
         for ending in (b"\n", b"\r\n"):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                home, cwd, scratch = root / "home", root / "work", root / "scratch"
+                home, cwd, scratch = root / "records/home", root / "work", root / "scratch"
                 for directory in (home, cwd, scratch):
-                    directory.mkdir()
+                    directory.mkdir(parents=True)
                 policy_bytes = ending.join([b"Never read or expose secrets files", b"pira_nav", b""])
                 policy = root / "policy.md"
                 policy.write_bytes(policy_bytes)

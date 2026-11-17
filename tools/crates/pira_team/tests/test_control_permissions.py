@@ -7,15 +7,13 @@ import os
 from pathlib import Path
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fake-peer control fixtures")
 class ControlPermissionTests(unittest.TestCase):
     def setUp(self):
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
 
     def assert_steer_denied(self, run: Path, error: str):
         files = [run / name for name in ("manifest.json", "requests.jsonl", "controls.jsonl")]

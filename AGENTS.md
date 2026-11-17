@@ -159,7 +159,7 @@ If documented PIRA tool behavior fails locally, raise the mismatch immediately a
 - Never use `sudo`; if elevation is needed, tell the user to run the command in their terminal.
 - Establish the workspace boundary early: infer when confident, otherwise ask once. The workspace is the default allowed scope. Standing exceptions are platform temporary locations for task-local artifacts and read-only access to applicable instruction files explicitly designated by trusted PIRA instructions. The instruction exception does not authorize adjacent files, writes, or execution. Otherwise, require explicit user confirmation before reading, writing, or executing outside the workspace.
 - Use the narrowest reversible action that works. Avoid force flags, broad globs, and global changes unless clearly needed.
-- Put temporary files—including downloads, extracted sources, inspection renders, and debug artifacts—in platform temp unless the user wants them kept: macOS `$TMPDIR`; Linux `/tmp`; Windows `%TEMP%` or `%TMP%`.
+- Put temporary files—including downloads, extracted sources, inspection renders, and debug artifacts—in platform temp: macOS `$TMPDIR`; Linux `/tmp`; Windows `%TEMP%` or `%TMP%`. Retain downloads or extracted sources only when explicitly requested, in a designated project location. Never place downloads or extracted source trees inside Team record storage, even when retention is requested.
 - If a backup is needed, use workspace `.backup/` and ensure it is gitignored before writing.
 - Modify global system state, credentials, or unrelated repositories only when explicitly requested.
 - After the user commits and pushes intended changes, remove obsolete temporary `.backup/` files.
@@ -287,6 +287,7 @@ No search matches succeeds. Query options with no applicable operation error.
 - Bookmark only workers or results likely to be reused: `run --label LABEL` or `bookmark RUN_REF --label LABEL`. Reusing an exact, case-sensitive label moves it to the new run and reports the previous target; old runs remain intact. Use `bookmarks` to list, `search QUERY` for case-insensitive literal label search, and `unbookmark LABEL` to remove only the mapping. Labels stay in the selected store, never worker input. Use `@LABEL` in place of a run ID; it resolves once per invocation. Keep run bookkeeping here, not in workbook ID lists; the workbook records useful outcomes and next steps.
 - Choose `--format auto|markdown|text|json|csv`; `--schema FILE` constrains JSON and `--columns JSON_ARRAY` checks CSV headers. The launcher checks delivery/format, not truth or gate satisfaction. Non-completed handoffs bypass schema/column checks. One same-conversation format repair is allowed; include its usage and disclose accounting gaps.
 - Use `--model` and `--effort` for explicit worker overrides. `config show` displays bundled defaults, saved overrides and their managed file path; `config set --main MODEL --model WORKER --effort EFFORT` saves an exact-main-model override, and `config reset --main MODEL` removes it. These commands launch no worker and require no caller session. Saved defaults apply to new runs; explicit flags win per field. Resumes retain their selected profile unless explicitly overridden. Do not change user defaults without authorization; test with temporary stores.
+- `config retention show|set|reset` manages store-wide cleanup thresholds; `set` accepts `--max-age-days DAYS` and/or `--target-gb GB`. Changes require user authorization and do not trigger cleanup. Use `cleanup --dry-run` to preview effective policy and eligible removals; actual cleanup is destructive and requires permission.
 - `run` and `resume` block without an execution deadline. Await the original invocation, not status/log polling; wait when no coordination is ready and surface each completion independently. Resume continues retained work; taskless resume keeps the assignment/gate. Replacement tasks and `steer` require a new explicit gate. `steer` redirects an active turn; `interrupt` stops it. Control acknowledgement is not completion; steering is unavailable during startup/repair. Failure or interruption may leave edits, with no automatic rollback. Inspect retained diagnostics/current files before recovery; do not blindly retry controls, rerun work or revert shared files.
 
 #### Forms
@@ -304,6 +305,9 @@ pira_team search QUERY [--limit N]
 pira_team config show
 pira_team config set --main MODEL --model WORKER --effort EFFORT
 pira_team config reset --main MODEL
+pira_team config retention show|reset
+pira_team config retention set [--max-age-days DAYS] [--target-gb GB]
+pira_team cleanup --dry-run [--json]
 ```
 
 Replace `--task TASK` with `--task-file FILE` for file input. All commands accept `--store DIR`; run/resume also accept `--output artifact|answer`.

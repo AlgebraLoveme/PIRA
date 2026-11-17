@@ -128,8 +128,8 @@ class PrivateCITests(unittest.TestCase):
             'assets/scripts/test_team_store_relocation.py': b'# helper tests',
             'assets/scripts/team_relocation_fixture.py': b'# native fixture',
             'tools/build/private_ci.py': b'# provisioning helper',
-            'tools/src/pira_team/tier_fixture.py': b'# maintained tier fixture\r\n',
-            'tools/src/pira_team/tier_control_tests.rs': b'const T: &str = include_str!("tier_fixture.py");\n',
+            'tools/src/pira_team/runtime/tests/fixtures/tier.py': b'# maintained tier fixture\r\n',
+            'tools/src/pira_team/runtime/tests/tier_control.rs': b'const T: &str = include_str!("fixtures/tier.py");\n',
             'tools/src/pira_write_check/help.md': b'checker help\r\n',
             'tools/src/pira_write_check/lexicon.json': b'{"scope": ["only"]}\r\n',
             'tools/crates/pira_write_check/tests/evaluation.json': b'[]\r\n',
@@ -174,7 +174,7 @@ class PrivateCITests(unittest.TestCase):
     def test_team_runtime_python_include_is_explicit_and_byte_preserving(self):
         self.write('tools/src/pira_team/unselected.py', b'not a reviewed runtime fixture')
         data = ci.verify(self.stage())
-        name = 'tools/src/pira_team/tier_fixture.py'
+        name = 'tools/src/pira_team/runtime/tests/fixtures/tier.py'
         self.assertEqual(data[name], self.files[name])
         self.assertNotIn('tools/src/pira_team/unselected.py', data)
 

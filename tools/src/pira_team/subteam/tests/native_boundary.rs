@@ -11,7 +11,7 @@ mod launch_context_tests {
             let root = std::env::temp_dir().join(format!(
                 "team-context-{}-{}",
                 std::process::id(),
-                crate::claude::uuid().unwrap()
+                crate::harness::claude::uuid().unwrap()
             ));
             crate::private_dir(&root).unwrap();
             let run = root.join("run");

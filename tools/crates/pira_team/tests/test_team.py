@@ -1,7 +1,8 @@
 """CLI contract checks using a fake Codex process; no model calls or credentials."""
 from __future__ import annotations
 
-from native_fixture import cleanup_temporary, run_directories
+from native_fixture import run_directories
+from team_fixture import TeamFixture
 
 import concurrent.futures
 import json
@@ -14,89 +15,13 @@ import unittest
 
 class TeamTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix="team-test-")
-        self.addCleanup(cleanup_temporary, self.temp)
-        self.root = Path(self.temp.name).resolve()
-        self.bin = Path(os.environ["PIRA_TEAM_BIN"]).resolve()
-        home = self.root / "original-home"
-        home.mkdir()
-        (home / "AGENTS.md").write_text("global instructions must not be inherited")
-        self.env = dict(os.environ, PATH=f"{self.root}{os.pathsep}{os.environ['PATH']}", CODEX_HOME=str(home))
-        self.env["PIRA_CTX_STORE_DIR"] = str(self.root / "ctx-store")
-        self.env["PIRA_DEC_STORE_DIR"] = str(self.root / "dec-store")
-        self.env["TEAM_TEST_BACKEND_CONTRACT"] = str(Path(__file__).resolve().parents[3] / "src/pira_team/backend_contract.json")
-        self.env["TEAM_TEST_BACKEND_FIXTURE"] = str(Path(__file__).with_name("backend_fixture.py").resolve())
-        self.env.pop("PIRA_TEAM_BUILD_ROOTS", None)
-        self.env.pop("PIRA_TEAM_CHILD", None)
-        self.env.pop("PIRA_TEAM_ATTEMPT", None)
-        self.env.pop("PIRA_TEAM_CONTEXT", None)
-        self.env.pop("PIRA_TEAM_HANDOFF", None)
-        self.env.pop("CLAUDE_CODE_SESSION_ID", None)
-        self.env.pop("CODEX_THREAD_ID", None)
-        self.env.pop("CODEX_API_KEY", None)
-        self.env.pop("PIRA_TEAM_DIR", None)
-        fake = self.root / "codex"
-        fake.write_text(Path(__file__).with_name("fake_codex.py").read_text())
-        fake.chmod(0o700)
-        if os.name == "nt":
-            import shutil
-            import sys
-            shutil.copyfile(os.environ["PIRA_TEAM_TEST_CODEX"], self.root / "codex.exe")
-            self.env.update(TEAM_FIXTURE_PYTHON=sys.executable, TEAM_FIXTURE_CODEX=str(fake))
-        self.parent([{}])
-
-    def launch(self, task: str, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [str(self.bin), "run", "--completion-gate", "Report findings and actual checks", "--model", "test-model", "--effort", "high",
-             "--store", str(self.root / "logs"), "--cwd", str(self.root), *extra, "--task", task],
-            env=self.env, capture_output=True, text=True, timeout=10,
-        )
-
-    def fail_startup(self, proc: subprocess.Popen[str], reason: str, consumed_stderr: str = "") -> None:
-        if proc.poll() is None:
-            proc.terminate()
-        try:
-            stdout, stderr = proc.communicate(timeout=8)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate(timeout=5)
-        self.fail(f"{reason}; launcher exit={proc.returncode}\nstdout:\n{stdout}\nstderr:\n{consumed_stderr}{stderr}")
-
-    def assert_worker_ready(self, proc: subprocess.Popen[str], read_fd: int) -> None:
-        import select
-        if not select.select([read_fd], [], [], 5)[0]:
-            self.fail_startup(proc, "worker readiness timed out")
-        ready = os.read(read_fd, 1)
-        if ready != b"1":
-            self.fail_startup(proc, f"worker readiness returned {ready!r}, expected b'1'")
-
-    def wait_stderr_notice(self, proc: subprocess.Popen[str], notice: str, timeout: float = 5) -> str:
-        import queue
-        import threading
-        consumed = []
-        result = queue.Queue(maxsize=1)
-        def read_notice():
-            while True:
-                line = proc.stderr.readline()
-                consumed.append(line)
-                if not line or notice in line:
-                    result.put(line)
-                    return
-        reader = threading.Thread(target=read_notice, daemon=True)
-        reader.start()
-        try:
-            try:
-                line = result.get(timeout=timeout)
-            except queue.Empty:
-                if proc.poll() is None:
-                    proc.terminate()
-                reader.join(timeout=8)
-                self.fail_startup(proc, f"launcher notice timed out: {notice}", "".join(consumed))
-            if not line:
-                self.fail_startup(proc, f"launcher exited before {notice}", "".join(consumed))
-            return line
-        finally:
-            reader.join(timeout=1)
+        fixture = TeamFixture(self.addCleanup)
+        self.temp, self.root, self.bin, self.env = fixture.temp, fixture.root, fixture.bin, fixture.env
+        self.launch, self.access, self.parent = fixture.launch, fixture.access, fixture.parent
+        self.permission_context = fixture.permission_context
+        self.fail_startup, self.assert_worker_ready = fixture.fail_startup, fixture.assert_worker_ready
+        self.wait_stderr_notice = fixture.wait_stderr_notice
+        self.candidate, self.start_control_fixture = fixture.candidate, fixture.start_control_fixture
 
     def metadata(self, receipt: dict) -> dict:
         self.assertEqual(set(receipt), {"run_id", "status", "run_root", "handoff_path"})
@@ -153,24 +78,6 @@ class TeamTests(unittest.TestCase):
                     self.assertEqual(manifest.read_bytes(), original)
                     self.assertEqual(len(list(run_directories(self.root / "logs"))), 1)
         self.assertNotEqual(self.access("interrupt", receipt["run_id"], "--task", "invalid").returncode, 0)
-
-    def permission_context(self) -> dict:
-        return {"cwd":str(self.root), "approval_policy":"never", "sandbox_policy":{
-            "type":"workspace-write", "writable_roots":[], "network_access":False,
-            "exclude_tmpdir_env_var":True, "exclude_slash_tmp":True}}
-
-    def parent(self, contexts: list[dict], *, identity: str = "parent-session") -> Path:
-        self.env["CODEX_THREAD_ID"] = "parent-session"
-        directory = self.root / "original-home/sessions/2026/10/01"
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "rollout-2026-10-01-parent-session.jsonl"
-        events = [{"type":"session_meta", "payload":{"id":identity}},
-                  {"type":"response_item", "payload":{"text":"PARENT_TRANSCRIPT_MUST_NOT_BE_FORWARDED"}}]
-        events += [{"type":"turn_context", "payload":{**self.permission_context(), **c}} for c in contexts]
-        path.write_text("".join(json.dumps(e)+"\n" for e in events))
-        # A sibling session must not be read; its content is deliberately invalid JSON.
-        (directory / "rollout-other-session.jsonl").write_text("unrelated private conversation")
-        return path
 
     @unittest.skipUnless(os.name == "posix", "POSIX fixture readiness")
     def test_startup_diagnostics_expose_scope_rejection(self) -> None:
@@ -456,12 +363,6 @@ class TeamTests(unittest.TestCase):
         path.symlink_to(target)
         self.assertNotEqual(self.launch_inherited().returncode, 0)
         self.assertFalse((self.root / "logs").exists())
-
-    def access(self, command: str, run: str, *extra: str) -> subprocess.CompletedProcess[str]:
-        if command in ("resume", "steer") and extra and not any(x.startswith("--completion-gate") for x in extra):
-            extra = (*extra, "--completion-gate", "Report findings and actual checks")
-        return subprocess.run([str(self.bin), command, run, *extra, "--store", str(self.root / "logs")],
-            env=self.env, capture_output=True, text=True, timeout=5)
 
     def test_run_id_reads_exact_artifact_and_resolves_paths_with_verified_parent(self) -> None:
         self.env["TEAM_CANDIDATE"] = self.candidate('line\r\nλ\n', "notes.txt", "text")
@@ -1417,9 +1318,6 @@ class TeamTests(unittest.TestCase):
         for result, expected in zip(results, ["ANSWER one", "ANSWER two"]):
             self.assertEqual(self.access("read", json.loads(result.stdout)["run_id"]).stdout, expected)
 
-    def candidate(self, content: str, filename: str = "findings.json", format: str = "json") -> str:
-        return json.dumps({"filename": filename, "format": format, "content": content})
-
     def test_json_repair_retains_candidates_and_totals_usage(self) -> None:
         self.env["TEAM_CANDIDATE"] = self.candidate('{"findings": [1')
         self.env["TEAM_REPAIRED"] = self.candidate('{"findings": [1]}\n')
@@ -1599,26 +1497,96 @@ class TeamTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["status"], "needs_decision")
         self.assertEqual(self.metadata(json.loads(result.stdout))["repairs"], 1)
 
-    def test_temp_defaults_use_scratch_without_ambient_root_grants(self) -> None:
-        forbidden = []
-        for key in ("TMPDIR", "TMP", "TEMP"):
-            path = self.root / ("ambient-" + key)
-            path.mkdir()
-            self.env[key] = str(path)
-            forbidden.append(str(path))
+    def test_temp_defaults_outside_records_on_launch_resume_and_repair(self) -> None:
         self.env["TEAM_ASSERT_TEMP"] = "1"
-        self.env["TEAM_FORBIDDEN_TEMP_ROOTS"] = json.dumps(forbidden)
         result = self.launch("review")
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
-        # Same scratch contract applies to resumed turns and output-format repairs.
+        run = Path(receipt["run_root"])
+        phase = (run / "phase.md").read_text()
+        scratch = Path(json.loads(phase.splitlines()[2])["scratch"])
+        self.assertTrue(scratch.parent.samefile(self.root / "platform-temp"))
+        self.assertNotIn(run.parent, scratch.parents)
+        self.assertFalse((run / "scratch").exists())
+        # An old retained scratch stays untouched; obsolete temp env redirects safely.
+        old = run / "scratch"
+        old.mkdir()
+        (old / "keep").write_text("retained")
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.env[key] = str(old)
+        self.parent([{"sandbox_policy":{"type":"danger-full-access"}}])
         self.env["TEAM_CANDIDATE"] = self.candidate("[")
         self.env["TEAM_REPAIRED"] = self.candidate("{}")
         resumed = self.access("resume", receipt["run_id"])
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(self.metadata(json.loads(resumed.stdout))["repairs"], 1)
-        for path in forbidden:
-            self.assertEqual(list(Path(path).iterdir()), [])
+        self.assertEqual({p.name: p.read_text() for p in old.iterdir()}, {"keep":"retained"})
+        phase = (run / "revisions/000002/phase.md").read_text()
+        resumed_temp = Path(json.loads(phase.splitlines()[2])["scratch"])
+        self.addCleanup(resumed_temp.rmdir)
+        self.assertNotIn(run.parent, resumed_temp.parents)
+        self.assertNotEqual(resumed_temp, old)
+
+    def test_temp_workspace_recreated_and_denied_without_permission_expansion(self) -> None:
+        self.env["TEAM_ASSERT_TEMP"] = "1"
+        first = self.launch("review")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt["run_root"])
+        scratch = Path(json.loads((run / "phase.md").read_text().splitlines()[2])["scratch"])
+        scratch.rmdir()
+        resumed = self.access("resume", receipt["run_id"])
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        phase = (run / "revisions/000002/phase.md").read_text()
+        self.assertEqual(json.loads(phase.splitlines()[2])["scratch"], str(scratch))
+        self.assertTrue(scratch.is_dir())
+        outside = tempfile.TemporaryDirectory(prefix="team-denied-temp-")
+        self.addCleanup(outside.cleanup)
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.env[key] = outside.name
+        denied = self.access("resume", receipt["run_id"])
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("no extra write root", denied.stderr)
+        self.assertEqual(list(Path(outside.name).iterdir()), [])
+
+    def test_temp_implicit_tmpdir_grant_keeps_exact_caller_sandbox(self) -> None:
+        outside = tempfile.TemporaryDirectory(prefix="team-implicit-temp-")
+        self.addCleanup(outside.cleanup)
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.env[key] = outside.name
+        policy = {**self.permission_context()["sandbox_policy"], "exclude_tmpdir_env_var":False}
+        self.parent([{"sandbox_policy":policy}])
+        self.env["TEAM_ASSERT_TEMP"] = "1"
+        result = self.launch("review")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.metadata(json.loads(result.stdout))
+        sandbox = manifest["execution_permissions"]["sandbox_policy"]
+        roots = sandbox.pop("writableRoots")
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(Path(roots[0]).samefile(self.root))
+        self.assertEqual(sandbox, {
+            "type":"workspaceWrite",
+            "networkAccess":False, "excludeTmpdirEnvVar":False, "excludeSlashTmp":True})
+        self.assertEqual(len(list(Path(outside.name).iterdir())), 1)
+
+    @unittest.skipUnless(os.name == "posix", "Unix implicit /tmp grant")
+    def test_temp_inside_records_falls_back_with_only_implicit_slash_tmp_grant(self) -> None:
+        old = self.root / "logs/old-run/scratch"
+        old.mkdir(parents=True)
+        (old / "keep").write_text("retained")
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.env[key] = str(old)
+        policy = {**self.permission_context()["sandbox_policy"], "exclude_slash_tmp":False}
+        self.parent([{"sandbox_policy":policy}])
+        self.env["TEAM_ASSERT_TEMP"] = "1"
+        result = self.launch("review")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = Path(json.loads(result.stdout)["run_root"])
+        scratch = Path(json.loads((run / "phase.md").read_text().splitlines()[2])["scratch"])
+        self.assertEqual(scratch.parent, Path("/tmp").resolve())
+        self.addCleanup(scratch.rmdir)
+        self.assertEqual((old / "keep").read_text(), "retained")
+        self.assertEqual(list(old.iterdir()), [old / "keep"])
 
     def test_control_errors_report_persisted_state_without_launching(self) -> None:
         # Control needs only persisted state; no backend or listening owner is required.
@@ -1652,6 +1620,7 @@ class TeamTests(unittest.TestCase):
     def test_environment_inheritance_exclusions_and_resume(self) -> None:
         for key in ("CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR", "TMPDIR"):
             self.env[key] = str(self.root / key.lower())
+        Path(self.env["TMPDIR"]).mkdir()
         self.env["TEAM_ASSERT_BUILD_ENV"] = "1"
         self.env.update({
             "PRIVATE_ACCESS_TOKEN": "synthetic-not-a-secret",
@@ -2099,25 +2068,6 @@ class TeamTests(unittest.TestCase):
         finally:
             for stream in streams:
                 stream.close()
-
-    def start_control_fixture(self, *, pass_fds: tuple[int, ...] = (), extra: tuple[str, ...] = ()):
-        import time
-        proc = subprocess.Popen([str(self.bin), "run", "--completion-gate", "Report actual checks",
-            "--model", "test-model", "--effort", "high", "--cwd", str(self.root),
-            "--store", str(self.root / "logs"), *extra, "--task", "steerable"],
-            env=self.env, pass_fds=pass_fds, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        def cleanup():
-            if proc.poll() is None:
-                proc.terminate()
-            try:
-                proc.communicate(timeout=8)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate(timeout=3)
-        self.addCleanup(cleanup)
-        self.wait_stderr_notice(proc, "pira_team active:")
-        endpoint, = (self.root / "logs").glob("*/control.json")
-        return proc, endpoint.parent, json.loads(endpoint.read_text())
 
     @unittest.skipUnless(os.name == "posix", "POSIX lifecycle fixture")
     def test_interrupt_retains_admission_when_steer_replies_are_saturated(self) -> None:

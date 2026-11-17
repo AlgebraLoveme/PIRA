@@ -6,14 +6,7 @@ const NOW: u64 = 1_700_000_000_000;
 struct Store(PathBuf);
 impl Store {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "team-retention-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::tests::temp_path("team-retention");
         crate::private_dir(&path).unwrap();
         Self(path)
     }
@@ -74,7 +67,168 @@ fn unit(id: &str, last: u64, bytes: u64) -> Unit {
     }
 }
 fn planned(store: &Store) -> Plan {
-    plan(&store.0, NOW).unwrap()
+    plan(&store.0, NOW, policy::load(&store.0).unwrap()).unwrap()
+}
+
+fn config(root: &Path, arguments: &[&str]) -> Result<(), String> {
+    let mut args = vec!["config".to_owned(), "retention".to_owned()];
+    args.extend(arguments.iter().map(|arg| (*arg).to_owned()));
+    args.extend(["--store".into(), root.to_str().unwrap().into()]);
+    crate::profile::defaults::command(&args, || panic!("explicit store")).map(|_| ())
+}
+
+#[test]
+fn retention_defaults_show_and_preview_do_not_create_store() {
+    let fixture = Store::new();
+    let absent = fixture.0.join("absent");
+    config(&absent, &["show"]).unwrap();
+    let preview = execute(&absent, true).unwrap();
+    assert_eq!(preview["effective_policy"]["max_age_days"], 30);
+    assert_eq!(preview["max_age_ms"], 30 * 86_400_000_u64);
+    assert_eq!(preview["target_bytes"], 50_000_000_000_u64);
+    assert!(!absent.exists());
+}
+
+#[test]
+fn policy_persists_partial_updates_reset_and_store_isolation_without_cleanup() {
+    let store = Store::new();
+    let other = Store::new();
+    let run = store.run("old", Some(NOW - AGE_MS - 1));
+    let manifest = fs::read(run.join("manifest.json")).unwrap();
+    config(
+        &store.0,
+        &["set", "--max-age-days", "7", "--target-gb", "2"],
+    )
+    .unwrap();
+    config(&store.0, &["set", "--max-age-days", "14"]).unwrap();
+    let policy = policy::load(&store.0).unwrap().value();
+    assert_eq!(policy["max_age_days"], 14);
+    assert_eq!(policy["target_bytes"], 2_000_000_000_u64);
+    assert_eq!(policy::load(&other.0).unwrap().value()["target_gb"], 50);
+    assert_eq!(fs::read(run.join("manifest.json")).unwrap(), manifest);
+    assert!(!store.0.join(".cleanup-report.json").exists());
+    config(&store.0, &["reset"]).unwrap();
+    assert_eq!(policy::load(&store.0).unwrap(), policy::Policy::default());
+    assert_eq!(fs::read(run.join("manifest.json")).unwrap(), manifest);
+}
+
+#[test]
+fn malformed_policy_blocks_manual_and_background_cleanup_before_any_mutation() {
+    let store = Store::new();
+    let run = store.run("old", Some(NOW - AGE_MS - 1));
+    for invalid in [
+        "null",
+        "[]",
+        "{",
+        "{\"unknown\":1}",
+        "{\"max_age_days\":0}",
+        "{\"target_gb\":-1}",
+        "{\"max_age_days\":1.0}",
+        "{\"target_gb\":\"2\"}",
+        "{\"target_gb\":NaN}",
+        "{\"target_gb\":1e999}",
+        "{\"max_age_days\":36501}",
+        "{\"target_gb\":1000001}",
+    ] {
+        fs::write(store.0.join("retention_policy.json"), invalid).unwrap();
+        let before = fingerprint(&store.0);
+        assert!(execute(&store.0, true).is_err(), "{invalid}");
+        assert!(execute(&store.0, false).is_err(), "{invalid}");
+        assert_eq!(
+            background(&[
+                "__cleanup".into(),
+                "--store".into(),
+                store.0.to_str().unwrap().into()
+            ]),
+            1
+        );
+        assert_eq!(fingerprint(&store.0), before, "{invalid}");
+    }
+    config(&store.0, &["reset"]).unwrap();
+    assert!(run.exists());
+    assert_eq!(policy::load(&store.0).unwrap(), policy::Policy::default());
+}
+
+#[test]
+fn invalid_cli_thresholds_do_not_create_or_replace_configuration() {
+    let store = Store::new();
+    let absent = store.0.join("absent");
+    for (flag, maximum) in [("--max-age-days", "36501"), ("--target-gb", "1000001")] {
+        for value in [
+            "",
+            "0",
+            "-1",
+            "NaN",
+            "inf",
+            "1.5",
+            "1e3",
+            "+1",
+            "18446744073709551616",
+            maximum,
+        ] {
+            assert!(
+                config(&absent, &["set", flag, value]).is_err(),
+                "{flag}={value}"
+            );
+            assert!(!absent.exists());
+        }
+    }
+    config(
+        &store.0,
+        &["set", "--max-age-days", "36500", "--target-gb", "1000000"],
+    )
+    .unwrap();
+    let before = fingerprint(&store.0);
+    assert!(config(&store.0, &["set", "--target-gb", "0"]).is_err());
+    assert_eq!(fingerprint(&store.0), before);
+}
+
+#[test]
+fn saved_age_and_size_thresholds_drive_the_same_selection_and_report() {
+    let store = Store::new();
+    store.run("middle-aged", Some(NOW - 31 * policy::DAY_MS));
+    config(
+        &store.0,
+        &["set", "--max-age-days", "60", "--target-gb", "50"],
+    )
+    .unwrap();
+    assert!(planned(&store).units[0].reasons.is_empty());
+    config(&store.0, &["set", "--max-age-days", "7"]).unwrap();
+    assert_eq!(planned(&store).units[0].reasons, ["age"]);
+    change(&store.0.join("middle-aged"), |manifest| {
+        manifest["last_execution_activity_ms"] = json!(NOW)
+    });
+    let payload = crate::create(&store.0.join("middle-aged/payload")).unwrap();
+    payload.set_len(policy::GB).unwrap(); // Logical size only; sparse fixture, no large write.
+    config(&store.0, &["set", "--target-gb", "1"]).unwrap();
+    let plan = planned(&store);
+    assert_eq!(plan.units[0].reasons, ["storage"]);
+    let report = plan.value(NOW);
+    assert_eq!(report["target_bytes"], policy::GB);
+    assert_eq!(report["effective_policy"]["max_age_days"], 7);
+    assert_eq!(report["summary"]["target_reached"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn retention_config_rejects_busy_locks_and_symlink_reset_without_touching_target() {
+    let store = Store::new();
+    config(&store.0, &["set", "--max-age-days", "7"]).unwrap();
+    let held =
+        crate::storage::managed::lock_config(&store.0, "retention_policy.lock", "retention policy")
+            .unwrap();
+    let before = fingerprint(&store.0);
+    assert!(config(&store.0, &["set", "--target-gb", "2"]).is_err());
+    assert_eq!(fingerprint(&store.0), before);
+    drop(held);
+    let policy = store.0.join("retention_policy.json");
+    let target = store.0.join("unrelated.json");
+    fs::rename(&policy, &target).unwrap();
+    let before = fs::read(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &policy).unwrap();
+    assert!(config(&store.0, &["reset"]).is_err());
+    assert!(policy::load(&store.0).is_err());
+    assert_eq!(fs::read(target).unwrap(), before);
 }
 
 fn intent(store: &Store, unit: &Unit) {
@@ -109,7 +263,7 @@ fn exact_age_and_decimal_budget_boundaries_and_execution_order() {
         unit("older", NOW - AGE_MS - 1, 1),
         unit("younger", NOW - AGE_MS + 1, 1),
     ];
-    assert_eq!(select(&mut age, 3, NOW, BUDGET), 1);
+    assert_eq!(select(&mut age, 3, NOW, AGE_MS, BUDGET), 1);
     assert_eq!(
         age.iter().find(|u| u.id == "older").unwrap().reasons,
         vec!["age"]
@@ -120,7 +274,7 @@ fn exact_age_and_decimal_budget_boundaries_and_execution_order() {
             unit("created-last", NOW - 20, 2),
         ];
         assert_eq!(
-            select(&mut units, total, NOW, BUDGET),
+            select(&mut units, total, NOW, AGE_MS, BUDGET),
             if total < BUDGET { 0 } else { 2 }
         );
         assert_eq!(units[0].id, "created-last");
@@ -129,7 +283,7 @@ fn exact_age_and_decimal_budget_boundaries_and_execution_order() {
     let mut protected = unit("live", NOW - 100, BUDGET);
     protected.skip = Some("live_owner".into());
     let mut units = vec![protected, unit("idle", NOW - 10, 2)];
-    assert_eq!(select(&mut units, BUDGET + 2, NOW, BUDGET), 2);
+    assert_eq!(select(&mut units, BUDGET + 2, NOW, AGE_MS, BUDGET), 2);
     assert_eq!(
         units.iter().find(|u| u.id == "live").unwrap().reasons.len(),
         0
@@ -483,7 +637,7 @@ fn detached_process_survives_origin_exit_releases_lock_and_terminates() {
         .stderr(Stdio::piped());
     // The same native scope used by Team permits deliberate breakaway. Cargo's
     // external job may deny direct escape; this fixture owns the scope it kills.
-    let (mut origin, origin_scope) = crate::process::spawn(&mut command).unwrap();
+    let (mut origin, origin_scope) = crate::native::process::spawn(&mut command).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut connection = loop {
         match listener.accept() {
@@ -674,7 +828,7 @@ fn exited_native_scope_proof_survives_partial_metadata_deletion() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let (mut child, scope) = crate::process::spawn(&mut command).unwrap();
+    let (mut child, scope) = crate::native::process::spawn(&mut command).unwrap();
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut stream = loop {
         match listener.accept() {
@@ -704,7 +858,10 @@ fn exited_native_scope_proof_survives_partial_metadata_deletion() {
     stream.write_all(b"x").unwrap();
     assert!(scope.wait(&mut child).unwrap().success());
     drop(scope);
-    let mut unit = plan(&store.0, now_ms().unwrap()).unwrap().units.remove(0);
+    let mut unit = plan(&store.0, now_ms().unwrap(), policy::load(&store.0).unwrap())
+        .unwrap()
+        .units
+        .remove(0);
     assert!(unit.skip.is_none(), "{}", unit.value());
     unit.reasons = vec!["age"];
     intent(&store, &unit);

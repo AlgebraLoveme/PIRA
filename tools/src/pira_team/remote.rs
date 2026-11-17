@@ -1,7 +1,7 @@
 //! SSH is transport, not delegation authority. Only independently enrolled launcher
 //! signatures authorize root operations. Tasks on the same OS user are not isolated
 //! from a compromised launcher/key/store; no signing secret is transferred remotely.
-use crate::{lifecycle, profile, storage};
+use crate::{cli, lifecycle, profile, storage};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod bootstrap;
 pub(super) mod routing;
 mod transport;
 
@@ -18,6 +19,8 @@ const NAMESPACE: &str = "pira-team-remote-v2";
 const SCOPE: &str = "root-main-host-pinned";
 const LIMIT: u64 = 16 * 1024 * 1024;
 const VALIDITY: u64 = 300;
+const HANDOFF_LIMIT: u64 = 8 * 1024 * 1024;
+const CONTENT_CHUNK: usize = 1024 * 1024;
 const CAPABILITIES: &[&str] = &[
     "signed-delegation",
     "host-pinned-subteam",
@@ -26,6 +29,7 @@ const CAPABILITIES: &[&str] = &[
     "resume",
     "steer",
     "interrupt",
+    "artifact-chunks",
 ];
 
 fn capability_metadata() -> Value {
@@ -97,19 +101,9 @@ fn require_resume_capabilities(
 }
 
 fn requests_subteam(args: &[String]) -> bool {
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg == "--allow-subteam" {
-            return true;
-        }
-        if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-            rest.next();
-        }
-    }
-    false
+    cli::tokens(args.get(1..).unwrap_or_default())
+        .take_while(|token| token.raw != "--")
+        .any(|token| token.flag == Some(cli::Flag::AllowSubteam))
 }
 
 #[derive(Clone)]
@@ -137,6 +131,16 @@ fn install(grant: &Value) -> Result<(), String> {
 
 pub(super) fn dispatch(args: &mut [String]) -> Option<Result<(), String>> {
     match args.first().map(String::as_str) {
+        Some("__remote-info") => Some((|| {
+            let (exe, _, user) = endpoint_identity()?;
+            signing_support()?;
+            println!(
+                "{}",
+                json!({"version":env!("CARGO_PKG_VERSION"),"protocol":VERSION,"setup":1,"exe":exe,"user":user,"home":current_account()?.1})
+            );
+            Ok(())
+        })()),
+        Some("__remote-setup") if args.len() == 1 => Some(bootstrap::serve_setup()),
         Some("__remote-serve") => Some(if args.len() == 1 {
             serve()
         } else {
@@ -157,51 +161,14 @@ pub(super) fn dispatch(args: &mut [String]) -> Option<Result<(), String>> {
     }
 }
 fn has_option(args: &[String], option: &str) -> bool {
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg.split('=').next() == Some(option) {
-            return true;
-        }
-        if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-            rest.next();
-        }
-    }
-    false
-}
-fn flag(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--detach"
-            | "--artifact"
-            | "--inject-review"
-            | "--inject-implement"
-            | "--inject-write"
-            | "--inject-fig"
-            | "--allow-subteam"
-            | "--allow-fix"
-            | "--code-review"
-            | "-r"
-            | "--recursive"
-    )
+    cli::tokens(args.get(1..).unwrap_or_default())
+        .take_while(|token| token.raw != "--")
+        .any(|token| token.name == option)
 }
 fn has_host(args: &[String]) -> bool {
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg == "--host" || arg.starts_with("--host=") {
-            return true;
-        }
-        if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-            rest.next();
-        }
-    }
-    false
+    has_option(args, "--host")
 }
+
 fn text<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
     value[name]
         .as_str()
@@ -240,15 +207,19 @@ fn host(value: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn username(value: &str) -> Result<(), String> {
+fn account_name(value: &str) -> Result<(), String> {
+    // Account names are exact UID-bound data, passed as one -l argument, never
+    // interpolated into the remote command. NSS domains/Unicode are not shell syntax.
     if value.is_empty()
-        || value.len() > 128
+        || value.len() > 1024
         || value.starts_with('-')
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        || value.chars().any(|c| {
+            c.is_control()
+                || c.is_whitespace()
+                || (c.is_ascii() && !c.is_ascii_alphanumeric() && !"_.-@\\+".contains(c))
+        })
     {
-        return Err("invalid explicit remote user".into());
+        return Err("invalid remote account name".into());
     }
     Ok(())
 }
@@ -269,14 +240,8 @@ fn random() -> Result<String, String> {
 fn read(path: &Path) -> Result<Value, String> {
     lifecycle::read_json(path)
 }
-pub(super) fn sync_dir(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("sync remote directory: {e}"))?;
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+fn sync_dir(path: &Path) -> Result<(), String> {
+    storage::sync_directory(path).map_err(|e| format!("sync remote directory: {e}"))
 }
 fn ancestors(path: &Path) -> Result<(), String> {
     let physical = path
@@ -398,22 +363,101 @@ fn execute_policy(context: &Value, issuer: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn verified_root(args: &[String]) -> Result<Value, String> {
+fn authorize_root(args: &[String]) -> Result<(), String> {
     crate::subteam::authorize(args)?;
     if crate::subteam::caller_run()?.is_some() {
         return Err("only a verified root main may choose remote host or manage authority keys; coordinator/ordinary worker remote hops are forbidden".into());
     }
+    Ok(())
+}
+fn verified_root(args: &[String]) -> Result<Value, String> {
+    authorize_root(args)?;
     let context = profile::load()?;
     profile::validate_session_id(text(&context, "caller_thread_id")?)?;
     Ok(context)
+}
+fn verified_caller(args: &[String]) -> Result<Value, String> {
+    if matches!(
+        args[0].as_str(),
+        "read" | "wait" | "interrupt" | "attach" | "resolve" | "path"
+    ) {
+        authorize_root(args)?;
+        Ok(json!({"caller_thread_id":profile::caller_session()?}))
+    } else {
+        verified_root(args)
+    }
 }
 fn appended(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
 }
+fn ssh_keygen() -> Result<PathBuf, String> {
+    let name = if cfg!(windows) {
+        "ssh-keygen.exe"
+    } else {
+        "ssh-keygen"
+    };
+    let mut candidates = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| {
+            std::env::split_paths(&p)
+                .map(|dir| dir.join(name))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if cfg!(windows) {
+        if let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR")) {
+            candidates.push(PathBuf::from(root).join("System32/OpenSSH/ssh-keygen.exe"));
+        }
+    } else {
+        candidates.extend([
+            PathBuf::from("/usr/bin/ssh-keygen"),
+            PathBuf::from("/bin/ssh-keygen"),
+        ]);
+    }
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if candidate
+                .metadata()
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o111
+                == 0
+            {
+                continue;
+            }
+        }
+        let candidate = candidate.canonicalize().map_err(|e| e.to_string())?;
+        executable(&candidate)?;
+        return Ok(candidate);
+    }
+    Err("Remote Team requires OpenSSH ssh-keygen; install/update the OS OpenSSH client package and rerun PIRA setup on both hosts".into())
+}
+fn signing_support() -> Result<(), String> {
+    let output = Command::new(ssh_keygen()?)
+        .arg("-?")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("check OpenSSH signing support: {e}"))?;
+    let usage = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !usage.contains("-Y sign") || !usage.contains("-Y verify") {
+        return Err("Remote Team requires OpenSSH ssh-keygen with -Y sign/verify; update the OS OpenSSH client package and rerun PIRA setup on both hosts".into());
+    }
+    Ok(())
+}
 fn public_key(key: &Path) -> Result<String, String> {
-    let output = Command::new("ssh-keygen")
+    let output = Command::new(ssh_keygen()?)
         .args(["-y", "-P", "", "-f"])
         .arg(key)
         .stdin(Stdio::null())
@@ -453,7 +497,7 @@ fn keygen(args: &[String]) -> Result<(), String> {
             return Err("authority paths already exist; refusing overwrite".into());
         }
     }
-    let status = Command::new("ssh-keygen")
+    let status = Command::new(ssh_keygen()?)
         .args(["-q", "-t", "ed25519", "-N", "", "-C", issuer, "-f"])
         .arg(&path)
         .stdin(Stdio::null())
@@ -504,7 +548,7 @@ fn sign_with(grant: &Value, authority: &Path) -> Result<Value, String> {
     if data.len() as u64 > LIMIT - 16384 {
         return Err("remote grant exceeds protocol limit".into());
     }
-    let mut child = Command::new("ssh-keygen")
+    let mut child = Command::new(ssh_keygen()?)
         .args(["-Y", "sign", "-f"])
         .arg(authority)
         .args(["-n", NAMESPACE])
@@ -563,7 +607,7 @@ fn verify_with_keys(envelope: &Value, anchor_bytes: &[u8]) -> Result<Value, Stri
         return Err("oversized public authority anchor".into());
     }
     let anchor_text =
-        std::str::from_utf8(&anchor_bytes).map_err(|_| "invalid public authority anchor")?;
+        std::str::from_utf8(anchor_bytes).map_err(|_| "invalid public authority anchor")?;
     let principals = anchor_text
         .lines()
         .map(str::trim)
@@ -584,7 +628,7 @@ fn verify_with_keys(envelope: &Value, anchor_bytes: &[u8]) -> Result<Value, Stri
     file.write_all(signature.as_bytes())
         .map_err(|e| e.to_string())?;
     drop(file);
-    let mut child = Command::new("ssh-keygen")
+    let mut child = Command::new(ssh_keygen()?)
         .args(["-Y", "verify", "-f"])
         .arg(&anchor)
         .args(["-I", issuer, "-n", NAMESPACE, "-s"])
@@ -661,7 +705,7 @@ fn validate_grant(grant: &Value) -> Result<(), String> {
         return Err("invalid signed endpoint schema".into());
     }
     host(text(endpoint, "host")?)?;
-    username(text(endpoint, "user")?)?;
+    account_name(text(endpoint, "user")?)?;
     endpoint_id(text(endpoint, "endpoint_id")?)?;
     for name in ["exe", "backend", "store"] {
         absolute(text(endpoint, name)?)?;
@@ -734,10 +778,22 @@ fn validate_grant(grant: &Value) -> Result<(), String> {
                     return Err("invalid interrupt argv".into());
                 }
             }
-            "read" | "probe" => {
-                if args.len() != 1 {
-                    return Err("read/probe take no positional arguments".into());
+            "read" if args.first().map(String::as_str) == Some("read-chunk") => {
+                if args.len() != 3
+                    || (grant["artifact"] != true && !grant["file"].is_string())
+                    || !grant["operation_id"].is_null()
+                    || args[1]
+                        .parse::<u64>()
+                        .map_or(true, |offset| offset > HANDOFF_LIMIT)
+                    || args[2]
+                        .parse::<u64>()
+                        .map_or(true, |revision| revision == 0)
+                {
+                    return Err("invalid handoff chunk selection/offset/revision".into());
                 }
+            }
+            "read" | "probe" if args.len() != 1 => {
+                return Err("read/probe take no positional arguments".into());
             }
             _ => {}
         }
@@ -766,7 +822,49 @@ fn fresh(grant: &Value, at: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn ssh_command(host: &str, user: Option<&str>, command: &str) -> Command {
+    let mut ssh = Command::new("ssh");
+    ssh.args([
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "AddKeysToAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "CheckHostIP=no",
+        "-o",
+        "RemoteCommand=none",
+    ]);
+    if let Some(user) = user {
+        ssh.args(["-l", user]);
+    }
+    ssh.args(["--", host, command]);
+    ssh.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    ssh
+}
+
 struct Client {
+    diagnostics: RefCell<transport::Diagnostics>,
     endpoint: Value,
     authority: PathBuf,
     state: PathBuf,
@@ -784,8 +882,9 @@ impl Client {
         let mut fields = std::collections::BTreeMap::new();
         let mut forwarded = vec![args[0].clone()];
         let (mut detach, mut artifact) = (false, false);
-        let mut rest = args.iter().skip(1);
-        while let Some(arg) = rest.next() {
+        let mut rest = cli::tokens(args.get(1..).unwrap_or_default());
+        while let Some(token) = rest.next() {
+            let arg = token.raw;
             if arg == "--detach" {
                 if detach {
                     return Err("duplicate --detach".into());
@@ -800,7 +899,7 @@ impl Client {
                 artifact = true;
                 continue;
             }
-            let name = arg.split('=').next().unwrap();
+            let name = token.name;
             if ["--cwd", "--store", "--schema", "--label"].contains(&name) {
                 return Err(format!(
                     "{name} is unsupported remotely; local paths never grant remote filesystem authority"
@@ -823,18 +922,15 @@ impl Client {
             ]
             .contains(&name)
             {
-                let value = if let Some((_, value)) = arg.split_once('=') {
-                    value.to_owned()
-                } else {
-                    rest.next()
-                        .ok_or_else(|| format!("missing {name}"))?
-                        .clone()
-                };
+                let value = token
+                    .value
+                    .ok_or_else(|| format!("missing {name}"))?
+                    .to_owned();
                 if fields.insert(name.to_owned(), value).is_some() {
                     return Err(format!("duplicate {name}"));
                 }
             } else if arg == "--task-file" {
-                let path = rest.next().ok_or("missing --task-file")?;
+                let path = token.value.ok_or("missing --task-file")?;
                 let mut bytes = Vec::new();
                 File::open(path)
                     .and_then(|f| f.take(LIMIT + 1).read_to_end(&mut bytes))
@@ -848,13 +944,13 @@ impl Client {
                 ]);
             } else if arg == "--" {
                 forwarded.push(arg.clone());
-                forwarded.extend(rest.cloned());
+                forwarded.extend(rest.flat_map(|token| token.words.iter().cloned()));
                 break;
             } else {
-                forwarded.push(arg.clone());
-                if arg.starts_with('-') && !arg.contains('=') && !flag(arg) {
-                    forwarded.push(rest.next().ok_or_else(|| format!("missing {arg}"))?.clone());
+                if arg.starts_with('-') && token.flag.is_none() && token.value.is_none() {
+                    return Err(format!("missing {arg}"));
                 }
+                forwarded.extend(token.words.iter().cloned());
             }
         }
         let mut take = |name: &str| {
@@ -865,13 +961,13 @@ impl Client {
         let host_name = take("--host")?;
         host(&host_name)?;
         let user = take("--remote-user")?;
-        username(&user)?;
+        account_name(&user)?;
         let identity = take("--remote-endpoint-id")?;
         endpoint_id(&identity)?;
-        if let Some((selected, _)) = host_name.split_once('@') {
-            if selected != user {
-                return Err("host user and --remote-user must agree".into());
-            }
+        if let Some((selected, _)) = host_name.split_once('@')
+            && selected != user
+        {
+            return Err("host user and --remote-user must agree".into());
         }
         let exe = take("--remote-exe")?;
         absolute(&exe)?;
@@ -950,6 +1046,7 @@ impl Client {
         }
         Ok(Self {
             endpoint: json!({"host":host_name,"user":user,"endpoint_id":identity,"exe":exe,"backend":backend,"store":store}),
+            diagnostics: RefCell::default(),
             authority,
             state,
             id,
@@ -972,53 +1069,23 @@ impl Client {
         )
     }
     fn exchange(&self, envelope: &Value) -> Result<Value, String> {
-        let mut ssh = Command::new("ssh");
-        ssh.args([
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "UpdateHostKeys=no",
-            "-o",
-            "ControlMaster=no",
-            "-o",
-            "ControlPath=none",
-            "-o",
-            "ControlPersist=no",
-            "-o",
-            "PermitLocalCommand=no",
-            "-o",
-            "AddKeysToAgent=no",
-            "-o",
-            "ForwardX11=no",
-            "-o",
-            "CheckHostIP=no",
-            "-o",
-            "RemoteCommand=none",
-            "-l",
-            text(&self.endpoint, "user")?,
-            "--",
+        let mut ssh = ssh_command(
             text(&self.endpoint, "host")?,
-        ]);
-        ssh.arg(format!(
-            "exec {} __remote-serve",
-            quote(text(&self.endpoint, "exe")?)
-        ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+            Some(text(&self.endpoint, "user")?),
+            &format!(
+                "exec {} __remote-serve",
+                quote(text(&self.endpoint, "exe")?)
+            ),
+        );
         let mut request = serde_json::to_vec(envelope).map_err(|e| e.to_string())?;
         request.push(b'\n');
         let mut child = ssh.spawn().map_err(|e| format!("start SSH: {e}"))?;
-        let bytes = transport::exchange(&mut child, &request, || {
-            crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst)
-        })
+        let bytes = transport::exchange(
+            &mut child,
+            &request,
+            || crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
+            &mut self.diagnostics.borrow_mut(),
+        )
         .map_err(|error| self.delivery_error(&error))?;
         let reply: Value = serde_json::from_slice(&bytes)
             .map_err(|_| "invalid remote response/protocol mismatch; delivery unknown")?;
@@ -1135,7 +1202,7 @@ fn persist_submission(
     Ok((envelope, origin))
 }
 fn client(args: &[String]) -> Result<(), String> {
-    let context = verified_root(args)?;
+    let context = verified_caller(args)?;
     let cli = Client::parse(args)?;
     let issuer = text(&context, "caller_thread_id")?;
     let op = args[0].as_str();
@@ -1231,15 +1298,15 @@ fn client(args: &[String]) -> Result<(), String> {
 }
 
 fn validate_args(args: &[String]) -> Result<(), String> {
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
+    for token in cli::tokens(args.get(1..).unwrap_or_default()) {
+        let arg = token.raw;
         if arg == "--" {
             break;
         }
         if !arg.starts_with('-') {
             continue;
         }
-        let name = arg.split('=').next().unwrap();
+        let name = token.name;
         if [
             "--cwd",
             "--store",
@@ -1256,8 +1323,8 @@ fn validate_args(args: &[String]) -> Result<(), String> {
                 "remote argv may not override signed endpoint/path selection with {name}"
             ));
         }
-        if !arg.contains('=') && !flag(arg) {
-            rest.next().ok_or("missing remote option value")?;
+        if token.flag.is_none() && token.value.is_none() {
+            return Err("missing remote option value".into());
         }
     }
     Ok(())
@@ -1288,12 +1355,13 @@ fn control_task(args: &[String]) -> Result<(String, String), String> {
         return Err("control argv mismatch".into());
     }
     let (mut task, mut gate) = (None, None);
-    let mut rest = args.iter().skip(1);
-    while let Some(arg) = rest.next() {
+    let mut rest = cli::tokens(args.get(1..).unwrap_or_default());
+    while let Some(token) = rest.next() {
+        let arg = token.raw;
         if arg == "--" {
             crate::set_once(
                 &mut task,
-                rest.next().ok_or("missing task after --")?.clone(),
+                rest.next().ok_or("missing task after --")?.raw.clone(),
                 "task",
             )?;
             if rest.next().is_some() {
@@ -1308,13 +1376,13 @@ fn control_task(args: &[String]) -> Result<(String, String), String> {
         } else if arg == "--task" {
             crate::set_once(
                 &mut task,
-                rest.next().ok_or("missing task")?.clone(),
+                token.value.ok_or("missing task")?.to_owned(),
                 "task",
             )?;
         } else if arg == "--completion-gate" {
             crate::set_once(
                 &mut gate,
-                rest.next().ok_or("missing gate")?.clone(),
+                token.value.ok_or("missing gate")?.to_owned(),
                 "gate",
             )?;
         } else {
@@ -1360,22 +1428,72 @@ fn executable(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+fn account_home(home: &Path) -> Result<PathBuf, String> {
+    let home = home
+        .canonicalize()
+        .map_err(|e| format!("resolve actual account home: {e}"))?;
+    if !home.is_dir() {
+        return Err("actual account home must be an existing directory".into());
+    }
+    Ok(home)
+}
 fn current_user() -> Result<String, String> {
+    current_account().map(|account| account.0)
+}
+fn current_account() -> Result<(String, PathBuf), String> {
     #[cfg(unix)]
     {
         // getpwuid result is copied immediately, before spawning any threads.
         let passwd = unsafe { libc::getpwuid(libc::geteuid()) };
         if passwd.is_null() {
-            return Err("cannot resolve actual SSH account UID".into());
+            // Static musl cannot load the host's NSS modules (for example SSSD).
+            // Ask the trusted native host facility for this UID, never $USER.
+            #[cfg(target_os = "linux")]
+            {
+                let getent = Path::new("/usr/bin/getent");
+                executable(getent)?;
+                let uid = unsafe { libc::geteuid() };
+                let output = Command::new(getent)
+                    .args(["passwd", &uid.to_string()])
+                    .env_clear()
+                    .stdin(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("resolve actual SSH account with /usr/bin/getent: {e}"))?;
+                if output.status.success() {
+                    return passwd_account(&output.stdout, uid);
+                }
+            }
+            return Err("cannot resolve actual SSH account UID; native /usr/bin/getent passwd UID must work (including NSS accounts)".into());
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*passwd).pw_name) }
             .to_str()
             .map_err(|_| "remote username requires UTF-8")?
             .to_owned();
-        return Ok(name);
+        account_name(&name)?;
+        let home = unsafe { std::ffi::CStr::from_ptr((*passwd).pw_dir) }
+            .to_str()
+            .map_err(|_| "account home requires UTF-8")?;
+        absolute(home)?;
+        Ok((name, account_home(Path::new(home))?))
     }
     #[cfg(not(unix))]
     Err("remote endpoint requires Linux".into())
+}
+#[cfg(any(target_os = "linux", test))]
+fn passwd_account(bytes: &[u8], uid: u32) -> Result<(String, PathBuf), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "native account lookup requires UTF-8")?;
+    let lines: Vec<_> = text.lines().collect();
+    let fields: Vec<_> = text.trim_end_matches('\n').split(':').collect();
+    if lines.len() != 1 || fields.len() != 7 || fields[2].parse::<u32>() != Ok(uid) {
+        return Err("native account lookup did not return exactly the actual SSH UID".into());
+    }
+    account_name(fields[0])?;
+    absolute(fields[5])?;
+    Ok((fields[0].to_owned(), account_home(Path::new(fields[5]))?))
+}
+#[cfg(test)]
+fn passwd_user(bytes: &[u8], uid: u32) -> Result<String, String> {
+    passwd_account(bytes, uid).map(|a| a.0)
 }
 fn endpoint_identity() -> Result<(PathBuf, PathBuf, String), String> {
     let exe = std::env::current_exe()
@@ -1390,7 +1508,7 @@ fn endpoint_identity() -> Result<(PathBuf, PathBuf, String), String> {
 }
 fn endpoint_binding(grant: &Value, exe: &Path, user: &str) -> Result<(), String> {
     let endpoint = &grant["endpoint"];
-    let descriptor_path = appended(exe, ".remote-endpoint.json");
+    let (_, descriptor_path) = bootstrap::trust_paths(exe, text(endpoint, "endpoint_id")?)?;
     trusted_public(&descriptor_path).map_err(
         |_| "missing/unsafe fixed endpoint descriptor; operator must provision it separately",
     )?;
@@ -1454,7 +1572,9 @@ fn endpoint(envelope: Value) -> Result<Value, String> {
     if !cfg!(target_os = "linux") {
         return Err("remote supervisor v2 requires Linux; local commands remain supported".into());
     }
-    let (exe, anchor, user) = endpoint_identity()?;
+    let (exe, _, user) = endpoint_identity()?;
+    let (anchor, _) =
+        bootstrap::trust_paths(&exe, text(&envelope["grant"]["endpoint"], "endpoint_id")?)?;
     let grant = verify(&envelope, &anchor)?;
     endpoint_binding(&grant, &exe, &user)?;
     // No generic ancestry walk through privileged SSH monitors. Only this verified,
@@ -1503,7 +1623,7 @@ fn endpoint(envelope: Value) -> Result<Value, String> {
             control_using(&dir, &record, envelope, &grant, &anchor, |run, target| {
                 if grant["op"] == "steer" {
                     let (task, gate) = control_task(&strings(&grant["args"])?)?;
-                    crate::app_server::control_bound(run, "steer", &task, Some(&gate), target)
+                    crate::runtime::control_bound(run, "steer", &task, Some(&gate), target)
                 } else {
                     crate::subteam::interrupt_bound(
                         run,
@@ -1781,10 +1901,14 @@ fn supervise(dir: &Path) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("remote supervisor requires Linux".into());
     }
-    let (exe, anchor, user) = endpoint_identity()?;
+    let (exe, _, user) = endpoint_identity()?;
     canonical_path(dir, true)?;
     existing(dir, true)?;
     let record = read(&dir.join("request.json"))?;
+    let (anchor, _) = bootstrap::trust_paths(
+        &exe,
+        text(&record["envelope"]["grant"]["endpoint"], "endpoint_id")?,
+    )?;
     let grant = verify(&record["envelope"], &anchor)?;
     endpoint_binding(&grant, &exe, &user)?;
     if grant["op"] != "submit" || request_dir(&grant)? != dir {
@@ -1827,6 +1951,74 @@ fn supervise(dir: &Path) -> Result<(), String> {
     write_new(&dir.join("result.json"), &result)?;
     outcome
 }
+fn handoff_revision(
+    run: &Path,
+    relative: &Path,
+    current: &Value,
+) -> Result<Option<(PathBuf, u64)>, String> {
+    let parts = relative
+        .iter()
+        .filter_map(|part| part.to_str())
+        .collect::<Vec<_>>();
+    let (number, artifact_parts) = match parts.as_slice() {
+        ["revisions", number, rest @ ..]
+            if number.len() == 6 && number.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            (
+                number
+                    .parse::<u64>()
+                    .map_err(|_| "invalid artifact revision")?,
+                rest,
+            )
+        }
+        rest => (1, rest),
+    };
+    if !matches!(
+        artifact_parts,
+        ["artifacts", _] | ["implementation", "artifacts", _]
+    ) {
+        return Ok(None);
+    }
+    let snapshot = PathBuf::from(format!("revisions/{number:06}/manifest.json"));
+    let source = match fs::symlink_metadata(run.join(&snapshot)) {
+        Ok(_) => storage::managed_path(run, &snapshot)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Legacy/current fixtures can lack snapshots. Only the current accepted
+            // artifact may use the mutable root manifest in that case.
+            return if storage::artifact_path(run).ok().as_deref() == Some(relative) {
+                Ok(current["revision"]
+                    .as_u64()
+                    .map(|revision| (run.join("manifest.json"), revision)))
+            } else {
+                Ok(None)
+            };
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let retained = read(&source)?;
+    if retained["run_id"] != current["run_id"]
+        || retained["creator_main_session_id"] != current["creator_main_session_id"]
+        || retained["revision"] != number
+        || !matches!(
+            retained["status"].as_str(),
+            Some("completed" | "needs_decision" | "incomplete")
+        )
+    {
+        return Ok(None);
+    }
+    let artifact = if let Some(artifact) = retained["artifact"].as_str() {
+        Some(PathBuf::from(artifact))
+    } else {
+        retained["result"].as_str().and_then(|path| {
+            Path::new(path)
+                .strip_prefix(run)
+                .ok()
+                .map(Path::to_path_buf)
+        })
+    };
+    Ok((artifact.as_deref() == Some(relative)).then_some((source, number)))
+}
+
 fn view(dir: &Path, record: &Value, request: &Value, anchor: &Path) -> Result<Value, String> {
     let run = record_run(record, anchor)?;
     let result = if dir.join("result.json").exists() {
@@ -1857,7 +2049,7 @@ fn view(dir: &Path, record: &Value, request: &Value, anchor: &Path) -> Result<Va
         manifest["descendants"] = crate::subteam::summary(&run)?;
     }
     let accounting_gap = owner == "unknown" && result.is_null();
-    let (target, target_error) = match crate::app_server::control_target(&run) {
+    let (target, target_error) = match crate::runtime::control_target(&run) {
         Ok(target) => (Some(target), None),
         Err(error) => (None, Some(error)),
     };
@@ -1872,15 +2064,59 @@ fn view(dir: &Path, record: &Value, request: &Value, anchor: &Path) -> Result<Va
         };
         let path = storage::managed_path(&run, &relative)?;
         existing(&path, false)?;
+        let handoff = handoff_revision(&run, &relative, &manifest)?;
+        let maximum = if handoff.is_some() {
+            HANDOFF_LIMIT
+        } else {
+            LIMIT / 8
+        };
         let mut bytes = Vec::new();
         File::open(path)
-            .and_then(|f| f.take(LIMIT / 8 + 1).read_to_end(&mut bytes))
+            .and_then(|f| f.take(maximum + 1).read_to_end(&mut bytes))
             .map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > LIMIT / 8 {
-            return Err("remote file read exceeds 2 MiB UTF-8 limit".into());
+        if bytes.len() as u64 > maximum {
+            return Err(format!(
+                "remote read exceeds {} MiB UTF-8 limit",
+                maximum / 1024 / 1024
+            ));
         }
-        view["content"] =
-            json!(String::from_utf8(bytes).map_err(|_| "remote read requires UTF-8")?);
+        let content = String::from_utf8(bytes).map_err(|_| "remote read requires UTF-8")?;
+        if request["args"][0] == "read-chunk" || content.len() > (LIMIT / 8) as usize {
+            let (_, revision) = handoff.as_ref().ok_or("file is not an accepted handoff")?;
+            let revision = *revision;
+            if handoff_revision(&run, &relative, &read(&run.join("manifest.json"))?)? != handoff {
+                return Err("handoff changed during read; retry observation".into());
+            }
+            // Keep JSON escaping (up to six bytes per input byte) and manifest
+            // size out of chunk responses. The 16 MiB transport bound is unchanged.
+            let mut chunk = json!({"accepted":true,"request_id":record["envelope"]["grant"]["request_id"],
+                "run_id":run.file_name().unwrap().to_string_lossy(),"manifest":null,
+                "chunked":true,"total_bytes":content.len(),"revision":revision});
+            if request["args"][0] == "read-chunk" {
+                if request["args"][2]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    != Some(revision)
+                {
+                    return Err("handoff revision changed; retry observation".into());
+                }
+                let offset = request["args"][1]
+                    .as_str()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or("invalid handoff offset")?;
+                if offset >= content.len() || !content.is_char_boundary(offset) {
+                    return Err("invalid handoff byte boundary".into());
+                }
+                let mut end = (offset + CONTENT_CHUNK).min(content.len());
+                while !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                chunk["content"] = json!(&content[offset..end]);
+                chunk["next_offset"] = json!(end);
+            }
+            return Ok(chunk);
+        }
+        view["content"] = json!(content);
     }
     Ok(view)
 }
@@ -1901,7 +2137,88 @@ fn validate_target(target: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn steer_literals_are_not_host_selection_or_subteam_authority() {
+        for args in [
+            vec![
+                "steer",
+                "--completion-gate=done",
+                "--task",
+                "--allow-subteam",
+            ],
+            vec![
+                "steer",
+                "--completion-gate",
+                "--host=gate-data",
+                "--",
+                "--allow-subteam",
+            ],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            let (task, _) = super::control_task(&args).unwrap();
+            assert_eq!(task, "--allow-subteam");
+            assert!(!super::has_host(&args));
+            assert!(!super::requests_subteam(&args));
+        }
+        assert!(!super::has_host(&[]));
+        assert!(!super::requests_subteam(&[]));
+    }
+
     use super::*;
+    #[test]
+    fn native_nss_record_must_bind_exact_effective_uid() {
+        assert_eq!(
+            passwd_user(b"nss-user:*:554358:459170:Name:/:/bin/bash\n", 554358).unwrap(),
+            "nss-user"
+        );
+        for record in [
+            b"forged:*:1:2::/:/bin/sh\n".as_slice(),
+            b"user\n",
+            b"user:*:554358:1::/:/bin/sh\nother:*:554358:1::/:/bin/sh\n",
+            b"bad user:*:554358:1::/:/bin/sh\n",
+        ] {
+            assert!(passwd_user(record, 554358).is_err());
+        }
+    }
+    #[test]
+    fn native_domain_accounts_are_exact_uid_bound_data() {
+        for name in ["user@example.org", r"DOMAIN\user", "user+tag", "研究者"] {
+            let record = format!("{name}:*:554358:459170:Name:/:/bin/bash\n");
+            assert_eq!(passwd_account(record.as_bytes(), 554358).unwrap().0, name);
+            assert!(passwd_account(record.as_bytes(), 1).is_err());
+        }
+        for name in [
+            "bad\nuser",
+            "bad\0user",
+            "bad user",
+            "-option",
+            "bad;user",
+            "bad'quote",
+        ] {
+            assert!(account_name(name).is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn nss_home_is_an_existing_physical_directory() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("nss-home-{}", random().unwrap()));
+        crate::private_dir(&root).unwrap();
+        let physical = root.join("physical");
+        crate::private_dir(&physical).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let record = format!(
+            "nss-user:*:554358:459170:Name:{}:/bin/bash\n",
+            alias.display()
+        );
+        let account = passwd_account(record.as_bytes(), 554358).unwrap();
+        let result = account.1 == physical;
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(result, "NSS home was not canonicalized");
+    }
     struct Fixture {
         root: PathBuf,
         authority: PathBuf,
@@ -2037,14 +2354,14 @@ mod tests {
     fn signed_run_preserves_tier_selection_subteam_and_task_boundaries() {
         let f = Fixture::new();
         for (selection, expected) in [
-            (vec![], crate::service_tier::Tier::Standard),
+            (vec![], crate::profile::service_tier::Tier::Standard),
             (
                 vec!["--service-tier", "fast"],
-                crate::service_tier::Tier::Fast,
+                crate::profile::service_tier::Tier::Fast,
             ),
             (
                 vec!["--service-tier", "standard"],
-                crate::service_tier::Tier::Standard,
+                crate::profile::service_tier::Tier::Standard,
             ),
         ] {
             let mut grant = f.grant("submit");
@@ -2383,7 +2700,7 @@ mod tests {
         let old = control_target(1);
         for op in ["steer", "interrupt"] {
             assert!(
-                crate::app_server::control_bound(&run, op, "fixture", Some("fixture"), &old)
+                crate::runtime::control_bound(&run, op, "fixture", Some("fixture"), &old)
                     .unwrap_err()
                     .contains("stale")
             );
@@ -2396,7 +2713,7 @@ mod tests {
                 .contains("stale")
         );
         assert_eq!(read(&run.join("tree.json")).unwrap()["blocked"], false);
-        let target = crate::app_server::control_target(&run).unwrap();
+        let target = crate::runtime::control_target(&run).unwrap();
         assert!(target.get("token").is_none());
     }
     #[cfg(unix)]
@@ -2457,7 +2774,7 @@ mod tests {
         let grant = control_grant(&f, "steer");
         let verified = verify(&sign_with(&grant, &f.authority).unwrap(), &f.anchor).unwrap();
         install(&verified).unwrap();
-        let error = crate::app_server::control_bound(
+        let error = crate::runtime::control_bound(
             &run,
             "steer",
             "fixture",
@@ -2544,6 +2861,7 @@ mod tests {
     fn capability_metadata_request_is_identity_only_and_cannot_select_effects() {
         let f = Fixture::new();
         let cli = Client {
+            diagnostics: RefCell::default(),
             endpoint: f.grant("read")["endpoint"].clone(),
             authority: f.authority.clone(),
             state: f.root.join("missing-state"),
@@ -2650,5 +2968,5 @@ mod tests {
         );
     }
     #[cfg(unix)]
-    include!("remote_client_persistence_tests.rs");
+    include!("remote/tests/client_persistence.rs");
 }

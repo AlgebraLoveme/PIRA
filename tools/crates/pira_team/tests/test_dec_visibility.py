@@ -10,14 +10,12 @@ from pathlib import Path
 import subprocess
 import unittest
 
-import test_team
+from team_fixture import TeamFixture
 
 
 class DecVisibilityTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.fixture = test_team.TeamTests()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.doCleanups)
+        self.fixture = TeamFixture(self.addCleanup)
         self.root = self.fixture.root
         self.env = self.fixture.env
         self.env.pop("PIRA_DEC_WORKSPACE_DIR", None)

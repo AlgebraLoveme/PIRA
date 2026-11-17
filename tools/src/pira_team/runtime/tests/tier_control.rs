@@ -1,5 +1,5 @@
 //! Model-free integration of the actual owner loop, schema validator and control socket.
-use super::codex_turn::turn;
+use super::codex::turn;
 use super::*;
 
 #[test]
@@ -25,7 +25,7 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
     fs::write(root.join("policy.md"), "fixture policy").unwrap();
     fs::write(root.join("phase.md"), "fixture phase").unwrap();
     let fixture = root.join("codex-fixture");
-    fs::write(&fixture, include_str!("tier_fixture.py")).unwrap();
+    fs::write(&fixture, include_str!("fixtures/tier.py")).unwrap();
     fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
     let mut options = crate::parse_using(
         &[
@@ -48,7 +48,12 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
         },
     )
     .unwrap();
-    options.authentication = crate::authentication::Authentication::SelectedCaller(fixture);
+    options.temp_workspace = Some(root.join("scratch"));
+    options.authentication = crate::authentication::Authentication::SelectedCaller(
+        fixture,
+        crate::authentication::provider::Config::default(),
+        None,
+    );
     let (done, finished) = mpsc::channel();
     let owner_root = root.clone();
     let owner = std::thread::spawn(move || {
@@ -56,15 +61,15 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
             "run_id":"fixture","repairs":0,"service_tier":"standard"});
         lifecycle::save_json(&owner_root.join("tree.json"), &json!({"version":1,"epoch":0,"blocked":false,
             "members":{owner_root.file_name().unwrap().to_str().unwrap():{"active":true,"revision":1,"blocked":false}}})).unwrap();
-        let outcome = turn(
-            &options,
-            &owner_root,
-            &owner_root,
-            "fixture",
-            &mut manifest,
-            &owner_root.join("handoff"),
-            (false, false, false, false),
-        );
+        let outcome = turn(TurnRequest {
+            options: &options,
+            run: &owner_root,
+            dir: &owner_root,
+            task: "fixture",
+            manifest: &mut manifest,
+            handoff: &owner_root.join("handoff"),
+            guidance: (false, false, false, false),
+        });
         done.send((outcome, manifest)).unwrap();
     });
     // Bounded readiness observation of task-local fixture metadata, never a real worker.
@@ -143,8 +148,8 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
     assert_eq!(manifest["service_tier"], "standard");
     let retained = lifecycle::read_json(&root.join("manifest.json")).unwrap();
     assert_eq!(
-        crate::service_tier::Tier::retained(&retained).unwrap(),
-        crate::service_tier::Tier::Standard
+        crate::profile::service_tier::Tier::retained(&retained).unwrap(),
+        crate::profile::service_tier::Tier::Standard
     );
     let requests: Vec<Value> = fs::read_to_string(root.join("requests.jsonl"))
         .unwrap()
@@ -236,7 +241,7 @@ fn closed_stdin_probe(
     fs::write(root.join("phase.md"), "fixture phase").unwrap();
     fs::write(root.join("close-stdin"), "fixture input half-close").unwrap();
     let fixture = root.join("codex-fixture");
-    fs::write(&fixture, include_str!("tier_fixture.py")).unwrap();
+    fs::write(&fixture, include_str!("fixtures/tier.py")).unwrap();
     fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
     let mut options = crate::parse_using(
         &[
@@ -259,7 +264,12 @@ fn closed_stdin_probe(
         },
     )
     .unwrap();
-    options.authentication = crate::authentication::Authentication::SelectedCaller(fixture);
+    options.temp_workspace = Some(root.join("scratch"));
+    options.authentication = crate::authentication::Authentication::SelectedCaller(
+        fixture,
+        crate::authentication::provider::Config::default(),
+        None,
+    );
     let (done, finished) = mpsc::channel();
     let owner_root = root.clone();
     let owner = std::thread::spawn(move || {
@@ -267,15 +277,15 @@ fn closed_stdin_probe(
             "run_id":"fixture","repairs":0,"service_tier":"standard"});
         lifecycle::save_json(&owner_root.join("tree.json"), &json!({"version":1,"epoch":0,"blocked":false,
             "members":{owner_root.file_name().unwrap().to_str().unwrap():{"active":true,"revision":1,"blocked":false}}})).unwrap();
-        let outcome = turn(
-            &options,
-            &owner_root,
-            &owner_root,
-            "fixture",
-            &mut manifest,
-            &owner_root.join("handoff"),
-            (false, false, false, false),
-        );
+        let outcome = turn(TurnRequest {
+            options: &options,
+            run: &owner_root,
+            dir: &owner_root,
+            task: "fixture",
+            manifest: &mut manifest,
+            handoff: &owner_root.join("handoff"),
+            guidance: (false, false, false, false),
+        });
         done.send((outcome, manifest)).unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(10);
