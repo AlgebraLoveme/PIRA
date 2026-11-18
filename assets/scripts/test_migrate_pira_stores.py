@@ -75,6 +75,47 @@ class MigrationTests(unittest.TestCase):
             self.plan("pira_ctx")
         self.assertEqual(migration.inventory(self.destination, tool="pira_ctx"), before)
 
+    def test_standalone_cli_defaults_to_readonly_and_requires_explicit_apply(self):
+        # Exercise the actual script/exit path, with Linux default discovery in a
+        # disposable home on every host; never touch Windows HKCU or user profiles.
+        source = self.root / ".cache/pira/ctx/record.piractx"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"retained capture bytes")
+        destination = self.root / "data/pira/ctx/record.piractx"
+        profile = self.root / ".profile"
+        profile.write_bytes(b"# unrelated profile text\n")
+        script = Path(migration.__file__).resolve()
+        code = ("import runpy, sys\nfrom unittest.mock import patch\n"
+                f"sys.path.insert(0, {str(script.parent)!r})\n"
+                "import setup_pira_stores as stores\n"
+                "script = sys.argv.pop(1)\n"
+                "with patch.object(stores.sys, 'platform', 'linux'):\n"
+                "    runpy.run_path(script, run_name='__main__')\n")
+        env = {**native_ctx_environment(self.root), "SHELL": "/bin/sh",
+               "XDG_DATA_HOME": str(self.root / "data")}
+        def invoke(*mode):
+            return subprocess.run([sys.executable, "-B", "-c", code, str(script),
+                                   "--tool", "pira_ctx", *mode], cwd=self.root,
+                                  env=env, capture_output=True, text=True, timeout=20)
+        before = migration.inventory(self.root)
+        preview = invoke()
+        self.assertEqual(preview.returncode, 0, preview.stdout + preview.stderr)
+        self.assertEqual(migration.inventory(self.root), before)
+        verification = invoke("--verify")
+        self.assertNotEqual(verification.returncode, 0)
+        self.assertIn("verification", verification.stderr)
+        self.assertEqual(migration.inventory(self.root), before)
+        applied = invoke("--apply")
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        self.assertEqual(destination.read_bytes(), b"retained capture bytes")
+        self.assertEqual(source.read_bytes(), b"retained capture bytes")
+        self.assertTrue(profile.read_bytes().startswith(b"# unrelated profile text\n"))
+        self.assertIn(str(destination.parent), profile.read_text())
+        after = migration.inventory(self.root)
+        verification = invoke("--verify")
+        self.assertEqual(verification.returncode, 0, verification.stdout + verification.stderr)
+        self.assertEqual(migration.inventory(self.root), after)
+
     def test_identical_destination_addition_after_preflight_is_rejected(self):
         self.put(self.source, "record")
         self.put(self.destination, "record")

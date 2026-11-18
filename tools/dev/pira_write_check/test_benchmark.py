@@ -1,4 +1,4 @@
-"""Fresh-directory protection; no benchmark children or large fixtures."""
+"""Isolated filesystem and process-lifecycle checks; no benchmark workloads."""
 from __future__ import annotations
 
 import contextlib
@@ -6,6 +6,11 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -90,6 +95,75 @@ class WorkDirectoryTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(work.stat().st_mode & 0o077, 0)
             self.assertEqual(binary.read_bytes(), b"not executed")
+
+
+@unittest.skipUnless(all(hasattr(os, name) for name in
+                         ("fork", "waitid", "WNOWAIT", "killpg")),
+                     "requires POSIX process groups and waitid(WNOWAIT)")
+class RealCommunicationTests(unittest.TestCase):
+    def test_timeout_terminates_descendant_and_reaps_direct_child(self):
+        native_popen = subprocess.Popen
+        owned = []
+        probes = []
+        with tempfile.TemporaryDirectory(prefix="write-process-") as temporary:
+            ready = Path(temporary) / "ready"
+            # The descendant holds stderr open until death. Self-expiry also
+            # bounds fixture lifetime if a regression kills only its parent.
+            child_code = """import os, pathlib, sys, time
+if os.fork() == 0:
+    pathlib.Path(sys.argv[1]).write_text("ready")
+time.sleep(10)
+"""
+
+            def start(*args, **kwargs):
+                process = native_popen(*args, **kwargs)
+                owned.append(process)
+                probes.append(os.dup(process.stderr.fileno()))
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("descendant did not become ready")
+                    time.sleep(0.01)
+                return process
+
+            try:
+                # Instrument startup only: communicate/wait and all OS lifecycle
+                # operations remain real; timeout begins after descendant readiness.
+                with mock.patch.object(benchmark.subprocess, "Popen", side_effect=start):
+                    before = time.monotonic()
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        benchmark.run_bounded(
+                            [sys.executable, "-B", "-c", child_code, str(ready)],
+                            subprocess.DEVNULL, 0.1)
+                self.assertLess(time.monotonic() - before, 8)
+                process, = owned
+                self.assertIsNotNone(process.returncode)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(process.pid, os.WNOHANG)
+                self.assertTrue(select.select(probes, [], [], 3)[0],
+                                "descendant still holds stderr open")
+                self.assertEqual(os.read(probes[0], 1), b"")
+            finally:
+                for process in owned:
+                    # Never signal a group after its leader has been reaped.
+                    if process.returncode is None:
+                        try:
+                            os.waitid(os.P_PID, process.pid,
+                                      os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        except ChildProcessError:
+                            pass
+                        else:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=3)
+                    process.stderr.close()
+                for probe in probes:
+                    try:
+                        # Also await fixture self-expiry if only the leader died.
+                        if not select.select([probe], [], [], 11)[0]:
+                            self.fail("fixture stderr remained open after self-expiry")
+                    finally:
+                        os.close(probe)
 
 
 class CommunicationTests(unittest.TestCase):

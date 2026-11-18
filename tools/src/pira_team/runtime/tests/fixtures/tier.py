@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Model-free peer for the ignored owner-loop tier test; never accesses auth."""
+"""Model-free peer for the owner-loop tier tests; never accesses auth."""
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
 import threading
 
 if "generate-json-schema" in sys.argv:
     output = Path(sys.argv[sys.argv.index("--out") + 1])
-    shutil.copytree(os.environ["PIRA_TIER_SCHEMA"], output, dirs_exist_ok=True)
+    # tier_fixture prepends the shared deterministic schema exporter.
+    write_schemas(output, json.loads(Path(__file__).with_name("fixture-contract.json").read_text()))
     raise SystemExit(0)
 
+# A failed assertion in the Rust driver must not leave an indefinite peer.
+watchdog = threading.Timer(20, lambda: os._exit(10))
+watchdog.daemon = True
+watchdog.start()
 root = Path.cwd()
 os.mkfifo(root / "finish.fifo")
 lock = threading.Lock()

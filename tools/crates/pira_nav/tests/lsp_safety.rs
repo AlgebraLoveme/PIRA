@@ -1,10 +1,11 @@
 #![cfg(unix)]
+mod common;
 
 use std::{
     ffi::CString,
     fs,
     path::PathBuf,
-    process::{Command, Output, Stdio},
+    process::{Child, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
@@ -31,9 +32,8 @@ impl Fixture {
 
     fn run(&self, args: &[&str]) -> (Output, Duration) {
         let start = Instant::now();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
+        let mut child = common::command(&self.0)
             .args(args)
-            .current_dir(&self.0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -117,6 +117,99 @@ fn exited_leader_does_not_leave_descendant_pipes_blocking_cleanup() {
     let (output, elapsed) = f.lsp("descendant");
     assert!(output.status.success(), "{output:?}");
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    wait_until(
+        "owned descendant termination",
+        Duration::from_millis(500),
+        || descendant_exited(&f),
+    );
+}
+
+fn descendant_exited(f: &Fixture) -> bool {
+    use std::os::fd::AsRawFd;
+    let lock = fs::File::open(f.0.join("descendant.lock")).unwrap();
+    // SAFETY: this descriptor belongs to this fixture; a successful lock is
+    // released when the file closes. No PIDs are probed or signalled here.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return true;
+    }
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
+    false
+}
+
+fn wait_until(description: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct RunningCli(Option<Child>);
+impl Drop for RunningCli {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[test]
+fn catchable_cli_signals_cancel_pending_lsp_work_and_terminate_owned_descendants() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let f = Fixture::new();
+        let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/lsp_safety_server.py");
+        let child = common::command(&f.0)
+            .args([
+                "definition",
+                "source.py:2:5",
+                "--lsp",
+                "/usr/bin/env",
+                "--lsp-arg",
+                "python3",
+                "--lsp-arg",
+            ])
+            .arg(server)
+            .args(["--lsp-arg", "signal"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut cli = RunningCli(Some(child));
+        wait_until(
+            "pending request and locked descendant",
+            Duration::from_secs(3),
+            || f.0.join("ready").is_file(),
+        );
+        assert!(
+            !descendant_exited(&f),
+            "peer must be alive before cancellation"
+        );
+        let child = cli.0.as_mut().unwrap();
+        // SAFETY: only this test's unreaped Navigator child receives the signal.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        wait_until("Navigator cancellation", Duration::from_secs(2), || {
+            child.try_wait().unwrap().is_some()
+        });
+        let output = cli.0.take().unwrap().wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(128 + signal),
+            "signal={signal}: {output:?}"
+        );
+        wait_until(
+            "owned descendant termination",
+            Duration::from_millis(500),
+            || descendant_exited(&f),
+        );
+    }
 }
 
 #[test]
@@ -212,6 +305,10 @@ fn detached_pipe_holder_does_not_delay_cleanup_or_require_signalling_it() {
     let (output, elapsed) = f.lsp("detached");
     assert!(output.status.success(), "{output:?}");
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert!(
+        !descendant_exited(&f),
+        "detached descendants must not be killed"
+    );
 }
 
 #[test]

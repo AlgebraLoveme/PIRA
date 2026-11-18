@@ -162,6 +162,7 @@ class PackageGitHubReleaseTests(unittest.TestCase):
             )
             for tool, version in versions.items():
                 self.assertEqual(index["tools"][tool]["version"], version)
+                self.assertEqual(set(index["tools"][tool]["binaries"]), set(release.PLATFORMS))
                 for platform_key, record in index["tools"][tool]["binaries"].items():
                     asset = output / record["asset"]
                     self.assertTrue(asset.is_file())
@@ -170,6 +171,7 @@ class PackageGitHubReleaseTests(unittest.TestCase):
                     self.assertEqual(release.sha256_file(asset), record["asset_sha256"])
                     self.assertEqual(asset.stat().st_size, record["asset_size"])
                     data = gzip.decompress(asset.read_bytes())
+                    self.assertEqual(data, f"{tool}:{version}:{platform_key}".encode())
                     self.assertEqual(hashlib.sha256(data).hexdigest(), record["sha256"])
                     self.assertEqual(len(data), record["size"])
 

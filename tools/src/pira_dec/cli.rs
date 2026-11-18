@@ -643,12 +643,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_search_limit() {
-        let error = parse_args(&args(&[
-            "search", "--field", "context", "--regex", "x", "--limit", "0",
-        ]))
-        .unwrap_err();
-        assert!(error.contains("1 through 1000"));
+    fn browse_limits_accept_the_upper_boundary_and_reject_the_next_value() {
+        for command in ["list", "search", "export"] {
+            for (limit, accepted) in [("0", false), ("1", true), ("1000", true), ("1001", false)] {
+                let mut argv = vec![command, "--limit", limit];
+                match command {
+                    "search" => argv.push("needle"),
+                    "export" => argv.extend(["--output", "out.html"]),
+                    _ => {}
+                }
+                let result = parse_args(&args(&argv));
+                assert_eq!(result.is_ok(), accepted, "{argv:?}: {result:?}");
+                if let Err(error) = result {
+                    assert!(error.contains("1000"), "{argv:?}: {error}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -688,11 +698,9 @@ mod tests {
     }
 
     #[test]
-    fn list_rejects_search_filters_and_invalid_limits() {
+    fn list_rejects_search_filters() {
         let error = parse_args(&args(&["list", "--field", "context"])).unwrap_err();
         assert!(error.contains("unknown list argument"));
-        let error = parse_args(&args(&["list", "--limit", "0"])).unwrap_err();
-        assert!(error.contains("1 through 1000"));
     }
 
     #[test]
@@ -773,9 +781,15 @@ mod tests {
 
     #[test]
     fn literal_search_accepts_filters_and_dash_prefixed_query() {
-        for argv in [
-            vec!["search", "Cache[1]", "--since", "7d", "--limit", "5"],
-            vec!["search", "--since", "7d", "--limit", "5", "--", "--help"],
+        for (argv, expected) in [
+            (
+                vec!["search", "Cache[1]", "--since", "7d", "--limit", "5"],
+                "Cache[1]",
+            ),
+            (
+                vec!["search", "--since", "7d", "--limit", "5", "--", "--help"],
+                "--help",
+            ),
         ] {
             let config = parse_args(&args(&argv)).unwrap();
             let Command::Search {
@@ -789,7 +803,7 @@ mod tests {
                 panic!("expected search command");
             };
             assert!(field.is_none());
-            assert!(pattern.is_some());
+            assert_eq!(pattern.as_deref(), Some(expected));
             assert_eq!(since.as_deref(), Some("7d"));
             assert_eq!(limit, 5);
         }

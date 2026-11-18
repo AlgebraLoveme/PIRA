@@ -151,17 +151,26 @@ fn long_line_middles_are_searched_and_oversized_lines_are_disclosed() {
             "{text}"
         );
     }
-    // One byte above the 16 MiB search-line ceiling; no oversized stress fixture needed.
-    let (id, _) = capture_fixture(
-        &sandbox,
-        "import sys; sys.stdout.write('x'*(16*1024*1024+1))",
-    );
-    let output = retrieve(&sandbox, "search", &[&id, "absent", "--regex"]);
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        text.contains("complete=0") && text.contains("skipped_lines=1"),
-        "{text}"
-    );
+    // Inclusive search ceiling and its first excluded byte use the same marker.
+    for excess in [0, 1] {
+        let code = format!("import sys;sys.stdout.write('x'*(16*1024*1024-8+{excess})+'BOUNDARY')");
+        let (id, _) = capture_fixture(&sandbox, &code);
+        let output = retrieve(&sandbox, "search", &[&id, "BOUNDARY", "--regex"]);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        if excess == 0 {
+            assert!(
+                text.contains("1 hits") && text.contains("BOUNDARY"),
+                "{text}"
+            );
+            assert!(!text.contains("complete=0"), "{text}");
+        } else {
+            assert!(
+                text.contains("complete=0") && text.contains("skipped_lines=1"),
+                "{text}"
+            );
+        }
+    }
 }
 
 #[test]

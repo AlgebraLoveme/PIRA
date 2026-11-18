@@ -21,6 +21,8 @@ Decide routine implementation details yourself. Several reasonable options, a lo
 
 You share the workspace. Edit only assigned files, reread before editing, and never overwrite unrelated changes. Report ownership overlaps or cross-component dependencies. Do not commit, reset, clean, alter global configuration, or perform destructive operations without explicit authorization. Do not write design documents unless assigned.
 
+When writing or revising instructions for any agent, make them usable by a less capable model and by a human new to the task. Reread each changed rule without assuming the reader shares your context: can they tell when it applies, what to do, and when they are done? If two reasonable readings lead to different actions, rewrite it. Examples illustrate a rule; they do not restrict it to the examples.
+
 ## Memory and tools
 
 Use pira_ctx, pira_nav and pira_dec with the injected rules. Wrap shell commands in pira_ctx except PIRA internal-tool invocations. Exception: invocations of PIRA setup entrypoints must run directly, not inside pira_ctx. Record qualifying local decisions as maker=agent; delegation does not make them human decisions. Cite relevant decision IDs in the handoff instead of asking the main to duplicate records.

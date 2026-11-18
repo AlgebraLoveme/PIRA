@@ -2,10 +2,31 @@
 use super::codex::turn;
 use super::*;
 
-#[test]
-#[ignore = "requires Python 3 and PIRA_TIER_SCHEMA pointing to generated experimental schemas; no models/auth"]
-fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates() {
+fn tier_fixture(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    fs::write(
+        root.join("fixture-contract.json"),
+        include_str!("../../backend_contract.json"),
+    )
+    .unwrap();
+    let fixture = root.join("codex-fixture");
+    fs::write(
+        &fixture,
+        concat!(
+            "#!/usr/bin/env python3\n",
+            include_str!("../../../../crates/pira_team/tests/backend_fixture.py"),
+            "\n",
+            include_str!("fixtures/tier.py")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+    fixture
+}
+
+#[test]
+fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates() {
+    use std::os::unix::fs::OpenOptionsExt;
     let root = std::env::temp_dir().join(format!(
         "tier-owner-{}-{}",
         std::process::id(),
@@ -24,9 +45,7 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
     .unwrap();
     fs::write(root.join("policy.md"), "fixture policy").unwrap();
     fs::write(root.join("phase.md"), "fixture phase").unwrap();
-    let fixture = root.join("codex-fixture");
-    fs::write(&fixture, include_str!("fixtures/tier.py")).unwrap();
-    fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = tier_fixture(&root);
     let mut options = crate::parse_using(
         &[
             "run",
@@ -129,6 +148,7 @@ fn tier_owner_loop_preserves_job_after_rejected_unknown_and_unavailable_updates(
         assert!(!root.join("job-finished").exists());
         fs::OpenOptions::new()
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(root.join("finish.fifo"))
             .unwrap()
             .write_all(b"finish")
@@ -232,7 +252,7 @@ fn closed_stdin_probe(
     control: Option<&str>,
     finish: &str,
 ) -> (Value, Turn, bool, Value, Vec<Value>) {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::OpenOptionsExt;
     let root = closed_stdin_fixture_dir();
     for name in ["codex-home", "scratch"] {
         fs::create_dir(root.join(name)).unwrap();
@@ -240,9 +260,7 @@ fn closed_stdin_probe(
     fs::write(root.join("policy.md"), "fixture policy").unwrap();
     fs::write(root.join("phase.md"), "fixture phase").unwrap();
     fs::write(root.join("close-stdin"), "fixture input half-close").unwrap();
-    let fixture = root.join("codex-fixture");
-    fs::write(&fixture, include_str!("fixtures/tier.py")).unwrap();
-    fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = tier_fixture(&root);
     let mut options = crate::parse_using(
         &[
             "run",
@@ -351,6 +369,7 @@ fn closed_stdin_probe(
         }
         fs::OpenOptions::new()
             .write(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(root.join("finish.fifo"))
             .unwrap()
             .write_all(finish.as_bytes())
@@ -374,7 +393,6 @@ fn closed_stdin_probe(
 }
 
 #[test]
-#[ignore = "requires Python 3 and PIRA_TIER_SCHEMA; model-free actual owner loop"]
 fn closed_stdin_no_tier_workload_completes() {
     let (_, outcome, completed, _, _) = closed_stdin_probe(None, "finish");
     assert_eq!(outcome.status, "completed");
@@ -383,7 +401,6 @@ fn closed_stdin_no_tier_workload_completes() {
 }
 
 #[test]
-#[ignore = "requires Python 3 and PIRA_TIER_SCHEMA; model-free actual owner loop"]
 fn closed_stdin_tier_failure_preserves_active_workload() {
     let (receipt, outcome, completed, manifest, requests) =
         closed_stdin_probe(Some("tier"), "finish");
@@ -415,7 +432,6 @@ fn closed_stdin_tier_failure_preserves_active_workload() {
 }
 
 #[test]
-#[ignore = "requires Python 3 and PIRA_TIER_SCHEMA; model-free actual owner loop"]
 fn closed_stdin_ordinary_write_failure_remains_fatal() {
     let (_, outcome, completed, _, _) = closed_stdin_probe(Some("steer"), "finish");
     assert_eq!(outcome.status, "failed");
@@ -424,7 +440,6 @@ fn closed_stdin_ordinary_write_failure_remains_fatal() {
 }
 
 #[test]
-#[ignore = "requires Python 3 and PIRA_TIER_SCHEMA; model-free actual owner loop"]
 fn closed_stdin_tier_failure_does_not_hide_later_backend_exit() {
     let (_, outcome, completed, _, _) = closed_stdin_probe(Some("tier"), "exit");
     assert_eq!(outcome.status, "failed");

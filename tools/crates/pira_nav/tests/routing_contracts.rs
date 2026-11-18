@@ -1,3 +1,4 @@
+mod common;
 use serde_json::json;
 use std::{
     fs,
@@ -74,9 +75,8 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_pira_nav"));
+        let mut command = common::command(&self.project);
         command
-            .current_dir(&self.project)
             .args(args)
             .env("PATH", &self.bin)
             .env("NAV_ROUTING_MARKER", &self.marker);

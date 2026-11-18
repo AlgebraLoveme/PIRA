@@ -306,6 +306,40 @@ class MixedReleaseTests(unittest.TestCase):
                 with self.assertRaises(package.PackageError):
                     self.receipts()
 
+    def test_retained_lineage_accepts_sixteen_releases_and_rejects_seventeen(self):
+        # The documented bound counts releases including the original build.
+        tool = package.TOOLS[-1]
+        previous = self.origin
+        for depth in range(2, 18):
+            index = copy.deepcopy(previous["index"])
+            index.update(tag=f"pira-tools-chain-{depth}", source_sha_scope="assembly")
+            for record in index["tools"].values():
+                record["build_source_sha"] = self.source
+            assets = {asset["name"]: asset for asset in previous["release"]["assets"]}
+            index_asset = assets["pira-tools-release.json"]
+            record = index["tools"][tool]
+            record["retained_from"] = {
+                "release_id": previous["release"]["id"], "tag": previous["index"]["tag"],
+                "assembly_source_sha": self.source, "index_asset_id": index_asset["id"],
+                "index_sha256": self.sha(self.blobs[index_asset["id"]]),
+            }
+            for binary in record["binaries"].values():
+                binary["origin_asset_id"] = assets[binary["asset"]]["id"]
+            files = {name: self.blobs[asset["id"]] for name, asset in assets.items()
+                     if name != "pira-tools-release.json"}
+            previous = self.add_origin(index, files)
+            if depth >= 16:
+                requests = self.requests([tool])
+                requests[tool]["tag"] = index["tag"]
+                with self.subTest(releases=depth):
+                    if depth == 16:
+                        receipts = package.resolve_retained(self.repository, requests)
+                        self.assertEqual(receipts[tool]["record"]["build_source_sha"], self.source)
+                        self.assertEqual(receipts[tool]["release_id"], previous["release"]["id"])
+                    else:
+                        with self.assertRaisesRegex(package.PackageError, "overlong retained provenance"):
+                            package.resolve_retained(self.repository, requests)
+
     def test_only_full_source_commit_ids_can_be_packaged(self):
         for source in ("b" * 41, "b" * 63, None):
             with self.subTest(source=source), self.assertRaisesRegex(package.PackageError, "invalid source commit SHA"):

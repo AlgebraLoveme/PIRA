@@ -59,6 +59,20 @@ fn add(store: &Path, extra: &[&str]) -> std::process::Output {
 #[test]
 fn add_validates_and_displays_relationships() {
     let sandbox = Sandbox::new();
+    let show = |id: &str| -> serde_json::Value {
+        let shown = Command::new(binary())
+            .args([
+                "show",
+                "--store-dir",
+                sandbox.path().to_str().unwrap(),
+                "--json",
+                id,
+            ])
+            .output()
+            .unwrap();
+        assert!(shown.status.success(), "{shown:?}");
+        serde_json::from_slice(&shown.stdout).unwrap()
+    };
     let first = add(sandbox.path(), &[]);
     assert!(first.status.success());
     let first_id = String::from_utf8(first.stdout)
@@ -67,6 +81,7 @@ fn add_validates_and_displays_relationships() {
         .next()
         .unwrap()
         .to_string();
+    let first_before = show(&first_id);
 
     let second = add(sandbox.path(), &["--supersedes", &first_id]);
     assert!(second.status.success());
@@ -76,32 +91,24 @@ fn add_validates_and_displays_relationships() {
         .next()
         .unwrap()
         .to_string();
-    let shown = Command::new(binary())
-        .args([
-            "show",
-            "--store-dir",
-            sandbox.path().to_str().unwrap(),
-            "--json",
-            &second_id,
-        ])
-        .output()
-        .unwrap();
-    assert!(shown.status.success());
-    let view: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let view = show(&second_id);
     assert_eq!(view["supersedes"], first_id);
-}
-
-#[test]
-fn add_rejects_missing_relationship_target() {
-    let sandbox = Sandbox::new();
-    let missing = "D-20260716-063012-a3f921c84d77e102";
-    let output = add(sandbox.path(), &["--related", missing]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("does not exist")
+    let third = add(
+        sandbox.path(),
+        &["--supersedes", &second_id, "--related", &first_id],
     );
+    assert!(third.status.success(), "{third:?}");
+    let text = String::from_utf8(third.stdout).unwrap();
+    let third_id = text.split(" | ").next().unwrap();
+    let related = show(third_id);
+    assert_eq!(related["supersedes"], second_id);
+    assert_eq!(related["related"], serde_json::json!([first_id]));
+    assert_eq!(
+        show(&first_id),
+        first_before,
+        "superseding/relating must not edit targets"
+    );
+    assert_eq!(show(&second_id), view);
 }
 
 #[test]

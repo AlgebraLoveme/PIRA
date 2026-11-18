@@ -3,10 +3,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 BINARY, CASE = sys.argv[1:]
@@ -18,6 +20,26 @@ def run(store, operation, *args, env=None):
         env=env or ENV, capture_output=True, timeout=12,
     )
     return result
+
+
+def read_announcement(owner):
+    received = queue.Queue()
+    def read():
+        try:
+            received.put(owner.stderr.readline())
+        except Exception as error:
+            received.put(error)
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        value = received.get(timeout=5)
+    except queue.Empty as error:
+        if owner.poll() is None:
+            owner.kill()
+        owner.wait(timeout=5)
+        raise AssertionError("live announcement was not published within 5s") from error
+    if isinstance(value, Exception):
+        raise value
+    return value
 
 
 def ok(result):
@@ -171,11 +193,17 @@ def exec_case():
         result = run(store, "exec", path, "--code", code, env=env)
         assert ok(result) == "exact α bytes\n", (result.returncode, result.stdout, result.stderr)
         assert not list(Path(env["TMPDIR"]).glob(".pira_ctx-exec-*"))
-    # Multiple labels keep the same public eager snapshot/path API.
-    code = ("import sys;assert CAPTURE_NAMES==['first','second'];"
-            "assert CAPTURES['first']['bytes']==CAPTURES['second']['bytes'];"
-            "sys.stdout.buffer.write(b'snapshots\\n')")
-    result = run(store, "exec", "--input", "first=" + str(path), "--input", "second=" + str(path), "--code", code)
+    # Distinct inputs in reverse label order expose aliasing and list misalignment.
+    other = capture(store, "second Ω")
+    code = ("assert CAPTURE_NAMES==['second','first'];"
+            "assert MSGS==['second Ω\\n','exact α bytes\\n'];"
+            "assert MSG_BYTES_LIST==[s.encode('utf-8') for s in MSGS];"
+            f"assert MSG_IDS==[{other.stem!r},{path.stem!r}];"
+            "assert [CAPTURES[n]['id'] for n in CAPTURE_NAMES]==MSG_IDS;"
+            "assert all(CAPTURES[n]['state']=='complete' and CAPTURES[n]['exit']==0 and "
+            "CAPTURES[n]['generation']==0 for n in CAPTURE_NAMES);"
+            "assert 'MSG' not in globals();print('snapshots')")
+    result = run(store, "exec", "--input", "second=" + str(other), "--input", "first=" + str(path), "--code", code)
     assert ok(result) == "snapshots\n", (result.returncode, result.stdout, result.stderr)
 
 
@@ -270,7 +298,7 @@ def checkpoints():
         owner = subprocess.Popen([BINARY, "check", "--intent", "finite native checkpoint", "--", sys.executable, "-c", code],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            announcement = owner.stderr.readline()
+            announcement = read_announcement(owner)
             assert announcement.startswith(b"LIVE"), announcement
             path = next((store / "live").glob("*.live.json"))
             checkpoint = json.loads(path.read_bytes())
@@ -310,7 +338,7 @@ def interrupted():
                              env={**ENV, "PIRA_CTX_LIVE_CHECKPOINT_MS": "100"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(pipe_write,))
     os.close(pipe_write)
     try:
-        assert owner.stderr.readline().startswith(b"LIVE")
+        assert read_announcement(owner).startswith(b"LIVE")
         path = next((store / "live").glob("*.live.json"))
         owner.kill()
         owner.communicate(timeout=5)

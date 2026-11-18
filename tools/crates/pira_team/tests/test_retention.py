@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import statistics
 import subprocess
 import time
 import unittest
@@ -164,9 +163,7 @@ class RetentionTests(unittest.TestCase):
                 pass
         self.addCleanup(reap)
         self.finish(run)
-        returned = time.monotonic()
         self.assertEqual(self.wait(origin)[0], 0)
-        origin_return = time.monotonic() - returned
         os.kill(cleaner, 0)  # Still suspended, after its originating launcher exited.
         self.assertTrue(old.exists())
         self.assertFalse((store / ".cleanup-report.json").exists())
@@ -176,32 +173,14 @@ class RetentionTests(unittest.TestCase):
         for reply in replies:
             self.assertEqual(reply.returncode, 0, reply.stderr)
             self.assertEqual(json.loads(reply.stdout)["skipped"], "cleaner_already_active")
-        candidate = self.bin
-        baseline = Path(os.environ.get("PIRA_TEAM_BASELINE_BIN", str(candidate)))
-        times = {"baseline": [], "candidate_stalled": []}
         try:
-            for _ in range(3):
-                for label, binary in [("baseline", baseline), ("candidate_stalled", candidate)]:
-                    self.bin = binary
-                    start = time.monotonic()
-                    process, new_run = self.start(allow=False)
-                    created = time.monotonic()
-                    self.finish(new_run)
-                    self.assertEqual(self.wait(process)[0], 0)
-                    finished = time.monotonic()
-                    times[label].append({"creation_seconds": created-start, "return_after_finish_seconds": finished-created,
-                                         "total_seconds": finished-start})
-                    os.kill(cleaner, 0)
-            # Wide timing tolerance guards scheduling noise. The decisive property
-            # is that every foreground process exited while the cleaner stayed stopped.
-            for metric in ("creation_seconds", "return_after_finish_seconds"):
-                base = statistics.median(t[metric] for t in times["baseline"])
-                enabled = statistics.median(t[metric] for t in times["candidate_stalled"])
-                self.assertLess(enabled, base + 2.0, times)
-            print("RETENTION_LATENCY " + json.dumps({"baseline_binary": str(baseline), "origin_return_seconds": origin_return,
-                  "samples": times, "cleaner_survived_origin": True, "concurrent_triggers_skipped": 4}), flush=True)
+            # Creation as well as return must work while an existing cleaner is stopped.
+            process, new_run = self.start(allow=False)
+            self.finish(new_run)
+            self.assertEqual(self.wait(process)[0], 0)
+            os.kill(cleaner, 0)
+            self.assertTrue(old.exists())
         finally:
-            self.bin = candidate
             reap()
             exited()
         self.assertFalse(old.exists(), "released cleaner did not finish its synthetic deletion")

@@ -489,11 +489,20 @@ mod tests {
 
     #[test]
     fn parses_absolute_and_relative_search_times() {
-        let now = 10 * 3_600_000;
-        assert_eq!(
-            parse_time_bound("2h", now).unwrap().as_millisecond(),
-            8 * 3_600_000
-        );
+        let now = 14 * 86_400_000;
+        for (age, milliseconds) in [
+            ("30s", 30_000),
+            ("30m", 1_800_000),
+            ("2h", 7_200_000),
+            ("7d", 604_800_000),
+            ("1w", 604_800_000),
+        ] {
+            assert_eq!(
+                parse_time_bound(age, now).unwrap().as_millisecond(),
+                (now - milliseconds) as i64,
+                "{age}"
+            );
+        }
         assert_eq!(
             parse_time_bound("now", now).unwrap().as_millisecond(),
             now as i64

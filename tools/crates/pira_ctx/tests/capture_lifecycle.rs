@@ -1,5 +1,6 @@
+mod support;
+
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,10 +132,7 @@ fn full_id(store: &Path, handle: &str) -> String {
 fn announced_capture_is_running_and_releases_owner_file() {
     let sandbox = Sandbox::new("announced-capture");
     let mut child = spawn_capture(sandbox.path(), "capture");
-    let mut announcement = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announcement)
-        .unwrap();
+    let announcement = support::announcement(&mut child).unwrap();
     let id = announcement
         .trim()
         .strip_prefix("LIVE | result=")
@@ -149,7 +147,7 @@ fn announced_capture_is_running_and_releases_owner_file() {
             .join(format!("{id}.lock"))
             .is_file()
     );
-    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(support::wait(&mut child).unwrap().code(), Some(0));
     assert!(sandbox.path().join(format!("{id}.piractx")).is_file());
     assert!(
         !sandbox
@@ -211,10 +209,7 @@ fn check_prints_one_result_id_and_announces_only_after_delay() {
 fn cancel_terminates_capture_and_records_cancelled_state() {
     let sandbox = Sandbox::new("cancel-capture");
     let mut child = spawn_capture(sandbox.path(), "capture");
-    let mut announcement = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announcement)
-        .unwrap();
+    let announcement = support::announcement(&mut child).unwrap();
     let id = announcement
         .trim()
         .strip_prefix("LIVE | result=")
@@ -232,7 +227,7 @@ fn cancel_terminates_capture_and_records_cancelled_state() {
     assert_eq!(cancel.status.code(), Some(0));
     let id = full.as_str();
     assert!(String::from_utf8(cancel.stdout).unwrap().contains(id));
-    let completed = child.wait_with_output().unwrap();
+    let completed = support::output(child).unwrap();
     assert!(!completed.status.success());
     assert!(
         String::from_utf8(completed.stdout)
@@ -271,10 +266,7 @@ fn cancel_terminates_capture_and_records_cancelled_state() {
 fn cancelled_check_remains_status_only() {
     let sandbox = Sandbox::new("cancel-check");
     let mut child = spawn_capture(sandbox.path(), "check");
-    let mut announcement = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announcement)
-        .unwrap();
+    let announcement = support::announcement(&mut child).unwrap();
     let id = announcement
         .trim()
         .strip_prefix("LIVE | result=")
@@ -289,7 +281,7 @@ fn cancelled_check_remains_status_only() {
         .output()
         .unwrap();
     assert!(cancel.status.success());
-    let completed = child.wait_with_output().unwrap();
+    let completed = support::output(child).unwrap();
     assert!(!completed.status.success());
     let text = String::from_utf8(completed.stdout).unwrap();
     assert!(text.starts_with("CANCELLED |"), "{text}");
@@ -330,7 +322,7 @@ fn automatic_checkpoint_keeps_owner_lease_when_snapshot_is_old() {
         "{}",
         String::from_utf8_lossy(&cancel.stderr)
     );
-    assert!(!child.wait().unwrap().success());
+    assert!(!support::wait(&mut child).unwrap().success());
     assert!(!manifest.exists());
 }
 
@@ -371,7 +363,7 @@ fn large_live_index_is_bounded_disclosed_and_final_capture_remains_complete() {
             use std::io::Read;
             if let Some(mut pipe) = child.stdout.take() { let _ = pipe.read_to_string(&mut stdout); }
             if let Some(mut pipe) = child.stderr.take() { let _ = pipe.read_to_string(&mut stderr); }
-            let _ = child.wait();
+            let _ = support::wait(&mut child);
             panic!("live read failed: {error:?}; pre-cleanup status={status:?}; live entries={live_entries:?}; stdout={stdout:?}; stderr={stderr:?}");
         });
         assert!(data.len() <= 16 * 1024 * 1024);
@@ -423,7 +415,7 @@ fn large_live_index_is_bounded_disclosed_and_final_capture_remains_complete() {
     assert!(raw.status.success());
     assert_eq!(raw.stdout, b"x\n".repeat(400000));
     child.stdin.take().unwrap().write_all(b"x").unwrap();
-    assert!(child.wait_with_output().unwrap().status.success());
+    assert!(support::output(child).unwrap().status.success());
     let count = Command::new(binary())
         .args([
             "transform",
@@ -479,7 +471,7 @@ fn checkpoint_publication_failure_is_warned_without_changing_child_status() {
             .join(format!(".{id}.{}.tmp", child.id())),
     )
     .unwrap();
-    let result = child.wait_with_output().unwrap();
+    let result = support::output(child).unwrap();
     assert!(result.status.success());
     let text = String::from_utf8(result.stderr).unwrap();
     assert_eq!(
@@ -518,7 +510,7 @@ fn cancelled_short_exact_retains_partial_output_and_live_id() {
             "{}",
             String::from_utf8_lossy(&cancel.stderr)
         );
-        let result = child.wait_with_output().unwrap();
+        let result = support::output(child).unwrap();
         assert!(!result.status.success());
         let report = if redirected_stdout {
             &result.stderr
@@ -672,7 +664,7 @@ fn replacement_character_workspace_keeps_native_identity_live_and_final() {
     assert!(hash.starts_with("native-v1-"));
     let id = live["metadata"]["result_id"].as_str().unwrap();
     child.stdin.take().unwrap().write_all(b"x").unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = support::output(child).unwrap();
     assert!(
         output.status.success(),
         "{}",

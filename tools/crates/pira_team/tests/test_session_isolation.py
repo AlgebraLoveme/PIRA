@@ -56,7 +56,7 @@ class SessionIsolationTests(unittest.TestCase):
         return result
 
     def foreign_attempts(self, env, reference):
-        for args in [("read", reference), ("read", reference, "manifest.json"),
+        for args in [("wait", reference), ("read", reference), ("read", reference, "manifest.json"),
                      ("read", reference, "stderr.log"), ("path", reference),
                      ("path", reference, "."), ("path", reference, "manifest.json"),
                      ("resume", reference), ("resume", reference, "--task", "take over", "--completion-gate", "take over"),

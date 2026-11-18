@@ -172,7 +172,7 @@ fn technical_uses_remain_read_only_review_flags_alongside_defensive_markers() {
     );
 }
 #[test]
-fn literal_phrases_self_overlap_transitivity_and_adjacent_groups() {
+fn literal_phrases_self_overlap_transitivity_and_separated_groups() {
     let groups = scan(
         "A.B acb go\tgo go go x-y",
         r#"{"z":["a.b","go go","x","y"],"a":["go"]}"#,
@@ -185,13 +185,12 @@ fn literal_phrases_self_overlap_transitivity_and_adjacent_groups() {
     assert_eq!(groups[1]["matches"][1]["column"], 9);
     assert_eq!(groups[2]["span"], "x");
     assert_eq!(groups[3]["span"], "y");
-    let adjacent = scan("a-b", r#"{"x":["a","b"]}"#);
-    assert_eq!(adjacent.as_array().unwrap().len(), 2);
 }
 #[test]
 fn overlapping_unicode_nested_phrases_preserve_exact_union_and_hits() {
     let text = "é\té é é";
-    let groups = scan(text, r#"{"x":["é","é é","é é é"]}"#);
+    // Reverse inventory order so insertion order cannot satisfy marker ordering.
+    let groups = scan(text, r#"{"x":["é é é","é é","é"]}"#);
     assert_eq!(groups.as_array().unwrap().len(), 1);
     assert_eq!(groups[0]["span"], text);
     assert_eq!(groups[0]["context"], text);
@@ -207,6 +206,12 @@ fn overlapping_unicode_nested_phrases_preserve_exact_union_and_hits() {
             .map(|h| h["span"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["é", "é\té", "é\té é", "é", "é é", "é é é", "é", "é é", "é"]
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|h| h["marker"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["é", "é é", "é é é", "é", "é é", "é é é", "é", "é é", "é"]
     );
 }
 
@@ -246,6 +251,12 @@ fn unicode_scalar_columns_exact_context_and_python_line_breaks() {
         );
         assert_eq!(groups[0]["line"], 2, "{separator:?}");
         assert_eq!(groups[1]["line"], 3, "{separator:?}");
+        assert_eq!(groups.as_array().unwrap().len(), 2, "{separator:?}");
+        for (group, context) in groups.as_array().unwrap().iter().zip(["not", "no"]) {
+            assert_eq!(group["context"], context, "{separator:?}");
+            assert_eq!(group["span"], context, "{separator:?}");
+            assert_eq!(group["column"], 1, "{separator:?}");
+        }
     }
 }
 #[test]
@@ -254,14 +265,20 @@ fn unicode_boundaries_are_letters_numbers_underscore_not_marks() {
         "πnot not² _not not_ not\u{301} \u{301}not",
         r#"{"x":["not"]}"#,
     );
-    assert_eq!(groups.as_array().unwrap().len(), 2);
-    assert_eq!(groups[0]["span"], "not");
     assert_eq!(
-        scan("İS lıKely ſlightly", DEFAULT_LEXICON)
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        located(&groups),
+        vec![
+            json!({"line":1,"column":21,"span":"not","category":"x"}),
+            json!({"line":1,"column":27,"span":"not","category":"x"}),
+        ]
+    );
+    assert_eq!(
+        located(&scan("İS lıKely ſlightly", DEFAULT_LEXICON)),
+        vec![
+            json!({"line":1,"column":1,"span":"İS lıKely","category":"hedging/modality"}),
+            json!({"line":1,"column":4,"span":"lıKely","category":"hedging/modality"}),
+            json!({"line":1,"column":11,"span":"ſlightly","category":"minimization"}),
+        ]
     );
     assert_eq!(scan("İS", r#"{"x":["is"]}"#)[0]["span"], "İS");
 }
@@ -274,6 +291,37 @@ fn phrase_whitespace_does_not_cross_lines_or_non_ascii_spaces() {
     );
     assert_eq!(groups.as_array().unwrap().len(), 1);
     assert_eq!(groups[0]["span"], "hold \t back");
+}
+#[test]
+fn unicode_matching_neither_normalizes_nor_expands_full_case_folds() {
+    let groups = scan("ss SS ß ẞ", r#"{"x":["ss","ß"]}"#);
+    assert_eq!(
+        groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| (
+                g["column"].as_u64().unwrap(),
+                g["span"].as_str().unwrap(),
+                g["matches"][0]["marker"].as_str().unwrap(),
+                g["matches"].as_array().unwrap().len(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "ss", "ss", 1),
+            (4, "SS", "ss", 1),
+            (7, "ß", "ß", 1),
+            (9, "ẞ", "ß", 1)
+        ]
+    );
+    let groups = scan("é e\u{301} É", r#"{"x":["é"]}"#);
+    assert_eq!(
+        located(&groups),
+        vec![
+            json!({"line":1,"column":1,"span":"é","category":"x"}),
+            json!({"line":1,"column":6,"span":"É","category":"x"}),
+        ]
+    );
 }
 #[test]
 fn raw_markdown_and_legitimate_qualifications_are_not_suppressed() {
@@ -299,23 +347,24 @@ fn malformed_lexicons_and_duplicate_matching_equivalents_rejected() {
         "[]",
         "{}",
         r#"{"": ["not"]}"#,
+        r#"{" \t": ["not"]}"#,
         r#"{"x": []}"#,
         r#"{"x":"not"}"#,
         r#"{"x":[null]}"#,
         r#"{"x":[""]}"#,
         r#"{"x":[" not"]}"#,
+        r#"{"x":["not "]}"#,
         r#"{"x":["a  b"]}"#,
         r#"{"x":["a\tb"]}"#,
         r#"{"x":["a\u001fb"]}"#,
         r#"{"x":["a-"]}"#,
+        r#"{"x":["-a"]}"#,
         r#"{"x":["not","NOT"]}"#,
         r#"{"x":["is","İS"]}"#,
         r#"{"x":["\ud800"]}"#,
     ] {
         assert!(Lexicon::parse(invalid).is_err(), "{invalid}");
     }
-    // Full-fold expansions are not matching equivalences (documented difference).
-    assert!(Lexicon::parse(r#"{"x":["ss","ß"]}"#).is_ok());
     assert_eq!(
         scan("not", r#"{"a":["not"],"b":["not"]}"#)[0]["matches"]
             .as_array()
@@ -514,7 +563,6 @@ fn help_version_short_circuit_in_encounter_order() {
 fn delimiter_and_lexicon_values_preserve_help_and_version_filenames() {
     let tmp = Fixture::new();
     tmp.file("draft.md", b"sensor");
-    tmp.file("custom.json", br#"{"custom":["sensor"]}"#);
     for name in ["--help", "-h", "--version", "-V", "--"] {
         tmp.file(name, b"not");
         let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
@@ -532,8 +580,7 @@ fn delimiter_and_lexicon_values_preserve_help_and_version_filenames() {
             .args([
                 "draft.md",
                 "--json",
-                "--lexicon",
-                "custom.json",
+                "--lexicon=missing.json",
                 "--lexicon",
                 name,
             ])
@@ -627,15 +674,18 @@ fn cli_json_exact_expectations_determinism_and_unchanged_files() {
     let data = report(&out);
     assert_eq!(data["advisory"], ADVISORY);
     assert_eq!(data["errors"], json!([]));
+    let context = "😀\tNo exception, but it may fail.";
     assert_eq!(
-        located(&data["warnings"]),
-        vec![
-            json!({"line":1,"column":3,"span":"No","category":"negation"}),
-            json!({"line":1,"column":17,"span":"but","category":"contrast/concession"}),
-            json!({"line":1,"column":24,"span":"may","category":"hedging/modality"}),
-        ]
+        data["warnings"],
+        json!([
+            {"path":arg(&path),"line":1,"column":3,"span":"No","context":context,"prompt":PROMPT,
+             "matches":[{"column":3,"span":"No","marker":"no","category":"negation"}]},
+            {"path":arg(&path),"line":1,"column":17,"span":"but","context":context,"prompt":PROMPT,
+             "matches":[{"column":17,"span":"but","marker":"but","category":"contrast/concession"}]},
+            {"path":arg(&path),"line":1,"column":24,"span":"may","context":context,"prompt":PROMPT,
+             "matches":[{"column":24,"span":"may","marker":"may","category":"hedging/modality"}]},
+        ])
     );
-    assert_eq!(data["warnings"][0]["path"], arg(&path));
     assert_eq!(out.stdout, cli(&["--json", arg(&path)]).stdout);
     assert_eq!(
         before,
@@ -669,10 +719,7 @@ fn cli_long_line_and_final_tail_match_complete_owned_api_report() {
     let out = cli(&["--json", arg(&path)]);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    assert_eq!(
-        String::from_utf8(out.stdout).unwrap(),
-        format!("{}\n", serde_json::to_string_pretty(&expected).unwrap())
-    );
+    assert_eq!(report(&out), serde_json::to_value(&expected).unwrap());
     assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
 }
 
@@ -694,16 +741,19 @@ fn cli_mixed_file_errors_retain_success_and_argument_order() {
     let tmp = Fixture::new();
     let missing = tmp.0.join("missing");
     let bad = tmp.file("bad", b"\xff");
-    let good = tmp.file("good", b"perhaps");
+    let good = tmp.file("z-good", b"perhaps");
+    let other = tmp.file("a-good", b"not");
     let out = cli(&[
         "--json",
         arg(&missing),
         arg(&bad),
         arg(&tmp.0),
         arg(&good),
+        arg(&other),
         arg(&good),
     ]);
     assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
     let data = report(&out);
     let errors = data["errors"].as_array().unwrap();
     assert_eq!(errors.len(), 3);
@@ -714,8 +764,24 @@ fn cli_mixed_file_errors_retain_success_and_argument_order() {
             .collect::<Vec<_>>(),
         vec![arg(&missing), arg(&bad), arg(&tmp.0)]
     );
-    assert_eq!(data["warnings"].as_array().unwrap().len(), 2);
-    assert_eq!(data["warnings"][0]["span"], "perhaps");
+    assert!(
+        errors
+            .iter()
+            .all(|e| !e["reason"].as_str().unwrap().is_empty())
+    );
+    assert_eq!(
+        data["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| (g["path"].as_str().unwrap(), g["span"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            (arg(&good), "perhaps"),
+            (arg(&other), "not"),
+            (arg(&good), "perhaps")
+        ]
+    );
 }
 #[test]
 fn cli_invalid_lexicon_stops_scan_and_is_reported_in_selected_format() {
@@ -742,9 +808,20 @@ fn cli_custom_literals_option_equals_and_end_of_options() {
     let tmp = Fixture::new();
     let lex = tmp.file("lex", br#"{"custom":["a[b]c"]}"#);
     let good = tmp.file("good", b"A[B]C abc");
-    let out = cli(&["--json", &format!("--lexicon={}", arg(&lex)), arg(&good)]);
+    let out = cli(&[
+        "--json",
+        "--lexicon",
+        arg(&tmp.0.join("missing.json")),
+        &format!("--lexicon={}", arg(&lex)),
+        arg(&good),
+    ]);
     assert!(out.status.success());
     assert_eq!(report(&out)["warnings"][0]["span"], "A[B]C");
+    assert_eq!(report(&out)["warnings"].as_array().unwrap().len(), 1);
+    let separate = cli(&["--json", "--lexicon", arg(&lex), arg(&good)]);
+    assert_eq!(separate.status.code(), Some(0));
+    assert!(out.stderr.is_empty() && separate.stderr.is_empty());
+    assert_eq!(report(&out), report(&separate));
     let source = tmp.file("--json", b"not");
     let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
         .current_dir(&tmp.0)
@@ -754,18 +831,6 @@ fn cli_custom_literals_option_equals_and_end_of_options() {
     assert!(out.status.success());
     assert_eq!(report(&out)["warnings"][0]["path"], "--json");
     assert!(source.exists());
-}
-#[cfg(unix)]
-#[test]
-fn explicit_symlinks_read_regular_targets_without_rewriting() {
-    let tmp = Fixture::new();
-    let good = tmp.file("target", b"without");
-    let link = tmp.0.join("link");
-    std::os::unix::fs::symlink(&good, &link).unwrap();
-    let out = cli(&["--json", arg(&link)]);
-    assert!(out.status.success());
-    assert_eq!(report(&out)["warnings"][0]["path"], arg(&link));
-    assert_eq!(fs::read(&good).unwrap(), b"without");
 }
 #[cfg(unix)]
 #[test]
@@ -807,17 +872,113 @@ fn symlinked_document_and_custom_lexicon_preserve_regular_targets() {
 }
 
 #[cfg(unix)]
+fn wait_for_small_output(mut child: std::process::Child) -> Output {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // PIRA: these rejection fixtures emit only small reports, below pipe capacity.
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("CLI did not finish before deadline: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_rejects_fifo_documents_and_lexicons_without_a_writer() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, process::Stdio};
+    let tmp = Fixture::new();
+    let fifo = tmp.0.join("fifo");
+    let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a valid, terminated path owned by this temporary fixture.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let source = tmp.file("good", b"not");
+    for (args, warning_count) in [
+        (vec!["--json", arg(&fifo), arg(&source)], 1),
+        (vec!["--json", "--lexicon", arg(&fifo), arg(&source)], 0),
+    ] {
+        let child = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_for_small_output(child);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}");
+        let data = report(&out);
+        assert_eq!(data["errors"].as_array().unwrap().len(), 1, "{args:?}");
+        assert_eq!(data["errors"][0]["path"], arg(&fifo), "{args:?}");
+        assert!(!data["errors"][0]["reason"].as_str().unwrap().is_empty());
+        assert_eq!(
+            data["warnings"].as_array().unwrap().len(),
+            warning_count,
+            "{args:?}"
+        );
+        if warning_count == 1 {
+            assert_eq!(data["warnings"][0]["path"], arg(&source));
+            assert_eq!(data["warnings"][0]["span"], "not");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_closed_stdout_returns_one_even_with_input_errors() {
+    use std::{
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::Stdio,
+    };
+    let tmp = Fixture::new();
+    let good = tmp.file("good", b"not");
+    let missing = tmp.0.join("missing");
+    for options in [vec![], vec!["--json"]] {
+        let (output, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        let descriptor: OwnedFd = output.into();
+        let child = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .args(&options)
+            .args([arg(&good), arg(&missing)])
+            .stdout(Stdio::from(descriptor))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_for_small_output(child);
+        assert_eq!(out.status.code(), Some(1), "{options:?}");
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains("output error:")
+        );
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn malformed_unicode_arguments_are_usage_errors() {
     use std::os::unix::ffi::OsStrExt;
-    let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
-        .arg(std::ffi::OsStr::from_bytes(b"bad\xff"))
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("valid Unicode")
-    );
+    let tmp = Fixture::new();
+    let good = tmp.file("good", b"not");
+    let bad = std::ffi::OsStr::from_bytes(b"bad\xff");
+    for args in [
+        vec![bad],
+        vec![std::ffi::OsStr::new("--lexicon"), bad, good.as_os_str()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pira_write_check"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            String::from_utf8(out.stderr)
+                .unwrap()
+                .contains("valid Unicode"),
+            "{args:?}"
+        );
+    }
 }

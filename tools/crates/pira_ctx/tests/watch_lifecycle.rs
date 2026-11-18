@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
+mod support;
+
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,7 +42,14 @@ fn binary() -> &'static str {
 fn run(store: &Path, arguments: &[&str]) -> Output {
     let mut argv = vec![arguments[0], "--store-dir", store.to_str().unwrap()];
     argv.extend_from_slice(&arguments[1..]);
-    Command::new(binary()).args(argv).output().unwrap()
+    let child = Command::new(binary())
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    support::output(child).unwrap()
 }
 
 fn full_capture_id(store: &Path, handle: &str, session: Option<&str>) -> String {
@@ -136,10 +144,7 @@ fn start_pending_watch(store: &Path, extra: &[&str]) -> (Child, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut announcement = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announcement)
-        .unwrap();
+    let announcement = support::announcement(&mut child).unwrap();
     let id = announcement
         .trim()
         .strip_prefix("PIRA watch live | result=")
@@ -188,14 +193,14 @@ fn active_watch_announces_id_supports_latest_and_acknowledges_stop() {
     let stopped = run(sandbox.path(), &["watch", &id, "--stop"]);
     assert_eq!(stopped.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&stopped.stdout).contains("stopped"));
-    assert_eq!(owner.wait().unwrap().code(), Some(23));
+    assert_eq!(support::wait(&mut owner).unwrap().code(), Some(23));
 }
 
 #[test]
 fn paused_watch_lists_as_paused_and_latest_still_succeeds() {
     let sandbox = Sandbox::new("watch-paused");
     let (mut owner, id) = start_pending_watch(sandbox.path(), &["--review-after", "1s"]);
-    assert_eq!(owner.wait().unwrap().code(), Some(10));
+    assert_eq!(support::wait(&mut owner).unwrap().code(), Some(10));
     wait_for(sandbox.path(), &id, "\"monitor\":\"paused\"");
 
     let listed = run(sandbox.path(), &["list", "--limit", "5"]);
@@ -222,7 +227,7 @@ fn first_analyzer_replacement_is_applied() {
         &["watch", &id, "--set-analyzer-code", second],
     );
     assert_eq!(update.status.code(), Some(0));
-    assert_eq!(owner.wait().unwrap().code(), Some(10));
+    assert_eq!(support::wait(&mut owner).unwrap().code(), Some(10));
     let latest = run(sandbox.path(), &["watch", &id, "--latest"]);
     let report = String::from_utf8_lossy(&latest.stdout);
     assert!(report.contains("analyzer revision: 2"));
@@ -233,7 +238,7 @@ fn first_analyzer_replacement_is_applied() {
 fn stopping_paused_watch_is_direct_and_terminal_stop_is_noop() {
     let sandbox = Sandbox::new("watch-ownerless-stop");
     let (mut owner, id) = start_pending_watch(sandbox.path(), &["--review-after", "1s"]);
-    assert_eq!(owner.wait().unwrap().code(), Some(10));
+    assert_eq!(support::wait(&mut owner).unwrap().code(), Some(10));
 
     let stopped = run(sandbox.path(), &["watch", &id, "--stop"]);
     assert_eq!(stopped.status.code(), Some(0));
@@ -263,10 +268,7 @@ fn capture_announces_a_discoverable_id_before_completion() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut announcement = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announcement)
-        .unwrap();
+    let announcement = support::announcement(&mut child).unwrap();
     let id = announcement
         .trim()
         .strip_prefix("LIVE | result=")
@@ -279,7 +281,7 @@ fn capture_announces_a_discoverable_id_before_completion() {
             .join(format!("{id}.live.json"))
             .is_file()
     );
-    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(support::wait(&mut child).unwrap().code(), Some(0));
     assert!(sandbox.path().join(format!("{id}.piractx")).is_file());
 }
 
@@ -313,7 +315,7 @@ fn clearing_analyzer_clears_no_progress_threshold() {
         run(sandbox.path(), &["watch", &id, "--stop"]).status.code(),
         Some(0)
     );
-    assert_eq!(owner.wait().unwrap().code(), Some(23));
+    assert_eq!(support::wait(&mut owner).unwrap().code(), Some(23));
 }
 
 struct HeldCapture {
@@ -332,10 +334,7 @@ impl HeldCapture {
                 "i=0; while [ ! -f \"$1\" ]; do i=$((i+1)); [ \"$i\" -lt 1000 ] || exit 99; sleep .02; done; echo done",
                 "held-capture", release.to_str().unwrap()])
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let mut announcement = String::new();
-        BufReader::new(child.stderr.take().unwrap())
-            .read_line(&mut announcement)
-            .unwrap();
+        let announcement = support::announcement(&mut child).unwrap();
         // Own the child before assertions so failures also release and reap it.
         let mut held = Self {
             child,
@@ -355,14 +354,14 @@ impl HeldCapture {
 
     fn finish(&mut self) {
         fs::write(&self.release, b"").unwrap();
-        assert_eq!(self.child.wait().unwrap().code(), Some(0));
+        assert_eq!(support::wait(&mut self.child).unwrap().code(), Some(0));
     }
 }
 
 impl Drop for HeldCapture {
     fn drop(&mut self) {
         let _ = fs::write(&self.release, b"");
-        let _ = self.child.wait();
+        let _ = support::wait(&mut self.child);
     }
 }
 
@@ -388,10 +387,7 @@ fn current_selects_exactly_one_live_capture_in_detected_thread() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut watch_announcement = String::new();
-    BufReader::new(watch.stderr.take().unwrap())
-        .read_line(&mut watch_announcement)
-        .unwrap();
+    let watch_announcement = support::announcement(&mut watch).unwrap();
     assert!(watch_announcement.starts_with("PIRA watch live | result="));
     let watch_id = watch_announcement
         .trim()
@@ -399,7 +395,7 @@ fn current_selects_exactly_one_live_capture_in_detected_thread() {
         .unwrap();
     wait_for(sandbox.path(), watch_id, "\"job\":\"pending\"");
     capture.finish();
-    assert_eq!(watch.wait().unwrap().code(), Some(0));
+    assert_eq!(support::wait(&mut watch).unwrap().code(), Some(0));
     assert!(
         sandbox
             .path()

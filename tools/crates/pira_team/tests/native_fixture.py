@@ -1,4 +1,4 @@
-"""Native test-only synchronization; no polling, secrets or production endpoints."""
+"""Native test-only synchronization; bounded waits, no production endpoints."""
 import contextlib
 import json
 import os
@@ -101,12 +101,21 @@ def process_exit_waiter(pid):
     return wait
 
 
-def wait_owner(path):
+def wait_owner(path, timeout=8):
+    """Wait for actual owner release, failing with the lock path at the deadline."""
+    import time
+    deadline = time.monotonic() + timeout
     with Path(path).open("r+") as lock:
         if os.name != "nt":
             import fcntl
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            return
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"owner lock did not release: {path}") from None
+                    time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         import ctypes
         import msvcrt
         from ctypes import wintypes
@@ -118,8 +127,13 @@ def wait_owner(path):
         api.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
                                   wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped)]
         overlapped = Overlapped()
-        if not api.LockFileEx(msvcrt.get_osfhandle(lock.fileno()), 2, 0, 1, 0, ctypes.byref(overlapped)):
-            raise ctypes.WinError(ctypes.get_last_error())
+        while not api.LockFileEx(msvcrt.get_osfhandle(lock.fileno()), 3, 0, 1, 0, ctypes.byref(overlapped)):
+            error = ctypes.get_last_error()
+            if error != 33:  # ERROR_LOCK_VIOLATION, not an unrelated I/O error.
+                raise ctypes.WinError(error)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"owner lock did not release: {path}")
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         # Closing this test-owned handle releases the lock.
 
 

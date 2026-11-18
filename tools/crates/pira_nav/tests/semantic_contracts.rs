@@ -37,6 +37,222 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn dependency_traversal_observes_direction_depth_and_cycles() {
+    let f = Fixture::new();
+    f.write("a.py", "import b\n");
+    f.write("b.py", "import c\n");
+    f.write("c.py", "import a\n");
+    let config = json!({"log_requests": false, "positions": {
+        "a.py:0:7": ["b.py"], "b.py:0:7": ["c.py"], "c.py:0:7": ["a.py"]}});
+    let forward = [
+        "edge depth=1 direction=import from=\"a.py\" to=\"b.py\" line=1",
+        "edge depth=2 direction=import from=\"b.py\" to=\"c.py\" line=1",
+        "edge depth=3 direction=import from=\"c.py\" to=\"a.py\" line=1",
+    ];
+    let reverse = [
+        "edge depth=1 direction=dependent from=\"c.py\" to=\"a.py\" line=1",
+        "edge depth=2 direction=dependent from=\"b.py\" to=\"c.py\" line=1",
+    ];
+    for (direction, depth, expected) in [
+        ("both", "0", vec![]),
+        ("imports", "1", forward[..1].to_vec()),
+        ("imports", "2", forward[..2].to_vec()),
+        ("dependents", "1", reverse[..1].to_vec()),
+        ("dependents", "2", reverse.to_vec()),
+        (
+            "both",
+            "2",
+            vec![forward[0], reverse[0], forward[1], reverse[1]],
+        ),
+        ("imports", "256", forward.to_vec()),
+    ] {
+        let text = f.run(
+            &["deps", "a.py", "--direction", direction, "--depth", depth],
+            config.clone(),
+        );
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("edge "))
+            .collect();
+        assert_eq!(rows, expected, "{direction} depth={depth}: {text}");
+        assert!(text.contains("unresolved=0"), "{text}");
+        assert!(!text.contains("complete=0"), "{text}");
+    }
+    let rejected = lsp(&f.0, &["deps", "a.py", "--depth", "257"], config);
+    assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("256"));
+    assert!(rejected.stdout.is_empty());
+}
+
+#[test]
+fn dependency_row_caps_report_omissions_at_the_cli_boundary() {
+    let f = Fixture::new();
+    f.write("a.py", "import b\nimport c\n");
+    f.write("b.py", "import c\n");
+    f.write("c.py", "pass\n");
+    let config = json!({"log_requests": false, "positions": {
+        "a.py:0:7": ["b.py"], "a.py:1:7": ["c.py"], "b.py:0:7": ["c.py"]}});
+    for (args, row_prefix) in [
+        (vec!["imports", "a.py"], "import "),
+        (vec!["dependents", "c.py"], "dependent="),
+        (
+            vec!["deps", "b.py", "--direction", "both", "--depth", "1"],
+            "edge ",
+        ),
+    ] {
+        for (limit, rows, omitted) in [("2", 2, 0), ("1", 1, 1)] {
+            let mut args = args.clone();
+            args.extend(["--max-items", limit]);
+            let text = f.run(&args, config.clone());
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with(row_prefix))
+                    .count(),
+                rows,
+                "{args:?}: {text}"
+            );
+            if omitted > 0 {
+                assert!(text.contains("shown=1 omitted=1"), "{text}");
+            } else {
+                assert!(!text.contains("omitted="), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_location_variants_keep_their_method_identity_in_standalone_and_query() {
+    let f = Fixture::new();
+    f.write("main.py", "Thing()\n");
+    for file in ["definition.py", "implementation.py", "type.py"] {
+        f.write(file, "value\n");
+    }
+    let config = json!({"log_requests": false,
+        "capabilities": {"definitionProvider":true, "implementationProvider":true, "typeDefinitionProvider":true},
+        "method_positions": {
+            "textDocument/definition": {"main.py:0:0": ["definition.py"]},
+            "textDocument/implementation": {"main.py:0:0": ["implementation.py"]},
+            "textDocument/typeDefinition": {"main.py:0:0": ["type.py"]}}});
+    for (command, file) in [
+        ("definition", "definition.py"),
+        ("implementation", "implementation.py"),
+        ("type-definition", "type.py"),
+    ] {
+        let text = f.run(&[command, "main.py:1:1"], config.clone());
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("location "))
+            .collect();
+        assert_eq!(
+            rows,
+            [format!("location file=\"{file}\" range=L1:1-1:1")],
+            "{text}"
+        );
+    }
+    let text = f.run(
+        &[
+            "query",
+            "--type-definition",
+            "main.py:1:1",
+            "--implementation",
+            "main.py:1:1",
+            "--definition",
+            "main.py:1:1",
+        ],
+        config,
+    );
+    let rows: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("location "))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "location file=\"type.py\" range=L1:1-1:1",
+            "location file=\"implementation.py\" range=L1:1-1:1",
+            "location file=\"definition.py\" range=L1:1-1:1"
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn reference_declaration_inclusion_and_row_limits_reach_the_server() {
+    let f = Fixture::new();
+    f.write("main.py", "Thing()\n");
+    f.write("declaration.py", "value\n");
+    f.write("use.py", "value\n");
+    let location = |file: &str| {
+        json!({"path":file,
+        "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}})
+    };
+    let config = json!({"log_requests": false, "capabilities": {"referencesProvider":true},
+        "references": {"main.py:0:0": {"declarations":[location("declaration.py")], "uses":[location("use.py")]}}});
+    for query in [false, true] {
+        for include in [false, true] {
+            let mut args = if query {
+                vec!["query", "--references", "main.py:1:1"]
+            } else {
+                vec!["references", "main.py:1:1"]
+            };
+            if include {
+                args.push("--include-declaration");
+            }
+            let text = f.run(&args, config.clone());
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("location "))
+                    .count(),
+                if include { 2 } else { 1 },
+                "{args:?}: {text}"
+            );
+            assert_eq!(text.contains("file=\"declaration.py\""), include, "{text}");
+            assert!(text.contains("file=\"use.py\""), "{text}");
+        }
+    }
+    let capped = f.run(
+        &[
+            "references",
+            "main.py:1:1",
+            "--include-declaration",
+            "--limit",
+            "1",
+        ],
+        config,
+    );
+    assert!(capped.contains("count=2 shown=1 omitted=1"), "{capped}");
+    assert_eq!(
+        capped
+            .lines()
+            .filter(|line| line.starts_with("location "))
+            .count(),
+        1,
+        "{capped}"
+    );
+}
+
+#[test]
+fn negotiated_encodings_preserve_utf8_caller_coordinates_in_both_directions() {
+    let f = Fixture::new();
+    f.write("x.py", "\"😀\"; target()\n");
+    // Before target: eight UTF-8 bytes, six UTF-16 code units, five scalars.
+    for (encoding, character) in [("utf-8", 8), ("utf-16", 6), ("utf-32", 5)] {
+        let key = format!("x.py:0:{character}");
+        let config = json!({"log_requests":false,
+            "capabilities":{"definitionProvider":true,"positionEncoding":encoding},
+            "positions":{key:[{"path":"x.py",
+                "range":{"start":{"line":0,"character":character},
+                         "end":{"line":0,"character":character+6}}}]}});
+        let text = f.run(&["definition", "x.py:1:9"], config);
+        assert!(text.contains("count=1"), "{encoding}: {text}");
+        assert!(
+            text.contains("location file=\"x.py\" range=L1:9-1:15"),
+            "{encoding}: {text}"
+        );
+    }
+}
+
+#[test]
 fn deps_admits_explicit_ignored_and_unknown_suffix_targets_once() {
     for name in [
         "custom.inc",
@@ -115,8 +331,7 @@ fn structural_lsp_root_blocks_exposure_but_not_native_reads() {
         assert!(!started.exists(), "server started for rejected target");
         assert!(!opened.exists(), "source disclosed");
     }
-    let native = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let native = common::command(&f.0)
         .args([
             "show",
             "allowed-extra/outside.c::visible",
@@ -235,8 +450,7 @@ fn capability_required_even_for_empty_import_inventory() {
             "{out:?}"
         );
     }
-    let missing = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let missing = common::command(&f.0)
         .args(["imports", "empty.py"])
         .env("PATH", "")
         .output()
@@ -309,8 +523,7 @@ fn forced_server_bypasses_native_depth_failure_in_all_inventory_paths() {
             "]".repeat(300)
         ),
     );
-    let native = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let native = common::command(&f.0)
         .args(["outline", "source.py", "--native"])
         .output()
         .unwrap();
@@ -337,8 +550,7 @@ fn language_qualified_override_preserves_other_native_inventories() {
     f.write("source.rs", "fn native_rs() {}\n");
     f.write(".nav-lsp.json", "{}");
     let server = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/semantic_server.py");
-    let output = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let output = common::command(&f.0)
         .args([
             "map",
             ".",
@@ -578,8 +790,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
         "".to_owned(),
         f.0.to_str().unwrap().to_owned(),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-            .current_dir(&f.0)
+        let out = common::command(&f.0)
             .env("PATH", path)
             .args(["hover", "broken.c:1:5"])
             .output()
@@ -587,8 +798,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
         assert_eq!(out.status.code(), Some(2), "{out:?}");
         assert!(!f.0.join("started").exists());
     }
-    let explicit = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let explicit = common::command(&f.0)
         .env("PATH", ".")
         .args(["outline", "broken.c", "--lsp"])
         .arg(f.0.join("clangd"))
@@ -597,8 +807,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     assert!(explicit.status.success(), "{explicit:?}");
     assert_eq!(fs::read_to_string(f.0.join("started")).unwrap(), "started");
     fs::remove_file(f.0.join("started")).unwrap();
-    let allowed = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let allowed = common::command(&f.0)
         .env("PATH", &external.0)
         .args(["hover", "broken.c:1:5"])
         .output()
@@ -608,16 +817,14 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     fs::remove_file(f.0.join("started")).unwrap();
     fs::rename(external.0.join("clangd"), external.0.join("outside-peer")).unwrap();
     symlink(f.0.join("clangd"), external.0.join("clangd")).unwrap();
-    let linked = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let linked = common::command(&f.0)
         .env("PATH", &external.0)
         .args(["hover", "broken.c:1:5"])
         .output()
         .unwrap();
     assert_eq!(linked.status.code(), Some(2), "{linked:?}");
     assert!(!f.0.join("started").exists());
-    let ancestor = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(f.0.join("sub"))
+    let ancestor = common::command(&f.0.join("sub"))
         .env("PATH", &f.0)
         .args(["hover", "broken.c:1:5"])
         .output()
@@ -626,8 +833,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     assert!(!f.0.join("started").exists());
     fs::remove_file(f.0.join("clangd")).unwrap();
     symlink(external.0.join("outside-peer"), f.0.join("clangd")).unwrap();
-    let launcher = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let launcher = common::command(&f.0)
         .env("PATH", ".")
         .args(["hover", "broken.c:1:5"])
         .output()
@@ -637,8 +843,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     symlink(&f.0, external.0.join("alias")).unwrap();
     fs::create_dir(f.0.join("child")).unwrap();
     for path in [external.0.join("alias"), external.0.join("alias/child/..")] {
-        let hidden = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-            .current_dir(&f.0)
+        let hidden = common::command(&f.0)
             .env("PATH", path)
             .args(["hover", "broken.c:1:5"])
             .output()
@@ -646,8 +851,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
         assert_eq!(hidden.status.code(), Some(2), "{hidden:?}");
         assert!(!f.0.join("started").exists());
     }
-    let explicit_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let explicit_alias = common::command(&f.0)
         .env("PATH", "")
         .args(["outline", "broken.c", "--lsp"])
         .arg(external.0.join("alias/clangd"))
@@ -660,8 +864,7 @@ fn semantic_discovery_excludes_repository_launchers_and_resolved_targets() {
     symlink(external.0.join("outside-peer"), external.0.join("clangd")).unwrap();
     let third = Fixture::new();
     symlink(&external.0, third.0.join("external-alias")).unwrap();
-    let external_alias = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&f.0)
+    let external_alias = common::command(&f.0)
         .env("PATH", third.0.join("external-alias"))
         .args(["hover", "broken.c:1:5"])
         .output()

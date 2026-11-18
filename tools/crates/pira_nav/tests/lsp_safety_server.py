@@ -1,5 +1,6 @@
 """Finite, local protocol peer for pira_nav's process/pipe regression tests."""
 import json
+import fcntl
 import os
 import signal
 import sys
@@ -65,12 +66,16 @@ while True:
         }]})
     elif method == "textDocument/definition":
         position = {"line": 2147483648 if mode == "integer" else 1, "character": 0}
-        if mode in ("descendant", "detached"):
+        if mode in ("descendant", "detached", "signal"):
             ready_read, ready_write = os.pipe()
             if os.fork() == 0:
                 os.close(ready_read)
                 if mode == "detached":
                     os.setsid()
+                # Only this descendant owns the lock. Its release observes actual
+                # termination, rather than merely closing Navigator's pipe ends.
+                lock = Path("descendant.lock").open("w")
+                fcntl.flock(lock, fcntl.LOCK_EX)
                 os.write(ready_write, b"ready")
                 os.close(ready_write)
                 # Retain stdin/stdout/stderr but do no I/O. Finite even on regressions.
@@ -79,6 +84,10 @@ while True:
             os.close(ready_write)
             assert os.read(ready_read, 5) == b"ready"
             os.close(ready_read)
+            if mode == "signal":
+                Path("ready").write_text("pending definition")
+                time.sleep(4)  # Finite even if Navigator's cancellation regresses.
+                sys.exit(0)
         send({"jsonrpc": "2.0", "id": message["id"], "result": [{
             "uri": message["params"]["textDocument"]["uri"],
             "range": {"start": position, "end": position},

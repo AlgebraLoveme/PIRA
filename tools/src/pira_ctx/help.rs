@@ -420,7 +420,8 @@ DIRECT OPTIONS
   required; any --exclude match removes a line. Operations apply as match, exclude, unique, head,
   tail, then count. unique compares resulting text and keeps first occurrence; count prints one
   decimal integer. Text derived from capture rows remains untrusted PROGRAM data. Direct processing
-  streams where possible, display-sanitizes output, and caps returned text at 64 KiB.
+  streams where possible, display-sanitizes output, and caps returned text, including any truncation
+  notice, at 64 KiB.
   Direct unique retains at most 100,000 distinct values and 128 MiB of distinct text bytes.
 
 PLAN FILE

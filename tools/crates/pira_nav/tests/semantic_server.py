@@ -29,6 +29,9 @@ def read():
 
 def location(target):
     if isinstance(target, dict):
+        if "path" in target:
+            # Let pathlib encode fixture-relative paths, including temp-root spaces.
+            return {"uri": (root / target["path"]).as_uri(), "range": target["range"]}
         return target
     uri = target if "://" in target else (root / target).as_uri()
     span = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
@@ -71,7 +74,8 @@ while True:
     elif method in ("callHierarchy/outgoingCalls", "callHierarchy/incomingCalls"):
         direction = "outgoing_calls" if method.endswith("outgoingCalls") else "incoming_calls"
         result = config.get(direction, {}).get(message["params"]["item"]["uri"], [])
-    elif method in ("textDocument/definition", "textDocument/hover"):
+    elif method in ("textDocument/definition", "textDocument/implementation",
+                    "textDocument/typeDefinition", "textDocument/references", "textDocument/hover"):
         params = message["params"]
         path = Path(url2pathname(urlparse(params["textDocument"]["uri"]).path))
         position = params["position"]
@@ -79,7 +83,13 @@ while True:
         if config.get("log_requests", True):
             with (root / ".requests").open("a", newline="\n") as log:
                 log.write(key + "\n")
-        targets = config.get("positions", {}).get(key, config.get("default", []))
+        targets = config.get("method_positions", {}).get(method, {}).get(
+            key, config.get("positions", {}).get(key, config.get("default", [])))
+        if method == "textDocument/references" and key in config.get("references", {}):
+            references = config["references"][key]
+            targets = references["uses"]
+            if params["context"]["includeDeclaration"]:
+                targets = references["declarations"] + targets
         result = [location(target) for target in targets] if targets is not None else None
         if method == "textDocument/hover":
             result = {"contents": config.get("hovers", {}).get(key, "Fake semantic information.")}

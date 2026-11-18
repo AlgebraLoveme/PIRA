@@ -175,6 +175,7 @@ state = json.loads(state_path.read_text()) if state_path.exists() else {"thread"
 if os.environ.get("TEAM_SUBTEAM_FIXTURE") and not state_path.exists():
     state["thread"] = "worker-" + home.parent.name
 active = None
+tier_updates = 0
 due = None
 subteam_service = None
 service_read, service_write = os.pipe()
@@ -432,6 +433,14 @@ while True:
         if os.environ.get("TEAM_IMPLEMENT_WAIT") and "IMPLEMENTATION STAGE." in state.get("phase", ""):
             due = None
         result = {"turn":{"id":active}}
+    elif method == "turn/settings/update":
+        assert params["threadId"] == state["thread"] and params["turnId"] == active
+        assert set(params) == {"threadId", "turnId", "serviceTier"}
+        assert params["serviceTier"] in ("default", "fast")
+        replies = json.loads(os.environ.get("TEAM_TIER_REPLIES", '[{"result":{"status":"applied"}}]'))
+        send({"id": request["id"], **replies[min(tier_updates, len(replies) - 1)]})
+        tier_updates += 1
+        continue
     elif method == "turn/steer":
         assert params["expectedTurnId"] == active
         if os.environ.get("TEAM_STALL_STEER"):

@@ -276,11 +276,6 @@ fn shellish_quote(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-pub fn unicode_contains_ci(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
 pub fn sanitize_terminal(value: &str) -> String {
     let mut output = String::new();
     let mut chars = value.chars().peekable();
@@ -432,11 +427,6 @@ mod tests {
     fn strips_csi_osc_and_carriage_return() {
         let input = "\x1b[31mred\x1b[0m \x1b]8;;https://example.test\x07label\x1b]8;;\x07\rnext";
         assert_eq!(sanitize_terminal(input), "red label next");
-    }
-
-    #[test]
-    fn unicode_search_is_case_insensitive() {
-        assert!(unicode_contains_ci("CAFÉ diagnostic", "café"));
     }
 
     #[test]

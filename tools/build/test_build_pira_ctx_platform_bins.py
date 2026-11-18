@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import runpy
 import shlex
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,6 +136,90 @@ class RustToolsTests(unittest.TestCase):
 
             self.assertEqual(selected, rustup)
             self.assertTrue(selected.is_symlink())
+
+
+class BundlePublicationTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="pira-builder-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        previous = builder.TOOL_NAME, builder.USES_C_COMPILER
+        self.addCleanup(builder.configure_tool, previous[0], uses_c_compiler=previous[1])
+        builder.configure_tool("pira_ctx")
+        self.bundle = self.root / "bundle"
+        self.bundle.mkdir()
+        self.version = tomllib.loads((builder.TOOLS_DIR / "crates/pira_ctx/Cargo.toml").read_text())["package"]["version"]
+        self.manifest = {"schema_version": 1, "tool_name": "pira_ctx", "tool_version": self.version,
+                         "binaries": {"linux-x64": {"path": "linux-x64/pira_ctx",
+                             "target": "x86_64-unknown-linux-musl", "linkage": "static-pie",
+                             "sha256": hashlib.sha256(b"retained executable").hexdigest()}}}
+        retained = self.bundle / "linux-x64/pira_ctx"
+        retained.parent.mkdir()
+        retained.write_bytes(b"retained executable")
+        (self.bundle / "bundle.json").write_text(json.dumps(self.manifest))
+        self.arguments = ["--bundle-dir", str(self.bundle), "--build-root", str(self.root / "build"),
+                          "--rustup-root", str(self.root / "rustup"), "--zig-root", str(self.root / "zig"),
+                          "--platform", "darwin-arm64", "--platform", "windows-x64"]
+        self.rust = self.enterContext(patch.object(builder, "rust_tools", return_value=(self.root / "rustup", {})))
+        self.enterContext(patch.object(builder, "zig_tools", return_value=None))
+        self.enterContext(patch.object(builder, "prepare_toolchain"))
+        self.roots = {}
+        self.payloads = {}
+        self.compile = self.enterContext(patch.object(builder, "build_target", side_effect=self.build))
+        self.enterContext(patch("builtins.print"))
+
+    def build(self, target, args, rustup, environment, run_root, zig):
+        roots = self.roots.setdefault(target.platform_dir, [])
+        roots.append(run_root)
+        payload = self.payloads.get(target.platform_dir, [target.platform_dir.encode()] * 2)[len(roots) - 1]
+        artifact = run_root / target.exe_name
+        artifact.write_bytes(payload)
+        return artifact
+
+    def snapshot(self):
+        return {path.relative_to(self.bundle): path.read_bytes() for path in self.bundle.rglob("*") if path.is_file()}
+
+    def test_verified_partial_build_preserves_unselected_platform_and_publishes_known_bytes(self):
+        self.assertEqual(builder.main(self.arguments), 0)
+        manifest = json.loads((self.bundle / "bundle.json").read_text())
+        self.assertEqual(manifest["binaries"]["linux-x64"], self.manifest["binaries"]["linux-x64"])
+        self.assertEqual((self.bundle / "linux-x64/pira_ctx").read_bytes(), b"retained executable")
+        self.assertEqual(set(manifest["binaries"]), {"darwin-arm64", "windows-x64", "linux-x64"})
+        for platform, filename in (("darwin-arm64", "pira_ctx"), ("windows-x64", "pira_ctx.exe")):
+            with self.subTest(platform=platform):
+                self.assertEqual(len(self.roots[platform]), 2)
+                self.assertEqual(len(set(self.roots[platform])), 2)
+                record = manifest["binaries"][platform]
+                self.assertEqual(record["path"], f"{platform}/{filename}")
+                self.assertEqual(record["sha256"], hashlib.sha256(platform.encode()).hexdigest())
+                self.assertEqual((self.bundle / record["path"]).read_bytes(), platform.encode())
+        self.assertEqual(list((self.root / "build").iterdir()), [])
+
+    def test_later_verification_failure_never_publishes_earlier_verified_target(self):
+        before = self.snapshot()
+        build_path = str(self.root / "build")
+        cases = (("different-builds", [b"first", b"second"], "non-reproducible"),
+                 ("utf8-path", [build_path.encode()] * 2, "embeds host path"),
+                 ("utf16-path", [build_path.encode("utf-16-le")] * 2, "embeds host path"))
+        for case, payloads, diagnostic in cases:
+            with self.subTest(case=case):
+                self.roots.clear()
+                self.payloads["windows-x64"] = payloads
+                with self.assertRaisesRegex(builder.BuildError, diagnostic):
+                    builder.main(self.arguments)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(list((self.root / "build").iterdir()), [])
+
+    def test_version_change_rejects_partial_build_before_toolchain_or_output_writes(self):
+        self.manifest["tool_version"] = "0.0.0"
+        (self.bundle / "bundle.json").write_text(json.dumps(self.manifest))
+        before = self.snapshot()
+        with self.assertRaisesRegex(builder.BuildError, "select every platform"):
+            builder.main(self.arguments)
+        self.rust.assert_not_called()
+        self.compile.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse((self.root / "build").exists())
 
 
 if __name__ == "__main__":

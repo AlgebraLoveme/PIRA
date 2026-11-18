@@ -1,9 +1,8 @@
-#[cfg(unix)]
 mod common;
 use std::{
     fs,
     path::PathBuf,
-    process::{Command, Output},
+    process::Output,
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -22,11 +21,7 @@ impl Sandbox {
         fs::write(self.0.join(name), text).unwrap();
     }
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-            .current_dir(&self.0)
-            .args(args)
-            .output()
-            .unwrap()
+        common::command(&self.0).args(args).output().unwrap()
     }
     fn text(&self, args: &[&str]) -> String {
         let o = self.run(args);
@@ -43,6 +38,91 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn symbol_selection_modes_distinguish_exact_fallback_regex_and_kind() {
+    use std::collections::BTreeSet;
+    let s = Sandbox::new();
+    s.write("names.py", "def alpha():\n    return 'body_only'\ndef alpha_extra(): pass\nclass Box:\n    def ALPHA(self): pass\n");
+    let names = |text: &str| -> BTreeSet<String> {
+        text.lines()
+            .filter_map(|line| line.split_once(" name="))
+            .map(|(_, value)| {
+                serde_json::from_str(value.split_whitespace().next().unwrap()).unwrap()
+            })
+            .collect()
+    };
+    for (query, flags, expected) in [
+        ("alpha", vec![], vec!["alpha", "Box::ALPHA"]),
+        ("ALPHA", vec!["--exact"], vec!["alpha", "Box::ALPHA"]),
+        ("alpha_", vec![], vec!["alpha_extra"]),
+        ("alpha_", vec!["--exact"], vec![]),
+        (
+            "alpha",
+            vec!["--contains"],
+            vec!["alpha", "alpha_extra", "Box::ALPHA"],
+        ),
+        ("(^|::)alpha$", vec!["--regex"], vec!["alpha"]),
+        (
+            "(?i)(^|::)alpha$",
+            vec!["--regex"],
+            vec!["alpha", "Box::ALPHA"],
+        ),
+        ("alpha", vec!["--kind", "method"], vec!["Box::ALPHA"]),
+        ("body_only", vec![], vec![]),
+    ] {
+        let mut args = vec!["symbols", query, "names.py", "--locations-only"];
+        args.extend(flags);
+        let text = s.text(&args);
+        assert_eq!(
+            names(&text),
+            expected.into_iter().map(str::to_owned).collect(),
+            "{args:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn symbol_selection_modes_reject_conflicts_before_output() {
+    let s = Sandbox::new();
+    s.write(
+        "names.py",
+        "def alpha(): pass\ndef beta(): pass\ndef gamma(): pass\n",
+    );
+    for flags in [
+        ["--exact", "--contains"],
+        ["--contains", "--regex"],
+        ["--regex", "--exact"],
+    ] {
+        let output = s.run(&["symbols", "alpha", "names.py", flags[0], flags[1]]);
+        assert_eq!(output.status.code(), Some(2), "{flags:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("mutually exclusive"),
+            "{output:?}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn outline_matches_union_requested_declarations_and_allow_no_matches() {
+    let s = Sandbox::new();
+    s.write(
+        "names.py",
+        "def alpha(): pass\ndef beta(): pass\ndef gamma(): pass\n",
+    );
+    let filtered = s.text(&[
+        "outline", "names.py", "--match", "alpha", "--match", "gamma",
+    ]);
+    let names: Vec<_> = filtered
+        .lines()
+        .filter(|line| line.starts_with("function "))
+        .map(|line| line.split_whitespace().nth(1).unwrap())
+        .collect();
+    assert_eq!(names, ["alpha", "gamma"], "{filtered}");
+    let absent = s.text(&["outline", "names.py", "--match", "absent"]);
+    assert!(absent.contains("shown=0"), "{absent}");
 }
 
 #[test]
@@ -353,6 +433,107 @@ fn outline_shares_budget_with_later_files() {
         assert!(text.contains("important"), "{text}");
         assert!(!text.contains("symbols=1 shown=0"), "{text}");
     }
+    let partial = s.text(&[
+        "outline",
+        "small.rs",
+        "missing.rs",
+        "large.rs",
+        "--limit",
+        "2",
+    ]);
+    assert!(partial.contains("important"), "{partial}");
+    assert!(
+        partial.contains("files=3 succeeded=2 failed=1 complete=0"),
+        "{partial}"
+    );
+    let rows = partial
+        .lines()
+        .filter(|line| line.starts_with("function "))
+        .count();
+    assert_eq!(rows, 2, "{partial}");
+}
+
+#[test]
+fn outline_all_failed_peers_report_failure() {
+    let s = Sandbox::new();
+    let failed = s.run(&["outline", "missing.rs", "also_missing.rs"]);
+    assert!(!failed.status.success(), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stdout).contains("succeeded=0 failed=2 complete=0"),
+        "{failed:?}"
+    );
+}
+
+#[test]
+fn map_depth_bounds_directory_traversal_relative_to_each_root() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.0.join("sub/deeper")).unwrap();
+    s.write("a.py", "def root(): pass\n");
+    s.write("sub/b.py", "def child(): pass\n");
+    s.write("sub/deeper/c.py", "def grandchild(): pass\n");
+    for (depth, expected) in [
+        ("0", vec![]),
+        ("1", vec!["a.py"]),
+        ("2", vec!["a.py", "sub/b.py"]),
+    ] {
+        let text = s.text(&["map", ".", "--max-depth", depth]);
+        let paths: std::collections::BTreeSet<String> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("file="))
+            .map(|line| serde_json::from_str(line.split_whitespace().next().unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            expected.into_iter().map(str::to_owned).collect(),
+            "depth={depth}: {text}"
+        );
+    }
+    let narrow = s.text(&["map", "sub/deeper", "--max-depth", "1"]);
+    assert!(narrow.contains("grandchild"), "{narrow}");
+}
+
+#[test]
+fn query_batch_bounds_accept_the_limit_and_reject_the_next_request() {
+    let s = Sandbox::new();
+    s.write("names.rs", "fn needle() {}\n");
+    for command in ["search", "symbols", "query"] {
+        for count in [32, 33] {
+            let mut args = vec![command];
+            for _ in 0..count {
+                args.extend(if command == "query" {
+                    ["--show", "names.rs"]
+                } else {
+                    ["-e", "needle"]
+                });
+            }
+            if command != "query" {
+                args.push("names.rs");
+            }
+            let output = s.run(&args);
+            if count == 33 {
+                assert_eq!(output.status.code(), Some(2), "{command}: {output:?}");
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("32"),
+                    "{output:?}"
+                );
+            } else {
+                assert!(output.status.success(), "{command}: {output:?}");
+                let text = String::from_utf8(output.stdout).unwrap();
+                if command == "query" {
+                    assert!(text.contains("requests=32 succeeded=32"), "{text}");
+                    assert_eq!(text.matches("--- begin ---").count(), 32, "{text}");
+                } else {
+                    assert_eq!(
+                        text.matches("query index=").count(),
+                        32,
+                        "{command}: {text}"
+                    );
+                    assert!(text.contains("query index=32"), "{text}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -651,8 +832,7 @@ fn mixed_query_show_preserves_ranges_order_and_independent_failures() {
 fn mixed_query_missing_lsp_does_not_block_source() {
     let s = Sandbox::new();
     s.write("source.py", "def alpha():\n    return 8\n");
-    let output = Command::new(env!("CARGO_BIN_EXE_pira_nav"))
-        .current_dir(&s.0)
+    let output = common::command(&s.0)
         .env("PATH", "")
         .args([
             "query",

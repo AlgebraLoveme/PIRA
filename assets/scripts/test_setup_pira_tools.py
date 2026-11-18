@@ -1340,6 +1340,21 @@ class SetupPiraToolsTests(unittest.TestCase):
         with patch.object(setup, "request_bytes", return_value=encoded):
             self.assertEqual(setup.release_index()["tag"], "pira-tools-20260808-42")
 
+    def test_release_index_enforces_response_limit_without_content_length(self) -> None:
+        expected = self.index()
+        encoded = json.dumps(expected).encode()
+        for suffix in (b"", b" "):
+            with self.subTest(extra_bytes=len(suffix)):
+                response = io.BytesIO(encoded + suffix)
+                response.headers = {}
+                with patch.object(setup, "urlopen", return_value=response), \
+                     patch.object(setup, "MAX_INDEX_BYTES", len(encoded)):
+                    if suffix:
+                        with self.assertRaisesRegex(RuntimeError, "safety limit"):
+                            setup.release_index()
+                    else:
+                        self.assertEqual(setup.release_index(), expected)
+
     def test_exact_release_tag_uses_immutable_release_url(self) -> None:
         encoded = json.dumps(self.index()).encode()
         with patch.object(setup, "request_bytes", return_value=encoded) as request:
@@ -1373,27 +1388,97 @@ class SetupPiraToolsTests(unittest.TestCase):
             with self.assertRaises(selector.SelectionError):
                 selector.validate_tool_name("../" + tool)
 
-    def test_selector_installs_checkers_atomically(self) -> None:
-        for tool in ("pira_svg_check", "pira_write_check"):
+    def test_selector_installs_checker_bytes_and_replaces_alternate_name(self) -> None:
+        for tool, platform_key, suffix in (("pira_svg_check", "linux-x64", ""),
+                                           ("pira_write_check", "windows-x64", ".exe")):
             selector = setup.load_selector()
-            with tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(tool=tool, platform=platform_key), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                source = root / ("downloaded-" + tool)
+                source = root / ("downloaded-" + tool + suffix)
                 source.write_bytes((tool + "-binary").encode())
                 record = {"sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
                 source.chmod(0o755)
-                for platform_key in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "windows-x64"):
-                    selected, selected_record = selector.select_binary(
-                        platform_key, tool_name=tool, bundle_dir=root,
-                        manifest={"schema_version": 1, "tool_name": tool,
-                                  "binaries": {platform_key: {**record, "path": source.name}}},
-                    )
-                    self.assertEqual(selected, source.resolve())
-                    installed = selector.install_binary(
-                        selected, selected_record, root / "bin", tool_name=tool,
-                    )
-                    self.assertEqual(installed.name, tool)
-                    self.assertEqual(installed.read_bytes(), source.read_bytes())
+                selected, selected_record = selector.select_binary(
+                    platform_key, tool_name=tool, bundle_dir=root,
+                    manifest={"schema_version": 1, "tool_name": tool,
+                              "binaries": {platform_key: {**record, "path": source.name}}},
+                )
+                self.assertEqual(selected, source.resolve())
+                install = root / "bin"
+                install.mkdir()
+                alternate = install / (tool if suffix else tool + ".exe")
+                alternate.write_bytes(b"old alternate executable")
+                installed = selector.install_binary(selected, selected_record, install, tool_name=tool)
+                self.assertEqual(installed.name, tool + suffix)
+                self.assertEqual(installed.read_bytes(), (tool + "-binary").encode())
+                self.assertFalse(alternate.exists())
+                self.assertEqual(list(install.iterdir()), [installed])
+
+    def test_selector_normalizes_platform_aliases_without_substituting_unsupported_targets(self) -> None:
+        selector = setup.load_selector()
+        cases = (("Darwin", "ARM64", "darwin-arm64"), ("linux", "aarch64", "linux-arm64"),
+                 ("linux", "x86_64", "linux-x64"), ("win32", "AMD64", "windows-x64"),
+                 ("cygwin_nt-10.0", "x86_64", "windows-x64"),
+                 ("msys_nt-10.0", "arm64", "windows-arm64"))
+        for system, machine, expected in cases:
+            with self.subTest(system=system, machine=machine):
+                self.assertEqual(selector.normalize_platform(system, machine), expected)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "pira_ctx"
+            binary.write_bytes(b"x64 executable")
+            binary.chmod(0o755)
+            manifest = {"schema_version": 1, "binaries": {"windows-x64": {
+                "path": binary.name, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}}}
+            with self.assertRaisesRegex(selector.SelectionError, "unsupported platform windows-arm64"):
+                selector.select_binary(selector.normalize_platform("win32", "aarch64"),
+                                       bundle_dir=root, manifest=manifest)
+
+    def test_selector_failed_refresh_preserves_installed_bytes_and_cleans_stage(self) -> None:
+        selector = setup.load_selector()
+        for failure, diagnostic in (("checksum", "checksum mismatch"),
+                                    ("replace", "injected replace failure")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "downloaded"
+                source.write_bytes(b"new executable")
+                install = root / "bin"
+                install.mkdir()
+                old = install / "pira_ctx"
+                old.write_bytes(b"previous usable executable")
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                with patch.object(selector.os, "replace", side_effect=OSError("injected replace failure")) as replace:
+                    with self.assertRaisesRegex(selector.SelectionError, diagnostic):
+                        selector.install_binary(source, {"sha256": "0" * 64 if failure == "checksum" else digest}, install)
+                    if failure == "checksum":
+                        replace.assert_not_called()
+                    else:
+                        replace.assert_called_once()
+                self.assertEqual(old.read_bytes(), b"previous usable executable")
+                self.assertEqual(list(install.iterdir()), [old])
+
+    def test_selector_rejects_escaping_binary_paths_before_reading_them(self) -> None:
+        selector = setup.load_selector()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            outside = root / "outside"
+            outside.write_bytes(b"outside executable")
+            outside.chmod(0o755)
+            record = {"sha256": hashlib.sha256(outside.read_bytes()).hexdigest()}
+            for path in ("../outside", str(outside)):
+                with self.subTest(path=path), self.assertRaisesRegex(selector.SelectionError, "unsafe binary path"):
+                    selector.select_binary("linux-x64", bundle_dir=bundle,
+                        manifest={"schema_version": 1, "binaries": {"linux-x64": {**record, "path": path}}})
+            try:
+                (bundle / "link").symlink_to(outside)
+            except OSError:
+                self.skipTest("symlinks unavailable; lexical path rejections were checked")
+            with self.assertRaisesRegex(selector.SelectionError, "escapes bundle directory"):
+                selector.select_binary("linux-x64", bundle_dir=bundle,
+                    manifest={"schema_version": 1, "binaries": {"linux-x64": {**record, "path": "link"}}})
+            self.assertEqual(outside.read_bytes(), b"outside executable")
 
     def test_selection_includes_available_checkers(self) -> None:
         for tool in ("pira_svg_check", "pira_write_check"):
@@ -1473,7 +1558,7 @@ class SetupPiraToolsTests(unittest.TestCase):
                 setup.request_to_path(
                     "https://example.invalid/asset.gz",
                     destination,
-                    limit=1024,
+                    limit=len(data),
                     expected_size=len(data),
                     expected_hash=hashlib.sha256(data).hexdigest(),
                 )
@@ -1490,6 +1575,33 @@ class SetupPiraToolsTests(unittest.TestCase):
                         expected_hash=hashlib.sha256(data).hexdigest(),
                     )
             self.assertEqual(destination.read_bytes(), b"keep")
+
+    def test_streamed_download_rejections_remove_only_the_created_partial_file(self) -> None:
+        data = b"verified asset"
+        digest = hashlib.sha256(data).hexdigest()
+        class Interrupted(io.BytesIO):
+            def read(self, size=-1):
+                if self.tell():
+                    raise TimeoutError("injected interrupted response")
+                return super().read(1)
+        cases = (("checksum", data, "0" * 64, "checksum mismatch"),
+                 ("truncated", data[:-1], digest, "size mismatch"),
+                 ("over-limit", data + b"x", digest, "safety limit"),
+                 ("interrupted", data, digest, "injected interrupted response"))
+        for case, payload, expected_hash, diagnostic in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                unrelated = root / "keep"
+                unrelated.write_bytes(b"unrelated file")
+                response = Interrupted(payload) if case == "interrupted" else io.BytesIO(payload)
+                response.headers = {}  # The byte bound must not rely on server headers.
+                destination = root / "asset.gz"
+                with patch.object(setup, "urlopen", return_value=response):
+                    with self.assertRaisesRegex(RuntimeError, diagnostic):
+                        setup.request_to_path("https://example.invalid/asset.gz", destination,
+                            limit=len(data), expected_size=len(data), expected_hash=expected_hash)
+                self.assertEqual(list(root.iterdir()), [unrelated])
+                self.assertEqual(unrelated.read_bytes(), b"unrelated file")
 
     def test_decompression_rejects_content_larger_than_declared(self) -> None:
         index = self.index()

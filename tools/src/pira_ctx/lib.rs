@@ -1538,15 +1538,28 @@ fn run_transform(config: &Config) -> Result<i32, String> {
     let store = open_target(config)?;
     let lines = transform::run(&store, &config.transform)?;
     const MAX_BYTES: usize = 64 * 1024;
+    const NOTICE: &str = "[transform output truncated]";
+    let truncated = lines.iter().fold(0_usize, |bytes, line| {
+        bytes.saturating_add(line.len()).saturating_add(1)
+    }) > MAX_BYTES;
+    // Reserve the notice only for an overflow, so exact-limit results stay unchanged.
+    // Keep the existing whole-line accounting; stdout_line's sanitization cannot expand it.
+    let data_budget = if truncated {
+        MAX_BYTES - NOTICE.len() - 1
+    } else {
+        MAX_BYTES
+    };
     let mut used = 0_usize;
     for line in lines {
-        let needed = line.len() + 1;
-        if used + needed > MAX_BYTES {
-            util::stdout_line("[transform output truncated]")?;
+        let needed = line.len().saturating_add(1);
+        if needed > data_budget - used {
             break;
         }
         util::stdout_line(&line)?;
         used += needed
+    }
+    if truncated {
+        util::stdout_line(NOTICE)?;
     }
     Ok(0)
 }

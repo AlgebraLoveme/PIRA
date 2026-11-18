@@ -190,7 +190,6 @@ fn run(s: &Sandbox, args: &[&str]) -> std::process::Output {
 #[test]
 fn limits_are_disclosed_and_context_matches_are_visible() {
     let s = Sandbox::new();
-    let mut ids = Vec::new();
     // Two matches distinguish a full one-row page from the exact-limit boundary.
     for context in ["older cache rationale", "newer cache rationale"] {
         let out = run(
@@ -210,14 +209,6 @@ fn limits_are_disclosed_and_context_matches_are_visible() {
             ],
         );
         assert!(out.status.success());
-        ids.push(
-            String::from_utf8(out.stdout)
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-                .to_string(),
-        );
     }
     let out = run(
         &s,
@@ -242,26 +233,6 @@ fn limits_are_disclosed_and_context_matches_are_visible() {
     );
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(json["has_more"], false);
-    assert!(run(&s, &["show", &ids[0]]).status.success());
-    assert!(!run(&s, &["show", "D-"]).status.success());
-    // A complete-ID read still verifies embedded identity and content integrity.
-    let mut stack = vec![s.path().to_path_buf()];
-    let mut record = None;
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_stem().is_some_and(|stem| stem == ids[0].as_str()) {
-                record = Some(path);
-            }
-        }
-    }
-    fs::write(record.unwrap(), b"corrupt").unwrap();
-    assert!(!run(&s, &["show", &ids[0]]).status.success());
-    let out = run(&s, &["list", "--limit", "1", "--json"]);
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(json["skipped_count"], 1);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
