@@ -134,11 +134,7 @@ pub(crate) fn command(
     if options.execution.mode != "danger-full-access" {
         return Err("Claude workers require verified full-access permission; workspace-write cannot be represented by Claude's tool permissions".into());
     }
-    if options.service_tier != crate::profile::service_tier::Tier::Standard {
-        return Err(
-            "Claude service-tier selection is not supported; use --service-tier standard".into(),
-        );
-    }
+    super::Harness::Claude.validate_service_tier(options.service_tier)?;
     let manifest = lifecycle::read_json(&run.join("manifest.json"))?;
     let session = manifest["thread_id"]
         .as_str()

@@ -312,6 +312,19 @@ class SubteamTests(unittest.TestCase):
         self.finish(coordinator)
         self.assertEqual(self.wait(process2)[0], 0)
 
+    def test_watcher_reports_metadata_read_failure_on_cancellation(self):
+        process, coordinator = self.start()
+        path = self.root / "logs" / coordinator / "tree.json"
+        before = path.read_bytes()
+        try:
+            path.write_bytes(b"{")
+            self.wait_stderr_notice(process, "cannot verify subtree interruption gate")
+        finally:
+            path.write_bytes(before)
+        code, stdout, stderr = self.wait(process)
+        self.assertNotEqual(code, 0, stderr)
+        self.assertEqual(stdout, "")
+
     def test_recursive_active_subtree_and_stale_endpoint(self):
         process, coordinator = self.start()
         child = self.child(coordinator)

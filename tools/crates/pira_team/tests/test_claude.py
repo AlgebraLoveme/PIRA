@@ -60,6 +60,32 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(new['thread_id'],manifest['thread_id'])
         self.assertEqual(new['usage']['input_tokens'],20)
         self.assertEqual(json.loads(Path(json.loads(result.stdout)['handoff_path']).read_text()),['initial','recall'])
+    def test_rejected_tier_resume_preserves_state_and_plain_resume(self):
+        first = self.launch('initial')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        receipt = json.loads(first.stdout)
+        run = Path(receipt['run_root'])
+        before = {name: (run / name).read_bytes() for name in
+                  ('manifest.json', 'tree.json', 'revisions/000001/manifest.json')}
+        result = self.f.access('resume', receipt['run_id'], '--service-tier', 'fast')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Claude service-tier selection is not supported', result.stderr)
+        for name, content in before.items():
+            self.assertEqual((run / name).read_bytes(), content, name)
+        self.assertFalse((run / 'revisions/000002').exists())
+        plain = self.f.access('resume', receipt['run_id'])
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        current = json.loads((run / 'manifest.json').read_text())
+        self.assertEqual(current['service_tier'], 'standard')
+        self.assertEqual(current['revision'], 2)
+        self.assertEqual(current['thread_id'], json.loads(before['manifest.json'])['thread_id'])
+
+    def test_rejected_tier_launch_does_not_allocate_run(self):
+        result = self.launch('initial', '--service-tier', 'fast')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Claude service-tier selection is not supported', result.stderr)
+        self.assertFalse((self.f.root / 'logs').exists())
+
     def test_parallel_workers_can_use_both_families(self):
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

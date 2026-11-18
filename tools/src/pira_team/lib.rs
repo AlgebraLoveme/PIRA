@@ -442,7 +442,7 @@ mod tests {
     pub(crate) fn temp_path(prefix: &str) -> PathBuf {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).unwrap();
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "{prefix}-{}-{:032x}",
             std::process::id(),
             u128::from_ne_bytes(bytes)

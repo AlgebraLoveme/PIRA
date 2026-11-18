@@ -428,14 +428,7 @@ fn restricted() -> Value {
 
 #[test]
 fn latest_verified_context_replaces_full_access_without_backfilling_resume() {
-    let path = std::env::temp_dir().join(format!(
-        "team-profile-{}-{}.jsonl",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::tests::temp_path("team-profile").with_extension("jsonl");
     let records = |latest: Value| {
         format!(
             "{}\n{}\n{}\n{}\n",

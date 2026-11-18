@@ -2,6 +2,7 @@
 import unittest
 
 import native_ci
+from native_fixture import windows_verbatim_path
 
 
 def cases(suite):
@@ -13,6 +14,21 @@ def cases(suite):
 
 
 class NativeSelectionTests(unittest.TestCase):
+    def test_windows_fixture_spelling_handles_drive_unc_and_verbatim_paths(self):
+        for source, expected in (
+            (r"C:\fixture\root", r"\\?\C:\fixture\root"),
+            (r"\\server\share\root", r"\\?\UNC\server\share\root"),
+            (r"\\?\C:\fixture\root", r"\\?\C:\fixture\root"),
+            (r"\\?\UNC\server\share\root", r"\\?\UNC\server\share\root"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(windows_verbatim_path(source), expected)
+
+    def test_windows_fixture_spelling_rejects_relative_paths(self):
+        for path in ("relative", r"C:relative", r"\rooted"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                windows_verbatim_path(path)
+
     def test_windows_gate_retains_new_categories_and_launch_bursts(self):
         loader = unittest.TestLoader()
         selected = [case.id() for case in cases(native_ci.windows_suite(loader))]

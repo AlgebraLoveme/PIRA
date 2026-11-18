@@ -291,10 +291,10 @@ pub(super) fn artifact_path(run: &Path) -> Result<PathBuf, String> {
     let path = managed_path(run, Path::new("manifest.json"))?;
     let file = File::open(path).map_err(|e| format!("open run manifest: {e}"))?;
     let mut bytes = Vec::new();
-    file.take(16 * 1024 * 1024 + 1)
+    file.take(crate::lifecycle::MAX_METADATA_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() > 16 * 1024 * 1024 {
+    if bytes.len() > crate::lifecycle::MAX_METADATA_BYTES {
         return Err("run manifest exceeds 16 MiB".into());
     }
     let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid run manifest")?;

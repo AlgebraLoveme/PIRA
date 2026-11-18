@@ -103,27 +103,35 @@ pub fn private_path(path: &Path, directory: bool) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn read_json(path: &Path) -> Result<Value, String> {
     private_path(path, false)?;
     let mut bytes = Vec::new();
     File::open(path)
-        .and_then(|f| f.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes))
+        .and_then(|f| {
+            f.take(MAX_METADATA_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
         .map_err(|e| e.to_string())?;
-    if bytes.len() > 16 * 1024 * 1024 {
+    if bytes.len() > MAX_METADATA_BYTES {
         return Err("run metadata exceeds 16 MiB".into());
     }
     serde_json::from_slice(&bytes).map_err(|e| format!("invalid run metadata: {e}"))
 }
 
 pub fn save_json(path: &Path, value: &Value) -> Result<(), String> {
+    // Bound the exact representation, including escaping, indentation and newline,
+    // before touching durable state or allocating its replacement.
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err("run metadata exceeds 16 MiB".into());
+    }
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     // Cleanup owns this path only after exclusive creation succeeds.
     let mut file = create(&temp)?;
     let result = (|| {
-        // Formatting directly into File issues thousands of tiny writes while
-        // tree.lock is held. Encode first; retain identical bytes and durability.
-        let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
-        bytes.push(b'\n');
         file.write_all(&bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(&temp, path).map_err(|e| e.to_string())?;
@@ -190,6 +198,8 @@ pub(super) fn owner(run: &Path) -> Result<Owner, String> {
 const FIX_TASK: &str = include_str!("docs/fix_task.md");
 
 pub fn launch(options: Options) -> Result<(), String> {
+    crate::harness::Harness::for_model(&options.model)
+        .validate_service_tier(options.service_tier)?;
     for path in [
         &options.store,
         &options.cwd,
@@ -508,6 +518,8 @@ fn admitted_revision(
     manifest: &mut Value,
     owner: &Owner,
 ) -> Result<(), String> {
+    crate::harness::Harness::for_model(&options.model)
+        .validate_service_tier(options.service_tier)?;
     let resume = manifest["revision"] != 1;
     let mut admission = crate::subteam::admit(run, manifest, resume, owner)?;
     revision(options, run, manifest, &mut admission).map_err(|error| {
@@ -668,7 +680,7 @@ fn revision(
         }
     }
     crate::retention::activity(manifest)?;
-    if let Err(error) = crate::subteam::finish(run, manifest) {
+    if let Err(error) = settle_revision(run, manifest) {
         outcome = Err(error);
     }
     manifest["validation"] = json!(if manifest["status"] != "completed" {
@@ -717,6 +729,18 @@ fn revision(
         }
         Err(error) => Err(format!("{error}; logs: {}", dir.display())),
     }
+}
+
+fn settle_revision(run: &Path, manifest: &mut Value) -> Result<(), String> {
+    crate::subteam::finish(run, manifest).map_err(|error| {
+        // A validated handoff is not completion until subtree settlement succeeds.
+        // Keep deliberate refusals (incomplete/interrupted) and worker dispositions.
+        if manifest["status"] == "completed" {
+            manifest["status"] = json!("failed");
+        }
+        manifest["error"] = json!(error);
+        error
+    })
 }
 
 // Keep fallible generation separate so every failure returns through revision finalization.
@@ -1041,6 +1065,7 @@ fn generate_stage(
 mod tests {
     use super::*;
     include!("lifecycle/tests/admission.rs");
+    include!("lifecycle/tests/outcomes.rs");
 
     #[test]
     fn policy_bundle_composes_each_selection_without_changing_default_scope() {

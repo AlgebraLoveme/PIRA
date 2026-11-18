@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from native_fixture import cleanup_temporary
+from native_fixture import cleanup_temporary, windows_verbatim_path
 
 
 class TeamFixture:
@@ -18,6 +18,8 @@ class TeamFixture:
         self.temp = tempfile.TemporaryDirectory(prefix="team-test-")
         self.add_cleanup(cleanup_temporary, self.temp)
         self.root = Path(self.temp.name).resolve()
+        if os.name == "nt":
+            self.root = Path(windows_verbatim_path(str(self.root)))
         self.bin = Path(os.environ["PIRA_TEAM_BIN"]).resolve()
         home = self.root / "original-home"
         home.mkdir()

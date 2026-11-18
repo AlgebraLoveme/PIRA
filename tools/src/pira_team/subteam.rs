@@ -592,7 +592,7 @@ pub(super) fn admit<'a>(
 
 pub struct Watcher {
     done: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<Option<String>>>,
 }
 impl Watcher {
     pub fn start(run: &Path, manifest: &Value) -> Result<Self, String> {
@@ -602,21 +602,26 @@ impl Watcher {
         let (done, receiver) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             loop {
-                match read_tree(&root) {
+                let reason = match read_tree(&root) {
                     Ok(tree)
                         if tree["blocked"] == false
                             && tree["epoch"] == epoch
-                            && tree["members"][&member]["blocked"] != true => {}
-                    _ => {
-                        CANCELLED.store(true, Ordering::SeqCst);
-                        break;
+                            && tree["members"][&member]["blocked"] != true =>
+                    {
+                        None
                     }
+                    Ok(_) => Some("subtree interruption gate changed".to_owned()),
+                    Err(error) => Some(format!("cannot verify subtree interruption gate: {error}")),
+                };
+                if let Some(reason) = reason {
+                    CANCELLED.store(true, Ordering::SeqCst);
+                    break Some(format!("pira_team: cancelling {member}: {reason}"));
                 }
                 if !matches!(
                     receiver.recv_timeout(Duration::from_millis(20)),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 ) {
-                    break;
+                    break None;
                 }
             }
         });
@@ -629,8 +634,11 @@ impl Watcher {
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.done.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Ok(Some(reason)) = thread.join()
+        {
+            // Cancellation and watcher shutdown must not wait on a diagnostic pipe.
+            crate::notice(format_args!("{reason}"));
         }
     }
 }

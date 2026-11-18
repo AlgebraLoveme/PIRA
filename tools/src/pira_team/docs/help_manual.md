@@ -152,7 +152,7 @@ Team writes must fit caller writable scope; no roots are added. Claude requires 
 remote requirements are described separately. Read-only, interactive approvals and
 unrepresentable fine-grained profiles are unsupported. Team does not add filesystem/network
 authority. Full access does not expand task ownership.
-On new runs, caller model exactly gpt-6-astra (at any effort) maps to gpt-6.1-sol/high.
+On new runs, both gpt-6-astra and gpt-6.2-astra callers (at any effort) map to gpt-6.1-sol/high.
 Recognized callers gpt-6.1-sol, gpt-6-sol, gpt-6-luna and gpt-5.6-sol inherit model/effort
 unchanged. Unknown or missing caller model identity falls back to gpt-6.1-sol/high, not the
 caller's effort. These bundled defaults apply unless config supplies an exact caller-model

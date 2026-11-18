@@ -89,6 +89,10 @@ class WindowsCodexSearchTests(unittest.TestCase):
 
 class TeamInitializeProcessTests(unittest.TestCase):
     def setUp(self):
+        # Signing capability has separate tests; these fixtures supply other prerequisites.
+        signing = patch.object(setup, "check_team_remote_signing")
+        signing.start()
+        self.addCleanup(signing.stop)
         search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
         search.start()
         self.addCleanup(search.stop)
@@ -592,6 +596,10 @@ class TeamAuthTests(unittest.TestCase):
 
 class SetupPiraToolsTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Signing capability has separate tests; these fixtures supply other prerequisites.
+        signing = patch.object(setup, "check_team_remote_signing")
+        signing.start()
+        self.addCleanup(signing.stop)
         search = patch.object(setup, "windows_codex_binary", side_effect=lambda: setup.shutil.which("codex.exe"))
         search.start()
         self.addCleanup(search.stop)

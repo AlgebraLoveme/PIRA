@@ -169,6 +169,19 @@ impl Harness {
         }
     }
 
+    pub(crate) fn validate_service_tier(
+        self,
+        tier: crate::profile::service_tier::Tier,
+    ) -> Result<(), String> {
+        if self == Self::Claude && tier != crate::profile::service_tier::Tier::Standard {
+            return Err(
+                "Claude service-tier selection is not supported; use --service-tier standard"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_effort(self, effort: &str) -> Result<(), String> {
         if self == Self::Claude && !["low", "medium", "high", "xhigh", "max"].contains(&effort) {
             return Err(format!(

@@ -13,6 +13,10 @@
     "gpt-6-astra": {
       "model": "gpt-6.1-sol",
       "effort": "high"
+    },
+    "gpt-6.2-astra": {
+      "model": "gpt-6.1-sol",
+      "effort": "high"
     }
   }
 }

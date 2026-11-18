@@ -26,8 +26,20 @@ class NativeAuthTests(unittest.TestCase):
 
     def launch(self) -> dict:
         result = self.fixture.launch("inert persistent auth fixture")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if result.returncode:
+            logs = "\n".join(path.read_text() for path in
+                             (self.fixture.root / "logs").rglob("stderr.log"))
+            self.fail(f"{result.stderr}\nbackend diagnostics:\n{logs}")
         return json.loads(result.stdout)
+
+    def test_failed_native_launch_reports_peer_diagnostics(self):
+        peer = self.fixture.root / "codex"
+        script = peer.read_text()
+        probe = ('if "--stdio" in sys.argv:\n'
+                 '    raise RuntimeError("synthetic peer failure for diagnostic regression")\n')
+        peer.write_text(script.replace("args = sys.argv[1:]", probe + "args = sys.argv[1:]", 1))
+        with self.assertRaisesRegex(AssertionError, "synthetic peer failure for diagnostic regression"):
+            self.launch()
 
     def test_selected_file_native_atomic_refresh_target_is_retained_through_resume(self):
         selected = self.fixture.root / "team-native-login"

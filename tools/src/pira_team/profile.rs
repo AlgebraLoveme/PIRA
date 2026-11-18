@@ -380,14 +380,16 @@ mod tests {
 
     #[test]
     fn astra_defaults_are_independent_of_caller_effort() {
-        for effort in [
-            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-        ] {
-            let (model, effort, sources, execution) =
-                resolve(None, None, caller("gpt-6-astra", effort)).unwrap();
-            assert_eq!((model.as_str(), effort.as_str()), ("gpt-6.1-sol", "high"));
-            assert_eq!(sources, json!({"model":"mapping", "effort":"mapping"}));
-            assert_eq!(execution.mode, "workspace-write");
+        for main in ["gpt-6-astra", "gpt-6.2-astra"] {
+            for effort in [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ] {
+                let (model, effort, sources, execution) =
+                    resolve(None, None, caller(main, effort)).unwrap();
+                assert_eq!((model.as_str(), effort.as_str()), ("gpt-6.1-sol", "high"));
+                assert_eq!(sources, json!({"model":"mapping", "effort":"mapping"}));
+                assert_eq!(execution.mode, "workspace-write");
+            }
         }
     }
 

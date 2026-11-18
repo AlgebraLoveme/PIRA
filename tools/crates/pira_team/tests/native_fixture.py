@@ -2,8 +2,19 @@
 import contextlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import socket
+
+
+def windows_verbatim_path(path: str) -> str:
+    """Match Rust canonical spelling for an already resolved Windows fixture path."""
+    if not PureWindowsPath(path).is_absolute():
+        raise ValueError("Windows fixture path must be absolute and resolved")
+    if path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
 
 
 def cleanup_temporary(temporary):
