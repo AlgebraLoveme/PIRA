@@ -48,8 +48,10 @@ def ok(result):
 
 
 def capture(store, text="hello"):
+    # Bindings are checked against UTF-8/LF bytes, not platform text-stream newlines.
+    payload = (text + "\n").encode("utf-8")
     ok(run(store, "capture", "--intent", "small repair fixture", "--", sys.executable,
-           "-c", "print(" + repr(text) + ")"))
+           "-c", "import sys;sys.stdout.buffer.write(" + repr(payload) + ")"))
     return max(store.glob("*.piractx"), key=lambda p: metadata(p)["start_unix_ms"])
 
 
@@ -202,7 +204,7 @@ def exec_case():
             "assert [CAPTURES[n]['id'] for n in CAPTURE_NAMES]==MSG_IDS;"
             "assert all(CAPTURES[n]['state']=='complete' and CAPTURES[n]['exit']==0 and "
             "CAPTURES[n]['generation']==0 for n in CAPTURE_NAMES);"
-            "assert 'MSG' not in globals();print('snapshots')")
+            "assert 'MSG' not in globals();import sys;sys.stdout.buffer.write(b'snapshots\\n')")
     result = run(store, "exec", "--input", "second=" + str(other), "--input", "first=" + str(path), "--code", code)
     assert ok(result) == "snapshots\n", (result.returncode, result.stdout, result.stderr)
 

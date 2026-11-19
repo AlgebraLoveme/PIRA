@@ -734,11 +734,26 @@ fn add_enforces_the_complete_record_byte_limit() {
     for extra in [0, 1] {
         let s = Sandbox::new();
         let mut choices: Vec<_> = (0..16)
-            .map(|i| format!("{i:02}{}", "x".repeat(3998)))
+            // Preserve UTF-8 byte sizes without exceeding Windows' UTF-16 argv limit.
+            .map(|i| format!("{i:02}{}xx", "前".repeat(1332)))
             .collect();
-        choices.push("z".repeat(1330 + extra));
+        choices.push(format!("{}{}", "後".repeat(443), "z".repeat(1 + extra)));
+        assert_eq!(
+            choices.iter().map(String::len).sum::<usize>(),
+            65_330 + extra
+        );
         let choices: Vec<_> = choices.iter().map(String::as_str).collect();
-        let out = s.run(&add_args("valid", &choices, "1"));
+        let mut command = s.command(&add_args("valid", &choices, "1"));
+        let units = |arg: &std::ffi::OsStr| arg.to_string_lossy().encode_utf16().count();
+        // These arguments need at most two quotes and one separator/null each.
+        let command_units = units(command.get_program())
+            + 3
+            + command.get_args().map(|arg| units(arg) + 3).sum::<usize>();
+        assert!(
+            command_units <= 32_767,
+            "fixture exceeds Windows argv limit: {command_units}"
+        );
+        let out = command.output().unwrap();
         assert_eq!(
             out.status.code(),
             Some(if extra == 0 { 0 } else { 2 }),

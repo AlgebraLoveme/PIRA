@@ -1412,7 +1412,9 @@ class SetupPiraToolsTests(unittest.TestCase):
                 self.assertEqual(installed.name, tool + suffix)
                 self.assertEqual(installed.read_bytes(), (tool + "-binary").encode())
                 self.assertFalse(alternate.exists())
-                self.assertEqual(list(install.iterdir()), [installed])
+                entries = list(install.iterdir())
+                self.assertEqual(len(entries), 1)
+                self.assertTrue(entries[0].samefile(installed))
 
     def test_selector_normalizes_platform_aliases_without_substituting_unsupported_targets(self) -> None:
         selector = setup.load_selector()
