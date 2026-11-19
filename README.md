@@ -1,36 +1,20 @@
 # PIRA
 
-PIRA (pronounced "Pyra") is a research-oriented personal agent for reasoning, writing, coding, learning, and practical problem-solving.
+> *Agents work. PIRA collaborates.*
+>
+> — PIRA designers
 
-It adds a small, inspectable set of instructions and tools to Codex or Claude Code to make the agent more careful, useful, and consistent.
+## Features
 
-## What PIRA helps with
+- 🗂️ **Work everywhere.** PIRA helps with science, work, and everyday life, coordinating multiple workloads in parallel.
+- 💬 **Talk anytime.** A collaborator does not stop unfinished work to answer new requests, and neither does PIRA.
+- 🛡️ **Safe independence.** PIRA works independently and carefully with full access. It asks for approval for irreversible or potentially destructive work, not concrete commands.
+- 🧠 **Forever memory.** PIRA has a specialized memory design to remember all work lifelong.
+- 👤 **Everyone's special PIRA.** PIRA remembers and adapts to individual communication preferences. Just ask it to use the style you want.
+- 💰 **Budget friendly.** PIRA does its best to remove unnecessary costs.
+- 🖥️ **Machine friendly.** PIRA can work across multiple machines and handle disconnections safely.
 
-- planning research and checking evidence;
-- writing and polishing scientific text;
-- coding, debugging, and repository work;
-- learning difficult material through clear explanations;
-- practical day-to-day problem-solving.
-
-PIRA follows five principles:
-
-- **Useful:** give concrete next steps.
-- **Honest:** never invent claims, citations, or results.
-- **Evidence-first:** prefer primary sources when facts matter.
-- **Transparent:** separate facts from interpretation and state uncertainty.
-- **Kind:** stay supportive, collaborative, and respectful.
-
-## PIRA blogs
-
-- [Making Reliable Research Agents Accessible](https://algebraloveme.github.io/2026-07-23-pira-design-and-use/) — PIRA’s design, research workflow, and practical use.
-- [Working with PIRA Team](https://algebraloveme.github.io/2026-10-10-working-with-pira-team/) — Parallel collaboration, worker configuration, and getting started.
-- [Everything Everywhere with One PIRA](https://algebraloveme.github.io/everything-everywhere-with-one-pira/) — One communicator for your work across projects and machines.
-
-## Tested compatibility
-
-PIRA has been tested extensively with **Codex on GPT-5.4, GPT-5.5, 5.6/6.1-sol and GPT-6 Astra**. Other models and agent platforms have received less testing.
-
-> **Using Claude Code?** Use the same `master` checkout with setup's `--include ClaudeCode`, or `--include Codex ClaudeCode` for both. Setup defaults to Codex. See [Claude setup options](#claude-setup-options).
+**[Read the guide to working with PIRA →](https://algebraloveme.github.io/everything-everywhere-with-one-pira/)**
 
 ## Install or update
 
@@ -40,7 +24,7 @@ PIRA installs to `~/agent` by default. Before updating, close active PIRA sessio
 Install or update PIRA, including its tools, following https://github.com/AlgebraLoveme/PIRA. Preserve my existing preferences and local changes.
 ```
 
-For Claude Code, specify whether to configure Claude Code alone or both CLIs.
+Setup defaults to Codex. For Claude Code, say whether you want Claude Code alone or both. PIRA has been tested most extensively with Codex.
 
 <details>
 <summary>Technical installation and update instructions</summary>
@@ -139,9 +123,9 @@ The macOS/Linux and Windows wrappers support the same options. If Python is miss
 
 ## One assistant across projects
 
-Setup creates your communication workspace at `~/pira` if it is missing and leaves an existing directory unchanged. Open a new agent session there to work across all your projects.
+Setup creates your communication workspace at `~/pira` if it is missing and leaves an existing directory unchanged. Open your agent there and use the same PIRA for all your projects.
 
-Your communicator’s local instructions and workbook keep track of your preferences, projects and unfinished work, so you can manage them through one conversation. Project details stay in their own project workbooks.
+Tell PIRA where your projects live and how you like to work. It tracks unfinished commitments across projects here; each project keeps its own decisions and results. You can send another request while work is underway and let PIRA coordinate the work.
 
 <details>
 <summary>Communication-workspace guidance for agents</summary>
@@ -154,7 +138,7 @@ After successful installation or update, give the following handoff only when th
 
 > Open a new agent session in YOUR_ABSOLUTE_HOME/pira and use it across all your projects. Tell PIRA what you are working on and where those projects live. Make a deliberate effort to bring new tasks to this communicator, even while it is working, rather than opening separate sessions out of habit. Let it manage progress across projects for you.
 
-Append the collaborator article from **PIRA blogs** to the handoff, with its link and the label **Highly recommended reading**. Replace the path placeholder with the actual absolute path. Omit this onboarding handoff when the communicator handles setup directly or delegates it to a worker, even if that worker runs from another directory. Use the assignment context rather than the setup process’s working directory to determine this.
+Append [Everything Everywhere with One PIRA](https://algebraloveme.github.io/everything-everywhere-with-one-pira/) to the handoff with the label **Highly recommended reading**. Replace the path placeholder with the actual absolute path. Omit this onboarding handoff when the communicator handles setup directly or delegates it to a worker, even if that worker runs from another directory. Use the assignment context rather than the setup process’s working directory to determine this.
 
 </details>
 
@@ -282,6 +266,17 @@ If setup cannot safely handle an existing conflicting file or Codex setting, it 
 
 </details>
 
+## How PIRA works
+
+<details>
+<summary>The meta-harness: how PIRA fits with your model and agent</summary>
+
+PIRA is a **meta-harness** for Codex and Claude Code. The model supplies the reasoning and the harness runs commands and edits files. PIRA adds working rules, project memory, and tools for coordinating tasks across workers and machines. PIRA’s safety rules guide the agent’s actions. Any sandbox restrictions are enforced by the underlying harness or operating system.
+
+PIRA keeps large command outputs out of the main conversation and can assign independent tasks to less expensive workers. In the [known-fix benchmark](#known-target-fix-benchmark), an economical team matched the strongest tested solo model’s 15 clean fixes out of 20 at about one-twelfth the API cost.
+
+</details>
+
 ## Memory System
 
 PIRA separates memory by how long it should remain useful. This prevents raw command logs from crowding out important project knowledge.
@@ -291,6 +286,9 @@ PIRA separates memory by how long it should remain useful. This prevents raw com
 | Activity | Commands, actions, and detailed evidence | `pira_ctx` | Agents search it when needed |
 | Decisions | Important choices, alternatives, and reasons | `pira_dec` | Agents search it when needed |
 | Project knowledge | Durable state, validated results, lessons, and limitations | `AGENT_WORKBOOK.md` | Agents and humans read it directly |
+
+<details>
+<summary>Memory storage, retention, and session logs</summary>
 
 Detailed activity remains searchable within the retention limits. After a conversation is compacted, `pira_ctx recap` can restore recent activity from this layer so work can continue.
 
@@ -306,7 +304,7 @@ A Codex session log is **session-centered and chronological**: it preserves the 
 | Organizing unit | One conversation or thread | One workspace, with automatically scoped thread events |
 | Primary content | Chronological conversation and session activity | Command events, structured decisions, and curated high-level project knowledge |
 | Retrieval model | Reopen or continue the session | Agents search lower layers; agents and humans read the workbook directly |
-| Cross-session value | Preserves each session's history | Carries operational evidence, decisions, and durable project understanding across sessions |
+| Continuity | Preserves the history of one thread | Keeps evidence, decisions, and project knowledge available as work continues |
 | Noise policy | Retains the conversational sequence | Separates event detail, concluded decisions, and promoted high-level knowledge |
 
 A session log answers **“what happened in this conversation?”** PIRA answers **“what has been done in this project, what evidence remains available, and what should future work remember?”**
@@ -314,6 +312,8 @@ A session log answers **“what happened in this conversation?”** PIRA answers
 </details>
 
 Information moves upward only when its lasting value increases. Activity stays in `pira_ctx`; concluded choices go to `pira_dec`; durable consequences become self-contained workbook entries. The workbook never requires a reader to look up a lower-level record.
+
+</details>
 
 ## Evaluations
 
@@ -337,7 +337,10 @@ A private behavior-based evaluator was added only after each agent finished. It 
 
 The estimate applies standard GPT-5.6 Sol rates at run time to aggregate usage telemetry: \$5 per million uncached input tokens, \$0.50 per million cached input tokens, and \$30 per million output tokens. PIRA issued more commands, including 34 `pira_ctx` and 66 `pira_nav` calls. It exposed substantially less command text and reduced the base-rate estimate. PIRA used 8,508 additional instruction bytes.
 
-#### `pira_ctx`: natural implementation task
+#<details>
+<summary>Tool guides, Team configuration, and benchmarks</summary>
+
+### `pira_ctx`: natural implementation task
 
 Two fresh `gpt-5.6-sol` high-reasoning agents received byte-identical prompts and clean Git repositories containing only the current `pira_dec` design. Both were asked to implement and test the complete tool in Python. No command output, capture, prescribed workflow, existing implementation, or answer was supplied. The tool condition had only `pira_ctx 1.4.0` and its ctx-specific rules; the baseline had no PIRA rules or binaries, and neither condition had a navigation or decision binary. Both could write their isolated workspace and use ordinary Python and Git.
 
@@ -585,14 +588,14 @@ For reproducible font selection, use `--isolated-fonts --font-dir DIR` with expl
 
 ### `pira_team`: scoped technical workers
 
-`pira_team --help` lists commands and topics. Use `pira_team COMMAND --help`
-for focused syntax, `pira_team help remote` for remote interfaces, and
-`pira_team help manual` for the full safety, recovery, session and transport reference.
-
 `pira_team` delegates substantial reviews and implementation tasks to Codex or Claude Code workers so your main agent can focus on decisions and communication. **Team configurations achieved the lowest main-agent API cost and context use in all three benchmarks below.** Offloading detailed work leaves room for more tasks between compactions, supporting longer-running conversations.
 
 <details>
 <summary>When to use Team, design differences, requirements, and benchmark results</summary>
+
+`pira_team --help` lists commands and topics. Use `pira_team COMMAND --help`
+for focused syntax, `pira_team help remote` for remote interfaces, and
+`pira_team help manual` for the full safety, recovery, session and transport reference.
 
 #### When it helps
 
@@ -724,15 +727,7 @@ Costs are **Standard API-equivalent USD estimates**, excluding setup and indepen
 
 </details>
 
-## Why this design
-
-PIRA keeps its design small and inspectable:
-
-- **Inspectable.** Behavior is organized in readable policy and module files that are easy to review and customize.
-- **Lightweight.** It avoids a heavy framework and keeps instruction overhead low.
-- **Research-oriented.** Default workflows emphasize reasoning, writing, coding, evidence gathering, and careful iteration.
-- **Lean by default.** Inspired by [Ponytail](https://github.com/DietrichGebert/ponytail) and general lessons from *Clean Code* and *Clean Architecture*, its coding style prefers simple, safe implementations and clear boundaries over speculative abstractions.
-- **Tool-friendly.** The small, explicit design integrates naturally with official tools such as Codex.
+</details>
 
 ## Safety model
 
@@ -792,22 +787,27 @@ The public repository contains the shared policy framework plus tool source, rep
 
 If PIRA materially assists a research project, disclose that assistance where appropriate, such as in an acknowledgement, LLM-use disclosure, or reproducibility checklist, and cite this repository. Describe the assistance actually used, including the model/version or reasoning setting if your venue requires it.
 
+<details>
+<summary>Suggested disclosure and BibTeX</summary>
+
 Suggested disclosure text:
 
-> This paper was assisted by PIRA~\citep{pira}, a research-assistant agent powered by {the model used, such as GPT-5.5}. The assistance included [brainstorming / implementation assistance / writing polish / ...]. The authors are fully responsible for the final content.
+> This paper was assisted by PIRA~\citep{pira}, a meta-harness used with [agent harness] and [model/version]. The assistance included [brainstorming / implementation assistance / writing polish / ...]. The authors are fully responsible for the final content.
 
 Suggested BibTeX entry:
 
 ```bibtex
 @misc{pira,
   author = {{PIRA Project}},
-  title = {{PIRA}: A Research Assistant},
+  title = {{PIRA}},
   year = {2026},
   howpublished = {\url{https://github.com/AlgebraLoveme/PIRA}}
 }
 ```
 
 Credit PIRA for tool assistance. Do not list it as a scientific author.
+
+</details>
 
 ## License
 
