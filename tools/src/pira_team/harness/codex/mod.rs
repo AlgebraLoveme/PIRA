@@ -4,6 +4,7 @@ mod caller_log;
 mod schema;
 
 pub(super) use caller::{caller_context, caller_identity};
+pub(crate) use schema::resume_params;
 #[cfg(test)]
 pub(crate) use schema::tests::installed_native_schema_supports_team_requests;
 pub(super) use schema::{preflight, validate_request};

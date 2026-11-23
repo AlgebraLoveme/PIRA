@@ -26,6 +26,18 @@ pub(crate) fn turn(request: TurnRequest<'_>) -> Result<Turn, String> {
         "approvalPolicy":"never","baseInstructions":policy,"developerInstructions":""});
         let thread = if let Some(id) = manifest["thread_id"].as_str() {
             params["threadId"] = json!(id);
+            params = crate::harness::codex::resume_params(
+                server
+                    .request_schema
+                    .as_ref()
+                    .ok_or("missing Codex request schema")?,
+                params,
+            );
+            if params.get("excludeTurns").is_none() {
+                crate::notice(format_args!(
+                    "pira_team warning: Codex schema lacks metadata-only resume; using bounded legacy resume; update Codex to avoid full-history hydration and its 16 MiB event limit"
+                ));
+            }
             let result = server.request("thread/resume", params)?;
             if result["thread"]["id"].as_str() != Some(id) {
                 return Err("Codex resumed a different thread".into());

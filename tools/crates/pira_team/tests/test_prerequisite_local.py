@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import unittest
 
 import test_provider_config
@@ -199,22 +200,98 @@ class PrerequisiteLocalTests(unittest.TestCase):
         self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
 
     def test_indexed_transcript_still_requires_matching_native_metadata(self) -> None:
-        path = self.root / "rollout-wrong-parent-session.jsonl"
-        path.write_text('{"type":"session_meta","payload":{"id":"other-session"}}\n')
-        self.index(path)
-        bad = self.fixture.launch("mismatched indexed identity")
+        connection = self.index(self.source_log())
+        for suffix in ["", "_01234567-89ab-cdef-0123-456789abcdef"]:
+            with self.subTest(suffix=suffix):
+                path = self.root / f"rollout-wrong-parent-session{suffix}.jsonl"
+                path.write_text('{"type":"session_meta","payload":{"id":"other-session"}}\n')
+                connection.execute("UPDATE threads SET rollout_path = ? WHERE id = ?",
+                                   (str(path), "parent-session"))
+                connection.commit()
+                bad = self.fixture.launch("mismatched indexed identity")
+                self.assertNotEqual(bad.returncode, 0)
+                self.assertIn("identity mismatch", bad.stderr)
+        self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
+
+    def test_indexed_uuid_preserves_caller_permissions_without_broadening_discovery(self) -> None:
+        connection = self.index(self.source_log())
+        legacy = self.success("legacy indexed caller")
+        before = json.loads((Path(legacy["run_root"]) / "manifest.json").read_text())
+        path = self.source_log().with_name(
+            "rollout-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl")
+        self.source_log().rename(path)
+        connection.execute("DELETE FROM threads WHERE id = 'parent-session'")
+        connection.commit()
+        bad = self.fixture.launch("UUID trailer is indexed-only")
         self.assertNotEqual(bad.returncode, 0)
-        self.assertIn("identity mismatch", bad.stderr)
+        self.assertIn("expected one matching parent session log", bad.stderr)
+        connection.execute("INSERT INTO threads VALUES (?, ?)", ("parent-session", str(path)))
+        connection.commit()
+        receipt = self.success("UUID indexed caller")
+        # Identity-only access must work through the same indexed filename too.
+        result = self.fixture.access("read", receipt["run_id"], "manifest.json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = json.loads(result.stdout)
+        self.assertEqual(after["creator_main_session_id"], "parent-session")
+        self.assertEqual(after["execution_permissions"], before["execution_permissions"])
+        self.assertEqual(after["execution_permissions"]["source"], "verified-caller-turn-context")
+        self.assertEqual(after["execution_permissions"]["caller_thread_id"], "parent-session")
+
+    def test_indexed_uuid_rejects_relative_and_traversal_paths(self) -> None:
+        path = self.root / "rollout-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl"
+        path.write_bytes(self.source_log().read_bytes())
+        connection = self.index(path)
+        (self.root / "traversal").mkdir()
+        for invalid in [Path(path.name), self.root / "traversal" / ".." / path.name]:
+            with self.subTest(path=invalid):
+                connection.execute("UPDATE threads SET rollout_path = ? WHERE id = ?",
+                                   (str(invalid), "parent-session"))
+                connection.commit()
+                bad = self.fixture.launch("indexed paths remain absolute without traversal")
+                self.assertNotEqual(bad.returncode, 0)
+                self.assertIn("invalid indexed caller path", bad.stderr)
+        self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
+
+    def test_indexed_uuid_still_requires_verified_caller_permissions(self) -> None:
+        source = self.fixture.parent([{"approval_policy": "on-request"}])
+        path = source.with_name(
+            "rollout-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl")
+        source.rename(path)
+        self.index(path)
+        bad = self.fixture.launch("UUID filename must not bypass caller permissions")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("cannot inherit caller approval policy", bad.stderr)
+        self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX mode boundary")
+    def test_indexed_uuid_rejects_group_writable_file(self) -> None:
+        path = self.root / "rollout-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl"
+        # Only this disposable creator changes its process mask; neither the shell
+        # nor the launcher inherits it. Never chmod a transcript to bypass checks.
+        subprocess.run([sys.executable, "-c",
+            "import os,sys; os.umask(0); fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o620); "
+            "os.write(fd, sys.stdin.buffer.read()); os.close(fd)", str(path)],
+            input=self.source_log().read_bytes(), check=True, timeout=5)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o620)
+        self.index(path)
+        bad = self.fixture.launch("indexed caller metadata must remain non-writable by others")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("not group/world writable", bad.stderr)
         self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
 
     @unittest.skipUnless(os.name == "posix", "POSIX symlink boundary")
     def test_indexed_symlink_transcript_is_not_followed(self) -> None:
-        link = self.root / "rollout-link-parent-session.jsonl"
-        link.symlink_to(self.source_log())
-        self.index(link)
-        bad = self.fixture.launch("must not follow indexed file link")
-        self.assertNotEqual(bad.returncode, 0)
-        self.assertIn("symlinks", bad.stderr)
+        connection = self.index(self.source_log())
+        for suffix in ["", "_01234567-89ab-cdef-0123-456789abcdef"]:
+            with self.subTest(suffix=suffix):
+                link = self.root / f"rollout-link-parent-session{suffix}.jsonl"
+                link.symlink_to(self.source_log())
+                connection.execute("UPDATE threads SET rollout_path = ? WHERE id = ?",
+                                   (str(link), "parent-session"))
+                connection.commit()
+                bad = self.fixture.launch("must not follow indexed file link")
+                self.assertNotEqual(bad.returncode, 0)
+                self.assertIn("symlinks", bad.stderr)
         self.assertFalse(list((self.root / "logs").rglob("requests.jsonl")))
 
 

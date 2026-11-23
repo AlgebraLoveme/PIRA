@@ -35,7 +35,7 @@ class NativeSelectionTests(unittest.TestCase):
         self.assertFalse(loader.errors, loader.errors)
         self.assertEqual(len(selected), len(set(selected)), "duplicate native checks")
         for module in ("test_native_auth", "test_provider_config", "test_prerequisite_local", "test_local_usability",
-                       "test_active_controls", "test_native_fixture"):
+                       "test_active_controls", "test_native_fixture", "test_history_resume"):
             expected = {case.id() for case in cases(loader.loadTestsFromName(module))}
             self.assertTrue(expected, module)
             self.assertTrue(expected.issubset(selected), module)

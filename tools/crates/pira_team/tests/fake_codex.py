@@ -347,6 +347,14 @@ while True:
             assert params["model"] == os.environ["TEAM_EXPECT_MODEL"]
         assert params["config"] == ({"sandbox_workspace_write":{k.split(".")[1]:v for k,v in config.items()}} if config else {})
         result = {"thread":{"id":state["thread"]}, "sandbox":dict(expected_sandbox), "approvalPolicy":"never"}
+        if method == "thread/resume":
+            assert "excludeTurns" not in params or os.environ.get("TEAM_BAD_BACKEND") != "legacy-resume"
+            result["thread"]["turns"] = [] if params.get("excludeTurns") else [{
+                "id": "historical-turn", "status": "completed", "items": [{
+                    "type": "agentMessage", "id": "historical-item", "phase": "final_answer",
+                    "text": "x" * int(os.environ.get("TEAM_RESUME_HISTORY_BYTES", "32")),
+                }],
+            }]
         if os.environ.get("TEAM_BAD_PERMISSION"):
             result["sandbox"]["type"] = "dangerFullAccess"
         state_path.write_text(json.dumps(state))

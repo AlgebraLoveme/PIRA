@@ -138,6 +138,17 @@ pub fn validate_request(validator: &jsonschema::Validator, request: &Value) -> R
     ))
 }
 
+pub(crate) fn resume_params(validator: &jsonschema::Validator, mut params: Value) -> Value {
+    // Team consumes thread identity/permissions, not historical turns. Probe the
+    // published-fields-only schema rather than assuming a particular CLI version.
+    params["excludeTurns"] = json!(true);
+    if !validator.is_valid(&json!({"id":1,"method":"thread/resume","params":params})) {
+        // Older schemas retain their bounded legacy resume behavior.
+        params.as_object_mut().unwrap().remove("excludeTurns");
+    }
+    params
+}
+
 fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Result<(), String> {
     let id = "00000000-0000-0000-0000-000000000001";
     let mut thread = json!({"model":options.model,"cwd":options.cwd,"sandbox":options.execution.mode,"config":super::execution_config(&options.execution),
@@ -167,7 +178,7 @@ fn validate_examples(validator: &jsonschema::Validator, options: &Options) -> Re
     examples.push(("thread/start", thread.clone()));
     thread.as_object_mut().unwrap().remove("ephemeral");
     thread["threadId"] = json!(id);
-    examples.push(("thread/resume", thread));
+    examples.push(("thread/resume", resume_params(validator, thread)));
     for (method, params) in examples {
         validate_request(validator, &json!({"id":1,"method":method,"params":params}))?;
     }

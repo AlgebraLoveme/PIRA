@@ -116,7 +116,23 @@ fn query_index(home: &Path, thread: &str) -> Result<Option<PathBuf>, IndexError>
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            name.starts_with("rollout-") && name.ends_with(&format!("-{thread}.jsonl"))
+            if !name.starts_with("rollout-") {
+                return false;
+            }
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                return false;
+            };
+            let identity = format!("-{thread}");
+            // Indexed rollouts may append one UUID; discovery stays legacy-only.
+            stem.ends_with(&identity)
+                || stem.rsplit_once('_').is_some_and(|(base, uuid)| {
+                    base.ends_with(&identity)
+                        && uuid.len() == 36
+                        && uuid.bytes().enumerate().all(|(i, byte)| match i {
+                            8 | 13 | 18 | 23 => byte == b'-',
+                            _ => byte.is_ascii_hexdigit(),
+                        })
+                })
         })
     {
         return Err(IndexError::Invalid(
@@ -206,4 +222,115 @@ fn metadata_without_links(path: &Path) -> Result<fs::Metadata, String> {
         }
     }
     Err("caller metadata path unavailable".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_requires_exact_thread_and_at_most_one_uuid_trailer() {
+        let home = crate::tests::temp_path("team-caller-index");
+        crate::private_dir(&home).unwrap();
+        let connection = Connection::open(home.join(STATE_DB)).unwrap();
+        connection
+            .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+            .unwrap();
+        for (thread, suffix, accepted) in [
+            ("parent-session", "", true),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcdef",
+                true,
+            ),
+            (
+                "parent_session",
+                "_ABCDEF01-2345-6789-ABCD-EF0123456789",
+                true,
+            ),
+            (
+                "12345678-1234-5678-9abc-123456789abc",
+                "_01234567-89ab-cdef-0123-456789abcdef",
+                true,
+            ),
+            ("parent-session", "_", false),
+            ("parent-session", "_0123456789abcdef0123456789abcdef", false),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcde",
+                false,
+            ),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcdef0",
+                false,
+            ),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcdeg",
+                false,
+            ),
+            (
+                "parent-session",
+                "_0123456-789ab-cdef-0123-456789abcdef",
+                false,
+            ),
+            (
+                "parent-session",
+                "__01234567-89ab-cdef-0123-456789abcdef",
+                false,
+            ),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcdef_extra",
+                false,
+            ),
+            (
+                "parent-session",
+                "_01234567-89ab-cdef-0123-456789abcdef_01234567-89ab-cdef-0123-456789abcdef",
+                false,
+            ),
+            (
+                "parent-session",
+                "-extra_01234567-89ab-cdef-0123-456789abcdef",
+                false,
+            ),
+        ] {
+            let path = home.join(format!("rollout-native-{thread}{suffix}.jsonl"));
+            fs::write(&path, "").unwrap();
+            connection
+                .execute(
+                    "INSERT OR REPLACE INTO threads VALUES (?1, ?2)",
+                    (thread, path.to_str().unwrap()),
+                )
+                .unwrap();
+            let expected = if accepted {
+                Ok(Some(path.clone()))
+            } else {
+                Err("native index path does not match caller identity".into())
+            };
+            assert_eq!(indexed(&home, thread), expected, "{}", path.display());
+        }
+        for name in [
+            "rollout-native-prefixparent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl",
+            "other-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl",
+            "rollout-native-parent-session_01234567-89ab-cdef-0123-456789abcdef.jsonl.bak",
+        ] {
+            let path = home.join(name);
+            fs::write(&path, "").unwrap();
+            connection
+                .execute(
+                    "UPDATE threads SET rollout_path = ?1 WHERE id = 'parent-session'",
+                    [path.to_str().unwrap()],
+                )
+                .unwrap();
+            assert_eq!(
+                indexed(&home, "parent-session"),
+                Err("native index path does not match caller identity".into()),
+                "{name}"
+            );
+        }
+        drop(connection);
+        fs::remove_dir_all(home).unwrap();
+    }
 }

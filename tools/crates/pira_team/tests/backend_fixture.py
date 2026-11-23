@@ -22,6 +22,8 @@ def write_schemas(directory, contract, fault=""):
                     continue
                 definition = f"Parameters{index}"
                 schema["definitions"][definition] = {"type": "object", "properties": {key: {} for key in names}}
+                if method == "thread/resume" and fault != "legacy-resume":
+                    schema["definitions"][definition]["properties"]["excludeTurns"] = {"type": "boolean"}
                 if fault == "field" and method == "turn/start":
                     del schema["definitions"][definition]["properties"]["sandboxPolicy"]
                 if fault == "required" and method == "turn/start":

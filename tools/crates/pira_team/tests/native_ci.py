@@ -52,7 +52,7 @@ def windows_suite(loader: unittest.TestLoader) -> unittest.TestSuite:
             "test_abandoned_resume_preserves_prior_history_and_cumulative_usage",
         )]))
     for module in ("test_native_auth", "test_provider_config", "test_prerequisite_local", "test_local_usability",
-                   "test_active_controls", "test_native_fixture"):
+                   "test_active_controls", "test_native_fixture", "test_history_resume"):
         suite.addTests(loader.loadTestsFromName(module))
     return suite
 
