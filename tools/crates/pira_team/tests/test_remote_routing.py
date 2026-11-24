@@ -447,26 +447,61 @@ if result.get("manifest"):
         result["manifest"]["status"] = "running"
         result["operation_result"] = None
         result["supervisor"] = "live"
-    elif os.environ.get("TEAM_DIAGNOSTIC_FAILURE"):
-        sys.stderr.write("synthetic SSH connection failure\n")
-        sys.exit(255)
+    else:
+        outcome = os.environ["TEAM_DIAGNOSTIC_OUTCOME"]
+        if outcome in ("changed", "failed-distinct"):
+            sys.stderr.write("synthetic SSH new diagnostic\n")
+        if outcome.startswith("failed"):
+            sys.exit(255)
 stdout = json.dumps(reply)
 '''
         transport.write_text(source.replace("sys.stdout.write(stdout)", injection + "\nsys.stdout.write(stdout)"),
                              encoding="utf-8")
-        for fail in (False, True):
-            with self.subTest(failed_exchange=fail):
-                self.f.env["TEAM_DIAGNOSTIC_FAILURE"] = "1" if fail else ""
+        for outcome in ("success", "changed", "failed-identical", "failed-distinct"):
+            with self.subTest(outcome=outcome):
+                self.f.env["TEAM_DIAGNOSTIC_OUTCOME"] = outcome
                 result = self.f.invoke("run", *self.options(), "--store", self.local_store,
                     "--remote-cwd", self.f.cwd, "--model", "test-model", "--effort", "high",
                     "--task", "diagnostic fixture", "--completion-gate", "Report fixture result")
-                if fail:
+                if outcome.startswith("failed"):
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("synthetic SSH connection failure", result.stderr)
+                    self.assertIn("SSH process failed", result.stderr)
                     self.assertIn("remote worker was not interrupted", result.stderr)
                 else:
                     self.assertEqual(self.receipt(result)["status"], "completed")
-                self.assertEqual(result.stderr.count("synthetic SSH banner\n"), 2 if fail else 1)
+                self.assertEqual(result.stderr.count("synthetic SSH new diagnostic\n"),
+                                 1 if outcome in ("changed", "failed-distinct") else 0)
+                self.assertEqual(result.stderr.count("synthetic SSH banner\n"),
+                                 1 if outcome == "success" else 2)
+
+    def test_diagnostics_span_routed_resume_controls_and_pending_read_fallback(self):
+        self.f.env["TEAM_ROUTING_MODE"] = "fake"
+        transport = self.f.root / "ssh"
+        source = transport.read_text(encoding="utf-8")
+        banner = "fixture routed login diagnostic\n"
+        transport.write_text(source.replace("wire = sys.stdin.read()",
+            f"sys.stderr.write({banner!r})\nwire = sys.stdin.read()"), encoding="utf-8")
+        result = self.launch("diagnostic routing")
+        run = self.receipt(result)["run_id"]
+        self.assertEqual(result.stderr.count(banner), 1, result.stderr)
+        for op, extra in (("resume", ("--task", "next", "--completion-gate", "Return fixture")),
+                          ("steer", ("--task", "steered", "--completion-gate", "Return fixture")),
+                          ("interrupt", ()), ("wait", ())):
+            with self.subTest(operation=op):
+                result = self.ordinary(op, run, *extra)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.count(banner), 1, result.stderr)
+                json.loads(result.stdout)
+        self.f.env["TEAM_ROUTING_DROP"] = "submit-before"
+        result = self.ordinary("resume", run, "--detach")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.count(banner), 2, result.stderr)
+        before = len(self.submissions())
+        # Pending resume was never accepted: observation switches to the initial client.
+        result = self.ordinary("read", run, "manifest.json")
+        self.assertEqual(self.success(result)["revision"], 2)
+        self.assertEqual(result.stderr.count(banner), 1, result.stderr)
+        self.assertEqual(len(self.submissions()), before)
 
     def test_local_bookmark_routes_read_resume_steer_and_interrupt(self):
         run = self.started("steerable", "--label", "remote λ")

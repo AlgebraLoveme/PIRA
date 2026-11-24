@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod bootstrap;
@@ -863,8 +864,11 @@ fn ssh_command(host: &str, user: Option<&str>, command: &str) -> Command {
     ssh
 }
 
+// One command can construct several clients while bootstrapping or reconciling.
+type SharedDiagnostics = Rc<RefCell<transport::Diagnostics>>;
+
 struct Client {
-    diagnostics: RefCell<transport::Diagnostics>,
+    diagnostics: SharedDiagnostics,
     endpoint: Value,
     authority: PathBuf,
     state: PathBuf,
@@ -878,7 +882,7 @@ struct Client {
     args: Vec<String>,
 }
 impl Client {
-    fn parse(args: &[String]) -> Result<Self, String> {
+    fn parse(args: &[String], diagnostics: SharedDiagnostics) -> Result<Self, String> {
         let mut fields = std::collections::BTreeMap::new();
         let mut forwarded = vec![args[0].clone()];
         let (mut detach, mut artifact) = (false, false);
@@ -1046,7 +1050,7 @@ impl Client {
         }
         Ok(Self {
             endpoint: json!({"host":host_name,"user":user,"endpoint_id":identity,"exe":exe,"backend":backend,"store":store}),
-            diagnostics: RefCell::default(),
+            diagnostics,
             authority,
             state,
             id,
@@ -1203,7 +1207,7 @@ fn persist_submission(
 }
 fn client(args: &[String]) -> Result<(), String> {
     let context = verified_caller(args)?;
-    let cli = Client::parse(args)?;
+    let cli = Client::parse(args, SharedDiagnostics::default())?;
     let issuer = text(&context, "caller_thread_id")?;
     let op = args[0].as_str();
     let execute = ["run", "resume", "steer", "remote-check"].contains(&op);
@@ -2861,7 +2865,7 @@ mod tests {
     fn capability_metadata_request_is_identity_only_and_cannot_select_effects() {
         let f = Fixture::new();
         let cli = Client {
-            diagnostics: RefCell::default(),
+            diagnostics: SharedDiagnostics::default(),
             endpoint: f.grant("read")["endpoint"].clone(),
             authority: f.authority.clone(),
             state: f.root.join("missing-state"),

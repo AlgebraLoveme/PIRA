@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-/// One logical client's successful SSH diagnostics, never persisted or shared between invocations.
+/// One logical command's successful SSH diagnostics, never persisted or shared between invocations.
 #[derive(Default)]
 pub(super) struct Diagnostics {
     previous: Vec<u8>,

@@ -16,6 +16,7 @@ def team_version(fixture):
 SSH=r'''#!/usr/bin/env python3
 import json,os,sys
 from pathlib import Path
+sys.stderr.write(os.environ.get("TEAM_BOOTSTRAP_STDERR", ""))
 wire=sys.stdin.read(); data=json.loads(wire)
 with open(os.environ["TEAM_REMOTE_TRACE"],"a") as out:
  out.write(json.dumps({"argv":sys.argv[1:],"wire":wire})+"\n")
@@ -61,6 +62,25 @@ class InstalledDiscoveryTests(unittest.TestCase):
   discovery=exchanges[0]["argv"][-1]
   self.assertIn("command -v pira_team",discovery)
   self.assertIn('$HOME/.local/bin/pira_team',discovery)
+ def test_successful_discovery_setup_and_signed_requests_share_diagnostics(self):
+  banner="fixture login diagnostic\n"
+  self.f.env["TEAM_BOOTSTRAP_STDERR"]=banner
+  for _ in range(2):
+   result=self.launch();self.assertEqual(result.returncode,0,result.stderr)
+   self.assertEqual(result.stderr.count(banner),1,result.stderr)
+   self.assertRegex(json.loads(result.stdout)["run_id"],r"^remote-[0-9a-f]{64}$")
+  phases=[entry["argv"][-1].split()[-1] for entry in self.f.exchanges()]
+  self.assertEqual(phases,["__remote-info","__remote-setup","__remote-serve","__remote-serve"]*2)
+ def test_failed_setup_repeats_identical_diagnostics(self):
+  banner="fixture login diagnostic\n"
+  self.f.env["TEAM_BOOTSTRAP_STDERR"]=banner
+  path=self.f.root/"ssh"
+  path.write_text(path.read_text().replace('elif "__remote-setup" in sys.argv[-1]:',
+      'elif "__remote-setup" in sys.argv[-1]:\n sys.exit(255)'))
+  result=self.launch();self.assertNotEqual(result.returncode,0)
+  self.assertEqual(result.stderr.count(banner),2,result.stderr)
+  self.assertIn("SSH process failed",result.stderr)
+  self.assertEqual(len(self.f.exchanges()),2)
  def test_standard_location_fallback_works_with_empty_path_and_no_python(self):
   result=self.launch();self.assertEqual(result.returncode,0,result.stderr)
   command=self.f.exchanges()[0]["argv"][-1]

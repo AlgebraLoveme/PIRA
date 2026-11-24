@@ -19,7 +19,12 @@ fn option(args: &[String], name: &str) -> Result<Option<String>, String> {
     Ok(value)
 }
 
-fn exchange(host: &str, command: &str, request: &Value) -> Result<Value, String> {
+fn exchange(
+    host: &str,
+    command: &str,
+    request: &Value,
+    diagnostics: &SharedDiagnostics,
+) -> Result<Value, String> {
     let mut child = ssh_command(host, None, command)
         .spawn()
         .map_err(|e| format!("start SSH discovery: {e}"))?;
@@ -27,7 +32,7 @@ fn exchange(host: &str, command: &str, request: &Value) -> Result<Value, String>
         &mut child,
         &serde_json::to_vec(request).map_err(|e| e.to_string())?,
         || crate::CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
-        &mut transport::Diagnostics::default(),
+        &mut diagnostics.borrow_mut(),
     )
         .map_err(|e|format!("installed remote Team unavailable/incompatible: {e}; run PIRA setup/update on the server; no worker submitted"))?;
     let reply:Value=serde_json::from_slice(&bytes).map_err(|_|"installed Team lacks structured remote setup; update PIRA Team on the server; no worker submitted")?;
@@ -39,7 +44,12 @@ fn exchange(host: &str, command: &str, request: &Value) -> Result<Value, String>
 
 const DISCOVER: &str = r#"p=$(command -v pira_team 2>/dev/null) || p="$HOME/.local/bin/pira_team"; if [ ! -x "$p" ]; then printf '%s\n' 'PIRA Team not found; run PIRA setup on the server' >&2; exit 127; fi; exec "$p" __remote-info"#;
 
-pub(super) fn prepare(args: &mut Vec<String>, root: &Path, context: &Value) -> Result<(), String> {
+pub(super) fn prepare(
+    args: &mut Vec<String>,
+    root: &Path,
+    context: &Value,
+    diagnostics: &SharedDiagnostics,
+) -> Result<(), String> {
     // The complete explicit endpoint interface is unchanged, including its independent enrollment.
     if has_option(args, "--remote-endpoint-id") {
         return Ok(());
@@ -51,7 +61,7 @@ pub(super) fn prepare(args: &mut Vec<String>, root: &Path, context: &Value) -> R
     let command = option(args, "--remote-exe")?
         .map(|p| format!("exec {} __remote-info", quote(&p)))
         .unwrap_or_else(|| DISCOVER.into());
-    let info = exchange(&host_name, &command, &Value::Null)?;
+    let info = exchange(&host_name, &command, &Value::Null, diagnostics)?;
     if info["protocol"] != VERSION
         || info["setup"] != 1
         || info["version"] != env!("CARGO_PKG_VERSION")
@@ -116,6 +126,7 @@ pub(super) fn prepare(args: &mut Vec<String>, root: &Path, context: &Value) -> R
         &format!("exec {} __remote-setup", quote(text(&info, "exe")?)),
         &json!({"issuer":issuer,"public":public,"version":env!("CARGO_PKG_VERSION"),"protocol":VERSION,
         "backend":option(args,"--remote-backend")?,"store":option(args,"--remote-store")?}),
+        diagnostics,
     )?;
     let defaults = [
         ("--remote-user", endpoint["user"].clone()),

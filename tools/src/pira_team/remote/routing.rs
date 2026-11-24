@@ -87,9 +87,9 @@ impl Route {
         verify_with_keys(envelope, anchor.as_bytes())
     }
 
-    fn cli(&self, grant: &Value) -> Result<Client, String> {
+    fn cli(&self, grant: &Value, diagnostics: &SharedDiagnostics) -> Result<Client, String> {
         Ok(Client {
-            diagnostics: RefCell::default(),
+            diagnostics: Rc::clone(diagnostics),
             endpoint: self.envelope["grant"]["endpoint"].clone(),
             authority: self.authority.clone(),
             state: self.dir.clone(),
@@ -352,8 +352,9 @@ pub(super) fn launch(args: &[String]) -> Result<(), String> {
     // Legacy explicit request-ID transport remains available. Normal launch IDs
     // and their location are generated and retained by the launcher, not MAIN.
     set_launch_identity(&mut forwarded, &root, request);
-    bootstrap::prepare(&mut forwarded, &root, &context)?;
-    let cli = Client::parse(&forwarded)?;
+    let diagnostics = SharedDiagnostics::default();
+    bootstrap::prepare(&mut forwarded, &root, &context, &diagnostics)?;
+    let cli = Client::parse(&forwarded, diagnostics)?;
     let grant = cli.grant("submit", issuer, Some(&execution(&context)))?;
     validate_grant(&grant)?;
     let envelope = sign(&grant, &cli.authority)?;
@@ -513,7 +514,7 @@ fn reconcile_submission(
         let refreshed = sign(&grant, &route.authority)?;
         let metadata = cli.metadata(issuer)?;
         if cli.args[0] == "resume" {
-            let initial = route.cli(&route.envelope["grant"])?;
+            let initial = route.cli(&route.envelope["grant"], &cli.diagnostics)?;
             let retained = initial.observe(issuer)?;
             require_resume_capabilities(&metadata, &retained, &route.envelope["grant"], &cli.args)?;
         } else {
@@ -718,6 +719,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         return Err("remote live tier control is unsupported; resume --service-tier retains launch/resume support".into());
     }
     let (forwarded, detach) = forwarded_args(args, target)?;
+    let diagnostics = SharedDiagnostics::default();
     if matches!(op, "read" | "wait") {
         if forwarded.len() > 2
             || (forwarded.len() == 2 && (op == "wait" || forwarded[1].starts_with('-')))
@@ -726,7 +728,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         }
         let pending = route.pending("resume", issuer)?;
         let envelope = pending.as_ref().unwrap_or(&route.envelope);
-        let mut cli = route.cli(&envelope["grant"])?;
+        let mut cli = route.cli(&envelope["grant"], &diagnostics)?;
         cli.negotiate(issuer, "read", false)?;
         let mut pending_accepted = false;
         let mut result = if pending.is_some() {
@@ -737,7 +739,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
             {
                 // Ordinary observation cannot create even a previously intended
                 // resume turn. Only a repeated explicit resume submits it.
-                cli = route.cli(&route.envelope["grant"])?;
+                cli = route.cli(&route.envelope["grant"], &diagnostics)?;
                 observe(route, &cli, &context)?
             } else {
                 validate_view(route, &observed, &cli.id)?;
@@ -791,7 +793,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         execute_policy(&context, issuer)?;
     }
     let _lock = lock(&route.dir.join("controller.lock"))?;
-    let initial = route.cli(&route.envelope["grant"])?;
+    let initial = route.cli(&route.envelope["grant"], &diagnostics)?;
     let initial_view = initial.observe(issuer)?;
     if initial_view["accepted"] == false
         && initial_view["status"] == "not_found"
@@ -817,7 +819,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         );
     }
     let pending = route.pending(op, issuer)?;
-    let mut base = route.cli(&route.envelope["grant"])?;
+    let mut base = route.cli(&route.envelope["grant"], &diagnostics)?;
     base.args = forwarded.clone();
     base.cwd = None;
     base.detach = detach;
@@ -874,7 +876,7 @@ fn ordinary(route: &Route, args: &[String], target: usize) -> Result<(), String>
         sync_dir(&route.dir)?;
         envelope
     };
-    let mut cli = route.cli(&envelope["grant"])?;
+    let mut cli = route.cli(&envelope["grant"], &diagnostics)?;
     cli.detach = base.detach;
     let result = if op == "resume" {
         // Retained pending submit is observed before any possible resubmission.
@@ -1022,7 +1024,7 @@ mod tests {
             )
             .unwrap();
             let cli = Client {
-                diagnostics: RefCell::default(),
+                diagnostics: SharedDiagnostics::default(),
                 endpoint: json!({"host":"fixture","user":"fixture","endpoint_id":"a".repeat(64),
                     "exe":"/opt/pira_team","backend":"/opt/codex","store":"/srv/team"}),
                 authority,
@@ -1089,7 +1091,7 @@ mod tests {
             "--host=literal --request-id=literal",
         ]);
         set_launch_identity(&mut args, &local, "stable".into());
-        let cli = Client::parse(&args).unwrap();
+        let cli = Client::parse(&args, SharedDiagnostics::default()).unwrap();
         assert_eq!(cli.id, "stable");
         assert_eq!(cli.state, local.join(".remote-controller"));
         assert_eq!(cli.authority, authority);
@@ -1098,7 +1100,9 @@ mod tests {
             let value = relative.iter().position(|arg| arg == option).unwrap() + 1;
             relative[value] = "relative-local-path".into();
             assert_eq!(
-                Client::parse(&relative).err().as_deref(),
+                Client::parse(&relative, SharedDiagnostics::default())
+                    .err()
+                    .as_deref(),
                 Some("--remote-state and --authority-key are explicit local absolute paths"),
                 "{option}"
             );
@@ -1258,7 +1262,9 @@ mod tests {
     fn observing_new_epoch_retires_unknown_control_without_claiming_delivery() {
         let fixture = Fixture::new();
         let route = fixture.route();
-        let mut cli = route.cli(&fixture.envelope["grant"]).unwrap();
+        let mut cli = route
+            .cli(&fixture.envelope["grant"], &SharedDiagnostics::default())
+            .unwrap();
         cli.args = strings(&["interrupt"]);
         cli.cwd = None;
         cli.operation = Some("stop".into());
