@@ -74,6 +74,27 @@ else:
     if op == "read" and grant["args"] == ["capabilities"]:
         value = {"protocol":2, "scope":"root-main-host-pinned", "capabilities":[
             "signed-delegation", "host-pinned-subteam", "durable-submit", "read", "resume", "steer", "interrupt"]}
+    elif op == "read" and grant["args"][0] == "search":
+        from datetime import datetime, timezone
+        _, selector, pattern, limit, batch = grant["args"]
+        hits = []
+        for requested, label in json.loads(batch):
+            if requested not in requests:
+                continue
+            run_id = requests[requested]["run_id"]
+            run = runs[run_id]
+            m = run["manifest"]
+            text = {"input":m["task"], "gate":m.get("completion_gate", ""),
+                    "final":run["handoff"], "label":label or ""}[selector]
+            if pattern.lower() not in text.lower():
+                continue
+            at = m.get("revision_started_at_ms")
+            hits.append({"run_id":run_id, "label":label,"revision":m["revision"],"status":m["status"],
+                         "revision_at":datetime.fromtimestamp(at / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z") if at is not None else None,
+                         "excerpt":text[:240]})
+        hits.sort(key=lambda h: h["run_id"])
+        hits.sort(key=lambda h: h["revision_at"] or "", reverse=True)
+        value = {"matches":hits[:int(limit)], "has_more":len(hits)>int(limit), "errors":[]}
     elif op == "submit":
         if request in requests:
             retained = requests[request]["envelope"]["grant"]
@@ -276,6 +297,60 @@ class RemoteRoutingTests(unittest.TestCase):
         self.assertEqual(manifest["creator_main_session_id"], "parent-session")
         self.assertEqual(manifest["status"], "completed")
         self.assertEqual(len(self.submissions()), before, "read must not start a model turn")
+
+    def test_search_merges_newest_ten_with_projection_route_failures_and_no_fetch_fanout(self):
+        remote_ids = [self.started("retained phrase") for _ in range(7)]
+        expected = []
+        for n, run_id in enumerate(remote_ids):
+            at = (n * 2 + 1) * 1000
+            if self.proxy:
+                path = self.f.store / run_id / "manifest.json"
+                manifest = json.loads(path.read_text())
+                manifest["revision_started_at_ms"] = at
+                path.write_text(json.dumps(manifest))
+            else:
+                path = self.f.trace.with_suffix(".server.json")
+                state = json.loads(path.read_text())
+                state["runs"][run_id]["manifest"]["revision_started_at_ms"] = at
+                path.write_text(json.dumps(state))
+            expected.append((at, run_id))
+        for n in range(7):
+            run_id = f"local-{n}"
+            run = self.local_store / run_id
+            run.mkdir(mode=0o700)
+            at = n * 2000
+            (run / "manifest.json").write_text(json.dumps({"run_id":run_id,
+                "creator_main_session_id":"parent-session", "revision":1,"status":"completed",
+                "revision_started_at_ms":at,"task":"retained phrase"}))
+            expected.append((at, run_id))
+        expected.sort(key=lambda pair: (-pair[0], pair[1]))
+        before = len(self.f.exchanges())
+        submissions = len(self.submissions())
+        result = self.success(self.f.invoke("search", "input", "retained phrase"))
+        self.assertEqual([h["run_id"] for h in result["matches"]], [p[1] for p in expected[:10]])
+        self.assertTrue(result["has_more"])
+        self.assertNotIn("incomplete", result)
+        self.assertEqual(len(self.f.exchanges()) - before, 1, "one batch, no handoff/manifest fetch fan-out")
+        search = self.f.grants("read")[-1]
+        self.assertEqual(search["args"][:4], ["search", "input", "retained phrase", "10"])
+        self.assertFalse(search["artifact"])
+        self.assertIsNone(search["file"])
+        projected = self.success(self.f.invoke("search", "input", "retained phrase", "--fields", "run_id"))
+        self.assertEqual(projected, {"matches":[{"run_id":h["run_id"]} for h in result["matches"]], "has_more":True})
+        all_hits = self.success(self.f.invoke("search", "input", "retained phrase", "--limit", "14"))
+        self.assertEqual([h["run_id"] for h in all_hits["matches"]], [p[1] for p in expected])
+        self.assertFalse(all_hits["has_more"])
+        empty = self.success(self.f.invoke("search", "input", "absent phrase"))
+        self.assertEqual(empty, {"matches":[],"has_more":False})
+        self.f.env["TEAM_ROUTING_DROP"] = "read-before"
+        failed = self.success(self.f.invoke("search", "input", "retained phrase"))
+        self.assertTrue(failed["incomplete"])
+        self.assertEqual(len(failed["errors"]), 1)
+        self.assertEqual({h["run_id"] for h in failed["matches"]}, {f"local-{n}" for n in range(7)})
+        self.assertEqual(len(self.submissions()), submissions, "search never submits a model turn")
+        self.f.env.pop("TEAM_ROUTING_DROP")
+        self.assertEqual(self.success(self.f.invoke("search", "input", "retained phrase", "--store", self.f.root / "empty")),
+                         {"matches":[],"has_more":False})
 
     def test_explicit_request_id_retains_lower_level_structured_transport(self):
         result = self.legacy_launch("legacy-request")

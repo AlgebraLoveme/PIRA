@@ -94,29 +94,116 @@ class BookmarkTests(unittest.TestCase):
         self.assertFalse((self.root / "no-session-or-auth").exists())
         self.assertFalse(any((run / "codex-home").exists() for run in (first, second)))
 
-    def test_literal_case_search_order_limits_and_metadata_only_fields(self) -> None:
+    def test_literal_case_search_distinct_runs_and_unchanged_bookmark_paging(self) -> None:
         run = self.owned_run("run")
         for label in ("alpha ordinary", "ALPHA [X].* Λ", "Alpha [x].* λ"):
             self.assign(run.name, label)
         result = self.success("search", "[x].* λ", "--limit", "1")
-        self.assertEqual(result, {"matches": [{"label": "ALPHA [X].* Λ", **self.reference(run)}],
-                                  "has_more": True, "next_after": "ALPHA [X].* Λ"})
-        self.assertFalse(self.success("search", "[x].* λ", "--limit", "2")["has_more"])
-        self.assertEqual([r["label"] for r in self.success("search", "alpha")["matches"]],
-                         ["ALPHA [X].* Λ", "Alpha [x].* λ", "alpha ordinary"])
+        self.assertEqual(result, {"matches": [{"label": "ALPHA [X].* Λ", "run_id":run.name,
+            "revision":None,"revision_at":None,"status":"completed","excerpt":"ALPHA [X].* Λ"}], "has_more":False})
+        self.assertEqual(self.success("search", "label", "[x].* λ"), result)
+        self.assertEqual(self.success("search", "alpha", "--fields", "run_id"),
+                         {"matches":[{"run_id":run.name}], "has_more":False})
         self.assertEqual(self.success("search", "alpha.*")["matches"], [])
         self.assertEqual(self.success("search", "task keywords")["matches"], [])
         self.assertEqual(self.success("search", "--", "--literal")["matches"], [])
         for n in range(21):
-            self.assign(run.name, f"default-{n:02}")
+            target = self.owned_run(f"default-{n:02}")
+            self.assign(target.name, target.name)
         result = self.success("search", "default-")
-        self.assertEqual(len(result["matches"]), 20)
+        self.assertEqual(len(result["matches"]), 10)
         self.assertTrue(result["has_more"])
         self.assertEqual(len(self.success("search", "default-", "--limit", "1000")["matches"]), 21)
-        self.assertTrue(self.success("bookmarks", "--limit", "1")["has_more"])
+        first = self.success("bookmarks", "--limit", "1")
+        self.assertTrue(first["has_more"])
+        self.assertEqual(first["next_after"], "ALPHA [X].* Λ")
+        second = self.success("bookmarks", "--limit", "1", "--after", first["next_after"])
+        self.assertEqual(second["matches"][0]["label"], "Alpha [x].* λ")
         # Listing/search must hide pointers whose ownership cannot be verified.
         (run / "manifest.json").write_text("invalid manifest")
-        self.assertEqual(self.success("search", "default-", "--limit", "1000")["matches"], [])
+        self.assertEqual(self.success("search", "alpha")["matches"], [])
+
+    def test_content_fields_selected_store_projection_and_no_model_discovery(self) -> None:
+        run = self.owned_run("unbookmarked")
+        manifest = json.loads((run / "manifest.json").read_text())
+        manifest.update(revision=3, revision_started_at_ms=1000,
+                        task="input marker", completion_gate="gate marker", status="running")
+        (run / "manifest.json").write_text(json.dumps(manifest))
+        # Every invocation is synthetic; make any attempted backend discovery observable.
+        sentinel = self.root / "unexpected-backend"
+        (self.root / "codex").write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 99\n")
+        (self.root / "codex").chmod(0o700)
+        for selector, pattern in (("input","input marker"), ("gate","gate marker")):
+            hit = self.success("search", selector, pattern)["matches"][0]
+            self.assertEqual(hit["run_id"], run.name)
+            self.assertIsNone(hit["label"])
+            self.assertEqual(hit["revision"], 3)
+            self.assertEqual(hit["revision_at"], "1970-01-01T00:00:01.000Z")
+            self.assertEqual(hit["status"], "running")
+            projected = self.success("search", selector, pattern, "--fields", "run_id,excerpt")
+            self.assertEqual(projected["matches"], [{"run_id":run.name,"excerpt":hit["excerpt"]}])
+        self.assertFalse(sentinel.exists())
+        self.assertEqual(self.success("search", "input", "gate marker")["matches"], [])
+        other = self.root / "other-store"
+        self.assertEqual(self.success("search", "input", "input marker", "--store", str(other))["matches"], [])
+        self.assertFalse(other.exists())
+        before = {p:p.read_bytes() for p in run.rglob("*") if p.is_file()}
+        self.success("search", "input", "marker", "--store", "logs")
+        self.assertEqual(before, {p:p.read_bytes() for p in before})
+        for args in (("--fields", ""), ("--fields", "task"), ("--fields", "run_id,run_id"),
+                     ("--fields", "run_id", "--fields", "label"), ("--after", "x")):
+            self.failure("search", "input", "marker", *args)
+        self.failure("search", "unknown-selector", "marker")
+        for pattern in (" ", "x\n", "λ" * 65):
+            self.failure("search", "input", pattern)
+
+    def legacy_pending_run(self, run_id: str) -> tuple[Path, dict, dict]:
+        run = self.owned_run(run_id)
+        original = json.loads((run / "manifest.json").read_text())
+        original.pop("creator_main_session_id")
+        original.update(revision=1, execution_permissions={
+            "source":"verified-caller-turn-context", "caller_thread_id":"parent-session"})
+        (run / "revisions/000001").mkdir(parents=True, mode=0o700)
+        (run / "revisions/000001/manifest.json").write_text(json.dumps(original))
+        current = dict(original, creator_main_session_id="parent-session", revision=2,
+                       status="running", artifact=None, revisions=[{"revision":1}])
+        (run / "manifest.json").write_text(json.dumps(current))
+        return run, original, current
+
+    def test_final_search_legacy_snapshot_uses_verified_original_creator(self) -> None:
+        run, original, current = self.legacy_pending_run("legacy")
+        self.assertEqual(self.cli("read", run.name, "artifacts/handoff").stdout, "legacy handoff legacy")
+        expected = {"matches":[{"run_id":run.name, "label":None, "revision":1,
+            "revision_at":None, "status":"completed", "excerpt":"legacy handoff legacy"}], "has_more":False}
+        before = {p:p.read_bytes() for p in run.rglob("*") if p.is_file()}
+        self.assertEqual(self.success("search", "final", "legacy handoff"), expected)
+        self.assertEqual(before, {p:p.read_bytes() for p in before})
+        self.assertFalse((run / "codex-home").exists())
+        # Later legacy snapshots inherit the original creator, not their latest
+        # execution caller. They can also predate current creator backfilling.
+        (run / "revisions/000002/artifacts").mkdir(parents=True, mode=0o700)
+        (run / "revisions/000002/artifacts/handoff").write_text("legacy second handoff")
+        second = dict(original, revision=2, status="incomplete", artifact="revisions/000002/artifacts/handoff",
+                      execution_permissions={"source":"verified-caller-turn-context", "caller_thread_id":"later-caller"})
+        (run / "revisions/000002/manifest.json").write_text(json.dumps(second))
+        current.update(revision=3, revisions=[{"revision":1},{"revision":2}])
+        (run / "manifest.json").write_text(json.dumps(current))
+        hit = self.success("search", "final", "second handoff")["matches"][0]
+        self.assertEqual((hit["revision"], hit["status"], hit["excerpt"]), (2, "incomplete", "legacy second handoff"))
+        self.assertEqual(self.success("search", "final", "legacy handoff")["matches"], [])
+
+    def test_final_search_rejects_conflicting_legacy_identity_and_paths(self) -> None:
+        run, original, _ = self.legacy_pending_run("legacy")
+        for changes in [
+            {"creator_main_session_id":"other-main"}, {"creator_main_session_id":None},
+            {"execution_permissions":{"source":"verified-caller-turn-context", "caller_thread_id":"other-main"}},
+            {"execution_permissions":{"source":"unverified", "caller_thread_id":"parent-session"}},
+            {"run_id":"other-run"}, {"revision":2},
+            {"artifact":"artifacts/../handoff"}, {"artifact":"revisions/000002/artifacts/handoff"},
+        ]:
+            with self.subTest(changes=changes):
+                (run / "revisions/000001/manifest.json").write_text(json.dumps(dict(original, **changes)))
+                self.assertEqual(self.success("search", "final", "legacy handoff")["matches"], [])
 
     def test_invalid_cli_and_label_boundaries_leave_index_unchanged(self) -> None:
         run = self.owned_run("valid")
@@ -395,6 +482,10 @@ class BookmarkTests(unittest.TestCase):
         run = Path(receipt["run_root"])
         self.assertEqual(self.cli("read", "@" + label).stdout, "ANSWER review")
         self.assertEqual(self.cli("path", "@" + label).stdout.strip(), receipt["handoff_path"])
+        initial = json.loads((run / "manifest.json").read_text())
+        initial_time = initial["revision_started_at_ms"]
+        self.assertIsInstance(initial_time, int)
+        self.assertEqual(json.loads((run / "revisions/000001/manifest.json").read_text())["revision_started_at_ms"], initial_time)
         base = (run / "policy.md").read_bytes()
         self.assert_not_worker_input(run, (label,))
         index_before = self.index.read_bytes()
@@ -402,6 +493,9 @@ class BookmarkTests(unittest.TestCase):
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(json.loads(resumed.stdout)["run_id"], run.name)
         self.assertEqual(json.loads(self.cli("read", "@" + label).stdout), ["review", "recall"])
+        resumed_state = json.loads((run / "manifest.json").read_text())
+        self.assertGreaterEqual(resumed_state["revision_started_at_ms"], initial_time)
+        self.assertEqual(json.loads((run / "revisions/000001/manifest.json").read_text())["revision_started_at_ms"], initial_time)
         self.assertEqual(self.index.read_bytes(), index_before)
         self.assertEqual((run / "policy.md").read_bytes(), base)
         self.assert_not_worker_input(run, (label,))
@@ -429,7 +523,7 @@ class BookmarkTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("native schema generation failed", result.stderr)
-        new = Path(self.success("search", "reusable")["matches"][0]["run_root"])
+        new = Path(self.cli("path", "@reusable", ".").stdout.strip())
         self.assertNotEqual(new, old)
         self.assertEqual(json.loads((new / "manifest.json").read_text())["status"], "failed")
         self.assertEqual((old / "artifacts/handoff").read_text(), "legacy handoff old")
@@ -469,6 +563,10 @@ class BookmarkTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, err)
                     self.assertEqual(json.loads(out)["status"], "completed")
                     self.assertEqual(self.cli("read", "@live").stdout, "ANSWER replacement")
+                    self.assertEqual(self.success("search", "input", "replacement", "--fields", "run_id")["matches"], [{"run_id":run.name}])
+                    self.assertEqual(self.success("search", "gate", "Replacement complete", "--fields", "run_id")["matches"], [{"run_id":run.name}])
+                    self.assertEqual(self.success("search", "input", "steerable")["matches"], [])
+                    self.assertEqual(state["revision_started_at_ms"], json.loads(before)["revision_started_at_ms"])
                 else:
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertEqual(state["status"], "interrupted")

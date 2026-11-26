@@ -331,27 +331,59 @@ EXIT STATUS
   1  Invalid arguments or operation failure; inspect stderr and retained diagnostics.
 
 # search
-pira_team search — search this main session's labels
+pira_team search — find visible retained runs by assignment, gate, handoff or label
 
 USAGE
-  pira_team search QUERY [--limit N] [--after LABEL] [--store DIR]
+  pira_team search [input|gate|final|label] PATTERN [--limit N] [--fields FIELD,...] [--store DIR]
 
 OPTIONS
-  --limit N    Integer 1..1000 (default 20).
-  --after LABEL  Continue strictly after this exact label (use next_after).
-  --store DIR  Team store.
-  --           End options; exactly one query follows.
+  --limit N    Integer 1..1000 (default 10 distinct runs).
+  --fields FIELDS  Comma-separated selection from run_id,label,revision,revision_at,status,excerpt.
+                  All six fields are returned by default.
+  --store DIR  Team store (otherwise the automatically selected store).
+  --           End options; the remaining one or two arguments are positional.
 
-QUERY is a nonblank case-insensitive literal keyword, at most 128 UTF-8 bytes,
-without control characters. Only labels are searched. Results follow the same
-pagination, ordering and visibility rules as bookmarks. See help sessions.
+One argument searches current labels. Two arguments select a field and a pattern.
+PATTERN is nonblank case-insensitive literal text, at most 128 UTF-8 bytes, without
+control characters. Quote patterns containing spaces. Search is observational:
+no model launch, log search, credential reads, or remote content-download fan-out.
+
+input searches the latest effective assignment, including accepted steering/resume;
+gate searches its completion gate. Neither searches injected policy or diagnostics.
+final searches the latest readable delivered handoff (completed, needs_decision or
+incomplete), in any UTF-8 text format, not historical matches or review checkpoints.
+A newer pending revision can return an older handoff; revision, revision_at and status
+always describe the matching revision, not the pending one. Unbookmarked runs are
+searchable by content. label returns the first matching label in exact lexical order;
+other selectors return the first current label, or null.
+
+JSON contains matches and has_more. Hits are ordered by recorded revision start time
+(UTC) descending, then run_id ascending; older records without reliable timing have
+revision_at:null and sort last. Unknown legacy revision numbers are null. Excerpts
+include the first match with nearby text, capped at 240 characters. --fields changes
+only the returned keys, not matching or order. No --after cursor: label-ordered paging
+remains available through bookmarks, whose interface is unchanged.
+
+Only caller-readable records in the selected store are searched. Retained remote
+routes are batched by endpoint/authority; matching stays on the owning server, with
+bounded returned hits. The limit applies after local/remote merging. Unavailable
+routes (including older endpoints without retained-search support) return incomplete:true
+and generic errors alongside any successful matches; this differs from zero hits.
+Older endpoints can omit remote label matches as well as content matches from search.
+Use bookmarks to list retained labels during mixed-version rollout; it remains available.
+Search does not install or upgrade endpoints. See help sessions for authorization.
+
+Use read RUN_ID manifest.json for full input/gate. For an earlier matching handoff,
+read its retained revision manifest, then the artifact path named there.
 
 EXAMPLES
-  pira_team search parser --limit 10
+  pira_team search parser
+  pira_team search final "proof gap" --fields run_id,label,revision,excerpt
+  pira_team search input "parser cleanup" --limit 20
 
 EXIT STATUS
-  0  Search succeeded, including zero matches.
-  1  Invalid arguments or operation failure; inspect stderr and retained diagnostics.
+  0  Search returned JSON, possibly with incomplete:true; inspect errors in that case.
+  1  Invalid arguments or store/identity failure.
 
 # config
 pira_team config — manage store-wide worker defaults and retention

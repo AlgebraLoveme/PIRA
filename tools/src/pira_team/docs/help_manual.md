@@ -10,7 +10,7 @@ Usage: pira_team run --task TASK --completion-gate TEXT [--inject-review] [--inj
        pira_team bookmark RUN_REF --label LABEL [--store DIR]
        pira_team unbookmark LABEL [--store DIR]
        pira_team bookmarks [--limit N] [--after LABEL] [--store DIR]
-       pira_team search QUERY [--limit N] [--after LABEL] [--store DIR]
+       pira_team search [input|gate|final|label] PATTERN [--limit N] [--fields FIELD,...] [--store DIR]
        pira_team config show [--store DIR]
        pira_team config set --main MODEL --model WORKER --effort EFFORT [--store DIR]
        pira_team config reset (--main MODEL | --all) [--store DIR]
@@ -89,14 +89,32 @@ observe complete snapshots. This budget never limits worker startup/inference.
 bookmark RUN_REF --label LABEL atomically adds/moves a label; its JSON receipt reports
 previous/current run references and changed. Same-target assignment is a no-write no-op.
 unbookmark LABEL removes only the mapping, never runs/artifacts; absence is a no-op.
-bookmarks lists labels; search performs case-insensitive literal keyword matching on
-labels only. Both return JSON matches (label, run_id, run_root) and has_more, ordered
+bookmarks lists labels as JSON matches (label, run_id, run_root) and has_more, ordered
 by exact label ascending, with --limit 1..1000 (default 20). When has_more is true,
-pass next_after as --after LABEL to continue strictly after the last returned label.
-Pages reflect current metadata, not a pinned snapshot. Invalid/unreadable metadata
-fails visibly, never resets or reports partial results. Run ownership is verified before
-listing; logs are not searched. Inaccessible pointers are hidden from listings and
-previous/current receipts, but own dangling mappings may still be removed.
+pass next_after as --after LABEL. Pages reflect current metadata, not a pinned snapshot.
+Invalid/unreadable bookmark metadata fails visibly, never resets. Ownership is verified
+before listing; inaccessible pointers are hidden, but own dangling mappings may be removed.
+
+search [input|gate|final|label] PATTERN finds distinct retained runs. One argument
+searches labels; two select latest effective assignment, its gate, latest readable
+delivered handoff, or current labels. Matching is case-insensitive literal text;
+patterns must be nonblank, control-free and at most 128 UTF-8 bytes. Content selectors
+include unbookmarked runs, not injected policies, logs, review checkpoints or attachments.
+Search returns matches and has_more, newest matching revision first, then run_id ascending.
+The default is ten hits (--limit 1..1000). Each hit has run_id,label,revision,revision_at
+(UTC),status,excerpt; --fields selects those keys without changing hits or order.
+Excerpts include the first match and nearby text, capped at 240 characters. Labels use
+the first exact lexical matching name (or first current name for content); absent labels
+are null. Legacy unknown revision/time is null; unknown times sort last. A pending newer
+revision can return an older handoff with that delivered revision's exact provenance.
+Read the matching revision manifest for its artifact path. Search has no --after cursor.
+Retained remote routes use existing signed authorization, batched by endpoint/authority;
+matching stays on the owning server, with bounded hits and the limit applied after merging.
+No model, new setup, automatic upgrades, or per-run content downloads. Unavailable routes
+(including older endpoints without retained-search support) yield incomplete:true and errors,
+separately from successful zero matches. Older endpoints can omit remote label matches
+as well as content matches from search; bookmarks remains available to list retained
+labels during mixed-version rollout. See help search for examples and details.
 Use @LABEL as RUN_REF for resume/steer/interrupt/read/path/bookmark. Aliases resolve once
 at invocation; plain run IDs are never interpreted as labels. Missing labels fail closed.
 All run and bookmark operations require verified main caller identity, including literal

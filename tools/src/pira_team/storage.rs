@@ -239,6 +239,18 @@ pub(crate) fn creator_session(run: &Path) -> Result<String, String> {
         crate::profile::validate_session_id(owner)?;
         return Ok(owner.to_owned());
     }
+    original_creator_session(run, &manifest)
+}
+
+/// Resolve creator evidence from the original revision, not a later execution caller.
+/// Only an actively owned initial invocation may lack that original snapshot.
+pub(crate) fn original_creator_session(run: &Path, current: &Value) -> Result<String, String> {
+    use crate::lifecycle::{private_path, read_json};
+    private_path(run, true)?;
+    let id = run
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or(UNAVAILABLE)?;
     let first = run.join("revisions/000001/manifest.json");
     // A present but invalid original snapshot never falls back to mutable state.
     let original = match fs::symlink_metadata(&first) {
@@ -250,9 +262,9 @@ pub(crate) fn creator_session(run: &Path) -> Result<String, String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // Before the first snapshot, accept only an actively owned initial
             // invocation, not an orphan/historical revision-1 manifest.
-            if manifest["revision"] != 1
-                || manifest["status"] != "running"
-                || !manifest["revisions"].as_array().is_some_and(Vec::is_empty)
+            if current["revision"] != 1
+                || current["status"] != "running"
+                || !current["revisions"].as_array().is_some_and(Vec::is_empty)
             {
                 return Err(UNAVAILABLE.into());
             }
@@ -266,7 +278,7 @@ pub(crate) fn creator_session(run: &Path) -> Result<String, String> {
             if !matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock)) {
                 return Err(UNAVAILABLE.into());
             }
-            manifest
+            current.clone()
         }
         Err(_) => return Err(UNAVAILABLE.into()),
     };
@@ -298,6 +310,10 @@ pub(super) fn artifact_path(run: &Path) -> Result<PathBuf, String> {
         return Err("run manifest exceeds 16 MiB".into());
     }
     let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid run manifest")?;
+    artifact_for(run, &manifest)
+}
+
+pub(super) fn artifact_for(run: &Path, manifest: &Value) -> Result<PathBuf, String> {
     if !["completed", "needs_decision", "incomplete"]
         .contains(&manifest["status"].as_str().unwrap_or(""))
     {

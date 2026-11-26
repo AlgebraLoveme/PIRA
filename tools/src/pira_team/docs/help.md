@@ -17,7 +17,7 @@ COMMANDS
   bookmark     Assign or move a session-scoped label.
   unbookmark   Remove a label, retaining its run and artifacts.
   bookmarks    List this session's labels.
-  search       Search labels by case-insensitive literal keyword.
+  search       Search retained input, gate, final handoff, or labels.
   cleanup      Preview or execute store-wide age and storage retention.
   config       Show, set, or reset worker defaults and retention thresholds.
   resolve      Recover an ordinary run handle from a remote request ID.

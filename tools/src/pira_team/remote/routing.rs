@@ -196,6 +196,151 @@ pub(crate) fn reference_for(root: &Path, id: &str, issuer: &str) -> Result<Optio
     Ok(Route::load(root, id, issuer)?.map(|_| json!({"run_id":id,"run_root":null})))
 }
 
+/// Search only retained, verified routes in the selected store. No discovery,
+/// per-run content fetches, reconciliation writes, or new endpoint provisioning.
+pub(crate) fn search(
+    root: &Path,
+    issuer: &str,
+    selector: &str,
+    pattern: &str,
+    limit: usize,
+    labels: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<Value, String> {
+    search_using(
+        root,
+        issuer,
+        selector,
+        pattern,
+        limit,
+        labels,
+        |route, requests| {
+            let cli = route.cli(&route.envelope["grant"], &SharedDiagnostics::default())?;
+            let mut grant = cli.capability_request(issuer)?;
+            grant["args"] = json!([
+                "search",
+                selector,
+                pattern,
+                limit.to_string(),
+                requests.to_string()
+            ]);
+            validate_grant(&grant)?;
+            cli.exchange(&sign(&grant, &route.authority)?)
+        },
+    )
+}
+
+fn search_using(
+    root: &Path,
+    issuer: &str,
+    selector: &str,
+    pattern: &str,
+    limit: usize,
+    labels: &std::collections::BTreeMap<String, Vec<String>>,
+    mut exchange: impl FnMut(&Route, &Value) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let mut hits = Vec::new();
+    let mut errors = Vec::new();
+    let mut has_more = false;
+    let routes = root.join(ROUTES);
+    if !present(&routes)? {
+        return Ok(json!({"matches":[],"has_more":false,"errors":[]}));
+    }
+    existing(&routes, true)?;
+    let mut groups: std::collections::BTreeMap<String, Vec<Route>> = Default::default();
+    for entry in fs::read_dir(&routes).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if storage::validate_run_id(&id).is_err() {
+            continue;
+        }
+        // Another main's retained records are not this caller's search authority.
+        if existing(&entry.path(), true).is_err() {
+            continue;
+        }
+        let Ok(record) = read(&entry.path().join("route.json")) else {
+            continue;
+        };
+        if record["envelope"]["grant"]["issuer"] != issuer {
+            continue;
+        }
+        let label = crate::search::label_for(
+            labels.get(&id).map(Vec::as_slice).unwrap_or_default(),
+            selector,
+            pattern,
+        );
+        if selector == "label" && label.is_none() {
+            continue;
+        }
+        match Route::load(root, &id, issuer) {
+            Ok(Some(route)) => {
+                let group =
+                    json!([route.envelope["grant"]["endpoint"], route.authority]).to_string();
+                groups.entry(group).or_default().push(route);
+            }
+            _ => errors.push(json!({"run_id":id,"error":"retained remote route unavailable"})),
+        }
+    }
+    for group in groups.values_mut() {
+        group.sort_by(|a, b| a.id.cmp(&b.id));
+        for batch in group.chunks(crate::search::BATCH_SIZE) {
+            let requests = json!(
+                batch
+                    .iter()
+                    .map(|route| {
+                        let label = crate::search::label_for(
+                            labels.get(&route.id).map(Vec::as_slice).unwrap_or_default(),
+                            selector,
+                            pattern,
+                        );
+                        json!([route.envelope["grant"]["request_id"], label])
+                    })
+                    .collect::<Vec<_>>()
+            );
+            let result = exchange(&batch[0], &requests).and_then(|result| {
+                let matches = result["matches"]
+                    .as_array()
+                    .ok_or("invalid remote search hits")?;
+                if matches.len() > limit
+                    || !result["has_more"].is_boolean()
+                    || !result["errors"].is_array()
+                {
+                    return Err("invalid remote search page".into());
+                }
+                for hit in matches {
+                    if !batch.iter().any(|route| hit["run_id"] == route.id)
+                        || hit["excerpt"]
+                            .as_str()
+                            .is_none_or(|s| s.chars().count() > 240)
+                    {
+                        return Err("invalid remote search provenance/excerpt".into());
+                    }
+                }
+                Ok(result)
+            });
+            match result {
+                Ok(result) => {
+                    hits.extend(result["matches"].as_array().unwrap().iter().cloned());
+                    has_more |= result["has_more"] == true;
+                    if !result["errors"].as_array().unwrap().is_empty() {
+                        errors.push(json!({"run_ids":batch.iter().map(|r| &r.id).collect::<Vec<_>>(),
+                            "error":"retained remote content unavailable"}));
+                    }
+                }
+                Err(_) => errors.push(json!({"run_ids":batch.iter().map(|r| &r.id).collect::<Vec<_>>(),
+                    "error":"retained remote search unavailable; endpoint may lack retained-search support"})),
+            }
+        }
+    }
+    let mut result = crate::search::page(hits, limit);
+    if has_more {
+        result["has_more"] = json!(true);
+    }
+    result["errors"] = json!(errors);
+    Ok(result)
+}
+
 // Compatibility submissions with explicit request IDs use the same ordinary
 // route index, irrespective of their explicit transport controller directory.
 pub(super) fn retain_transport(cli: &Client, envelope: &Value) -> Result<(), String> {
@@ -1061,6 +1206,82 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn retained_search_groups_routes_bounds_batches_and_distinguishes_unavailable_from_empty() {
+        let f = Fixture::new();
+        let mut ids = Vec::new();
+        for n in 0..12 {
+            let mut grant = f.envelope["grant"].clone();
+            grant["request_id"] = json!(format!("request-{n}"));
+            grant["nonce"] = json!(format!("{n:064x}"));
+            let envelope = sign(&grant, &f.cli.authority).unwrap();
+            ids.push(retain_at(&f.root, &f.cli, &envelope).unwrap().id);
+        }
+        let labels = Default::default();
+        let mut calls = 0;
+        let remote = search_using(&f.root, "root", "input", "phrase", 10, &labels, |_, requests| {
+            calls += 1;
+            assert_eq!(requests.as_array().unwrap().len(), 12); // One server-side batch, not 12 fetches.
+            let hits = ids.iter().enumerate().map(|(n,id)| json!({"run_id":id,"label":null,"revision":1,
+                "revision_at":format!("2026-01-01T00:00:{n:02}.000Z"),"status":"completed","excerpt":"phrase"})).collect();
+            let mut page = crate::search::page(hits, 10);
+            page["errors"] = json!([]);
+            Ok(page)
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(remote["has_more"], true);
+        // The caller applies its limit only after merging both sources.
+        let mut hits = remote["matches"].as_array().unwrap().clone();
+        hits.push(json!({"run_id":"local-newest","revision_at":"2026-01-01T00:01:00.000Z"}));
+        hits.push(json!({"run_id":"local-tie","revision_at":"2026-01-01T00:00:11.000Z"}));
+        let merged = crate::search::page(hits, 10);
+        assert_eq!(merged["matches"][0]["run_id"], "local-newest");
+        assert_eq!(merged["matches"][1]["run_id"], "local-tie");
+        assert_eq!(merged["matches"][2]["run_id"], ids[11]);
+        assert_eq!(merged["has_more"], true);
+        let empty = search_using(&f.root, "root", "input", "phrase", 10, &labels, |_, _| {
+            Ok(json!({"matches":[],"has_more":false,"errors":[]}))
+        })
+        .unwrap();
+        assert_eq!(empty["errors"], json!([]));
+        let failed = search_using(&f.root, "root", "input", "phrase", 10, &labels, |_, _| {
+            Err("private diagnostic must not escape".into())
+        })
+        .unwrap();
+        assert_eq!(failed["matches"], json!([]));
+        assert_eq!(failed["errors"].as_array().unwrap().len(), 1);
+        assert!(!failed.to_string().contains("private diagnostic"));
+        let hidden = search_using(
+            &f.root,
+            "stranger",
+            "input",
+            "phrase",
+            10,
+            &labels,
+            |_, _| panic!("unauthorized route must not contact an endpoint"),
+        )
+        .unwrap();
+        assert_eq!(hidden["matches"], json!([]));
+        assert_eq!(hidden["errors"], json!([]));
+        let labels = [(ids[0].clone(), vec!["match".to_owned()])]
+            .into_iter()
+            .collect();
+        let labeled = search_using(
+            &f.root,
+            "root",
+            "label",
+            "MATCH",
+            10,
+            &labels,
+            |_, requests| {
+                assert_eq!(requests, &json!([["request-0", "match"]]));
+                Ok(json!({"matches":[],"has_more":false,"errors":[]}))
+            },
+        )
+        .unwrap();
+        assert_eq!(labeled["errors"], json!([]));
     }
 
     #[test]

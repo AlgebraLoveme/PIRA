@@ -226,7 +226,16 @@ fn documented_defaults_and_key_error_contracts_are_visible() {
     }
     assert!(success(&["resume", "--help"]).contains("retains its gate"));
     assert!(success(&["bookmarks", "--help"]).contains("1..1000 (default 20)"));
-    assert!(success(&["search", "--help"]).contains("Only labels are searched"));
+    let search = success(&["search", "--help"]);
+    for needle in [
+        "input|gate|final|label",
+        "default 10",
+        "--fields",
+        "240 characters",
+        "incomplete:true",
+    ] {
+        assert!(search.contains(needle), "{needle}");
+    }
     assert!(success(&["tier", "--help"]).contains("Remote live tier is unsupported"));
 }
 

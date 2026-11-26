@@ -31,6 +31,7 @@ const CAPABILITIES: &[&str] = &[
     "steer",
     "interrupt",
     "artifact-chunks",
+    "retained-search",
 ];
 
 fn capability_metadata() -> Value {
@@ -778,6 +779,9 @@ fn validate_grant(grant: &Value) -> Result<(), String> {
                 {
                     return Err("invalid interrupt argv".into());
                 }
+            }
+            "read" if args.first().map(String::as_str) == Some("search") => {
+                search_selection(grant)?;
             }
             "read" if args.first().map(String::as_str) == Some("read-chunk") => {
                 if args.len() != 3
@@ -1608,6 +1612,9 @@ fn endpoint(envelope: Value) -> Result<Value, String> {
             if grant["args"][0] == "capabilities" {
                 return Ok(capability_metadata());
             }
+            if grant["args"][0] == "search" {
+                return search_retained(&grant, &anchor);
+            }
             if unaccepted(&grant)? {
                 return Ok(
                     json!({"request_id":grant["request_id"],"accepted":false,"status":"not_found"}),
@@ -1727,6 +1734,73 @@ fn owned(grant: &Value, anchor: &Path) -> Result<(PathBuf, Value), String> {
     record_run(&record, anchor)?;
     Ok((dir, record))
 }
+// The signed read envelope binds the endpoint and issuer. Each requested initial
+// ledger is independently authorized; labels are caller-owned management metadata.
+fn search_selection(grant: &Value) -> Result<(Vec<(String, Option<String>)>, usize), String> {
+    let args = strings(&grant["args"])?;
+    if args.len() != 5
+        || args[0] != "search"
+        || grant["artifact"] != false
+        || !grant["file"].is_null()
+        || !grant["operation_id"].is_null()
+    {
+        return Err("invalid retained search selection".into());
+    }
+    let limit = args[3]
+        .parse::<usize>()
+        .map_err(|_| "invalid retained search limit")?;
+    crate::search::validate(&args[1], &args[2], limit)?;
+    let requests: Vec<(String, Option<String>)> =
+        serde_json::from_str(&args[4]).map_err(|_| "invalid retained search batch")?;
+    if requests.is_empty() || requests.len() > crate::search::BATCH_SIZE {
+        return Err("retained search batch must contain 1..128 requests".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (request, label) in &requests {
+        key(request)?;
+        if !seen.insert(request) {
+            return Err("duplicate retained search request".into());
+        }
+        if let Some(label) = label {
+            crate::bookmarks::validate_label(label)?;
+        }
+        if args[1] == "label" && label.is_none() {
+            return Err("label search requires a label".into());
+        }
+    }
+    Ok((requests, limit))
+}
+
+fn search_retained(grant: &Value, anchor: &Path) -> Result<Value, String> {
+    let (requests, limit) = search_selection(grant)?;
+    let args = strings(&grant["args"])?;
+    let mut hits = Vec::new();
+    let mut errors = Vec::new();
+    for (request, label) in requests {
+        let mut selection = grant.clone();
+        selection["request_id"] = json!(request);
+        // Same ledger verification as read, including signed root ownership,
+        // physical endpoint paths and exclusion of coordinator descendants.
+        let result = (|| {
+            if unaccepted(&selection)? {
+                return Ok(None);
+            }
+            let (_, record) = owned(&selection, anchor)?;
+            let run = record_run(&record, anchor)?;
+            crate::search::hit(&run, &args[1], &args[2], label.as_deref())
+        })();
+        match result {
+            Ok(Some(hit)) => hits.push(hit),
+            Ok(None) => {}
+            Err(_) => errors
+                .push(json!({"request_id":request,"error":"retained remote content unavailable"})),
+        }
+    }
+    let mut result = crate::search::page(hits, limit);
+    result["errors"] = json!(errors);
+    Ok(result)
+}
+
 fn submit_using(
     envelope: Value,
     grant: &Value,
@@ -2971,6 +3045,115 @@ mod tests {
                 .is_err()
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn retained_search_batches_authorize_each_ledger_without_model_or_content_fetch() {
+        let f = Fixture::signing();
+        let mut requests = Vec::new();
+        let mut runs = Vec::new();
+        for n in 0..12 {
+            let mut original = f.grant("submit");
+            original["request_id"] = json!(format!("search-{n:02}"));
+            original["nonce"] = json!(format!("{n:064x}"));
+            let envelope = sign_with(&original, &f.authority).unwrap();
+            submit_using(envelope, &original, &f.anchor, |_| Ok(())).unwrap(); // No supervisor.
+            let (_, record) = owned(&original, &f.anchor).unwrap();
+            let run = record_run(&record, &f.anchor).unwrap();
+            lifecycle::save_json(
+                &run.join("manifest.json"),
+                &json!({"run_id":run.file_name().unwrap().to_str(),
+                "creator_main_session_id":"fixture-root","parent_run_id":null,"revision":1,
+                "status":"incomplete","task":"input phrase","completion_gate":"gate phrase",
+                "revision_started_at_ms":n * 1000,"artifact":"artifacts/handoff"}),
+            )
+            .unwrap();
+            crate::private_dir(&run.join("artifacts")).unwrap();
+            fs::write(
+                run.join("artifacts/handoff"),
+                format!("{} final phrase {}", "λ".repeat(500), "尾".repeat(500)),
+            )
+            .unwrap();
+            fs::write(run.join("stderr.log"), "diagnostic-only phrase").unwrap();
+            requests.push(json!([original["request_id"], null]));
+            runs.push(run);
+        }
+        let mut grant = f.grant("read");
+        grant["args"] = json!([
+            "search",
+            "final",
+            "FINAL PHRASE",
+            "10",
+            json!(requests).to_string()
+        ]);
+        let verified = verify(&sign_with(&grant, &f.authority).unwrap(), &f.anchor).unwrap();
+        let result = search_retained(&verified, &f.anchor).unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 10);
+        assert_eq!(result["has_more"], true);
+        assert_eq!(result["errors"], json!([]));
+        assert_eq!(
+            result["matches"][0]["run_id"],
+            runs[11].file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(result["matches"][0]["status"], "incomplete");
+        assert_eq!(
+            result["matches"][0]["excerpt"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            240
+        );
+        for (selector, pattern, expected) in [
+            ("input", "input phrase", 10),
+            ("gate", "gate phrase", 10),
+            ("final", "input phrase", 0),
+            ("final", "diagnostic-only", 0),
+        ] {
+            grant["args"] = json!([
+                "search",
+                selector,
+                pattern,
+                "10",
+                json!(requests).to_string()
+            ]);
+            validate_grant(&grant).unwrap();
+            assert_eq!(
+                search_retained(&grant, &f.anchor).unwrap()["matches"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                expected
+            );
+        }
+        grant["args"] = verified["args"].clone();
+        let mut unauthorized = grant.clone();
+        unauthorized["issuer"] = json!("another-main");
+        let hidden = search_retained(&unauthorized, &f.anchor).unwrap();
+        assert_eq!(hidden["matches"], json!([]));
+        assert!(!hidden.to_string().contains("final phrase"));
+        assert!(!hidden.to_string().contains("remote-"));
+        let mut manifest = lifecycle::read_json(&runs[11].join("manifest.json")).unwrap();
+        manifest["parent_run_id"] = json!("coordinator");
+        lifecycle::save_json(&runs[11].join("manifest.json"), &manifest).unwrap();
+        let hidden = search_retained(&grant, &f.anchor).unwrap();
+        assert_eq!(hidden["errors"].as_array().unwrap().len(), 1);
+        assert!(
+            !hidden["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["run_id"] == runs[11].file_name().unwrap().to_str().unwrap())
+        );
+        let mut invalid = grant.clone();
+        invalid["artifact"] = json!(true);
+        assert!(validate_grant(&invalid).is_err());
+        invalid = grant.clone();
+        invalid["args"][4] = json!(json!([["search-00", null], ["search-00", null]]).to_string());
+        assert!(validate_grant(&invalid).is_err());
+        invalid["args"][4] = json!(json!([["../escape", null]]).to_string());
+        assert!(validate_grant(&invalid).is_err());
+    }
+
     #[cfg(unix)]
     include!("remote/tests/client_persistence.rs");
 }

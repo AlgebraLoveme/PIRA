@@ -9,6 +9,7 @@ mod profile;
 mod remote;
 mod retention;
 mod runtime;
+mod search;
 mod storage;
 mod subteam;
 
@@ -410,11 +411,10 @@ pub fn run() -> i32 {
         storage::wait(&args)
     } else if matches!(args[0].as_str(), "read" | "path") {
         storage::access(&args)
-    } else if matches!(
-        args[0].as_str(),
-        "bookmark" | "unbookmark" | "bookmarks" | "search"
-    ) {
+    } else if matches!(args[0].as_str(), "bookmark" | "unbookmark" | "bookmarks") {
         bookmarks::command(&args)
+    } else if args[0] == "search" {
+        search::command(&args)
     } else if args[0] == "cleanup" {
         retention::command(&args)
     } else if args[0] == "config" {

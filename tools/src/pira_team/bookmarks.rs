@@ -342,19 +342,13 @@ fn remove(root: &Path, label: &str) -> Result<Value, String> {
     )
 }
 
-fn browse(
-    root: &Path,
-    query: Option<&str>,
-    limit: usize,
-    after: Option<&str>,
-) -> Result<Value, String> {
+fn browse(root: &Path, limit: usize, after: Option<&str>) -> Result<Value, String> {
     let session = crate::profile::caller_session()?;
     let Some(root) = root_if_present(root)? else {
         return Ok(json!({"matches":[],"has_more":false}));
     };
     // Validate the whole index before filtering; expose only accessible runs.
     let index = load(&root)?;
-    let query = query.map(str::to_lowercase);
     let mut matches = Vec::new();
     let mut has_more = false;
     for ((owner, label), id) in index.scoped {
@@ -364,12 +358,6 @@ fn browse(
         let Some(reference) = visible_reference(&root, &id, &session) else {
             continue;
         };
-        if query
-            .as_ref()
-            .is_some_and(|q| !label.to_lowercase().contains(q))
-        {
-            continue;
-        }
         if matches.len() == limit {
             has_more = true;
             break;
@@ -382,6 +370,20 @@ fn browse(
             result["matches"].as_array().unwrap().last().unwrap()["label"].clone();
     }
     Ok(result)
+}
+
+/// Current caller-scoped labels, from one validated index snapshot.
+pub(super) fn labels_for(
+    root: &Path,
+    session: &str,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut labels: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for ((owner, label), id) in load(root)?.scoped {
+        if owner == session {
+            labels.entry(id).or_default().push(label);
+        }
+    }
+    Ok(labels)
 }
 
 /// Session-scoped bookmark management; no worker launch or authentication lookup.
@@ -408,8 +410,8 @@ pub fn command(args: &[String]) -> Result<(), String> {
         let slot = match arg.as_str() {
             "--store" => &mut store,
             "--label" if action == "bookmark" => &mut label,
-            "--limit" if matches!(action, "search" | "bookmarks") => &mut limit,
-            "--after" if matches!(action, "search" | "bookmarks") => &mut after,
+            "--limit" if action == "bookmarks" => &mut limit,
+            "--after" if action == "bookmarks" => &mut after,
             _ => return Err(format!("unknown {action} option {arg}")),
         };
         crate::set_once(
@@ -450,14 +452,6 @@ pub fn command(args: &[String]) -> Result<(), String> {
         "bookmarks" if target.is_some() => {
             return Err("bookmarks takes no positional arguments".into());
         }
-        "search" => {
-            let query = target.as_deref().ok_or("search requires QUERY")?;
-            if query.trim().is_empty() || query.len() > 128 || query.chars().any(char::is_control) {
-                return Err(
-                    "query must be nonblank, without controls, and at most 128 UTF-8 bytes".into(),
-                );
-            }
-        }
         _ => {}
     }
     let root = store
@@ -467,8 +461,7 @@ pub fn command(args: &[String]) -> Result<(), String> {
     let result = match action {
         "bookmark" => assign(&root, target.as_deref().unwrap(), label.as_deref().unwrap())?,
         "unbookmark" => remove(&root, target.as_deref().unwrap())?,
-        "bookmarks" => browse(&root, None, limit, after.as_deref())?,
-        "search" => browse(&root, target.as_deref(), limit, after.as_deref())?,
+        "bookmarks" => browse(&root, limit, after.as_deref())?,
         _ => unreachable!(),
     };
     println!("{result}");

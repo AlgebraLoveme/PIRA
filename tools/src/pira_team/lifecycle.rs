@@ -624,6 +624,7 @@ fn revision(
         manifest["execution_permissions"]["source"] = json!("launcher-signed-delegation-v2");
     }
     crate::retention::activity(manifest)?;
+    manifest["revision_started_at_ms"] = manifest["last_execution_activity_ms"].clone();
     begin_revision(&snapshot, || {
         save_json(&run.join("manifest.json"), manifest)
     })?;
