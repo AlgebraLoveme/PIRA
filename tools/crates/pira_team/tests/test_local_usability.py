@@ -199,7 +199,7 @@ class LocalUsabilityTests(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("canonical", failed.stderr)
 
-    def test_bookmarks_and_search_paginate_past_limit_without_exposing_hidden_rows(self) -> None:
+    def test_bookmarks_paginate_and_search_deduplicates_without_exposing_hidden_rows(self) -> None:
         first = self.receipt(self.launch("bookmarks fixture"))
         entries = [["parent-session", f"label-{i:04d}", first["run_id"]] for i in range(1001)]
         entries += [["other-session", "hidden", first["run_id"]], ["parent-session", "dangling", "missing-run"]]
@@ -207,15 +207,25 @@ class LocalUsabilityTests(unittest.TestCase):
         index.write_text(json.dumps([2, entries, []]))
         original = index.read_bytes()
         page = self.receipt(self.cli("bookmarks", "--limit", "1000"))
-        self.assertEqual(len(page["matches"]), 1000)
+        self.assertEqual([m["label"] for m in page["matches"]], [f"label-{i:04d}" for i in range(1000)])
         self.assertTrue(page["has_more"])
         self.assertEqual(page["next_after"], "label-0999")
         last = self.receipt(self.cli("bookmarks", "--limit", "1000", "--after", page["next_after"]))
         self.assertEqual([m["label"] for m in last["matches"]], ["label-1000"])
         self.assertFalse(last["has_more"])
         self.assertNotIn("next_after", last)
-        found = self.receipt(self.cli("search", "LABEL", "--after", page["next_after"]))
-        self.assertEqual(found["matches"], last["matches"])
+        found = self.receipt(self.cli("search", "LABEL"))
+        self.assertEqual([(m["run_id"], m["label"]) for m in found["matches"]],
+                         [(first["run_id"], "label-0000")])
+        self.assertFalse(found["has_more"])
+        self.assertNotIn("next_after", found)
+        for label in ("hidden", "dangling"):
+            with self.subTest(label=label):
+                self.assertEqual(self.receipt(self.cli("search", label)), {"matches": [], "has_more": False})
+        unsupported = self.cli("search", "LABEL", "--after", page["next_after"])
+        self.assertNotEqual(unsupported.returncode, 0)
+        self.assertEqual(unsupported.stdout, "")
+        self.assertIn("unknown search option --after", unsupported.stderr)
         empty = self.receipt(self.cli("bookmarks", "--after", "label-1000"))
         self.assertEqual(empty["matches"], [])
         for args in [("--limit", "1001"), ("--after", "bad/label"), ("--after", "one", "--after", "two")]:
