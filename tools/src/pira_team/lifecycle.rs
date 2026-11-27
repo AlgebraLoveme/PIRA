@@ -498,6 +498,32 @@ pub fn existing(args: &[String]) -> Result<(), String> {
     if options.allow_subteam && !manifest["parent_run_id"].is_null() {
         return Err("ordinary children cannot be granted --allow-subteam".into());
     }
+    if manifest["transport"] == "app-server" {
+        // Retain the last admitted context until execution-capable resume succeeds.
+        // A refused replacement must not become the next taskless resume's defaults.
+        manifest["goal_resume_context"] = json!({
+            "task":manifest["task"], "model":manifest["model"], "effort":manifest["effort"],
+            "profile_sources":manifest["profile_sources"], "service_tier":manifest["service_tier"],
+            "completion_gate":manifest["completion_gate"], "allow_subteam":manifest["allow_subteam"],
+            "execution_permissions":manifest["execution_permissions"], "sandbox":manifest["sandbox"]
+        });
+        // Active goals may execute inside thread/resume. Replacement work must never
+        // race that admission. The runtime checks this before execution-capable RPCs.
+        manifest["goal_resume_safe"] = json!(
+            !replacement
+                && options.model == manifest["model"]
+                && options.effort == manifest["effort"]
+                && options.completion_gate == manifest["completion_gate"]
+                && options.execution.sandbox == manifest["execution_permissions"]["sandbox_policy"]
+                && options.service_tier.name() == manifest["service_tier"]
+                && options.allow_subteam == (manifest["allow_subteam"] == true)
+                && manifest["worker_policy_version"] == crate::WORKER_POLICY_VERSION
+                && (!options.inject_review || manifest["inject_review"] == true)
+                && (!options.inject_implement || manifest["inject_implement"] == true)
+                && (!options.inject_fig || manifest["inject_fig"] == true)
+                && (!options.inject_write || manifest["inject_write"] == true)
+        );
+    }
     manifest["allow_subteam"] = json!(options.allow_subteam);
     manifest["schema_version"] = json!(4);
     let next = manifest["revision"]

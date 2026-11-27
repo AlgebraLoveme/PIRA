@@ -175,6 +175,8 @@ state = json.loads(state_path.read_text()) if state_path.exists() else {"thread"
 if os.environ.get("TEAM_SUBTEAM_FIXTURE") and not state_path.exists():
     state["thread"] = "worker-" + home.parent.name
 active = None
+goal_mode = os.environ.get("TEAM_GOAL_MODE", "")
+goal_turns = 0
 tier_updates = 0
 due = None
 subteam_service = None
@@ -186,6 +188,33 @@ def send(value):
 
 def notify(method, params):
     send({"method": method, "params": {"threadId": state["thread"], "turnId": active, **params}})
+
+def goal_update(status):
+    state["goal"] = {"threadId": state["thread"], "status": status, "objective": "synthetic proof"}
+    notify("thread/goal/updated", {"goal": state["goal"]})
+
+
+def native_goal_start():
+    global active, due, goal_turns, task, repair
+    assert active is None
+    goal_turns += 1
+    state["turns"] += 1
+    active = str(state["turns"])
+    task = "goal final"
+    repair = False
+    state.setdefault("native_turns", []).append({"id": active, "phase": state.get("phase"), "handoff": str(handoff)})
+    state_path.write_text(json.dumps(state))
+    if goal_mode == "terminal-race":
+        # Goal state can overtake public turn admission; thread/read still
+        # authoritatively reports the already-running native turn.
+        goal_update("complete")
+        due = None
+        return
+    notify("turn/started", {"turn": {"id": active, "status": "inProgress"}})
+    # Control mode stays silent until steer/interrupt. Status mode deliberately
+    # runs longer than the admission grace; this is not a running-turn timeout.
+    due = None if goal_mode == "control" else time.monotonic() + (5.4 if goal_mode == "status-active" else .001)
+
 
 def notification_burst():
     for index in range(int(os.environ.get("TEAM_BURST_COUNT", "0"))):
@@ -220,6 +249,15 @@ def refuse_request():
 def finish(status="completed"):
     global active, due
     if status == "completed":
+        if goal_mode and goal_turns:
+            if goal_turns > 1 or goal_mode == "resume":
+                goal_update("complete")
+            elif goal_mode in ("paused", "blocked", "usageLimited", "budgetLimited", "cleared"):
+                if goal_mode == "cleared":
+                    state["goal"] = None
+                    notify("thread/goal/cleared", {})
+                else:
+                    goal_update(goal_mode)
         for key, amount in {"inputTokens":17, "cachedInputTokens":3, "outputTokens":5, "reasoningOutputTokens":2, "cacheWriteInputTokens":1}.items():
             state["usage"][key] = state["usage"].get(key, 0) + amount
         if not os.environ.get("TEAM_NO_USAGE"):
@@ -227,6 +265,9 @@ def finish(status="completed"):
         notify("item/completed", {"item": {"type": "agentMessage", "phase": "commentary", "text": "not final"}})
         if task != "missing":
             candidate = {"filename":"review.md", "format":"markdown", "content":"ANSWER " + task}
+            if goal_turns == 1 and goal_mode not in ("resume", "paused", "blocked", "usageLimited", "budgetLimited", "cleared"):
+                candidate["content"] = "CHECKPOINT " + task
+                candidate["status"] = "completed" if goal_mode == "stage" else "incomplete"
             if task == "recall":
                 candidate["content"] = json.dumps(state["history"])
             if task == "decision-probe":
@@ -281,6 +322,11 @@ def finish(status="completed"):
         turn["error"] = {"message": "fixture native completion error"}
     notify("turn/completed", {"turn": turn})
     active, due = None, None
+    if status == "completed" and goal_turns == 1:
+        if goal_mode == "exit":
+            sys.exit(9)
+        if goal_mode in ("continue", "control", "stage", "repair"):
+            native_goal_start()
 
 if os.name == "nt":
     import queue
@@ -336,7 +382,15 @@ while True:
     if method in ("thread/start", "thread/resume"):
         state["cwd"] = params["cwd"]
         assert params["approvalPolicy"] == "never" and params["sandbox"] == sandbox
-        assert params["baseInstructions"] == policy and params["developerInstructions"] == ""
+        if (state.get("goal") or {}).get("status") == "active" and method == "thread/resume":
+            phase = Path("phase.md").read_text()
+            assert params["baseInstructions"].startswith(policy + "\n\n")
+            assert params["baseInstructions"].endswith(phase)
+            assert "supersedes retained phase/output contracts" in params["baseInstructions"]
+            state["phase"] = phase
+        else:
+            assert params["baseInstructions"] == policy
+        assert params["developerInstructions"] == ""
         if "base_policy" in state and os.environ.get("TEAM_ASSERT_PREFIX"):
             assert state["base_policy"] == policy
         else:
@@ -370,6 +424,22 @@ while True:
                 json.dumps({"type":"session_meta", "payload":{"id":state["thread"]}}) + "\n" +
                 json.dumps({"type":"turn_context", "payload":{"model":params["model"], "effort":"high", "cwd":state["cwd"],
                     "approval_policy":"never", "sandbox_policy":caller_policy}}) + "\n")
+    elif method == "thread/goal/get":
+        assert params["threadId"] == state["thread"]
+        if goal_mode == "terminal-race" and state["turns"] == 1:
+            native_goal_start()
+        result = {"goal": state.get("goal")}
+        if goal_mode in ("stale-snapshot", "stale-settlement"):
+            result = {"goal": {**state["goal"], "status": "complete"}}
+            if goal_mode == "stale-snapshot":
+                goal_update("active")
+        if os.environ.get("TEAM_GOAL_REPLY"):
+            result = json.loads(os.environ["TEAM_GOAL_REPLY"])
+        if os.environ.get("TEAM_GOAL_READ_RACE"):
+            goal_update("active")
+    elif method == "thread/read":
+        assert params == {"threadId": state["thread"], "includeTurns": False}
+        result = {"thread": {"id": state["thread"], "status": {"type": "active" if goal_mode in ("status-active", "terminal-race") else "idle"}}}
     elif method == "thread/inject_items":
         assert params["threadId"] == state["thread"]
         item, = params["items"]
@@ -441,6 +511,10 @@ while True:
         if os.environ.get("TEAM_IMPLEMENT_WAIT") and "IMPLEMENTATION STAGE." in state.get("phase", ""):
             due = None
         result = {"turn":{"id":active}}
+        if goal_mode and not (goal_mode == "stage" and "IMPLEMENTATION STAGE." in state.get("phase", "")) and not repair:
+            goal_turns = 1
+            goal_update("active")
+            due = time.monotonic() + .001
     elif method == "turn/settings/update":
         assert params["threadId"] == state["thread"] and params["turnId"] == active
         assert set(params) == {"threadId", "turnId", "serviceTier"}
@@ -481,7 +555,18 @@ while True:
             send({"id": request["id"], "error": {"message": "fixture turn/start error"}})
             continue
     pause_at(method)
+    if method == "thread/resume" and state.get("goal") and state["goal"]["status"] == "active":
+        # Deliberately deliver native admission before the RPC reply.
+        native_goal_start()
     send({"id":request["id"], "result":result})
+    if method == "thread/read" and goal_mode == "stale-settlement" and not state.get("fresh_notified"):
+        state["fresh_notified"] = True
+        goal_update("active")
+    if method == "thread/read" and goal_mode in ("status-active", "status-race"):
+        native_goal_start()
+    if method == "thread/read" and goal_mode == "terminal-race":
+        notify("turn/started", {"turn": {"id": active, "status": "inProgress"}})
+        due = time.monotonic() + .001
     if method == "turn/start" and os.environ.get("TEAM_BURST_AT") == "after-ack":
         notification_burst()
     if method == "turn/start" and failure == "after-refusal":

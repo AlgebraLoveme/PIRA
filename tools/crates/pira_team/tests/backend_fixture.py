@@ -6,7 +6,18 @@ from pathlib import Path
 def write_schemas(directory, contract, fault=""):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for name, expected in contract["schemas"].items():
+    schemas = dict(contract["schemas"])
+    import os
+    if fault != "no-goals" and (path := os.environ.get("TEAM_TEST_BACKEND_CONTRACT")):
+        optional = Path(path).parent / "harness/codex/goal_contract.json"
+        for name, expected in json.loads(optional.read_text()).items():
+            base = schemas.setdefault(name, {})
+            for section, entries in expected.items():
+                if isinstance(entries, dict):
+                    base.setdefault(section, {}).update(entries)
+                else:
+                    base.setdefault(section, []).extend(entries)
+    for name, expected in schemas.items():
         schema = {"type": "object", "properties": {key: {} for key in expected.get("fields", [])}, "definitions": {}}
         for definition, names in expected.get("definitions", {}).items():
             schema["definitions"][definition] = {"type": "object", "properties": {key: {} for key in names}}

@@ -288,6 +288,15 @@ impl Endpoint {
         )
     }
 
+    fn between_turns(&self) -> Result<(), String> {
+        self.attempt_gate.with_open(|| {
+            let mut turn = self.turn.lock().unwrap();
+            self.publish_locked(None)?;
+            *turn = None;
+            Ok(())
+        })
+    }
+
     fn activate(&self, id: &str) -> Result<(), String> {
         self.attempt_gate.with_open(|| {
             let mut turn = self.turn.lock().unwrap();

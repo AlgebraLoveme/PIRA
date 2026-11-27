@@ -54,6 +54,9 @@ assignment. See help safety and help manual for retained guidance and constraint
 
 Run blocks without an execution deadline. --timeout is rejected. Await the original
 invocation; use interrupt for a hung worker. Failure can leave partial edits.
+Team follows an active Codex goal across turns. If no continuation starts within
+five seconds and Codex is still idle, Team reports incomplete and retains the
+goal for resume. This check does not limit a running turn.
 The JSON receipt contains run_id, status, run_root, and handoff_path. Format checks
 validate delivery/format, not findings or completion. At most one format repair
 preserves substantive work. needs_decision/incomplete bypass schema/columns.
@@ -98,6 +101,7 @@ task requires its own gate. Model/effort/output/tier retain stored values unless
 overridden; caller defaults are not reapplied. Current verified caller permissions
 still apply. Resume retains guidance and stage; standalone runs do not become
 staged retroactively. Format, cwd, and label are not resume options.
+Resume an active Codex goal without a replacement task or execution changes.
 Concurrent resumes or unsettled running state fail closed. --timeout is rejected.
 Inspect partial work and external effects before explicit resume. See help recovery
 for guarded settlement and legacy migration, and help remote for retained routes.

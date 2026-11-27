@@ -122,6 +122,16 @@ pub fn preflight(
     check().map_err(|e| format!("unsupported Codex backend: {e}. {GUIDE}"))
 }
 
+// Optional: old single-turn backends do not need the Goal supervision API.
+pub(crate) fn goal_capability(dir: &Path) -> Result<(), String> {
+    let root = dir.join("backend-schema");
+    let contract: Value = serde_json::from_str(include_str!("goal_contract.json")).unwrap();
+    for (file, expected) in contract.as_object().unwrap() {
+        inventory(&read_schema(&root.join(file))?, expected)?;
+    }
+    Ok(())
+}
+
 fn read_schema(path: &Path) -> Result<Value, String> {
     let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {

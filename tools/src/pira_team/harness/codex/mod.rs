@@ -4,9 +4,9 @@ mod caller_log;
 mod schema;
 
 pub(super) use caller::{caller_context, caller_identity};
-pub(crate) use schema::resume_params;
 #[cfg(test)]
 pub(crate) use schema::tests::installed_native_schema_supports_team_requests;
+pub(crate) use schema::{goal_capability, resume_params};
 pub(super) use schema::{preflight, validate_request};
 
 use super::worker_path;
@@ -228,7 +228,14 @@ pub(super) fn set_worker_launcher(command: &mut Command) -> Result<(), String> {
 pub(crate) fn relevant_event(value: &Value) -> bool {
     value.get("id").is_some()
         || match value["method"].as_str() {
-            Some("turn/completed" | "thread/tokenUsage/updated") => true,
+            Some(
+                "turn/completed"
+                | "turn/started"
+                | "thread/goal/updated"
+                | "thread/goal/cleared"
+                | "thread/status/changed"
+                | "thread/tokenUsage/updated",
+            ) => true,
             Some("item/completed") => {
                 let item = &value["params"]["item"];
                 item["type"] == "agentMessage"

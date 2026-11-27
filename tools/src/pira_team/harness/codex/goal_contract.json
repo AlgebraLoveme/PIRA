@@ -1,0 +1,6 @@
+{
+  "ClientRequest.json": {"methods": {"thread/goal/get": ["threadId"], "thread/read": ["threadId", "includeTurns"]}},
+  "ServerNotification.json": {"methods": {"turn/started": ["threadId", "turn"], "thread/goal/updated": ["threadId", "goal"], "thread/goal/cleared": ["threadId"], "thread/status/changed": ["threadId", "status"]}},
+  "v2/ThreadGoalGetResponse.json": {"fields": ["goal"], "definitions": {"ThreadGoal": ["threadId", "status", "objective"]}},
+  "v2/ThreadReadResponse.json": {"fields": ["thread"], "definitions": {"Thread": ["id", "status"]}}
+}
