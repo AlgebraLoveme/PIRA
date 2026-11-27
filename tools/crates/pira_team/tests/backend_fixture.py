@@ -3,14 +3,12 @@ import json
 from pathlib import Path
 
 
-def write_schemas(directory, contract, fault=""):
+def write_schemas(directory, contract, fault="", *, goal_contract=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     schemas = dict(contract["schemas"])
-    import os
-    if fault != "no-goals" and (path := os.environ.get("TEAM_TEST_BACKEND_CONTRACT")):
-        optional = Path(path).parent / "harness/codex/goal_contract.json"
-        for name, expected in json.loads(optional.read_text()).items():
+    if goal_contract is not None:
+        for name, expected in goal_contract.items():
             base = schemas.setdefault(name, {})
             for section, entries in expected.items():
                 if isinstance(entries, dict):

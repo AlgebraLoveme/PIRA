@@ -29,8 +29,13 @@ if args[:2] == ["app-server", "generate-json-schema"]:
         print("fixture schema process failure", file=sys.stderr)
         sys.exit(7)
     contract = json.loads(Path(os.environ["TEAM_TEST_BACKEND_CONTRACT"]).read_text())
-    fixture = runpy.run_path(os.environ["TEAM_TEST_BACKEND_FIXTURE"])
-    fixture["write_schemas"](args[args.index("--out") + 1], contract, os.environ.get("TEAM_BAD_BACKEND", ""))
+    fixture_path = Path(os.environ["TEAM_TEST_BACKEND_FIXTURE"]).resolve()
+    fixture = runpy.run_path(str(fixture_path))
+    fault = os.environ.get("TEAM_BAD_BACKEND", "")
+    # The base inventory can be overridden by fault tests in a temporary directory.
+    goal_path = fixture_path.parents[3] / "src/pira_team/harness/codex/goal_contract.json"
+    goal_contract = None if fault == "no-goals" else json.loads(goal_path.read_text())
+    fixture["write_schemas"](args[args.index("--out") + 1], contract, fault, goal_contract=goal_contract)
     sys.exit(0)
 if real_codex := os.environ.get("TEAM_REAL_COORDINATOR_CODEX"):
     home = Path(os.environ["CODEX_HOME"])
